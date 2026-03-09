@@ -2,10 +2,10 @@
 backtest.py — CLI entry point for alpha-engine-backtester.
 
 Usage:
-    # Mode 1 — Signal quality report (works now; results meaningful at Week 4+)
+    # Mode 1 — Signal quality report
     python backtest.py --mode signal-quality
 
-    # Mode 2 — Portfolio simulation (deferred until Week 4+)
+    # Mode 2 — Portfolio simulation (requires executor_path in config.yaml)
     python backtest.py --mode simulate
 
     # Full report (both modes)
@@ -111,24 +111,114 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
     return sq_result, regime_rows, score_rows, attr_result
 
 
-def run_simulate(config: dict):
+def run_simulate(config: dict) -> dict:
     """
-    Run Mode 2: executor portfolio simulation via vectorbt.
+    Run Mode 2: replay all historical signal dates through the executor with
+    SimulatedIBKRClient, then compute portfolio metrics via vectorbt.
 
-    DEFERRED — requires:
-      1. Phase 0a: SimulatedIBKRClient in alpha-engine/executor/ibkr.py
-      2. Phase 0b: simulate= mode in alpha-engine/executor/main.py
-      3. Phase 0c: prices.json written to S3 by alpha-engine-research pipeline
-      4. 20+ trading days of signal history (available Week 4+)
+    Price data comes from S3 prices.json when available, falling back to
+    yfinance for any dates where prices.json is missing — so this works
+    with any number of signal dates in S3.
 
-    Raises NotImplementedError with a clear message until prerequisites are met.
+    Returns a stats dict with status, returns, Sharpe, drawdown, etc.
+    Returns {"status": "insufficient_data", ...} if fewer than
+    config["min_simulation_dates"] signal dates exist in S3.
     """
-    raise NotImplementedError(
-        "Mode 2 (portfolio simulation) is data-gated until Week 4+.\n"
-        "Requires 20+ trading days of signals.json + prices.json in S3.\n"
-        "Phase 0 (SimulatedIBKRClient, simulate= mode, price snapshots) is complete.\n"
-        "Wire up run_simulate() once sufficient signal history is available."
+    import sys
+    import pandas as pd
+
+    executor_path = config.get("executor_path")
+    if not executor_path:
+        raise ValueError(
+            "executor_path not set in config.yaml. "
+            "Set it to the alpha-engine repo root "
+            "(e.g. /home/ec2-user/alpha-engine)."
+        )
+    if executor_path not in sys.path:
+        sys.path.insert(0, executor_path)
+
+    from executor.main import run as executor_run
+    from executor.ibkr import SimulatedIBKRClient
+    from loaders import signal_loader, price_loader
+    from vectorbt_bridge import orders_to_portfolio
+    from vectorbt_bridge import portfolio_stats as compute_portfolio_stats
+
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    min_dates = config.get("min_simulation_dates", 5)
+    init_cash = float(config.get("init_cash", 1_000_000.0))
+
+    dates = signal_loader.list_dates(bucket)
+    logger.info("Mode 2: %d signal dates available in S3", len(dates))
+
+    if len(dates) < min_dates:
+        logger.warning(
+            "Mode 2: only %d signal dates available (need %d) — skipping simulation",
+            len(dates), min_dates,
+        )
+        return {
+            "status": "insufficient_data",
+            "dates_available": len(dates),
+            "min_required": min_dates,
+        }
+
+    logger.info("Mode 2: building price matrix for %d dates (yfinance fallback)...", len(dates))
+    price_matrix = price_loader.build_matrix(dates, bucket)
+
+    if price_matrix.empty:
+        return {"status": "no_prices", "dates_available": len(dates)}
+
+    # One SimulatedIBKRClient for the entire run — positions and NAV carry forward
+    # across dates so the portfolio accumulates naturally over time.
+    sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
+    all_orders = []
+    dates_simulated = 0
+
+    for signal_date in dates:
+        ts = pd.Timestamp(signal_date)
+        if ts not in price_matrix.index:
+            logger.debug("No price row for %s — skipping", signal_date)
+            continue
+
+        date_prices = price_matrix.loc[ts].dropna().to_dict()
+        if not date_prices:
+            logger.warning("Empty price row for %s — skipping", signal_date)
+            continue
+
+        try:
+            signals_raw = signal_loader.load(bucket, signal_date)
+        except FileNotFoundError:
+            logger.warning("No signals.json for %s — skipping", signal_date)
+            continue
+
+        # Swap in the new day's prices; positions and NAV persist from prior day
+        sim_client._prices = date_prices
+
+        orders = executor_run(
+            simulate=True,
+            ibkr_client=sim_client,
+            signals_override=signals_raw,
+        )
+        if orders:
+            all_orders.extend(orders)
+        dates_simulated += 1
+
+    logger.info(
+        "Mode 2: %d dates simulated, %d orders generated", dates_simulated, len(all_orders)
     )
+
+    if not all_orders:
+        return {
+            "status": "no_orders",
+            "dates_simulated": dates_simulated,
+            "note": "No ENTER signals passed risk rules during the simulation period",
+        }
+
+    pf = orders_to_portfolio(all_orders, price_matrix, init_cash=init_cash)
+    stats = compute_portfolio_stats(pf)
+    stats["status"] = "ok"
+    stats["dates_simulated"] = dates_simulated
+    stats["total_orders"] = len(all_orders)
+    return stats
 
 
 def main():
@@ -179,8 +269,9 @@ def main():
     if args.mode in ("simulate", "all"):
         try:
             portfolio_stats = run_simulate(config)
-        except NotImplementedError as e:
-            logger.warning("%s", e)
+        except Exception as e:
+            logger.error("Mode 2 simulation failed: %s", e)
+            portfolio_stats = {"status": "error", "error": str(e)}
 
     report_md = build_report(
         run_date=args.date,
