@@ -113,6 +113,37 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
     return sq_result, regime_rows, score_rows, attr_result, df_base
 
 
+def _read_current_weights(config: dict) -> dict:
+    """
+    Read current scoring weights from alpha-engine-research/config/universe.yaml.
+    Falls back to weight_optimizer.DEFAULT_WEIGHTS if the research repo isn't found.
+    """
+    research_paths = config.get("research_paths", [])
+    if isinstance(research_paths, str):
+        research_paths = [research_paths]
+    research_path = next((p for p in research_paths if os.path.isdir(p)), None)
+
+    if not research_path:
+        logger.warning(
+            "research_paths not found on disk — using default scoring weights. "
+            "Add research repo path to research_paths in config.yaml for accurate readings."
+        )
+        return weight_optimizer.DEFAULT_WEIGHTS.copy()
+
+    universe_yaml = os.path.join(research_path, "config", "universe.yaml")
+    try:
+        with open(universe_yaml) as f:
+            universe = yaml.safe_load(f)
+        weights = universe.get("scoring_weights", {})
+        if weights:
+            logger.info("Scoring weights read from %s: %s", universe_yaml, weights)
+            return weights
+    except Exception as e:
+        logger.warning("Could not read universe.yaml from %s: %s", universe_yaml, e)
+
+    return weight_optimizer.DEFAULT_WEIGHTS.copy()
+
+
 def run_weight_optimizer(config: dict, df_base: pd.DataFrame) -> dict:
     """
     Run the weight optimizer: join sub-scores from signals.json in S3 with
@@ -121,7 +152,7 @@ def run_weight_optimizer(config: dict, df_base: pd.DataFrame) -> dict:
     Advisory only — no weights are changed. Output included in the weekly report.
     """
     bucket = config.get("signals_bucket", "alpha-engine-research")
-    current_weights = config.get("current_scoring_weights", weight_optimizer.DEFAULT_WEIGHTS)
+    current_weights = _read_current_weights(config)
     min_samples = config.get("weight_optimizer_min_samples", 30)
 
     try:
