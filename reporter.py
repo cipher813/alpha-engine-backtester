@@ -30,6 +30,7 @@ def build_report(
     attribution: dict,
     portfolio_stats: dict | None = None,
     sweep_df=None,
+    weight_result: dict | None = None,
     config: dict | None = None,
 ) -> str:
     """
@@ -69,6 +70,11 @@ def build_report(
     # Param sweep
     if sweep_df is not None and not sweep_df.empty:
         lines += _section_param_sweep(sweep_df)
+        lines += [""]
+
+    # Weight recommendation
+    if weight_result:
+        lines += _section_weight_recommendation(weight_result)
         lines += [""]
 
     lines += [
@@ -274,6 +280,48 @@ def _section_portfolio(stats: dict) -> list[str]:
         f"| Total trades | {stats.get('total_trades', 'N/A')} |",
         f"| Win rate | {_pct(stats.get('win_rate'))} |",
     ]
+
+
+def _section_weight_recommendation(result: dict) -> list[str]:
+    lines = ["## Scoring weight recommendation"]
+    status = result.get("status")
+
+    if status in ("insufficient_data", "no_subscores", "error"):
+        lines += ["", f"> **Deferred.** {result.get('note', result.get('error', 'Unavailable.'))}"]
+        return lines
+
+    n = result.get("n_samples", 0)
+    confidence = result.get("confidence", "unknown")
+    current = result.get("current_weights", {})
+    suggested = result.get("suggested_weights", {})
+    changes = result.get("changes", {})
+    correlations = result.get("correlations", {})
+
+    lines += [
+        "",
+        f"_n={n} signals · confidence: {confidence}_",
+        "",
+        "| Sub-score | Current | Corr (10d) | Corr (30d) | Suggested | Change |",
+        "|-----------|---------|------------|------------|-----------|--------|",
+    ]
+    for k in ("technical", "news", "research"):
+        corr = correlations.get(k, {})
+        c10 = corr.get("beat_spy_10d")
+        c30 = corr.get("beat_spy_30d")
+        chg = changes.get(k, 0)
+        chg_str = f"+{chg:.1%}" if chg > 0 else f"{chg:.1%}"
+        lines.append(
+            f"| {k} | {_pct(current.get(k))} | {_fmt(c10)} | {_fmt(c30)} "
+            f"| {_pct(suggested.get(k))} | {chg_str} |"
+        )
+
+    lines += [
+        "",
+        "> **Action required:** If changes look meaningful, update `scoring_weights` in "
+        "`alpha-engine-research/config/universe.yaml` and redeploy the research Lambda.",
+        f"> {result.get('note', '')}",
+    ]
+    return lines
 
 
 def _section_param_sweep(df) -> list[str]:

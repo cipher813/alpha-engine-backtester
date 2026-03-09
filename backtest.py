@@ -37,9 +37,11 @@ from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
+import pandas as pd
 import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution, param_sweep
+from optimizer import weight_optimizer
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
 
@@ -108,7 +110,30 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
 
     attr_result = attribution.compute_attribution(df_base)
 
-    return sq_result, regime_rows, score_rows, attr_result
+    return sq_result, regime_rows, score_rows, attr_result, df_base
+
+
+def run_weight_optimizer(config: dict, df_base: pd.DataFrame) -> dict:
+    """
+    Run the weight optimizer: join sub-scores from signals.json in S3 with
+    score_performance outcomes, then suggest revised scoring weights.
+
+    Advisory only — no weights are changed. Output included in the weekly report.
+    """
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    current_weights = config.get("current_scoring_weights", weight_optimizer.DEFAULT_WEIGHTS)
+    min_samples = config.get("weight_optimizer_min_samples", 30)
+
+    try:
+        df_with_sub = weight_optimizer.load_with_subscores(df_base, bucket)
+        return weight_optimizer.compute_weights(
+            df_with_sub,
+            current_weights=current_weights,
+            min_samples=min_samples,
+        )
+    except Exception as e:
+        logger.warning("Weight optimizer failed: %s", e)
+        return {"status": "error", "error": str(e)}
 
 
 def _setup_simulation(config: dict) -> tuple:
@@ -316,14 +341,17 @@ def main():
 
     portfolio_stats = None
     sweep_df = None
+    weight_result = None
 
     if args.mode in ("signal-quality", "all"):
-        sq_result, regime_rows, score_rows, attr_result = run_signal_quality(config)
+        sq_result, regime_rows, score_rows, attr_result, df_base = run_signal_quality(config)
+        weight_result = run_weight_optimizer(config, df_base)
     else:
         sq_result = {"status": "skipped"}
         regime_rows = []
         score_rows = []
         attr_result = {"status": "skipped"}
+        df_base = None
 
     if args.mode in ("simulate", "all"):
         try:
@@ -347,6 +375,7 @@ def main():
         attribution=attr_result,
         portfolio_stats=portfolio_stats,
         sweep_df=sweep_df,
+        weight_result=weight_result,
         config=config,
     )
 
