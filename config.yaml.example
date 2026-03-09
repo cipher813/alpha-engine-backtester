@@ -21,6 +21,14 @@ executor_paths:
   - /path/to/local/alpha-engine        # local dev
   - /home/ec2-user/alpha-engine        # EC2
 
+# Current scoring weights (from alpha-engine-research/config/universe.yaml)
+# Update here whenever you change them in the research module.
+current_scoring_weights:
+  technical: 0.40
+  news: 0.30
+  research: 0.30
+weight_optimizer_min_samples: 30
+
 # Signal quality parameters (Mode 1)
 score_thresholds:
   - 60

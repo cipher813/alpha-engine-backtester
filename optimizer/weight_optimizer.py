@@ -1,0 +1,229 @@
+"""
+weight_optimizer.py — scoring weight recommendation based on sub-score attribution.
+
+Joins score_performance outcomes (research.db) with sub-scores from signals.json (S3)
+to compute which sub-scores (technical / news / research) best predict outperformance.
+Suggests revised weights and includes them in the weekly report for manual review.
+
+This is advisory only — no weights are changed automatically. The user reviews the
+suggestion and updates scoring_weights in alpha-engine-research/config/universe.yaml.
+
+Current default weights: technical=0.40, news=0.30, research=0.30
+"""
+
+import json
+import logging
+
+import boto3
+import pandas as pd
+from botocore.exceptions import ClientError
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_WEIGHTS = {"technical": 0.40, "news": 0.30, "research": 0.30}
+SUB_SCORES = ["technical", "news", "research"]
+
+# Blend factor: how much the correlation signal moves the suggested weight
+# toward the purely data-driven weight. 0.3 = conservative; 1.0 = fully data-driven.
+BLEND_FACTOR = 0.3
+
+# Confidence thresholds (number of samples with beat_spy_10d populated)
+CONFIDENCE_LOW = 50
+CONFIDENCE_MEDIUM = 200
+
+
+def load_with_subscores(
+    df: pd.DataFrame,
+    bucket: str,
+    signals_prefix: str = "signals",
+) -> pd.DataFrame:
+    """
+    Enrich a score_performance DataFrame with sub-scores from signals.json in S3.
+
+    For each unique score_date in df, loads the corresponding signals.json and
+    extracts technical/news/research sub-scores per symbol. Merges back by
+    (symbol, score_date).
+
+    Args:
+        df:              score_performance DataFrame (from signal_quality.load_score_performance).
+        bucket:          S3 bucket containing signals/{date}/signals.json.
+        signals_prefix:  S3 prefix for signals files (default "signals").
+
+    Returns:
+        DataFrame with technical_score, news_score, research_score columns added.
+        Rows where sub-scores could not be resolved are kept but have NaN sub-scores.
+    """
+    if df.empty:
+        return df
+
+    dates = df["score_date"].unique().tolist()
+    logger.info("Loading sub-scores for %d signal dates from S3...", len(dates))
+
+    # Build lookup: {score_date: {symbol: {technical: N, news: N, research: N}}}
+    subscores_by_date: dict[str, dict] = {}
+    s3 = boto3.client("s3")
+
+    for d in dates:
+        key = f"{signals_prefix}/{d}/signals.json"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            data = json.loads(obj["Body"].read())
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                logger.debug("No signals.json for %s — sub-scores unavailable for this date", d)
+            else:
+                logger.warning("S3 error loading signals for %s: %s", d, e)
+            continue
+
+        by_symbol: dict[str, dict] = {}
+        for stock in data.get("universe", []) + data.get("buy_candidates", []):
+            ticker = stock.get("ticker") or stock.get("symbol")
+            sub = stock.get("sub_scores", {})
+            if ticker and sub:
+                by_symbol[ticker] = {k: sub.get(k) for k in SUB_SCORES}
+
+        subscores_by_date[d] = by_symbol
+        logger.debug("Loaded sub-scores for %d symbols on %s", len(by_symbol), d)
+
+    loaded_dates = len(subscores_by_date)
+    logger.info(
+        "Sub-scores loaded for %d/%d dates", loaded_dates, len(dates)
+    )
+
+    if not subscores_by_date:
+        logger.warning(
+            "No sub-scores found in S3. signals.json must include sub_scores per stock. "
+            "Attribution and weight optimization will be skipped."
+        )
+        return df
+
+    # Build a flat sub-score DataFrame and merge
+    rows = []
+    for d, by_symbol in subscores_by_date.items():
+        for symbol, sub in by_symbol.items():
+            rows.append({"symbol": symbol, "score_date": d, **{f"{k}_score": v for k, v in sub.items()}})
+
+    sub_df = pd.DataFrame(rows)
+    merged = df.merge(sub_df, on=["symbol", "score_date"], how="left")
+    filled = merged[["technical_score", "news_score", "research_score"]].notna().any(axis=1).sum()
+    logger.info("Sub-scores matched for %d/%d score_performance rows", filled, len(merged))
+    return merged
+
+
+def compute_weights(
+    df: pd.DataFrame,
+    current_weights: dict | None = None,
+    min_samples: int = 30,
+) -> dict:
+    """
+    Compute suggested scoring weights from sub-score vs. beat_spy correlations.
+
+    Args:
+        df:               score_performance DataFrame with technical_score, news_score,
+                          research_score columns (from load_with_subscores).
+        current_weights:  Current weights dict. Defaults to DEFAULT_WEIGHTS.
+        min_samples:      Minimum rows with beat_spy_10d populated to proceed.
+
+    Returns:
+        {
+            "status": "ok" | "insufficient_data" | "no_subscores",
+            "n_samples": int,
+            "confidence": "low" | "medium" | "high",
+            "current_weights": {"technical": 0.40, "news": 0.30, "research": 0.30},
+            "correlations": {
+                "technical": {"beat_spy_10d": 0.24, "beat_spy_30d": 0.19},
+                "news":       {"beat_spy_10d": 0.11, "beat_spy_30d": 0.14},
+                "research":   {"beat_spy_10d": 0.18, "beat_spy_30d": 0.22},
+            },
+            "suggested_weights": {"technical": 0.44, "news": 0.28, "research": 0.28},
+            "changes": {"technical": +0.04, "news": -0.02, "research": -0.02},
+            "note": "..."
+        }
+    """
+    if current_weights is None:
+        current_weights = DEFAULT_WEIGHTS.copy()
+
+    populated = df[df["beat_spy_10d"].notna()].copy()
+    n = len(populated)
+
+    if n < min_samples:
+        return {
+            "status": "insufficient_data",
+            "n_samples": n,
+            "min_required": min_samples,
+            "current_weights": current_weights,
+            "note": (
+                f"Only {n} rows with beat_spy_10d populated "
+                f"(need {min_samples}). Weight recommendation deferred."
+            ),
+        }
+
+    # Check sub-score columns are present
+    sub_cols = {s: f"{s}_score" for s in SUB_SCORES if f"{s}_score" in populated.columns}
+    if not sub_cols:
+        return {
+            "status": "no_subscores",
+            "n_samples": n,
+            "current_weights": current_weights,
+            "note": (
+                "Sub-score columns not found. signals.json may not include sub_scores. "
+                "Run load_with_subscores() before compute_weights()."
+            ),
+        }
+
+    # Compute correlations with beat_spy outcomes
+    correlations: dict[str, dict] = {}
+    for label, col in sub_cols.items():
+        corr: dict[str, float | None] = {}
+        for target in ("beat_spy_10d", "beat_spy_30d"):
+            valid = populated[[col, target]].dropna()
+            corr[target] = float(valid[col].corr(valid[target])) if len(valid) >= 10 else None
+        correlations[label] = corr
+
+    # Derive suggested weights
+    # Use 60/40 blend of 10d and 30d correlations; clip negatives to 0
+    weighted_corrs: dict[str, float] = {}
+    for label, corr in correlations.items():
+        c10 = corr.get("beat_spy_10d") or 0.0
+        c30 = corr.get("beat_spy_30d") or 0.0
+        weighted_corrs[label] = max(0.0, 0.6 * c10 + 0.4 * c30)
+
+    total_corr = sum(weighted_corrs.values())
+    if total_corr == 0:
+        # No positive correlations — keep current weights
+        pure_suggested = current_weights.copy()
+    else:
+        pure_suggested = {k: v / total_corr for k, v in weighted_corrs.items()}
+
+    # Blend toward data-driven weights conservatively
+    suggested = {
+        k: round(current_weights.get(k, 0.0) * (1 - BLEND_FACTOR) + pure_suggested.get(k, 0.0) * BLEND_FACTOR, 3)
+        for k in SUB_SCORES
+    }
+
+    # Re-normalize to ensure sum == 1.0
+    total = sum(suggested.values())
+    suggested = {k: round(v / total, 3) for k, v in suggested.items()}
+
+    changes = {k: round(suggested[k] - current_weights.get(k, 0.0), 3) for k in SUB_SCORES}
+
+    confidence = (
+        "high" if n >= CONFIDENCE_MEDIUM
+        else "medium" if n >= CONFIDENCE_LOW
+        else "low"
+    )
+
+    return {
+        "status": "ok",
+        "n_samples": n,
+        "confidence": confidence,
+        "current_weights": current_weights,
+        "correlations": correlations,
+        "suggested_weights": suggested,
+        "changes": changes,
+        "note": (
+            f"Based on {n} signals. Confidence: {confidence}. "
+            "To apply: update scoring_weights in alpha-engine-research/config/universe.yaml. "
+            "Suggested weights blend 30% data signal with 70% current weights to avoid instability."
+        ),
+    }
