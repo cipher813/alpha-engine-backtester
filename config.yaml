@@ -15,9 +15,10 @@ init_cash: 1_000_000.0
 min_simulation_dates: 5
 
 # Path to alpha-engine repo root — required for Mode 2 (imports executor.main)
-# EC2:  /home/ec2-user/alpha-engine
-# Local: /Users/brianmcmahon/Development/alpha-engine
-executor_path: /home/ec2-user/alpha-engine
+# First existing path wins; supports running on both local and EC2 without changes.
+executor_paths:
+  - /Users/brianmcmahon/Development/alpha-engine
+  - /home/ec2-user/alpha-engine
 
 # Signal quality parameters (Mode 1)
 score_thresholds:
