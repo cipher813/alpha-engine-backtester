@@ -31,7 +31,7 @@ def load_with_regime(db_path: str) -> pd.DataFrame:
             """
             SELECT sp.*, ms.market_regime
             FROM score_performance sp
-            LEFT JOIN macro_snapshots ms ON date(sp.score_date) = date(ms.snapshot_date)
+            LEFT JOIN macro_snapshots ms ON date(sp.score_date) = ms.date
             ORDER BY sp.score_date
             """,
             conn,
