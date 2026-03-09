@@ -1,13 +1,8 @@
 #!/bin/bash
-# One-time setup for alpha-engine-backtester on the same EC2 instance as the executor.
+# Post-clone setup: venv, deps, log file, cron.
+# Run after git clone — credentials must already be in ~/.netrc.
 #
-# Deploy from local:
-#   git push origin main
-#   ae "bash ~/alpha-engine-backtester/infrastructure/setup-ec2.sh"
-#
-# Or if the repo isn't cloned yet, SSH in first:
-#   ae
-#   git clone https://github.com/brianmcmahon/alpha-engine-backtester.git
+# Usage (from EC2, after cloning):
 #   bash ~/alpha-engine-backtester/infrastructure/setup-ec2.sh
 
 set -euo pipefail
@@ -16,11 +11,9 @@ REPO_DIR="/home/ec2-user/alpha-engine-backtester"
 
 echo "=== Alpha Engine Backtester — EC2 setup ==="
 
-# ── 1. Pull latest code ───────────────────────────────────────────────────────
 cd "$REPO_DIR"
-git pull
 
-# ── 2. Create virtualenv (separate from executor's venv — different deps) ─────
+# ── 1. Virtualenv ─────────────────────────────────────────────────────────────
 if [ ! -d ".venv" ]; then
     echo "Creating virtualenv..."
     python3.11 -m venv .venv
@@ -30,18 +23,14 @@ echo "Installing dependencies..."
 .venv/bin/pip install --quiet --upgrade pip
 .venv/bin/pip install --quiet -r requirements.txt
 
-# ── 3. Create log file ────────────────────────────────────────────────────────
+# ── 2. Log file ───────────────────────────────────────────────────────────────
 sudo touch /var/log/backtester.log
 sudo chown ec2-user:ec2-user /var/log/backtester.log
 
-# ── 4. Register cron job ──────────────────────────────────────────────────────
+# ── 3. Cron ───────────────────────────────────────────────────────────────────
 bash "$REPO_DIR/infrastructure/add-cron.sh"
 
 echo ""
 echo "=== Setup complete ==="
-echo ""
-echo "Test run:"
-echo "  cd $REPO_DIR && .venv/bin/python backtest.py --mode signal-quality"
-echo ""
-echo "Logs:"
-echo "  tail -f /var/log/backtester.log"
+echo "Test: cd $REPO_DIR && .venv/bin/python backtest.py --mode signal-quality"
+echo "Logs: tail -f /var/log/backtester.log"
