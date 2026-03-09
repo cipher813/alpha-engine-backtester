@@ -40,6 +40,7 @@ from botocore.exceptions import ClientError
 import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
+from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
 
 logger = logging.getLogger(__name__)
@@ -213,6 +214,21 @@ def main():
             run_date=args.date,
         )
         print(f"\nUploaded to s3://{config.get('output_bucket')}/{config.get('output_prefix')}/{args.date}/")
+
+    sender = config.get("email_sender")
+    recipients = config.get("email_recipients", [])
+    if sender and recipients:
+        send_report_email(
+            run_date=args.date,
+            report_md=report_md,
+            status=sq_result.get("status", "unknown"),
+            sender=sender,
+            recipients=recipients,
+            s3_bucket=config.get("output_bucket") if args.upload else None,
+            s3_prefix=config.get("output_prefix", "backtest"),
+        )
+    else:
+        logger.warning("No email_sender/email_recipients in config — skipping email")
 
 
 if __name__ == "__main__":
