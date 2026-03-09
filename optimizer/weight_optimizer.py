@@ -286,16 +286,26 @@ def apply_weights(result: dict, bucket: str) -> dict:
     }
 
     s3 = boto3.client("s3")
+    body = json.dumps(payload, indent=2)
     s3.put_object(
         Bucket=bucket,
         Key=S3_WEIGHTS_KEY,
-        Body=json.dumps(payload, indent=2),
+        Body=body,
         ContentType="application/json",
     )
     logger.info(
         "Scoring weights updated in S3: %s (n=%s, confidence=%s)",
         suggested, payload["n_samples"], confidence,
     )
+
+    history_key = f"config/scoring_weights_history/{date.today().isoformat()}.json"
+    s3.put_object(
+        Bucket=bucket,
+        Key=history_key,
+        Body=body,
+        ContentType="application/json",
+    )
+    logger.info("Scoring weights archived to s3://%s/%s", bucket, history_key)
 
     return {
         "applied": True,

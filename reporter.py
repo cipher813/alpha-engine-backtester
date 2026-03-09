@@ -90,6 +90,7 @@ def save(
     signal_quality: dict,
     score_analysis: list[dict],
     sweep_df=None,
+    attribution: dict | None = None,
     run_date: str | None = None,
     results_dir: str = "results",
 ) -> Path:
@@ -128,6 +129,11 @@ def save(
     if sweep_df is not None and not sweep_df.empty:
         sweep_df.to_csv(out_dir / "param_sweep.csv", index=False)
         logger.info("Wrote %s", out_dir / "param_sweep.csv")
+
+    # Attribution JSON
+    if attribution and attribution.get("status") == "ok":
+        (out_dir / "attribution.json").write_text(json.dumps(attribution, indent=2, default=str))
+        logger.info("Wrote %s", out_dir / "attribution.json")
 
     return out_dir
 

@@ -418,6 +418,7 @@ def main():
         signal_quality=sq_result,
         score_analysis=score_rows,
         sweep_df=sweep_df,
+        attribution=attr_result if args.mode in ("signal-quality", "all") else None,
         run_date=args.date,
         results_dir=config.get("results_dir", "results"),
     )
