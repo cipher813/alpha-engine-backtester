@@ -9,11 +9,13 @@
 3. [Data sources](#3-data-sources)
 4. [Mode 1 — Signal quality](#4-mode-1--signal-quality)
 5. [Mode 2 — Portfolio simulation](#5-mode-2--portfolio-simulation)
-6. [vectorbt metrics reference](#6-vectorbt-metrics-reference)
-7. [Reporter output](#7-reporter-output)
-8. [EC2 deployment](#8-ec2-deployment)
-9. [IAM policy](#9-iam-policy)
-10. [Development workflow](#10-development-workflow)
+6. [Param sweep](#6-param-sweep)
+7. [Weight optimizer](#7-weight-optimizer)
+8. [vectorbt metrics reference](#8-vectorbt-metrics-reference)
+9. [Reporter output](#9-reporter-output)
+10. [EC2 deployment](#10-ec2-deployment)
+11. [IAM policy](#11-iam-policy)
+12. [Development workflow](#12-development-workflow)
 
 ---
 
@@ -22,9 +24,10 @@
 ### Prerequisites
 
 - Python 3.11+
-- AWS credentials with access to the research S3 bucket (see [§9 IAM policy](#9-iam-policy))
+- AWS credentials with access to the research S3 bucket (see [§11 IAM policy](#11-iam-policy))
 - The [alpha-engine-research](https://github.com/cipher813/alpha-engine-research) pipeline running and writing to S3
-- The [alpha-engine](https://github.com/cipher813/alpha-engine) executor repo cloned alongside this one (required for Mode 2)
+- The [alpha-engine](https://github.com/cipher813/alpha-engine) executor repo cloned locally (required for Mode 2 and param sweep)
+- The [alpha-engine-research](https://github.com/cipher813/alpha-engine-research) repo cloned locally (used to read current scoring weights)
 
 ### Install
 
@@ -33,26 +36,16 @@ git clone https://github.com/cipher813/alpha-engine-backtester.git
 cd alpha-engine-backtester
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cp config.yaml.example config.yaml
 ```
 
-### Executor dependency (Mode 2 only)
-
-Mode 2 imports `executor.main.run(simulate=True)` and `executor.ibkr.SimulatedIBKRClient` from the alpha-engine repo. The executor must be on `sys.path`:
-
-```bash
-# Option A — clone executor next to backtester
-git clone https://github.com/cipher813/alpha-engine.git ../alpha-engine
-export PYTHONPATH=../alpha-engine:$PYTHONPATH
-
-# Option B — add to config.yaml
-executor_path: /home/ec2-user/alpha-engine
-```
+Edit `config.yaml` with your S3 bucket name, local repo paths, and email address.
 
 ---
 
 ## 2. Configuration
 
-All settings live in `config.yaml`:
+All settings live in `config.yaml` (gitignored). Use `config.yaml.example` as the template.
 
 ```yaml
 # S3 bucket written by alpha-engine-research
@@ -65,8 +58,24 @@ output_prefix: backtest
 # Local results directory
 results_dir: results
 
-# Starting portfolio value for Mode 2 simulation
+# Mode 2 simulation parameters
 init_cash: 1_000_000.0
+min_simulation_dates: 5
+
+# Path to alpha-engine repo — required for Mode 2 / param sweep
+# First existing path wins; supports local dev and EC2 without changes.
+executor_paths:
+  - /path/to/local/alpha-engine
+  - /home/ec2-user/alpha-engine
+
+# Path to alpha-engine-research repo — used to read current scoring weights
+# from config/universe.yaml automatically. First existing path wins.
+research_paths:
+  - /path/to/local/alpha-engine-research
+  - /home/ec2-user/alpha-engine-research
+
+# Minimum samples with beat_spy_10d populated before weight optimizer runs
+weight_optimizer_min_samples: 30
 
 # Score thresholds for Mode 1 accuracy-vs-threshold table
 score_thresholds: [60, 65, 70, 75, 80, 85, 90]
@@ -82,7 +91,7 @@ email_recipients:
 # research.db is pulled from S3 automatically — no path needed.
 # Override with --db flag for local development.
 
-# Param sweep grid (Mode 2, Phase 5)
+# Param sweep grid
 param_sweep:
   min_score: [65, 70, 75, 80]
   max_position_pct: [0.05, 0.10, 0.15]
@@ -91,12 +100,11 @@ param_sweep:
 
 ### research.db
 
-`research.db` is a SQLite database maintained by the alpha-engine-research Lambda. At the start of every backtester run, `backtest.py` pulls a fresh copy from `s3://{signals_bucket}/research.db` into a temp file. It is read-only — the backtester never writes to it.
+`research.db` is a SQLite database maintained by the alpha-engine-research Lambda. At the start of every backtester run, `backtest.py` pulls a fresh copy from `s3://{signals_bucket}/research.db` into a temp file. The backtester never writes to it.
 
 Override with `--db /path/to/research.db` to use a local copy during development:
 
 ```bash
-# Pull a local copy for development
 aws s3 cp s3://alpha-engine-research/research.db ./research.db
 python backtest.py --mode signal-quality --db ./research.db
 ```
@@ -112,13 +120,14 @@ Written daily by alpha-engine-research at `s3://{bucket}/signals/{date}/signals.
 ```json
 {
   "date": "2026-03-09",
-  "signals": [
+  "market_regime": "bull",
+  "universe": [
     {
-      "symbol": "PLTR",
+      "ticker": "PLTR",
+      "signal": "ENTER",
       "rating": "BUY",
       "score": 82,
       "conviction": "rising",
-      "market_regime": "bull",
       "sub_scores": {"technical": 85, "news": 78, "research": 83}
     }
   ]
@@ -146,7 +155,7 @@ Written daily by alpha-engine-research at `s3://{bucket}/prices/{date}/prices.js
 2. **yfinance** — tickers resolved automatically from the corresponding `signals.json`
 3. **IBKR `reqHistoricalData`** — optional; pass `ibkr_client=` to `build_matrix()` for gap-filling
 
-This means price data is available for all historical signal dates even before the research pipeline started writing `prices.json` files.
+Price data is available for all historical signal dates regardless of when `prices.json` files started being written.
 
 ### research.db schema (relevant tables)
 
@@ -168,7 +177,7 @@ macro_snapshots (
     vix, sp500_close, sp500_30d_return, ...
 )
 
--- Full investment thesis per stock per day
+-- Full investment thesis per stock per day (includes sub-scores)
 investment_thesis (
     symbol, date, rating, score,
     technical_score, news_score, research_score,
@@ -180,7 +189,7 @@ investment_thesis (
 
 ## 4. Mode 1 — Signal quality
 
-Reads `score_performance` from `research.db` and aggregates accuracy metrics.
+Reads `score_performance` from `research.db`, aggregates accuracy metrics, and runs the weight optimizer.
 
 ### Run
 
@@ -209,7 +218,7 @@ Slices computed: overall, by score bucket (60–70, 70–80, 80–90, 90+), by c
 | 55–60% | Meaningful edge |
 | > 60% | Strong edge |
 
-50 samples is the minimum for meaningful accuracy estimates. Results before Week 4 (~200 `score_performance` rows with 10d returns) will return `insufficient_data` and are expected.
+50 samples is the minimum for meaningful accuracy estimates. Results before ~Week 4 (~200 `score_performance` rows with 10d returns) will return `insufficient_data` and are expected.
 
 ### Score threshold analysis
 
@@ -217,7 +226,7 @@ Slices computed: overall, by score bucket (60–70, 70–80, 80–90, 90+), by c
 
 ### Attribution
 
-`analysis/attribution.py` computes correlation between each sub-score (technical, news, research) and `beat_spy_10d`. Use this quarterly to identify which signal component is driving returns and adjust scoring weights in the research pipeline accordingly.
+`analysis/attribution.py` computes correlation between each sub-score (technical, news, research) and `beat_spy_10d`. This feeds directly into the weight optimizer — see [§7](#7-weight-optimizer).
 
 ---
 
@@ -225,31 +234,115 @@ Slices computed: overall, by score bucket (60–70, 70–80, 80–90, 90+), by c
 
 Replays all historical signal dates through the executor's logic and builds a vectorbt portfolio.
 
-### Status
+### Run
 
-Mode 2 is data-gated. It requires 20+ trading days of `signals.json` in S3. The `run_simulate()` function in `backtest.py` raises `NotImplementedError` until it is wired to the executor. See `backtest.py:run_simulate()` for the wiring instructions.
+```bash
+python backtest.py --mode simulate
+```
 
 ### How it works
 
-For each historical date:
+For each historical date with signals in S3:
 
-```python
-from executor.main import run as executor_run
-from executor.ibkr import SimulatedIBKRClient
+1. Load `signals.json` from S3
+2. Resolve prices from the price matrix (S3 → yfinance fallback)
+3. Run `executor.main.run(simulate=True, ibkr_client=sim_client, signals_override=signals)`
+4. Collect orders — the same risk guard, position sizer, and conviction logic runs unchanged
 
-signals = signal_loader.load(bucket, date)
-prices  = price_loader.load(bucket, date, tickers=all_tickers)
-client  = SimulatedIBKRClient(prices["prices"], nav=current_nav)
-orders  = executor_run(simulate=True, ibkr_client=client, signals_override=signals)
-```
+A single `SimulatedIBKRClient` is maintained across all dates so positions and NAV accumulate naturally (entering on Day 1 means the position is still open on Day 2).
 
-The same executor logic — risk guard, position sizer, conviction check — runs unchanged. No separate copy of trading rules exists in the backtester.
+Orders are then passed to `vectorbt_bridge.orders_to_portfolio()` for analytics. See [§8](#8-vectorbt-metrics-reference) for available metrics.
 
-Orders are then passed to `vectorbt_bridge.orders_to_portfolio()` which builds a `vbt.Portfolio` for analysis.
+### Data requirement
+
+Returns `{"status": "insufficient_data"}` if fewer than `min_simulation_dates` (default 5) signal dates are available in S3.
 
 ---
 
-## 6. vectorbt metrics reference
+## 6. Param sweep
+
+Runs Mode 2 across a grid of executor risk parameters to find the combination with the best Sharpe ratio.
+
+### Run
+
+```bash
+python backtest.py --mode param-sweep
+```
+
+### How it works
+
+The price matrix is built **once** from S3/yfinance. For each combination of `min_score`, `max_position_pct`, and `drawdown_circuit_breaker` in the grid, the simulation loop re-runs with a fresh `SimulatedIBKRClient` using those parameters. Results are sorted by Sharpe ratio.
+
+Default grid (36 combinations):
+
+```yaml
+param_sweep:
+  min_score: [65, 70, 75, 80]
+  max_position_pct: [0.05, 0.10, 0.15]
+  drawdown_circuit_breaker: [0.10, 0.15, 0.20]
+```
+
+Output: top 10 combinations in the report, full results in `param_sweep.csv`.
+
+---
+
+## 7. Weight optimizer
+
+Automatically updates scoring weights in the research Lambda based on which sub-scores (technical / news / research) best predict outperformance.
+
+### How it works
+
+1. **Sub-score join** — `score_performance` outcomes (from `research.db`) are joined with sub-scores from `signals.json` in S3 for each signal date. This gives a dataset of `(symbol, date, technical_score, news_score, research_score, beat_spy_10d, beat_spy_30d)`.
+
+2. **Correlation** — each sub-score is correlated with `beat_spy_10d` (60% weight) and `beat_spy_30d` (40% weight).
+
+3. **Weight suggestion** — correlation scores are normalized to sum to 1.0, then blended conservatively with the current weights (30% data signal, 70% current weights) to avoid instability.
+
+4. **Autonomous application** — if all guardrails pass, the suggested weights are written to `s3://{bucket}/config/scoring_weights.json`. The research Lambda reads this file at cold-start and uses it in place of `universe.yaml` defaults — **no Lambda redeployment needed**.
+
+### Guardrails
+
+All three must pass before weights are applied:
+
+| Guardrail | Threshold |
+|-----------|-----------|
+| Confidence | `medium` or `high` (≥50 samples with `beat_spy_10d` populated) |
+| Max single change | ≤ 15 percentage points |
+| Min meaningful change | At least one weight changes by ≥ 2% |
+
+If any guardrail fails, the run is a no-op and the report explains why.
+
+### Feedback loop
+
+```
+Sunday backtester run
+  → correlate sub-scores vs. beat_spy outcomes
+  → if guardrails pass: write new weights to S3
+       ↓
+Monday Lambda cold-start
+  → aggregator._get_weights() reads S3 override
+  → new weights used for that day's scoring
+       ↓
+Following Sunday backtester run
+  → measures impact of updated weights
+  → adjusts again if warranted
+```
+
+### Current scoring weights
+
+Read automatically from `alpha-engine-research/config/universe.yaml` via `research_paths` in `config.yaml`. No manual sync required — the "Current" column in the weekly report always reflects the live values.
+
+### Confidence levels
+
+| Level | Samples | Meaning |
+|-------|---------|---------|
+| `low` | < 50 | Too noisy — weights not updated |
+| `medium` | 50–199 | Updates enabled with conservative blending |
+| `high` | 200+ | Full confidence — blending still applied for stability |
+
+---
+
+## 8. vectorbt metrics reference
 
 ### Building the portfolio
 
@@ -264,12 +357,15 @@ dates = signal_loader.list_dates(bucket="alpha-engine-research")
 prices = price_loader.build_matrix(dates, bucket="alpha-engine-research")
 # DataFrame: rows = datetime index, columns = ticker symbols
 
-# 3. Build order list (from executor simulation — see Mode 2)
+# 3. Run simulation to get orders
+from backtest import load_config, run_simulate
+config = load_config("config.yaml")
+stats = run_simulate(config)
+
+# 4. Or build the portfolio directly
 # orders = [{"date": "2026-03-09", "ticker": "PLTR",
 #            "action": "ENTER", "shares": 100, "price_at_order": 84.12}, ...]
-
-# 4. Build vectorbt Portfolio
-pf = orders_to_portfolio(orders, prices, init_cash=1_000_000.0)
+# pf = orders_to_portfolio(orders, prices, init_cash=1_000_000.0)
 ```
 
 ### Key metrics
@@ -316,20 +412,13 @@ print(f"SPY return:       {spy_pf.total_return()*100:.1f}%")
 ### Interactive plots
 
 ```python
-# Full portfolio stats dashboard
-pf.plot().show()
-
-# NAV vs SPY over time
-pf.value().vbt.plot(trace_kwargs=dict(name="Portfolio")).show()
-
-# Drawdown chart
-pf.drawdown().vbt.plot().show()
-
-# Individual trade waterfall
-pf.trades.plot().show()
+pf.plot().show()                                              # full dashboard
+pf.value().vbt.plot(trace_kwargs=dict(name="Portfolio")).show()  # NAV over time
+pf.drawdown().vbt.plot().show()                               # drawdown chart
+pf.trades.plot().show()                                       # trade waterfall
 ```
 
-### Summary dict (for metrics.json)
+### Summary dict
 
 ```python
 from vectorbt_bridge import portfolio_stats
@@ -344,35 +433,20 @@ stats = portfolio_stats(pf)
 # }
 ```
 
-### Param sweep
-
-`analysis/param_sweep.py` runs `orders_to_portfolio()` across a grid of executor risk parameters to find the combination with the best Sharpe ratio:
-
-```python
-from analysis.param_sweep import sweep, best_params
-
-results_df = sweep(
-    grid=config["param_sweep"],
-    run_simulation_fn=my_run_fn,   # wraps backtest.run_simulate()
-    base_config=config,
-)
-print(results_df.head(10))         # sorted by sharpe_ratio
-print(best_params(results_df))     # {"min_score": 75, "max_position_pct": 0.10, ...}
-```
-
 ---
 
-## 7. Reporter output
+## 9. Reporter output
 
-Every run produces three files in `results/{date}/`:
+Every run produces files in `results/{date}/`:
 
 | File | Contents |
 |------|----------|
-| `report.md` | Full markdown report — signal quality, regime, attribution, portfolio stats |
+| `report.md` | Full markdown report — signal quality, regime, attribution, portfolio stats, weight recommendation, param sweep |
 | `signal_quality.csv` | Accuracy by score threshold — one row per threshold |
-| `metrics.json` | Overall summary — status, accuracy_10d/30d, avg_alpha, portfolio stats |
+| `param_sweep.csv` | All param sweep combinations sorted by Sharpe ratio |
+| `metrics.json` | Overall summary — status, accuracy_10d/30d, avg_alpha |
 
-With `--upload`, all three are also written to `s3://{output_bucket}/{output_prefix}/{date}/`.
+With `--upload`, all files are also written to `s3://{output_bucket}/{output_prefix}/{date}/`.
 
 With `email_sender` configured, an HTML-formatted email is sent via SES. Subject line format:
 
@@ -382,11 +456,20 @@ Alpha Engine Backtester | 2026-03-09 | insufficient data (accumulating)
 Alpha Engine Backtester | 2026-03-09 | ERROR
 ```
 
+### Weight recommendation section
+
+The weekly email always includes the weight optimizer output:
+
+- **Applied** — new weights written to S3; Lambda picks them up on next cold-start
+- **Not applied** — reason shown (e.g., "confidence too low", "all changes < 2%")
+
+Current weights are read live from `universe.yaml` in the research repo — no manual sync needed.
+
 ---
 
-## 8. EC2 deployment
+## 10. EC2 deployment
 
-The backtester runs on the same EC2 instance as the executor (`i-xxxx`, t3.small, Amazon Linux 2023).
+The backtester runs on the same EC2 instance as the executor.
 
 ### First-time setup
 
@@ -418,7 +501,7 @@ git push origin main && ae "cd ~/alpha-engine-backtester && git pull"
 
 ```
 0 14 * * 0   cd /home/ec2-user/alpha-engine-backtester && \
-             .venv/bin/python backtest.py --mode signal-quality --upload \
+             .venv/bin/python backtest.py --mode all --upload \
              >> /var/log/backtester.log 2>&1
 ```
 
@@ -432,7 +515,7 @@ ae "tail -50 /var/log/backtester.log"
 
 ---
 
-## 9. IAM policy
+## 11. IAM policy
 
 The EC2 instance role (`alpha-engine-executor-role`) requires these S3 permissions:
 
@@ -459,42 +542,42 @@ The EC2 instance role (`alpha-engine-executor-role`) requires these S3 permissio
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": ["arn:aws:s3:::alpha-engine-research/backtest/*"]
+    },
+    {
+      "Sid": "WriteScoringWeights",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": ["arn:aws:s3:::alpha-engine-research/config/scoring_weights.json"]
     }
   ]
 }
 ```
 
-`ses:SendEmail` is required for email reports. See `alpha-engine/alpha-engine/infrastructure/s3-policy.json` for the full policy file used to apply these permissions.
+`ses:SendEmail` is required for email reports. The Lambda execution role also needs `s3:GetObject` on `config/scoring_weights.json` to read weight overrides at cold-start.
 
 ---
 
-## 10. Development workflow
+## 12. Development workflow
 
 ### Run locally against a pulled research.db
 
 ```bash
-# Pull latest research.db from S3
 aws s3 cp s3://alpha-engine-research/research.db ./research.db
-
-# Run Mode 1 locally
 python backtest.py --mode signal-quality --db ./research.db
-
-# Run with debug logging
 python backtest.py --mode signal-quality --db ./research.db --log-level DEBUG
 ```
 
 ### Inspect vectorbt output interactively
 
 ```python
-# In a Python REPL or notebook after Mode 2 is wired up:
 import yaml
 from backtest import load_config, run_simulate
-from vectorbt_bridge import orders_to_portfolio, portfolio_stats
+from vectorbt_bridge import portfolio_stats
 
 config = load_config("config.yaml")
-# pf = orders_to_portfolio(orders, prices)  # once Mode 2 is wired
-# pf.plot().show()
-# print(portfolio_stats(pf))
+stats = run_simulate(config)
+print(stats)
+# To access the portfolio object directly, call _setup_simulation + _run_simulation_loop
 ```
 
 ### Check score_performance directly
@@ -504,23 +587,31 @@ import sqlite3
 import pandas as pd
 
 conn = sqlite3.connect("research.db")
-
-# How many rows are populated?
 df = pd.read_sql("SELECT * FROM score_performance ORDER BY score_date", conn)
 print(f"Total rows: {len(df)}")
 print(f"beat_spy_10d populated: {df['beat_spy_10d'].notna().sum()}")
 print(f"beat_spy_30d populated: {df['beat_spy_30d'].notna().sum()}")
 
-# Overall accuracy (once populated)
 populated = df[df["beat_spy_10d"].notna()]
 print(f"10d accuracy: {populated['beat_spy_10d'].mean():.1%}")
 ```
 
+### Check current scoring weights in S3
+
+```bash
+# View the active weight override (if any)
+aws s3 cp s3://alpha-engine-research/config/scoring_weights.json - | python -m json.tool
+
+# Remove the override to revert to universe.yaml defaults
+aws s3 rm s3://alpha-engine-research/config/scoring_weights.json
+```
+
 ### Data availability timeline
 
-| Milestone | Date | What becomes available |
-|-----------|------|------------------------|
+| Milestone | Approx. date | What becomes available |
+|-----------|--------------|------------------------|
 | Pipeline start | 2026-03-05 | signals.json, investment_thesis |
-| Week 4 (~2026-03-20) | +10 trading days | First `beat_spy_10d` values |
-| Week 8 (~2026-05-01) | +30 trading days | First `beat_spy_30d` values; Mode 2 meaningful |
-| Month 6+ | +~120 trading days | Attribution reliable; weight optimizer viable |
+| Week 4 (~2026-03-20) | +10 trading days | First `beat_spy_10d` values; Mode 1 meaningful |
+| Week 8 (~2026-05-01) | +30 trading days | First `beat_spy_30d` values; attribution reliable |
+| Month 3+ | +~60 trading days | Weight optimizer at medium confidence (50+ samples) |
+| Month 6+ | +~120 trading days | Weight optimizer at high confidence (200+ samples) |

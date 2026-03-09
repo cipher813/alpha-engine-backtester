@@ -1,12 +1,13 @@
 # alpha-engine-backtester
 
-Backtesting and signal quality analysis for the [alpha-engine](https://github.com/cipher813/alpha-engine) trading system.
+Backtesting, signal quality analysis, and autonomous scoring optimization for the [alpha-engine](https://github.com/cipher813/alpha-engine) trading system.
 
-Answers three questions the live system cannot:
+Answers four questions the live system cannot:
 
 1. **Do the signals work?** — What % of BUY-rated stocks outperform SPY over 10d and 30d windows?
 2. **Are the risk parameters right?** — Would different `min_score`, `max_position_pct`, or `drawdown_circuit_breaker` values produce better risk-adjusted returns?
 3. **Is signal quality improving or degrading?** — As the research pipeline evolves, are signals getting sharper or noisier?
+4. **Are the scoring weights optimal?** — Which sub-score (technical / news / research) best predicts outperformance, and should the weights be rebalanced?
 
 ---
 
@@ -36,6 +37,8 @@ alpha-engine (executor, EC2)
      │   ├── score_analysis.py
      │   ├── attribution.py
      │   └── param_sweep.py
+     ├── optimizer/
+     │   └── weight_optimizer.py   ← autonomous scoring weight updates
      ├── reporter.py           markdown + CSV + S3 upload + SES email
      └── config.yaml
 
@@ -44,26 +47,38 @@ alpha-engine (executor, EC2)
    s3://your-bucket/backtest/{date}/report.md
    results/{date}/report.md
    results/{date}/signal_quality.csv
+   results/{date}/param_sweep.csv
    results/{date}/metrics.json
+
+              ↓ writes back ↓
+
+   s3://your-bucket/config/scoring_weights.json   ← picked up by Lambda on next cold-start
 ```
 
-The backtester is **read-only** with respect to all upstream systems.
+The backtester writes one upstream artifact: `config/scoring_weights.json`, updated autonomously by the weight optimizer when the data supports a change.
 
 ---
 
-## Two modes
+## Modes
 
-### Mode 1 — Signal quality (available now)
+### Mode 1 — Signal quality
 
 Reads `score_performance` from `research.db` and computes:
 - % of BUY signals that beat SPY at 10d and 30d
 - Accuracy by score bucket (60–70, 70–80, 80–90, 90+)
 - Accuracy by market regime (bull / neutral / bear / caution)
 - Sub-score attribution (technical vs. news vs. research)
+- **Scoring weight recommendation** — computed automatically; applied to S3 if guardrails pass
 
-### Mode 2 — Portfolio simulation (available Week 4+)
+### Mode 2 — Portfolio simulation
 
-Replays all historical signal dates through `executor.main.run(simulate=True)`, converts orders to a `vbt.Portfolio`, and produces Sharpe ratio, max drawdown, alpha vs SPY, and win rate. See [DOCS.md](DOCS.md#mode-2--portfolio-simulation) for details.
+Replays all historical signal dates through `executor.main.run(simulate=True)`, converts orders to a `vbt.Portfolio`, and produces Sharpe ratio, max drawdown, Calmar ratio, and win rate.
+
+### Mode: param-sweep
+
+Runs Mode 2 across a grid of `min_score`, `max_position_pct`, and `drawdown_circuit_breaker` values to find the risk parameter combination with the best Sharpe ratio. Price matrix is built once and reused across all combinations.
+
+See [DOCS.md](DOCS.md) for full details on all modes.
 
 ---
 
@@ -74,7 +89,7 @@ git clone https://github.com/cipher813/alpha-engine-backtester.git
 cd alpha-engine-backtester
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp config.yaml.example config.yaml   # edit bucket name and email
+cp config.yaml.example config.yaml   # edit bucket names, paths, and email
 python backtest.py --mode signal-quality
 ```
 
@@ -85,13 +100,16 @@ AWS credentials must be configured (`aws configure` or IAM role). The S3 bucket 
 ## Usage
 
 ```bash
-# Signal quality report (Mode 1)
+# Signal quality report + weight optimizer (Mode 1)
 python backtest.py --mode signal-quality
 
-# Portfolio simulation (Mode 2 — requires 20+ signal dates)
+# Portfolio simulation (Mode 2)
 python backtest.py --mode simulate
 
-# Both modes
+# Param sweep — grid search over risk parameters
+python backtest.py --mode param-sweep
+
+# All modes
 python backtest.py --mode all
 
 # Upload results to S3 and send email report
@@ -112,6 +130,8 @@ python backtest.py --mode signal-quality --date 2026-03-09
 - AWS credentials with access to the research S3 bucket
 - `research.db` in S3 (written by alpha-engine-research after each pipeline run)
 - `signals/{date}/signals.json` in S3 (one file per trading day)
+- `alpha-engine` repo cloned locally (required for Mode 2 / param-sweep)
+- `alpha-engine-research` repo cloned locally (used to read current scoring weights)
 
 See [DOCS.md](DOCS.md) for full setup, EC2 deployment, IAM policy, and vectorbt metric reference.
 
@@ -121,11 +141,11 @@ See [DOCS.md](DOCS.md) for full setup, EC2 deployment, IAM policy, and vectorbt 
 
 ```
 0 14 * * 0   cd /home/ec2-user/alpha-engine-backtester && \
-             .venv/bin/python backtest.py --mode signal-quality --upload \
+             .venv/bin/python backtest.py --mode all --upload \
              >> /var/log/backtester.log 2>&1
 ```
 
-Runs every Sunday at 14:00 UTC (9am ET / 6am PT). Results uploaded to S3 and emailed.
+Runs every Sunday at 14:00 UTC (9am ET / 6am PT). Results uploaded to S3 and emailed. Scoring weights updated in S3 automatically if the data supports a change.
 
 ---
 
