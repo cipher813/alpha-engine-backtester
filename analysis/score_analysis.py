@@ -1,0 +1,79 @@
+"""
+score_analysis.py — accuracy vs. score threshold analysis.
+
+Answers: "What is the optimal min_score cutoff?"
+
+For each candidate threshold, compute the accuracy at that threshold and above.
+Shows the tradeoff between signal count (universe size) and signal accuracy.
+
+Data availability: requires Week 4+ (200+ populated score_performance rows).
+"""
+
+import logging
+
+import pandas as pd
+
+from analysis.signal_quality import _compute_slice_metrics, MIN_SAMPLES
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_THRESHOLDS = [60, 65, 70, 72, 75, 78, 80, 85, 90]
+
+
+def accuracy_by_threshold(
+    df: pd.DataFrame,
+    thresholds: list[int] = DEFAULT_THRESHOLDS,
+    min_samples: int = MIN_SAMPLES,
+) -> list[dict]:
+    """
+    For each threshold T in thresholds, compute accuracy for signals with score >= T.
+
+    Returns list of dicts:
+        [{"threshold": 70, "accuracy_10d": 0.58, "n_10d": 120, ...}, ...]
+
+    Use this to find the score cutoff that maximises accuracy while maintaining
+    a meaningful sample size.
+    """
+    populated_10d = df[df["beat_spy_10d"].notna()]
+    populated_30d = df[df["beat_spy_30d"].notna()]
+
+    results = []
+    for t in sorted(thresholds):
+        slice_10d = populated_10d[populated_10d["score"] >= t]
+        slice_30d = populated_30d[populated_30d["score"] >= t]
+
+        if len(slice_10d) < min_samples:
+            logger.debug("Skipping threshold %d — only %d samples", t, len(slice_10d))
+            continue
+
+        metrics = _compute_slice_metrics(slice_10d, slice_30d)
+        results.append({"threshold": t, **metrics})
+
+    if not results:
+        logger.warning(
+            "No thresholds have %d+ samples. Score analysis deferred until Week 4.",
+            min_samples,
+        )
+
+    return results
+
+
+def optimal_threshold(
+    df: pd.DataFrame,
+    thresholds: list[int] = DEFAULT_THRESHOLDS,
+    min_samples: int = MIN_SAMPLES,
+    target: str = "accuracy_10d",
+    min_n: int = 20,
+) -> dict | None:
+    """
+    Return the threshold that maximises `target` metric while having at least min_n samples.
+
+    Returns None if insufficient data.
+    """
+    rows = accuracy_by_threshold(df, thresholds, min_samples=1)
+    eligible = [r for r in rows if r.get("n_10d", 0) >= min_n and r.get(target) is not None]
+
+    if not eligible:
+        return None
+
+    return max(eligible, key=lambda r: r[target])
