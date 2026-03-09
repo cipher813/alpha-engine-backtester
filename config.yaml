@@ -12,6 +12,12 @@ results_dir: results
 
 # Portfolio simulation parameters (Mode 2)
 init_cash: 1_000_000.0
+min_simulation_dates: 5
+
+# Path to alpha-engine repo root — required for Mode 2 (imports executor.main)
+# EC2:  /home/ec2-user/alpha-engine
+# Local: /Users/brianmcmahon/Development/alpha-engine
+executor_path: /home/ec2-user/alpha-engine
 
 # Signal quality parameters (Mode 1)
 score_thresholds:
