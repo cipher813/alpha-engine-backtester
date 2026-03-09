@@ -315,12 +315,22 @@ def _section_weight_recommendation(result: dict) -> list[str]:
             f"| {_pct(suggested.get(k))} | {chg_str} |"
         )
 
-    lines += [
-        "",
-        "> **Action required:** If changes look meaningful, update `scoring_weights` in "
-        "`alpha-engine-research/config/universe.yaml` and redeploy the research Lambda.",
-        f"> {result.get('note', '')}",
-    ]
+    apply = result.get("apply_result", {})
+    if apply.get("applied"):
+        lines += [
+            "",
+            f"> ✅ **Weights updated automatically** in S3 (`config/scoring_weights.json`). "
+            f"Research Lambda will use new weights on next cold-start. "
+            f"n={apply.get('n_samples')}, confidence={apply.get('confidence')}.",
+        ]
+    else:
+        reason = apply.get("reason", "guardrails not met")
+        lines += [
+            "",
+            f"> ⏸ **Not applied** — {reason}.",
+        ]
+
+    lines += [f"> {result.get('note', '')}"]
     return lines
 
 

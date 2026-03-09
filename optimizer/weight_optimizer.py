@@ -13,6 +13,7 @@ Current default weights: technical=0.40, news=0.30, research=0.30
 
 import json
 import logging
+from datetime import date
 
 import boto3
 import pandas as pd
@@ -22,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_WEIGHTS = {"technical": 0.40, "news": 0.30, "research": 0.30}
 SUB_SCORES = ["technical", "news", "research"]
+S3_WEIGHTS_KEY = "config/scoring_weights.json"
+
+# Guardrails for autonomous weight application
+MAX_SINGLE_CHANGE = 0.15   # no weight moves more than 15 percentage points
+MIN_MEANINGFUL_CHANGE = 0.02  # at least one weight must change by 2%+ to be worth updating
 
 # Blend factor: how much the correlation signal moves the suggested weight
 # toward the purely data-driven weight. 0.3 = conservative; 1.0 = fully data-driven.
@@ -223,7 +229,77 @@ def compute_weights(
         "changes": changes,
         "note": (
             f"Based on {n} signals. Confidence: {confidence}. "
-            "To apply: update scoring_weights in alpha-engine-research/config/universe.yaml. "
             "Suggested weights blend 30% data signal with 70% current weights to avoid instability."
         ),
+    }
+
+
+def apply_weights(result: dict, bucket: str) -> dict:
+    """
+    Apply suggested weights to S3 if guardrails pass.
+
+    Writes s3://{bucket}/config/scoring_weights.json. The research Lambda
+    reads this file at cold-start and uses it in place of universe.yaml defaults.
+
+    Guardrails (all must pass):
+      - confidence must be "medium" or "high" (>= 50 samples)
+      - no single weight changes by more than MAX_SINGLE_CHANGE (15%)
+      - at least one weight changes by more than MIN_MEANINGFUL_CHANGE (2%)
+
+    Args:
+        result: dict returned by compute_weights().
+        bucket: S3 bucket (same as signals_bucket).
+
+    Returns:
+        {"applied": True, "weights": {...}, "n_samples": int, "confidence": str}
+        or {"applied": False, "reason": str}
+    """
+    if result.get("status") != "ok":
+        return {"applied": False, "reason": f"status={result.get('status')}"}
+
+    confidence = result.get("confidence", "low")
+    if confidence == "low":
+        return {"applied": False, "reason": "confidence too low — need medium or high (50+ samples)"}
+
+    changes = result.get("changes", {})
+    max_change = max(abs(v) for v in changes.values()) if changes else 0
+    meaningful = any(abs(v) >= MIN_MEANINGFUL_CHANGE for v in changes.values())
+
+    if max_change > MAX_SINGLE_CHANGE:
+        return {
+            "applied": False,
+            "reason": f"largest change {max_change:.1%} exceeds {MAX_SINGLE_CHANGE:.0%} limit — skipping to avoid instability",
+        }
+
+    if not meaningful:
+        return {
+            "applied": False,
+            "reason": f"all changes < {MIN_MEANINGFUL_CHANGE:.0%} — not worth updating",
+        }
+
+    suggested = result.get("suggested_weights", {})
+    payload = {
+        **suggested,
+        "updated_at": str(date.today()),
+        "n_samples": result.get("n_samples"),
+        "confidence": confidence,
+    }
+
+    s3 = boto3.client("s3")
+    s3.put_object(
+        Bucket=bucket,
+        Key=S3_WEIGHTS_KEY,
+        Body=json.dumps(payload, indent=2),
+        ContentType="application/json",
+    )
+    logger.info(
+        "Scoring weights updated in S3: %s (n=%s, confidence=%s)",
+        suggested, payload["n_samples"], confidence,
+    )
+
+    return {
+        "applied": True,
+        "weights": suggested,
+        "n_samples": result.get("n_samples"),
+        "confidence": confidence,
     }
