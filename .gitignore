@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Virtual environment
+.venv/
+venv/
+
+# Config (contains secrets)
+config.yaml
+
+# Local results
+results/
+
+# Temp / research.db local copy
+*.db
+*.db-wal
+*.db-shm
+
+# Design docs — never commit, keep local only
+*-design-*.md
+*-design.md
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
