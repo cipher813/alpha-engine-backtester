@@ -127,12 +127,16 @@ def run_simulate(config: dict) -> dict:
     import sys
     import pandas as pd
 
-    executor_path = config.get("executor_path")
+    executor_paths = config.get("executor_paths", [])
+    if isinstance(executor_paths, str):
+        executor_paths = [executor_paths]
+    executor_path = next(
+        (p for p in executor_paths if os.path.isdir(p)), None
+    )
     if not executor_path:
         raise ValueError(
-            "executor_path not set in config.yaml. "
-            "Set it to the alpha-engine repo root "
-            "(e.g. /home/ec2-user/alpha-engine)."
+            f"None of the executor_paths exist: {executor_paths}. "
+            "Add the alpha-engine repo root to executor_paths in config.yaml."
         )
     if executor_path not in sys.path:
         sys.path.insert(0, executor_path)
