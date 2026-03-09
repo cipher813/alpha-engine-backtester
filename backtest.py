@@ -157,11 +157,14 @@ def run_weight_optimizer(config: dict, df_base: pd.DataFrame) -> dict:
 
     try:
         df_with_sub = weight_optimizer.load_with_subscores(df_base, bucket)
-        return weight_optimizer.compute_weights(
+        result = weight_optimizer.compute_weights(
             df_with_sub,
             current_weights=current_weights,
             min_samples=min_samples,
         )
+        apply_result = weight_optimizer.apply_weights(result, bucket)
+        result["apply_result"] = apply_result
+        return result
     except Exception as e:
         logger.warning("Weight optimizer failed: %s", e)
         return {"status": "error", "error": str(e)}
