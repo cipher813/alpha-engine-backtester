@@ -33,6 +33,11 @@ score_buckets:
 # Minimum samples required for a bucket to be reported
 min_samples: 5
 
+# Email (AWS SES — must match verified sender in executor's config/risk.yaml)
+email_sender: "cipher813@gmail.com"
+email_recipients:
+  - "cipher813@gmail.com"
+
 # research.db — pulled from s3://{signals_bucket}/research.db at run start.
 # Override with --db flag for local development (e.g. python backtest.py --db ~/path/to/research.db).
 # Do not set this in config.yaml for EC2 — the S3 pull is automatic.
