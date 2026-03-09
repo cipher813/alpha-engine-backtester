@@ -39,7 +39,7 @@ import boto3
 from botocore.exceptions import ClientError
 import yaml
 
-from analysis import signal_quality, regime_analysis, score_analysis, attribution
+from analysis import signal_quality, regime_analysis, score_analysis, attribution, param_sweep
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
 
@@ -111,18 +111,12 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
     return sq_result, regime_rows, score_rows, attr_result
 
 
-def run_simulate(config: dict) -> dict:
+def _setup_simulation(config: dict) -> tuple:
     """
-    Run Mode 2: replay all historical signal dates through the executor with
-    SimulatedIBKRClient, then compute portfolio metrics via vectorbt.
+    Resolve executor path, import executor modules, load signal dates, build price matrix.
 
-    Price data comes from S3 prices.json when available, falling back to
-    yfinance for any dates where prices.json is missing — so this works
-    with any number of signal dates in S3.
-
-    Returns a stats dict with status, returns, Sharpe, drawdown, etc.
-    Returns {"status": "insufficient_data", ...} if fewer than
-    config["min_simulation_dates"] signal dates exist in S3.
+    Returns (executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash).
+    price_matrix is None when fewer than min_simulation_dates are available or no prices found.
     """
     import sys
     import pandas as pd
@@ -130,9 +124,7 @@ def run_simulate(config: dict) -> dict:
     executor_paths = config.get("executor_paths", [])
     if isinstance(executor_paths, str):
         executor_paths = [executor_paths]
-    executor_path = next(
-        (p for p in executor_paths if os.path.isdir(p)), None
-    )
+    executor_path = next((p for p in executor_paths if os.path.isdir(p)), None)
     if not executor_path:
         raise ValueError(
             f"None of the executor_paths exist: {executor_paths}. "
@@ -144,35 +136,52 @@ def run_simulate(config: dict) -> dict:
     from executor.main import run as executor_run
     from executor.ibkr import SimulatedIBKRClient
     from loaders import signal_loader, price_loader
-    from vectorbt_bridge import orders_to_portfolio
-    from vectorbt_bridge import portfolio_stats as compute_portfolio_stats
 
     bucket = config.get("signals_bucket", "alpha-engine-research")
     min_dates = config.get("min_simulation_dates", 5)
     init_cash = float(config.get("init_cash", 1_000_000.0))
 
     dates = signal_loader.list_dates(bucket)
-    logger.info("Mode 2: %d signal dates available in S3", len(dates))
+    logger.info("Simulation setup: %d signal dates available in S3", len(dates))
 
     if len(dates) < min_dates:
         logger.warning(
-            "Mode 2: only %d signal dates available (need %d) — skipping simulation",
+            "Only %d signal dates available (need %d) — simulation skipped",
             len(dates), min_dates,
         )
-        return {
-            "status": "insufficient_data",
-            "dates_available": len(dates),
-            "min_required": min_dates,
-        }
+        return executor_run, SimulatedIBKRClient, dates, None, init_cash
 
-    logger.info("Mode 2: building price matrix for %d dates (yfinance fallback)...", len(dates))
+    logger.info("Building price matrix for %d dates (yfinance fallback)...", len(dates))
     price_matrix = price_loader.build_matrix(dates, bucket)
 
     if price_matrix.empty:
-        return {"status": "no_prices", "dates_available": len(dates)}
+        return executor_run, SimulatedIBKRClient, dates, None, init_cash
 
-    # One SimulatedIBKRClient for the entire run — positions and NAV carry forward
-    # across dates so the portfolio accumulates naturally over time.
+    return executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash
+
+
+def _run_simulation_loop(
+    executor_run,
+    SimulatedIBKRClient,
+    dates: list[str],
+    price_matrix,
+    config: dict,
+) -> dict:
+    """
+    Run one full simulation pass with the given config and pre-built price matrix.
+
+    A fresh SimulatedIBKRClient is created per call so param-sweep combinations
+    start from the same initial state. Prices are swapped per date; positions
+    and NAV carry forward across dates within a single run.
+    """
+    import pandas as pd
+    from loaders import signal_loader
+    from vectorbt_bridge import orders_to_portfolio
+    from vectorbt_bridge import portfolio_stats as compute_portfolio_stats
+
+    init_cash = float(config.get("init_cash", 1_000_000.0))
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+
     sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
     all_orders = []
     dates_simulated = 0
@@ -180,23 +189,18 @@ def run_simulate(config: dict) -> dict:
     for signal_date in dates:
         ts = pd.Timestamp(signal_date)
         if ts not in price_matrix.index:
-            logger.debug("No price row for %s — skipping", signal_date)
             continue
 
         date_prices = price_matrix.loc[ts].dropna().to_dict()
         if not date_prices:
-            logger.warning("Empty price row for %s — skipping", signal_date)
             continue
 
         try:
             signals_raw = signal_loader.load(bucket, signal_date)
         except FileNotFoundError:
-            logger.warning("No signals.json for %s — skipping", signal_date)
             continue
 
-        # Swap in the new day's prices; positions and NAV persist from prior day
         sim_client._prices = date_prices
-
         orders = executor_run(
             simulate=True,
             ibkr_client=sim_client,
@@ -207,7 +211,7 @@ def run_simulate(config: dict) -> dict:
         dates_simulated += 1
 
     logger.info(
-        "Mode 2: %d dates simulated, %d orders generated", dates_simulated, len(all_orders)
+        "Simulation loop: %d dates, %d orders", dates_simulated, len(all_orders)
     )
 
     if not all_orders:
@@ -225,9 +229,59 @@ def run_simulate(config: dict) -> dict:
     return stats
 
 
+def run_simulate(config: dict) -> dict:
+    """
+    Run Mode 2: replay all historical signal dates through the executor with
+    SimulatedIBKRClient, then compute portfolio metrics via vectorbt.
+
+    Returns a stats dict. Returns {"status": "insufficient_data"} if fewer than
+    config["min_simulation_dates"] signal dates exist in S3.
+    """
+    executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash = _setup_simulation(config)
+    min_dates = config.get("min_simulation_dates", 5)
+
+    if price_matrix is None:
+        return {
+            "status": "insufficient_data",
+            "dates_available": len(dates),
+            "min_required": min_dates,
+        }
+
+    return _run_simulation_loop(executor_run, SimulatedIBKRClient, dates, price_matrix, config)
+
+
+def run_param_sweep(config: dict):
+    """
+    Run Mode 2 across a grid of risk parameters (min_score, max_position_pct,
+    drawdown_circuit_breaker). Price matrix is built once and reused for all
+    combinations — only the simulation loop re-runs per combo.
+
+    Returns a DataFrame sorted by sharpe_ratio, or an empty DataFrame if
+    insufficient data is available.
+    """
+    import pandas as pd
+
+    executor_run, SimulatedIBKRClient, dates, price_matrix, _ = _setup_simulation(config)
+
+    if price_matrix is None:
+        logger.warning(
+            "Param sweep skipped: only %d signal dates available", len(dates)
+        )
+        return pd.DataFrame()
+
+    def sim_fn(combo_config: dict) -> dict:
+        return _run_simulation_loop(
+            executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config
+        )
+
+    grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
+    logger.info("Running param sweep: %s", {k: len(v) for k, v in grid.items()})
+    return param_sweep.sweep(grid, sim_fn, config)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Alpha Engine Backtester")
-    parser.add_argument("--mode", choices=["signal-quality", "simulate", "all"],
+    parser.add_argument("--mode", choices=["signal-quality", "simulate", "param-sweep", "all"],
                         default="signal-quality")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--db", help="Override research_db path from config")
@@ -261,6 +315,7 @@ def main():
             config["research_db"] = None  # run_signal_quality handles None gracefully
 
     portfolio_stats = None
+    sweep_df = None
 
     if args.mode in ("signal-quality", "all"):
         sq_result, regime_rows, score_rows, attr_result = run_signal_quality(config)
@@ -277,6 +332,13 @@ def main():
             logger.error("Mode 2 simulation failed: %s", e)
             portfolio_stats = {"status": "error", "error": str(e)}
 
+    if args.mode in ("param-sweep", "all"):
+        try:
+            sweep_df = run_param_sweep(config)
+        except Exception as e:
+            logger.error("Param sweep failed: %s", e)
+            sweep_df = None
+
     report_md = build_report(
         run_date=args.date,
         signal_quality=sq_result,
@@ -284,6 +346,7 @@ def main():
         score_analysis=score_rows,
         attribution=attr_result,
         portfolio_stats=portfolio_stats,
+        sweep_df=sweep_df,
         config=config,
     )
 
@@ -291,6 +354,7 @@ def main():
         report_md=report_md,
         signal_quality=sq_result,
         score_analysis=score_rows,
+        sweep_df=sweep_df,
         run_date=args.date,
         results_dir=config.get("results_dir", "results"),
     )
