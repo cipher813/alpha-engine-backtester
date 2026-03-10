@@ -348,6 +348,8 @@ def main():
     parser.add_argument("--date", default=date.today().isoformat(), help="Run date label")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--stop-instance", action="store_true",
+                        help="Stop this EC2 instance after completion (for scheduled runs)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -452,6 +454,30 @@ def main():
         )
     else:
         logger.warning("No email_sender/email_recipients in config — skipping email")
+
+    if args.stop_instance:
+        import urllib.request
+        try:
+            # Get instance ID from EC2 metadata endpoint
+            token = urllib.request.urlopen(
+                urllib.request.Request(
+                    "http://169.254.169.254/latest/api/token",
+                    headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+                    method="PUT",
+                ),
+                timeout=2,
+            ).read().decode()
+            instance_id = urllib.request.urlopen(
+                urllib.request.Request(
+                    "http://169.254.169.254/latest/meta-data/instance-id",
+                    headers={"X-aws-ec2-metadata-token": token},
+                ),
+                timeout=2,
+            ).read().decode()
+            logger.info("Stopping instance %s", instance_id)
+            boto3.client("ec2").stop_instances(InstanceIds=[instance_id])
+        except Exception as e:
+            logger.error("Failed to stop instance: %s", e)
 
 
 if __name__ == "__main__":
