@@ -1,13 +1,20 @@
 """
-emailer.py — send weekly backtest report via AWS SES.
+emailer.py — send weekly backtest report via Gmail SMTP (primary) or AWS SES (fallback).
 
 Matches the style and config conventions of executor/eod_emailer.py.
 Sender and recipients come from config.yaml (email_sender / email_recipients).
+
+Gmail path: set GMAIL_APP_PASSWORD env var (16-char App Password).
+SES fallback: used automatically when GMAIL_APP_PASSWORD is absent.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import boto3
 from botocore.exceptions import ClientError
@@ -66,6 +73,55 @@ def send_report_email(
     subject = _build_subject(run_date, status)
     html_body, plain_body = _build_body(run_date, report_md, s3_bucket, s3_prefix)
 
+    gmail_pw = os.environ.get("GMAIL_APP_PASSWORD", "") or _ssm_gmail_pw(region)
+    if gmail_pw:
+        _send_via_smtp(subject, plain_body, html_body, sender, recipients, gmail_pw)
+    else:
+        _send_via_ses(subject, plain_body, html_body, sender, recipients, region)
+
+
+def _ssm_gmail_pw(region: str) -> str:
+    """Fetch Gmail App Password from SSM Parameter Store (silent on failure)."""
+    try:
+        ssm = boto3.client("ssm", region_name=region)
+        resp = ssm.get_parameter(Name="/alpha-engine/gmail_app_password", WithDecryption=True)
+        return resp["Parameter"]["Value"]
+    except Exception:
+        return ""
+
+
+def _send_via_smtp(
+    subject: str,
+    plain_body: str,
+    html_body: str,
+    sender: str,
+    recipients: list[str],
+    gmail_pw: str,
+) -> None:
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg.attach(MIMEText(plain_body, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(sender, gmail_pw)
+            server.sendmail(sender, recipients, msg.as_string())
+        logger.info("Backtest report email sent via Gmail SMTP: '%s' → %s", subject, recipients)
+    except Exception as exc:
+        logger.warning("Gmail SMTP failed (%s) — falling back to SES", exc)
+        _send_via_ses(subject, plain_body, html_body, sender, recipients, "us-east-1")
+
+
+def _send_via_ses(
+    subject: str,
+    plain_body: str,
+    html_body: str,
+    sender: str,
+    recipients: list[str],
+    region: str,
+) -> None:
     ses = boto3.client("ses", region_name=region)
     try:
         ses.send_email(
@@ -79,7 +135,7 @@ def send_report_email(
                 },
             },
         )
-        logger.info("Backtest report email sent: '%s' → %s", subject, recipients)
+        logger.info("Backtest report email sent via SES: '%s' → %s", subject, recipients)
     except ClientError as e:
         logger.error("SES send failed: %s", e.response["Error"]["Message"])
     except Exception as e:

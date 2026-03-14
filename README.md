@@ -120,6 +120,9 @@ python backtest.py --mode signal-quality --db ~/path/to/research.db
 
 # Date label for output directory
 python backtest.py --mode signal-quality --date 2026-03-09
+
+# Stop the EC2 instance after completion (used by the Sunday cron job)
+python backtest.py --mode signal-quality --upload --stop-instance
 ```
 
 ---
@@ -137,15 +140,33 @@ See [DOCS.md](DOCS.md) for full setup, EC2 deployment, IAM policy, and vectorbt 
 
 ---
 
-## Cron schedule (EC2)
+## EC2 Schedule
+
+The backtester runs automatically every Sunday via EventBridge + cron on the `alpha-engine-executor` EC2 instance.
+
+### EventBridge (starts the instance)
+
+| Schedule | Time | Action |
+|----------|------|--------|
+| `alpha-engine-sunday-start` | 9:45 AM ET Sunday | Starts EC2 instance |
+
+The instance is normally stopped outside market hours. This schedule boots it in time for the 10:00 AM cron.
+
+### Crontab (runs the backtester)
 
 ```
-0 14 * * 0   cd /home/ec2-user/alpha-engine-backtester && \
-             .venv/bin/python backtest.py --mode all --upload \
-             >> /var/log/backtester.log 2>&1
+0 14 * * 0  cd /home/ec2-user/alpha-engine-backtester && .venv/bin/python backtest.py --mode signal-quality --upload --stop-instance >> /var/log/backtester.log 2>&1
 ```
 
-Runs every Sunday at 14:00 UTC (9am ET / 6am PT). Results uploaded to S3 and emailed. Scoring weights updated in S3 automatically if the data supports a change.
+14:00 UTC = 10:00 AM ET. The `--stop-instance` flag stops the EC2 instance automatically when the run completes — no fixed shutdown time needed.
+
+### Sunday flow
+
+1. **9:45 AM ET** — EventBridge starts the instance
+2. **10:00 AM ET** — cron fires, backtester runs
+3. **When done** — `--stop-instance` stops the instance
+
+Results are uploaded to S3 and emailed. Scoring weights in S3 are updated automatically if the data supports a change.
 
 ---
 
