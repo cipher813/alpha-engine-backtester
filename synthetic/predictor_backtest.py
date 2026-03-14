@@ -185,22 +185,37 @@ def download_gbm_model(bucket: str = "alpha-engine-research", region: str = "us-
     """
     Download GBM model weights + metadata from S3 to a temp file.
 
+    Tries predictor/weights/ first, falls back to backtest/ prefix
+    (EC2 IAM role may lack access to predictor/ prefix).
+
     Returns the local path to the model file.
     """
     s3 = boto3.client("s3", region_name=region)
 
-    # Download booster file
+    # Download booster file — try primary path, fall back to backtest/ mirror
     model_tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
     model_tmp.close()
-    s3.download_file(bucket, "predictor/weights/gbm_latest.txt", model_tmp.name)
-    logger.info("Downloaded GBM model to %s", model_tmp.name)
+    for key in ("predictor/weights/gbm_latest.txt", "backtest/gbm_latest.txt"):
+        try:
+            s3.download_file(bucket, key, model_tmp.name)
+            logger.info("Downloaded GBM model from s3://%s/%s", bucket, key)
+            break
+        except Exception as e:
+            logger.debug("Could not download %s: %s", key, e)
+    else:
+        raise RuntimeError(
+            f"GBM model not found in S3 bucket {bucket} at "
+            "predictor/weights/gbm_latest.txt or backtest/gbm_latest.txt"
+        )
 
-    # Download metadata
+    # Download metadata (optional)
     meta_path = model_tmp.name + ".meta.json"
-    try:
-        s3.download_file(bucket, "predictor/weights/gbm_latest.txt.meta.json", meta_path)
-    except Exception:
-        logger.warning("GBM metadata not found in S3, continuing without it")
+    for meta_key in ("predictor/weights/gbm_latest.txt.meta.json", "backtest/gbm_latest.txt.meta.json"):
+        try:
+            s3.download_file(bucket, meta_key, meta_path)
+            break
+        except Exception:
+            continue
 
     return model_tmp.name
 
