@@ -264,28 +264,32 @@ def run_inference(
         len(features_by_ticker), len(trading_dates),
     )
 
+    # Pre-extract feature vectors into {ticker: {date_str: numpy_array}}
+    # This avoids ~2M slow pandas .loc[] lookups in the inner loop.
+    logger.info("Pre-extracting feature vectors...")
+    feature_arrays: dict[str, dict[str, np.ndarray]] = {}
+    for ticker, featured_df in features_by_ticker.items():
+        try:
+            arr = featured_df[FEATURES].to_numpy(dtype=np.float32)
+            dates = featured_df.index.strftime("%Y-%m-%d")
+            # Handle duplicate dates: last value wins (same as iloc[-1])
+            feature_arrays[ticker] = dict(zip(dates, arr))
+        except (KeyError, ValueError):
+            continue
+    logger.info("Pre-extracted vectors for %d tickers", len(feature_arrays))
+
     predictions_by_date: dict[str, dict[str, float]] = {}
 
     for i, date_str in enumerate(trading_dates):
-        ts = pd.Timestamp(date_str)
-
         # Collect feature vectors for all tickers on this date
         tickers_batch = []
         vectors_batch = []
 
-        for ticker, featured_df in features_by_ticker.items():
-            if ts in featured_df.index:
-                row = featured_df.loc[ts]
-                # Handle duplicate dates (take last)
-                if isinstance(row, pd.DataFrame):
-                    row = row.iloc[-1]
-                try:
-                    vec = row[FEATURES].to_numpy(dtype=np.float32)
-                    if not np.any(np.isnan(vec)):
-                        tickers_batch.append(ticker)
-                        vectors_batch.append(vec)
-                except (KeyError, ValueError):
-                    continue
+        for ticker, date_to_vec in feature_arrays.items():
+            vec = date_to_vec.get(date_str)
+            if vec is not None and not np.any(np.isnan(vec)):
+                tickers_batch.append(ticker)
+                vectors_batch.append(vec)
 
         if not vectors_batch:
             continue
@@ -455,6 +459,7 @@ def run(config: dict) -> dict:
 
     pb_config = config.get("predictor_backtest", {})
     min_trading_days = pb_config.get("min_trading_days", 200)
+    max_trading_days = pb_config.get("max_trading_days", 500)
     top_n = pb_config.get("top_n_signals_per_day", 20)
     min_score = pb_config.get("min_score", 70)
     bucket = config.get("signals_bucket", "alpha-engine-research")
@@ -489,10 +494,18 @@ def run(config: dict) -> dict:
                     f"(need {min_trading_days})",
         }
 
-    logger.info(
-        "Trading dates: %d (from %s to %s)",
-        len(trading_dates), trading_dates[0], trading_dates[-1],
-    )
+    # Limit to most recent N trading days (slim cache may span >2y)
+    if len(trading_dates) > max_trading_days:
+        trading_dates = trading_dates[-max_trading_days:]
+        logger.info(
+            "Trimmed to most recent %d trading dates (from %s to %s)",
+            len(trading_dates), trading_dates[0], trading_dates[-1],
+        )
+    else:
+        logger.info(
+            "Trading dates: %d (from %s to %s)",
+            len(trading_dates), trading_dates[0], trading_dates[-1],
+        )
 
     # 4. Download GBM model
     model_path = download_gbm_model(bucket=bucket)
