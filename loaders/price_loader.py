@@ -117,6 +117,7 @@ def build_matrix(
     signals_prefix: str = "signals",
     prices_prefix: str = "prices",
     ibkr_client=None,
+    _ohlcv_out: dict | None = None,
 ) -> pd.DataFrame:
     """
     Build a price matrix for vectorbt: rows = dates, columns = tickers.
@@ -147,27 +148,40 @@ def build_matrix(
             data = _load_from_s3(bucket, d, prices_prefix)
             rows[d] = {ticker: info[field] for ticker, info in data.get("prices", {}).items()}
             sources[d] = "s3"
-            continue
         except FileNotFoundError:
-            pass
+            # Resolve tickers from signals.json so fallbacks know what to fetch
+            tickers = _tickers_from_signals(bucket, d, signals_prefix)
+            if not tickers:
+                logger.warning("No signals found for %s — skipping price row", d)
+                rows[d] = {}
+                sources[d] = "none"
+                continue
 
-        # Resolve tickers from signals.json so fallbacks know what to fetch
-        tickers = _tickers_from_signals(bucket, d, signals_prefix)
-        if not tickers:
-            logger.warning("No signals found for %s — skipping price row", d)
-            rows[d] = {}
-            sources[d] = "none"
-            continue
+            data = load(
+                bucket=bucket,
+                price_date=d,
+                tickers=tickers,
+                prefix=prices_prefix,
+                ibkr_client=ibkr_client,
+            )
+            rows[d] = {ticker: info[field] for ticker, info in data.get("prices", {}).items()}
+            sources[d] = data.get("source", "unknown")
 
-        data = load(
-            bucket=bucket,
-            price_date=d,
-            tickers=tickers,
-            prefix=prices_prefix,
-            ibkr_client=ibkr_client,
-        )
-        rows[d] = {ticker: info[field] for ticker, info in data.get("prices", {}).items()}
-        sources[d] = data.get("source", "unknown")
+        # Capture full OHLCV if caller requested it
+        if _ohlcv_out is not None:
+            for ticker, info in data.get("prices", {}).items():
+                _ohlcv_out.setdefault(ticker, []).append({
+                    "date": d,
+                    "open": info.get("open", info.get("close", 0)),
+                    "high": info.get("high", info.get("close", 0)),
+                    "low": info.get("low", info.get("close", 0)),
+                    "close": info.get("close", 0),
+                })
+
+    # Sort OHLCV bars ascending by date (needed for ATR / trailing stop lookback)
+    if _ohlcv_out is not None:
+        for ticker in _ohlcv_out:
+            _ohlcv_out[ticker].sort(key=lambda b: b["date"])
 
     # Log summary of data sources used
     from collections import Counter

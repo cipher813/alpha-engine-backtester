@@ -23,6 +23,9 @@ DEFAULT_GRID = {
     "min_score": [65, 70, 75, 80],
     "max_position_pct": [0.05, 0.10, 0.15],
     "drawdown_circuit_breaker": [0.10, 0.15, 0.20],
+    "atr_multiplier": [2.0, 3.0, 4.0],
+    "time_decay_reduce_days": [5, 7],
+    "time_decay_exit_days": [10, 15],
 }
 
 
@@ -88,7 +91,10 @@ def best_params(sweep_df: pd.DataFrame, metric: str = "sharpe_ratio") -> dict:
         raise ValueError(f"Metric '{metric}' not found in sweep results")
 
     best_row = sweep_df.dropna(subset=[metric]).iloc[0]
-    param_cols = [c for c in sweep_df.columns if c not in ["total_return", "sharpe_ratio",
-                                                             "max_drawdown", "calmar_ratio",
-                                                             "total_trades", "win_rate", "error"]]
+    stat_cols = {
+        "total_return", "sharpe_ratio", "max_drawdown", "calmar_ratio",
+        "total_trades", "win_rate", "error", "status", "dates_simulated",
+        "total_orders", "note",
+    }
+    param_cols = [c for c in sweep_df.columns if c not in stat_cols]
     return {col: best_row[col] for col in param_cols}
