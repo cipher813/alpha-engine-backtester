@@ -530,6 +530,7 @@ def run(config: dict) -> dict:
     model_path = download_gbm_model(bucket=bucket)
 
     # 6. Run inference
+    n_feature_tickers = len(features_by_ticker)
     predictions_by_date = run_inference(
         features_by_ticker, model_path, predictor_path, trading_dates,
     )
@@ -561,7 +562,7 @@ def run(config: dict) -> dict:
     )
 
     metadata = {
-        "n_tickers": len(features_by_ticker),
+        "n_tickers": n_feature_tickers,
         "n_dates": len(trading_dates),
         "date_range_start": trading_dates[0],
         "date_range_end": trading_dates[-1],
