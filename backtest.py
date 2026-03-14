@@ -319,8 +319,9 @@ def _setup_simulation(config: dict) -> tuple:
     """
     Resolve executor path, import executor modules, load signal dates, build price matrix.
 
-    Returns (executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash).
+    Returns (executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv_by_ticker).
     price_matrix is None when fewer than min_simulation_dates are available or no prices found.
+    ohlcv_by_ticker: {ticker: [{date, open, high, low, close}, ...]} for strategy layer.
     """
     import sys
     import pandas as pd
@@ -353,15 +354,17 @@ def _setup_simulation(config: dict) -> tuple:
             "Only %d signal dates available (need %d) — simulation skipped",
             len(dates), min_dates,
         )
-        return executor_run, SimulatedIBKRClient, dates, None, init_cash
+        return executor_run, SimulatedIBKRClient, dates, None, init_cash, {}
 
+    ohlcv_by_ticker = {}
     logger.info("Building price matrix for %d dates (yfinance fallback)...", len(dates))
-    price_matrix = price_loader.build_matrix(dates, bucket)
+    price_matrix = price_loader.build_matrix(dates, bucket, _ohlcv_out=ohlcv_by_ticker)
 
     if price_matrix.empty:
-        return executor_run, SimulatedIBKRClient, dates, None, init_cash
+        return executor_run, SimulatedIBKRClient, dates, None, init_cash, {}
 
-    return executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash
+    logger.info("OHLCV captured for %d tickers (strategy layer)", len(ohlcv_by_ticker))
+    return executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv_by_ticker
 
 
 def _run_simulation_loop(
@@ -370,6 +373,7 @@ def _run_simulation_loop(
     dates: list[str],
     price_matrix,
     config: dict,
+    ohlcv_by_ticker: dict | None = None,
 ) -> dict:
     """
     Run one full simulation pass with the given config and pre-built price matrix.
@@ -377,6 +381,9 @@ def _run_simulation_loop(
     A fresh SimulatedIBKRClient is created per call so param-sweep combinations
     start from the same initial state. Prices are swapped per date; positions
     and NAV carry forward across dates within a single run.
+
+    ohlcv_by_ticker: full OHLCV histories for strategy layer (ATR trailing stops).
+        Filtered to <= signal_date before each executor call to prevent lookahead.
     """
     import pandas as pd
     from loaders import signal_loader
@@ -385,6 +392,9 @@ def _run_simulation_loop(
 
     init_cash = float(config.get("init_cash", 1_000_000.0))
     bucket = config.get("signals_bucket", "alpha-engine-research")
+
+    # Build config_override from swept params that need to reach the executor
+    config_override = _build_config_override(config)
 
     sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
     all_orders = []
@@ -405,10 +415,22 @@ def _run_simulation_loop(
             continue
 
         sim_client._prices = date_prices
+        sim_client._simulation_date = signal_date
+
+        # Filter OHLCV histories to <= signal_date (no lookahead)
+        price_histories = None
+        if ohlcv_by_ticker:
+            price_histories = {
+                ticker: [b for b in bars if b["date"] <= signal_date]
+                for ticker, bars in ohlcv_by_ticker.items()
+            }
+
         orders = executor_run(
             simulate=True,
             ibkr_client=sim_client,
             signals_override=signals_raw,
+            price_histories=price_histories,
+            config_override=config_override,
         )
         if orders:
             all_orders.extend(orders)
@@ -433,6 +455,38 @@ def _run_simulation_loop(
     return stats
 
 
+def _build_config_override(config: dict) -> dict | None:
+    """
+    Map flat sweep params in config to the nested executor config structure.
+
+    Sweep grid uses flat keys (e.g. atr_multiplier) but the executor expects
+    them nested under strategy.exit_manager. This function builds the override
+    dict that executor.main.run(config_override=) can merge.
+    """
+    override = {}
+
+    # Direct risk params (top-level in executor's risk.yaml)
+    for key in ("min_score", "max_position_pct", "drawdown_circuit_breaker"):
+        if key in config:
+            override[key] = config[key]
+
+    # Strategy params → nested under strategy.exit_manager
+    strategy_keys = {
+        "atr_multiplier": "atr_multiplier",
+        "time_decay_reduce_days": "time_decay_reduce_days",
+        "time_decay_exit_days": "time_decay_exit_days",
+    }
+    exit_manager_overrides = {}
+    for sweep_key, config_key in strategy_keys.items():
+        if sweep_key in config:
+            exit_manager_overrides[config_key] = config[sweep_key]
+
+    if exit_manager_overrides:
+        override["strategy"] = {"exit_manager": exit_manager_overrides}
+
+    return override if override else None
+
+
 def run_simulate(config: dict) -> dict:
     """
     Run Mode 2: replay all historical signal dates through the executor with
@@ -441,7 +495,7 @@ def run_simulate(config: dict) -> dict:
     Returns a stats dict. Returns {"status": "insufficient_data"} if fewer than
     config["min_simulation_dates"] signal dates exist in S3.
     """
-    executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash = _setup_simulation(config)
+    executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv = _setup_simulation(config)
     min_dates = config.get("min_simulation_dates", 5)
 
     if price_matrix is None:
@@ -451,21 +505,24 @@ def run_simulate(config: dict) -> dict:
             "min_required": min_dates,
         }
 
-    return _run_simulation_loop(executor_run, SimulatedIBKRClient, dates, price_matrix, config)
+    return _run_simulation_loop(
+        executor_run, SimulatedIBKRClient, dates, price_matrix, config,
+        ohlcv_by_ticker=ohlcv,
+    )
 
 
 def run_param_sweep(config: dict):
     """
-    Run Mode 2 across a grid of risk parameters (min_score, max_position_pct,
-    drawdown_circuit_breaker). Price matrix is built once and reused for all
-    combinations — only the simulation loop re-runs per combo.
+    Run Mode 2 across a grid of risk + strategy parameters. Price matrix and
+    OHLCV histories are built once and reused for all combinations — only the
+    simulation loop re-runs per combo.
 
     Returns a DataFrame sorted by sharpe_ratio, or an empty DataFrame if
     insufficient data is available.
     """
     import pandas as pd
 
-    executor_run, SimulatedIBKRClient, dates, price_matrix, _ = _setup_simulation(config)
+    executor_run, SimulatedIBKRClient, dates, price_matrix, _, ohlcv = _setup_simulation(config)
 
     if price_matrix is None:
         logger.warning(
@@ -475,7 +532,8 @@ def run_param_sweep(config: dict):
 
     def sim_fn(combo_config: dict) -> dict:
         return _run_simulation_loop(
-            executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config
+            executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
+            ohlcv_by_ticker=ohlcv,
         )
 
     grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)

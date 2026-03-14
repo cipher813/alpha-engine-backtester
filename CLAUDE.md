@@ -70,7 +70,7 @@ ae "tail -50 /var/log/backtester.log"
 
 ```
 0 14 * * 0   cd /home/ec2-user/alpha-engine-backtester && \
-             .venv/bin/python backtest.py --mode signal-quality --upload \
+             .venv/bin/python backtest.py --mode all --upload \
              >> /var/log/backtester.log 2>&1
 ```
 
