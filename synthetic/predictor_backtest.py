@@ -23,6 +23,7 @@ Performance notes:
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -467,6 +468,17 @@ def run(config: dict) -> dict:
     # 1. Load slim cache
     price_data = load_slim_cache(predictor_path)
 
+    # Trim to recent rows to reduce memory on small instances (t3.small = 2GB).
+    # max_trading_days + 300 warmup rows is enough for feature computation.
+    trim_rows = max_trading_days + 300
+    trimmed = 0
+    for ticker in price_data:
+        if len(price_data[ticker]) > trim_rows:
+            price_data[ticker] = price_data[ticker].iloc[-trim_rows:]
+            trimmed += 1
+    if trimmed:
+        logger.info("Trimmed %d tickers to most recent %d rows (memory optimization)", trimmed, trim_rows)
+
     # 2. Load sector map
     sector_map = load_sector_map(predictor_path)
 
@@ -507,13 +519,25 @@ def run(config: dict) -> dict:
             len(trading_dates), trading_dates[0], trading_dates[-1],
         )
 
-    # 4. Download GBM model
+    # 4. Build price matrix and OHLCV early, then free raw price data
+    price_matrix = build_price_matrix(price_data, trading_dates)
+    ohlcv_by_ticker = build_ohlcv_by_ticker(price_data)
+    del price_data
+    gc.collect()
+    logger.info("Freed raw price data (memory optimization)")
+
+    # 5. Download GBM model
     model_path = download_gbm_model(bucket=bucket)
 
-    # 5. Run inference
+    # 6. Run inference
     predictions_by_date = run_inference(
         features_by_ticker, model_path, predictor_path, trading_dates,
     )
+
+    # Free features and model (no longer needed)
+    del features_by_ticker
+    gc.collect()
+    logger.info("Freed feature data (memory optimization)")
 
     # Clean up temp model file
     try:
@@ -524,15 +548,11 @@ def run(config: dict) -> dict:
     except OSError:
         pass
 
-    # 6. Generate signals
+    # 7. Generate signals
     signals_by_date = build_signals_by_date(
         predictions_by_date, sector_map,
         top_n=top_n, min_score=min_score,
     )
-
-    # 7. Build price matrix and OHLCV
-    price_matrix = build_price_matrix(price_data, trading_dates)
-    ohlcv_by_ticker = build_ohlcv_by_ticker(price_data)
 
     # Metadata for reporting
     n_enter_total = sum(
