@@ -19,6 +19,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 SUB_SCORES = ["technical", "news", "research"]
+PREDICTOR_COLS = ["p_up", "p_down", "prediction_confidence", "predicted_direction"]
 
 
 def compute_attribution(df: pd.DataFrame) -> dict:
@@ -84,12 +85,32 @@ def compute_attribution(df: pd.DataFrame) -> dict:
         reverse=True,
     )
 
+    # Predictor correlation (optional — only if predictor columns are present)
+    predictor_corr = {}
+    predictor_hit_rate = None
+    if "p_up" in populated.columns and "p_down" in populated.columns:
+        populated["_net_pred"] = (
+            pd.to_numeric(populated["p_up"], errors="coerce").fillna(0)
+            - pd.to_numeric(populated["p_down"], errors="coerce").fillna(0)
+        )
+        for outcome_col in ["beat_spy_10d", "beat_spy_30d"]:
+            if outcome_col in populated.columns:
+                valid = populated[["_net_pred", outcome_col]].dropna()
+                if len(valid) >= 10:
+                    predictor_corr[outcome_col] = float(valid["_net_pred"].corr(valid[outcome_col]))
+    if "correct_5d" in populated.columns:
+        resolved = pd.to_numeric(populated["correct_5d"], errors="coerce").dropna()
+        if len(resolved) >= 10:
+            predictor_hit_rate = float(resolved.mean())
+
     return {
         "status": "ok",
         "rows_analyzed": len(populated),
         "correlations": correlations,
         "ranking_10d": ranking_10d,
         "ranking_30d": ranking_30d,
+        "predictor_correlation": predictor_corr,
+        "predictor_hit_rate": predictor_hit_rate,
         "note": (
             "Correlations below 0.1 should be treated as noise at current sample sizes. "
             "Automated weight optimization activates at Month 6+ (500+ rows)."

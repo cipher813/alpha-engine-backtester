@@ -72,6 +72,149 @@ def pull_research_db(bucket: str, local_path: str, s3_key: str = "research.db") 
         return False
 
 
+def _push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
+    """
+    Compute 30-day rolling hit rate and IC from resolved predictor_outcomes rows
+    and merge into predictor/metrics/latest.json in S3.
+
+    Called after _backfill_predictor_outcomes() so correct_5d is populated.
+    Silent on any failure — never blocks the backtest run.
+    """
+    import json
+    import sqlite3 as _sqlite3
+    from datetime import datetime, timedelta
+
+    bucket = config.get("signals_bucket")
+    metrics_key = "predictor/metrics/latest.json"
+    if not bucket or not db_path or not os.path.exists(db_path):
+        return
+
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+        conn = _sqlite3.connect(db_path)
+        df = pd.read_sql_query(
+            "SELECT * FROM predictor_outcomes WHERE correct_5d IS NOT NULL "
+            "AND prediction_date >= ?",
+            conn,
+            params=(cutoff,),
+        )
+        conn.close()
+    except Exception as e:
+        logger.warning("_push_predictor_rolling_metrics: DB read failed: %s", e)
+        return
+
+    if len(df) < 5:
+        logger.info("_push_predictor_rolling_metrics: < 5 resolved outcomes, skipping S3 update")
+        return
+
+    # hit_rate_30d_rolling
+    hit_rate = float(pd.to_numeric(df["correct_5d"], errors="coerce").mean())
+
+    # ic_30d — Pearson correlation between net directional signal and actual return
+    df["net_signal"] = (
+        pd.to_numeric(df["p_up"], errors="coerce").fillna(0)
+        - pd.to_numeric(df["p_down"], errors="coerce").fillna(0)
+    )
+    df["actual"] = pd.to_numeric(df["actual_5d_return"], errors="coerce")
+    valid = df.dropna(subset=["net_signal", "actual"])
+    ic_30d = None
+    ic_ir_30d = None
+    if len(valid) >= 10:
+        from scipy.stats import pearsonr
+        ic_val, _ = pearsonr(valid["net_signal"], valid["actual"])
+        ic_30d = round(float(ic_val), 4)
+        # IC IR over weekly chunks
+        n_chunks = max(2, len(valid) // 5)
+        chunk_size = len(valid) // n_chunks
+        import numpy as np
+        chunk_ics = np.array([
+            pearsonr(
+                valid["net_signal"].iloc[i * chunk_size:(i + 1) * chunk_size],
+                valid["actual"].iloc[i * chunk_size:(i + 1) * chunk_size],
+            )[0]
+            for i in range(n_chunks)
+        ])
+        ic_ir_30d = round(float(chunk_ics.mean() / (chunk_ics.std() + 1e-8)), 3)
+
+    try:
+        s3 = boto3.client("s3")
+        # Read existing metrics, merge rolling stats on top
+        existing: dict = {}
+        try:
+            resp = s3.get_object(Bucket=bucket, Key=metrics_key)
+            existing = json.loads(resp["Body"].read())
+        except Exception:
+            pass  # fresh file or not yet written
+
+        existing["hit_rate_30d_rolling"] = round(hit_rate, 4)
+        existing["ic_30d"] = ic_30d
+        existing["ic_ir_30d"] = ic_ir_30d
+        existing["rolling_metrics_updated_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        existing["rolling_n"] = len(df)
+
+        s3.put_object(
+            Bucket=bucket,
+            Key=metrics_key,
+            Body=json.dumps(existing, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        logger.info(
+            "Predictor rolling metrics updated: hit_rate=%.3f  ic_30d=%s  n=%d",
+            hit_rate, ic_30d, len(df),
+        )
+    except Exception as e:
+        logger.warning("_push_predictor_rolling_metrics: S3 write failed: %s", e)
+
+
+def _backfill_predictor_outcomes(config: dict, df_base: pd.DataFrame) -> None:
+    """Backfill actual_5d_return and correct_5d for pending predictor_outcomes rows."""
+    import sqlite3 as _sqlite3
+    db_path = config.get("research_db")
+    if not db_path or not os.path.exists(db_path):
+        return
+    if "symbol" not in df_base.columns or "score_date" not in df_base.columns:
+        return
+    try:
+        conn = _sqlite3.connect(db_path)
+        pending = pd.read_sql_query(
+            "SELECT * FROM predictor_outcomes WHERE actual_5d_return IS NULL",
+            conn,
+        )
+        if pending.empty:
+            conn.close()
+            return
+        for _, row in pending.iterrows():
+            match = df_base[
+                (df_base["symbol"] == row["symbol"]) &
+                (df_base["score_date"] == row["prediction_date"])
+            ]
+            if match.empty:
+                continue
+            actual = pd.to_numeric(match.iloc[0].get("return_10d"), errors="coerce")
+            spy = pd.to_numeric(match.iloc[0].get("spy_10d_return", 0), errors="coerce") or 0
+            if pd.isna(actual):
+                continue
+            direction = row["predicted_direction"]
+            if direction == "UP":
+                correct = 1 if actual > spy else 0
+            elif direction == "DOWN":
+                correct = 1 if actual < spy else 0
+            elif direction == "FLAT":
+                correct = 1 if abs(actual - spy) < 0.01 else 0
+            else:
+                continue
+            conn.execute(
+                "UPDATE predictor_outcomes SET actual_5d_return=?, correct_5d=? "
+                "WHERE symbol=? AND prediction_date=?",
+                (float(actual), correct, row["symbol"], row["prediction_date"]),
+            )
+        conn.commit()
+        conn.close()
+        logger.info("Backfilled predictor outcomes from score_performance data")
+    except Exception as e:
+        logger.warning("_backfill_predictor_outcomes: %s", e)
+
+
 def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
     """
     Run Mode 1: aggregate score_performance from research.db.
@@ -109,6 +252,8 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
     )
 
     attr_result = attribution.compute_attribution(df_base)
+    _backfill_predictor_outcomes(config, df_base)
+    _push_predictor_rolling_metrics(config, config.get("research_db", ""))
 
     return sq_result, regime_rows, score_rows, attr_result, df_base
 
