@@ -11,11 +11,14 @@ Usage:
     # Full report (both modes)
     python backtest.py --mode all
 
+    # Predictor-only backtest (2y historical, no LLM calls)
+    python backtest.py --mode predictor-backtest
+
     # Upload results to S3
     python backtest.py --mode signal-quality --upload
 
 Options:
-    --mode          signal-quality | simulate | all  (default: signal-quality)
+    --mode          signal-quality | simulate | param-sweep | all | predictor-backtest
     --config        path to config.yaml (default: ./config.yaml)
     --db            path to local research.db (skips S3 pull; useful locally)
     --upload        upload results to S3
@@ -374,6 +377,7 @@ def _run_simulation_loop(
     price_matrix,
     config: dict,
     ohlcv_by_ticker: dict | None = None,
+    signals_by_date: dict | None = None,
 ) -> dict:
     """
     Run one full simulation pass with the given config and pre-built price matrix.
@@ -384,9 +388,10 @@ def _run_simulation_loop(
 
     ohlcv_by_ticker: full OHLCV histories for strategy layer (ATR trailing stops).
         Filtered to <= signal_date before each executor call to prevent lookahead.
+    signals_by_date: optional pre-built signals for each date (predictor-only mode).
+        When provided, uses these instead of loading from S3 via signal_loader.
     """
     import pandas as pd
-    from loaders import signal_loader
     from vectorbt_bridge import orders_to_portfolio
     from vectorbt_bridge import portfolio_stats as compute_portfolio_stats
 
@@ -400,7 +405,13 @@ def _run_simulation_loop(
     all_orders = []
     dates_simulated = 0
 
-    for signal_date in dates:
+    # Use signals_by_date keys as iteration dates when available
+    if signals_by_date is not None:
+        sim_dates = sorted(signals_by_date.keys())
+    else:
+        sim_dates = dates
+
+    for signal_date in sim_dates:
         ts = pd.Timestamp(signal_date)
         if ts not in price_matrix.index:
             continue
@@ -409,10 +420,15 @@ def _run_simulation_loop(
         if not date_prices:
             continue
 
-        try:
-            signals_raw = signal_loader.load(bucket, signal_date)
-        except FileNotFoundError:
-            continue
+        # Load signals: from pre-built dict or from S3
+        if signals_by_date is not None:
+            signals_raw = signals_by_date[signal_date]
+        else:
+            from loaders import signal_loader
+            try:
+                signals_raw = signal_loader.load(bucket, signal_date)
+            except FileNotFoundError:
+                continue
 
         sim_client._prices = date_prices
         sim_client._simulation_date = signal_date
@@ -541,9 +557,130 @@ def run_param_sweep(config: dict):
     return param_sweep.sweep(grid, sim_fn, config)
 
 
+def run_predictor_backtest(config: dict) -> dict:
+    """
+    Run predictor-only historical backtest: generate synthetic signals from
+    GBM inference on 2y of slim cache data, then simulate through the full
+    executor pipeline (risk guard, position sizing, ATR stops, time decay,
+    graduated drawdown).
+
+    Returns a stats dict with portfolio metrics + metadata, or a status dict
+    if insufficient data.
+    """
+    import sys
+    from synthetic.predictor_backtest import run as run_predictor_pipeline
+
+    # Prepare data: load cache, compute features, run GBM, generate signals
+    result = run_predictor_pipeline(config)
+
+    if result.get("status") != "ok":
+        return result
+
+    signals_by_date = result["signals_by_date"]
+    price_matrix = result["price_matrix"]
+    ohlcv_by_ticker = result["ohlcv_by_ticker"]
+    metadata = result["metadata"]
+
+    # Import executor modules
+    executor_paths = config.get("executor_paths", [])
+    if isinstance(executor_paths, str):
+        executor_paths = [executor_paths]
+    executor_path = next((p for p in executor_paths if os.path.isdir(p)), None)
+    if not executor_path:
+        return {"status": "error", "error": f"executor_paths not found: {executor_paths}"}
+    if executor_path not in sys.path:
+        sys.path.insert(0, executor_path)
+
+    from executor.main import run as executor_run
+    from executor.ibkr import SimulatedIBKRClient
+
+    # Run simulation
+    logger.info("Running predictor-only simulation: %d dates", len(signals_by_date))
+    stats = _run_simulation_loop(
+        executor_run, SimulatedIBKRClient,
+        dates=[],  # not used when signals_by_date is provided
+        price_matrix=price_matrix,
+        config=config,
+        ohlcv_by_ticker=ohlcv_by_ticker,
+        signals_by_date=signals_by_date,
+    )
+
+    # Merge metadata into stats for reporting
+    stats["predictor_metadata"] = metadata
+    return stats
+
+
+def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
+    """
+    Run predictor-only backtest with param sweep.
+
+    Loads data once (features, GBM inference, signal generation), then runs
+    the simulation loop for each parameter combination.
+
+    Returns (single_run_stats, sweep_df).
+    """
+    import sys
+    from synthetic.predictor_backtest import run as run_predictor_pipeline
+
+    # Prepare data once
+    result = run_predictor_pipeline(config)
+
+    if result.get("status") != "ok":
+        return result, pd.DataFrame()
+
+    signals_by_date = result["signals_by_date"]
+    price_matrix = result["price_matrix"]
+    ohlcv_by_ticker = result["ohlcv_by_ticker"]
+    metadata = result["metadata"]
+
+    # Import executor modules
+    executor_paths = config.get("executor_paths", [])
+    if isinstance(executor_paths, str):
+        executor_paths = [executor_paths]
+    executor_path = next((p for p in executor_paths if os.path.isdir(p)), None)
+    if not executor_path:
+        return {"status": "error", "error": f"executor_paths not found: {executor_paths}"}, pd.DataFrame()
+    if executor_path not in sys.path:
+        sys.path.insert(0, executor_path)
+
+    from executor.main import run as executor_run
+    from executor.ibkr import SimulatedIBKRClient
+
+    # Single run with default config
+    logger.info("Running predictor-only simulation (default params): %d dates", len(signals_by_date))
+    single_stats = _run_simulation_loop(
+        executor_run, SimulatedIBKRClient,
+        dates=[],
+        price_matrix=price_matrix,
+        config=config,
+        ohlcv_by_ticker=ohlcv_by_ticker,
+        signals_by_date=signals_by_date,
+    )
+    single_stats["predictor_metadata"] = metadata
+
+    # Param sweep
+    sweep_df = pd.DataFrame()
+    grid = config.get("param_sweep")
+    if grid:
+        def sim_fn(combo_config: dict) -> dict:
+            return _run_simulation_loop(
+                executor_run, SimulatedIBKRClient,
+                dates=[],
+                price_matrix=price_matrix,
+                config=combo_config,
+                ohlcv_by_ticker=ohlcv_by_ticker,
+                signals_by_date=signals_by_date,
+            )
+
+        logger.info("Running predictor param sweep: %s", {k: len(v) for k, v in grid.items()})
+        sweep_df = param_sweep.sweep(grid, sim_fn, config)
+
+    return single_stats, sweep_df
+
+
 def main():
     parser = argparse.ArgumentParser(description="Alpha Engine Backtester")
-    parser.add_argument("--mode", choices=["signal-quality", "simulate", "param-sweep", "all"],
+    parser.add_argument("--mode", choices=["signal-quality", "simulate", "param-sweep", "all", "predictor-backtest"],
                         default="signal-quality")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--db", help="Override research_db path from config")
@@ -581,6 +718,8 @@ def main():
     portfolio_stats = None
     sweep_df = None
     weight_result = None
+    predictor_stats = None
+    predictor_sweep_df = None
 
     if args.mode in ("signal-quality", "all"):
         sq_result, regime_rows, score_rows, attr_result, df_base = run_signal_quality(config)
@@ -606,6 +745,14 @@ def main():
             logger.error("Param sweep failed: %s", e)
             sweep_df = None
 
+    if args.mode == "predictor-backtest":
+        try:
+            predictor_stats, predictor_sweep_df = run_predictor_param_sweep(config)
+        except Exception as e:
+            logger.error("Predictor backtest failed: %s", e)
+            predictor_stats = {"status": "error", "error": str(e)}
+            predictor_sweep_df = None
+
     report_md = build_report(
         run_date=args.date,
         signal_quality=sq_result,
@@ -616,13 +763,20 @@ def main():
         sweep_df=sweep_df,
         weight_result=weight_result,
         config=config,
+        predictor_stats=predictor_stats,
+        predictor_sweep_df=predictor_sweep_df,
     )
+
+    # For predictor-backtest mode, use predictor_sweep_df as the sweep output
+    save_sweep_df = sweep_df
+    if predictor_sweep_df is not None and not predictor_sweep_df.empty:
+        save_sweep_df = predictor_sweep_df
 
     out_dir = save(
         report_md=report_md,
         signal_quality=sq_result,
         score_analysis=score_rows,
-        sweep_df=sweep_df,
+        sweep_df=save_sweep_df,
         attribution=attr_result if args.mode in ("signal-quality", "all") else None,
         run_date=args.date,
         results_dir=config.get("results_dir", "results"),

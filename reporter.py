@@ -32,6 +32,8 @@ def build_report(
     sweep_df=None,
     weight_result: dict | None = None,
     config: dict | None = None,
+    predictor_stats: dict | None = None,
+    predictor_sweep_df=None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
@@ -75,6 +77,16 @@ def build_report(
     # Weight recommendation
     if weight_result:
         lines += _section_weight_recommendation(weight_result)
+        lines += [""]
+
+    # Predictor-only backtest (2y historical)
+    if predictor_stats:
+        lines += _section_predictor_backtest(predictor_stats)
+        lines += [""]
+
+    # Predictor param sweep
+    if predictor_sweep_df is not None and not predictor_sweep_df.empty:
+        lines += _section_param_sweep_predictor(predictor_sweep_df)
         lines += [""]
 
     lines += [
@@ -337,6 +349,80 @@ def _section_weight_recommendation(result: dict) -> list[str]:
         ]
 
     lines += [f"> {result.get('note', '')}"]
+    return lines
+
+
+def _section_predictor_backtest(stats: dict) -> list[str]:
+    """Build report section for predictor-only backtest results."""
+    lines = ["## Predictor-Only Backtest (2y historical)"]
+    status = stats.get("status", "unknown")
+
+    if status in ("insufficient_data", "error"):
+        note = stats.get("note", stats.get("error", "Unavailable."))
+        lines += ["", f"> **Deferred.** {note}"]
+        return lines
+
+    if status == "no_orders":
+        lines += [
+            "",
+            "> No ENTER signals passed risk rules during the simulation period.",
+            f"> Dates simulated: {stats.get('dates_simulated', 'N/A')}",
+        ]
+        return lines
+
+    meta = stats.get("predictor_metadata", {})
+    lines += [
+        "",
+        f"_GBM-only signals (no LLM research component). "
+        f"{meta.get('n_tickers', 'N/A')} tickers, "
+        f"{meta.get('n_dates', 'N/A')} trading days "
+        f"({meta.get('date_range_start', '?')} → {meta.get('date_range_end', '?')}). "
+        f"Top {meta.get('top_n_per_day', 'N/A')} ENTER signals/day, "
+        f"min score {meta.get('min_score', 'N/A')}._",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Total return | {_pct(stats.get('total_return'))} |",
+        f"| Sharpe ratio | {_fmt(stats.get('sharpe_ratio'))} |",
+        f"| Max drawdown | {_pct(stats.get('max_drawdown'))} |",
+        f"| Calmar ratio | {_fmt(stats.get('calmar_ratio'))} |",
+        f"| Total trades | {stats.get('total_trades', 'N/A')} |",
+        f"| Win rate | {_pct(stats.get('win_rate'))} |",
+        f"| Dates simulated | {stats.get('dates_simulated', 'N/A')} |",
+        f"| Total orders | {stats.get('total_orders', 'N/A')} |",
+        "",
+        "> This tests the full executor pipeline (risk guard, position sizing, ATR stops, "
+        "time decay, graduated drawdown) using GBM predictions on historical price data. "
+        "Macro context is neutral; sector ratings are market-weight.",
+    ]
+    return lines
+
+
+def _section_param_sweep_predictor(df) -> list[str]:
+    """Build report section for predictor-only param sweep results."""
+    lines = ["## Predictor param sweep — top combinations by Sharpe ratio", ""]
+    param_cols = [c for c in df.columns if c not in [
+        "total_return", "sharpe_ratio", "max_drawdown", "calmar_ratio",
+        "total_trades", "win_rate", "status", "dates_simulated", "total_orders",
+        "note", "error",
+    ]]
+    stat_cols = [c for c in ["sharpe_ratio", "total_return", "max_drawdown", "win_rate"] if c in df.columns]
+    show_cols = param_cols + stat_cols
+    header = "| " + " | ".join(show_cols) + " |"
+    sep    = "| " + " | ".join("---" for _ in show_cols) + " |"
+    lines += [header, sep]
+    for _, row in df.head(10).iterrows():
+        cells = []
+        for c in show_cols:
+            v = row.get(c)
+            if c in ("total_return", "max_drawdown", "win_rate"):
+                cells.append(_pct(v))
+            elif c in ("sharpe_ratio",):
+                cells.append(_fmt(v))
+            else:
+                cells.append(str(v) if v is not None else "—")
+        lines.append("| " + " | ".join(cells) + " |")
+    lines += ["", f"_Full results in param_sweep.csv (predictor-only)_"]
     return lines
 
 
