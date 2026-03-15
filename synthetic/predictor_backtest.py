@@ -317,34 +317,55 @@ def run_inference(
 def build_signals_by_date(
     predictions_by_date: dict[str, dict[str, float]],
     sector_map: dict[str, str],
+    ohlcv_by_ticker: dict[str, list[dict]],
     top_n: int = 20,
-    min_score: float = 70,
+    min_score: float = 60,
 ) -> dict[str, dict]:
     """
-    Convert per-date predictions to executor signal envelopes.
+    Convert per-date predictions to executor signal envelopes using
+    technical scoring from OHLCV data (not the broken alpha-to-score mapping).
 
     Parameters
     ----------
     predictions_by_date : {date: {ticker: alpha}} from run_inference()
     sector_map : {ticker: sector_etf} from sector_map.json
+    ohlcv_by_ticker : {ticker: [{date, open, high, low, close}, ...]}
     top_n : max ENTER signals per day (prevents unrealistic portfolio churn)
-    min_score : minimum composite score for ENTER signal
+    min_score : minimum trading score for ENTER signal
 
     Returns
     -------
     {date: signal_envelope} — each envelope is a full signals_override dict.
     """
     signals_by_date: dict[str, dict] = {}
+    sorted_dates = sorted(predictions_by_date.keys())
 
-    for date_str, predictions in predictions_by_date.items():
+    for i, date_str in enumerate(sorted_dates):
+        predictions = predictions_by_date[date_str]
+
+        # Filter OHLCV to dates <= current date to prevent lookahead bias
+        ohlcv_up_to_date = {}
+        for ticker, bars in ohlcv_by_ticker.items():
+            filtered = [bar for bar in bars if bar["date"] <= date_str]
+            if filtered:
+                ohlcv_up_to_date[ticker] = filtered
+
         envelope = predictions_to_signals(
             predictions=predictions,
             date=date_str,
             sector_map=sector_map,
+            ohlcv_by_ticker=ohlcv_up_to_date,
             top_n=top_n,
             min_score=min_score,
         )
         signals_by_date[date_str] = envelope
+
+        if (i + 1) % 50 == 0:
+            n_enter = len(envelope.get("buy_candidates", []))
+            logger.info(
+                "  Signal generation: %d/%d dates (ENTER=%d on %s)",
+                i + 1, len(sorted_dates), n_enter, date_str,
+            )
 
     return signals_by_date
 
@@ -549,9 +570,9 @@ def run(config: dict) -> dict:
     except OSError:
         pass
 
-    # 7. Generate signals
+    # 7. Generate signals (using technical scoring from OHLCV, enriched by GBM alpha)
     signals_by_date = build_signals_by_date(
-        predictions_by_date, sector_map,
+        predictions_by_date, sector_map, ohlcv_by_ticker,
         top_n=top_n, min_score=min_score,
     )
 
