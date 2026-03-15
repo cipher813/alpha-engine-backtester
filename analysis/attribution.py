@@ -1,15 +1,13 @@
 """
-attribution.py — which sub-score (technical / news / research) drives beat-SPY?
+attribution.py — which sub-score (news / research) drives beat-SPY?
 
 Computes correlation between each sub-score and beat_spy_10d/30d.
 This is the primary mechanism for improving research pipeline scoring weights.
 
-Data availability: noisy with <200 rows; meaningful at Week 8+ (~500 rows).
-Automated weight optimization is deferred to Phase 2 (Month 6+).
+Horizon separation: Research uses news + research only (6–12 month fundamental).
+Technical analysis is handled by Predictor (GBM) and Executor (ATR/time exits).
 
-The feedback loop:
-    attribution output → human review (quarterly) → manual weight change in
-    alpha-engine-research scoring config → backtester regression test validates change
+Data availability: noisy with <200 rows; meaningful at Week 8+ (~500 rows).
 """
 
 import logging
@@ -18,7 +16,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-SUB_SCORES = ["technical", "news", "research"]
+SUB_SCORES = ["news", "research"]
 PREDICTOR_COLS = ["p_up", "p_down", "prediction_confidence", "predicted_direction"]
 
 
@@ -28,17 +26,16 @@ def compute_attribution(df: pd.DataFrame) -> dict:
 
     Expects score_performance rows joined with sub-score columns.
     Sub-scores are assumed to be in a 'sub_scores' JSON column or as separate
-    columns named technical_score, news_score, research_score.
+    columns named news_score, research_score.
 
     Returns:
         {
             "status": "ok" | "insufficient_data",
             "correlations": {
-                "technical": {"beat_spy_10d": 0.12, "beat_spy_30d": 0.09, "return_10d": 0.15, ...},
-                "news": {...},
+                "news": {"beat_spy_10d": 0.12, "beat_spy_30d": 0.09, ...},
                 "research": {...},
             },
-            "ranking_10d": ["technical", "research", "news"],  # descending by correlation
+            "ranking_10d": ["research", "news"],  # descending by correlation
             "ranking_30d": [...],
             "note": "..."
         }

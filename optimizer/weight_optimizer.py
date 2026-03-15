@@ -2,13 +2,13 @@
 weight_optimizer.py — scoring weight recommendation based on sub-score attribution.
 
 Joins score_performance outcomes (research.db) with sub-scores from signals.json (S3)
-to compute which sub-scores (technical / news / research) best predict outperformance.
-Suggests revised weights and includes them in the weekly report for manual review.
+to compute which sub-scores (news / research) best predict outperformance.
+Suggests revised weights and applies them to S3 if guardrails pass.
 
-This is advisory only — no weights are changed automatically. The user reviews the
-suggestion and updates scoring_weights in alpha-engine-research/config/universe.yaml.
+Horizon separation: Research uses news + research only (6–12 month fundamental
+attractiveness). Technical analysis is handled by Predictor (GBM) and Executor.
 
-Current default weights: technical=0.40, news=0.30, research=0.30
+Current default weights: news=0.50, research=0.50
 """
 
 import json
@@ -21,8 +21,8 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_WEIGHTS = {"technical": 0.40, "news": 0.30, "research": 0.30}
-SUB_SCORES = ["technical", "news", "research"]
+DEFAULT_WEIGHTS = {"news": 0.50, "research": 0.50}
+SUB_SCORES = ["news", "research"]
 S3_WEIGHTS_KEY = "config/scoring_weights.json"
 
 # Guardrails for autonomous weight application
@@ -56,7 +56,7 @@ def load_with_subscores(
         signals_prefix:  S3 prefix for signals files (default "signals").
 
     Returns:
-        DataFrame with technical_score, news_score, research_score columns added.
+        DataFrame with news_score, research_score columns added.
         Rows where sub-scores could not be resolved are kept but have NaN sub-scores.
     """
     if df.empty:
@@ -111,7 +111,7 @@ def load_with_subscores(
 
     sub_df = pd.DataFrame(rows)
     merged = df.merge(sub_df, on=["symbol", "score_date"], how="left")
-    filled = merged[["technical_score", "news_score", "research_score"]].notna().any(axis=1).sum()
+    filled = merged[["news_score", "research_score"]].notna().any(axis=1).sum()
     logger.info("Sub-scores matched for %d/%d score_performance rows", filled, len(merged))
     return merged
 
@@ -125,7 +125,7 @@ def compute_weights(
     Compute suggested scoring weights from sub-score vs. beat_spy correlations.
 
     Args:
-        df:               score_performance DataFrame with technical_score, news_score,
+        df:               score_performance DataFrame with news_score,
                           research_score columns (from load_with_subscores).
         current_weights:  Current weights dict. Defaults to DEFAULT_WEIGHTS.
         min_samples:      Minimum rows with beat_spy_10d populated to proceed.
@@ -135,14 +135,13 @@ def compute_weights(
             "status": "ok" | "insufficient_data" | "no_subscores",
             "n_samples": int,
             "confidence": "low" | "medium" | "high",
-            "current_weights": {"technical": 0.40, "news": 0.30, "research": 0.30},
+            "current_weights": {"news": 0.50, "research": 0.50},
             "correlations": {
-                "technical": {"beat_spy_10d": 0.24, "beat_spy_30d": 0.19},
                 "news":       {"beat_spy_10d": 0.11, "beat_spy_30d": 0.14},
                 "research":   {"beat_spy_10d": 0.18, "beat_spy_30d": 0.22},
             },
-            "suggested_weights": {"technical": 0.44, "news": 0.28, "research": 0.28},
-            "changes": {"technical": +0.04, "news": -0.02, "research": -0.02},
+            "suggested_weights": {"news": 0.48, "research": 0.52},
+            "changes": {"news": -0.02, "research": +0.02},
             "note": "..."
         }
     """
