@@ -22,13 +22,22 @@ logger = logging.getLogger(__name__)
 
 S3_PARAMS_KEY = "config/predictor_params.json"
 
-CONFIDENCE_THRESHOLDS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
-CURRENT_DEFAULT_THRESHOLD = 0.65
+# ── Fallback defaults (override via veto_analysis section in config.yaml) ──
+_CONFIDENCE_THRESHOLDS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+_CURRENT_DEFAULT_THRESHOLD = 0.60
+_MIN_PREDICTIONS = 30
+_MIN_VETO_DECISIONS = 10
+_MIN_THRESHOLD_CHANGE = 0.10
+_COST_PENALTY_WEIGHT = 0.30
 
-# Guardrails
-MIN_PREDICTIONS = 20    # minimum predictions loaded to proceed
-MIN_VETO_DECISIONS = 5  # minimum vetoes at any threshold to recommend
-MIN_THRESHOLD_CHANGE = 0.05  # recommended must differ from current by this much
+# Module-level config ref — set by init_config() from backtest.py
+_cfg: dict = {}
+
+
+def init_config(config: dict) -> None:
+    """Load veto_analysis section from backtester config."""
+    global _cfg
+    _cfg = config.get("veto_analysis", {})
 
 
 def _load_predictions_for_dates(dates: list[str], bucket: str) -> dict:
@@ -91,13 +100,14 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
         return {"status": "insufficient_data", "note": "No score_performance data"}
 
     # Only look at rows with beat_spy_10d outcome resolved
+    min_preds = _cfg.get("min_predictions", _MIN_PREDICTIONS)
     populated = df[df["beat_spy_10d"].notna()].copy()
-    if len(populated) < MIN_PREDICTIONS:
+    if len(populated) < min_preds:
         return {
             "status": "insufficient_data",
             "n_rows": len(populated),
-            "min_required": MIN_PREDICTIONS,
-            "note": f"Only {len(populated)} rows with outcomes (need {MIN_PREDICTIONS})",
+            "min_required": min_preds,
+            "note": f"Only {len(populated)} rows with outcomes (need {min_preds})",
         }
 
     # Load predictions from S3
@@ -139,8 +149,13 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
     logger.info("Found %d DOWN predictions with outcomes for veto analysis", n_down)
 
     # Sweep thresholds
+    thresholds = _cfg.get("confidence_thresholds", _CONFIDENCE_THRESHOLDS)
+    current_default = _cfg.get("current_default_threshold", _CURRENT_DEFAULT_THRESHOLD)
+    min_veto_dec = _cfg.get("min_veto_decisions", _MIN_VETO_DECISIONS)
+    cost_weight = _cfg.get("cost_penalty_weight", _COST_PENALTY_WEIGHT)
+
     threshold_results = []
-    for threshold in CONFIDENCE_THRESHOLDS:
+    for threshold in thresholds:
         vetoed = down_df[down_df["prediction_confidence"] >= threshold]
         n_vetoes = len(vetoed)
 
@@ -173,24 +188,23 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
         })
 
     # Find best threshold: maximize precision while keeping missed_alpha low
-    # Score = precision - 0.5 * (missed_alpha / max_missed_alpha)  [if any vetoes]
-    scoreable = [t for t in threshold_results if t["n_vetoes"] >= MIN_VETO_DECISIONS]
+    scoreable = [t for t in threshold_results if t["n_vetoes"] >= min_veto_dec]
 
     if not scoreable:
         return {
             "status": "insufficient_vetoes",
-            "current_threshold": CURRENT_DEFAULT_THRESHOLD,
+            "current_threshold": current_default,
             "n_down_predictions": n_down,
             "thresholds": threshold_results,
             "note": (
-                f"No threshold has {MIN_VETO_DECISIONS}+ veto decisions. "
+                f"No threshold has {min_veto_dec}+ veto decisions. "
                 "Need more prediction history for reliable analysis."
             ),
         }
 
     max_missed = max(abs(t["missed_alpha"]) for t in scoreable) or 1.0
     for t in scoreable:
-        cost_penalty = 0.5 * (abs(t["missed_alpha"]) / max_missed)
+        cost_penalty = cost_weight * (abs(t["missed_alpha"]) / max_missed)
         t["_score"] = t["precision"] - cost_penalty
 
     best = max(scoreable, key=lambda t: t["_score"])
@@ -198,7 +212,7 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
 
     return {
         "status": "ok",
-        "current_threshold": CURRENT_DEFAULT_THRESHOLD,
+        "current_threshold": current_default,
         "n_down_predictions": n_down,
         "n_predictions_loaded": sum(len(v) for v in predictions_by_date.values()),
         "thresholds": threshold_results,
@@ -221,18 +235,21 @@ def apply(result: dict, bucket: str) -> dict:
     if result.get("status") != "ok":
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
+    current_default = _cfg.get("current_default_threshold", _CURRENT_DEFAULT_THRESHOLD)
+    min_change = _cfg.get("min_threshold_change", _MIN_THRESHOLD_CHANGE)
+
     recommended = result.get("recommended_threshold")
-    current = result.get("current_threshold", CURRENT_DEFAULT_THRESHOLD)
+    current = result.get("current_threshold", current_default)
 
     if recommended is None:
         return {"applied": False, "reason": "no recommended threshold"}
 
-    if abs(recommended - current) < MIN_THRESHOLD_CHANGE:
+    if abs(recommended - current) < min_change:
         return {
             "applied": False,
             "reason": (
                 f"Recommended ({recommended:.2f}) too close to current "
-                f"({current:.2f}) — need {MIN_THRESHOLD_CHANGE}+ difference"
+                f"({current:.2f}) — need {min_change}+ difference"
             ),
         }
 

@@ -24,8 +24,8 @@ DEFAULT_GRID = {
     "max_position_pct": [0.05, 0.10, 0.15],
     "drawdown_circuit_breaker": [0.10, 0.15, 0.20],
     "atr_multiplier": [2.0, 3.0, 4.0],
-    "time_decay_reduce_days": [5, 7],
-    "time_decay_exit_days": [10, 15],
+    "time_decay_reduce_days": [5, 7, 10],
+    "time_decay_exit_days": [10, 15, 20],
 }
 
 

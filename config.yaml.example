@@ -1,5 +1,6 @@
 # Alpha Engine Backtester Configuration
-# Copy to config.yaml and fill in your values. config.yaml is gitignored.
+# Copy to config.yaml and customise all values below.
+# config.yaml is gitignored and should never be committed.
 
 # S3 bucket for signals and prices
 signals_bucket: your-research-bucket
@@ -58,8 +59,51 @@ email_recipients:
 # Override with --db flag for local development (e.g. python backtest.py --db ~/path/to/research.db).
 # Do not set this in config.yaml for EC2 — the S3 pull is automatic.
 
-# Param sweep grid (Mode 2, Phase 5)
+# Path to alpha-engine-predictor repo root — used for predictor-only backtest
+predictor_paths:
+  - /path/to/local/alpha-engine-predictor
+  - /home/ec2-user/alpha-engine-predictor
+
+# Predictor backtest settings (--mode predictor-backtest)
+predictor_backtest:
+  min_trading_days: 200
+  max_trading_days: 500
+  top_n_signals_per_day: 20
+  min_score: 70
+
+# Param sweep grid (Mode 2 + strategy layer)
 param_sweep:
   min_score: [65, 70, 75, 80]
   max_position_pct: [0.05, 0.10, 0.15]
   drawdown_circuit_breaker: [0.10, 0.15, 0.20]
+  atr_multiplier: [2.0, 3.0, 4.0]
+  time_decay_reduce_days: [5, 7, 10]
+  time_decay_exit_days: [10, 15, 20]
+
+# ── Weight optimizer guardrails ──────────────────────────────────────────────
+weight_optimizer:
+  default_weights:
+    news: 0.50
+    research: 0.50
+  max_single_change: 0.10        # max weight move per update
+  min_meaningful_change: 0.03    # min change to trigger update
+  blend_factor: 0.20             # conservative: 20% data-driven, 80% current
+  confidence_low: 100            # samples threshold for "low" confidence
+  confidence_medium: 300         # samples threshold for "medium"/"high"
+  horizon_blend:
+    beat_spy_10d: 0.50
+    beat_spy_30d: 0.50
+
+# ── Executor optimizer guardrails ────────────────────────────────────────────
+executor_optimizer:
+  min_valid_combos: 5            # minimum sweep combos with sharpe_ratio
+  min_sharpe_improvement: 0.10   # best must exceed baseline by 10%+
+
+# ── Veto threshold analysis ─────────────────────────────────────────────────
+veto_analysis:
+  confidence_thresholds: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+  current_default_threshold: 0.60
+  min_predictions: 30
+  min_veto_decisions: 10
+  min_threshold_change: 0.10
+  cost_penalty_weight: 0.30
