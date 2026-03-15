@@ -34,6 +34,8 @@ def build_report(
     config: dict | None = None,
     predictor_stats: dict | None = None,
     predictor_sweep_df=None,
+    veto_result: dict | None = None,
+    executor_rec: dict | None = None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
@@ -77,6 +79,16 @@ def build_report(
     # Weight recommendation
     if weight_result:
         lines += _section_weight_recommendation(weight_result)
+        lines += [""]
+
+    # Veto threshold analysis
+    if veto_result:
+        lines += _section_veto_analysis(veto_result)
+        lines += [""]
+
+    # Executor parameter recommendations
+    if executor_rec:
+        lines += _section_executor_recommendations(executor_rec)
         lines += [""]
 
     # Predictor-only backtest (2y historical)
@@ -322,7 +334,7 @@ def _section_weight_recommendation(result: dict) -> list[str]:
         "| Sub-score | Current | Corr (10d) | Corr (30d) | Suggested | Change |",
         "|-----------|---------|------------|------------|-----------|--------|",
     ]
-    for k in ("technical", "news", "research"):
+    for k in ("news", "research"):
         corr = correlations.get(k, {})
         c10 = corr.get("beat_spy_10d")
         c30 = corr.get("beat_spy_30d")
@@ -450,6 +462,104 @@ def _section_param_sweep(df) -> list[str]:
                 cells.append(str(v) if v is not None else "—")
         lines.append("| " + " | ".join(cells) + " |")
     lines += ["", f"_Full results in param_sweep.csv_"]
+    return lines
+
+
+def _section_veto_analysis(result: dict) -> list[str]:
+    lines = ["## Predictor veto threshold analysis"]
+    status = result.get("status", "unknown")
+
+    if status != "ok":
+        note = result.get("note", result.get("error", "Unavailable."))
+        lines += ["", f"> **Deferred.** {note}"]
+        return lines
+
+    current = result.get("current_threshold", 0.65)
+    recommended = result.get("recommended_threshold")
+    n_down = result.get("n_down_predictions", 0)
+
+    lines += [
+        "",
+        f"_Analyzed {n_down} DOWN predictions with resolved outcomes._",
+        "",
+        "| Confidence | Vetoes | True neg | False neg | Precision | Missed alpha |",
+        "|------------|--------|----------|-----------|-----------|--------------|",
+    ]
+    for t in result.get("thresholds", []):
+        conf = t["confidence"]
+        marker = ""
+        if conf == current:
+            marker = " (current)"
+        if conf == recommended:
+            marker = " **→**"
+        prec = _pct(t["precision"]) if t["precision"] is not None else "—"
+        lines.append(
+            f"| {conf:.2f}{marker} | {t['n_vetoes']} | {t['true_negatives']} "
+            f"| {t['false_negatives']} | {prec} | {t['missed_alpha']:.4f} |"
+        )
+
+    lines += ["", f"> **Recommended:** {recommended:.2f} — {result.get('recommendation_reason', '')}"]
+
+    apply = result.get("apply_result", {})
+    if apply.get("applied"):
+        lines += [
+            f"> ✅ **Veto threshold updated** in S3 (`config/predictor_params.json`). "
+            f"Predictor Lambda will use {apply.get('veto_confidence'):.2f} on next cold-start.",
+        ]
+    else:
+        reason = apply.get("reason", "guardrails not met")
+        lines += [f"> ⏸ **Not applied** — {reason}."]
+
+    return lines
+
+
+def _section_executor_recommendations(result: dict) -> list[str]:
+    lines = ["## Executor parameter recommendations"]
+    status = result.get("status", "unknown")
+
+    if status != "ok":
+        note = result.get("note", result.get("error", "Unavailable."))
+        lines += ["", f"> **Deferred.** {note}"]
+        return lines
+
+    baseline = result.get("baseline_params", {})
+    recommended = result.get("recommended_params", {})
+    improvement = result.get("improvement_pct", 0)
+
+    lines += [
+        "",
+        f"_Tested {result.get('n_combos_tested', '?')} parameter combinations. "
+        f"Sharpe improvement: {improvement:.1%} "
+        f"({result.get('baseline_sharpe', 0):.4f} → {result.get('best_sharpe', 0):.4f})._",
+        "",
+        "| Parameter | Baseline | Recommended | Change |",
+        "|-----------|----------|-------------|--------|",
+    ]
+    all_keys = sorted(set(list(baseline.keys()) + list(recommended.keys())))
+    for k in all_keys:
+        b = baseline.get(k)
+        r = recommended.get(k)
+        b_str = f"{b:.4f}" if isinstance(b, float) else str(b) if b is not None else "—"
+        r_str = f"{r:.4f}" if isinstance(r, float) else str(r) if r is not None else "—"
+        if b is not None and r is not None and isinstance(b, (int, float)) and isinstance(r, (int, float)):
+            diff = r - b
+            chg_str = f"{'+' if diff >= 0 else ''}{diff:.4f}"
+        else:
+            chg_str = "—"
+        lines.append(f"| {k} | {b_str} | {r_str} | {chg_str} |")
+
+    lines += ["", f"> {result.get('note', '')}"]
+
+    apply = result.get("apply_result", {})
+    if apply.get("applied"):
+        lines += [
+            f"> ✅ **Executor params updated** in S3 (`config/executor_params.json`). "
+            f"Executor Lambda will use new params on next cold-start.",
+        ]
+    else:
+        reason = apply.get("reason", "guardrails not met")
+        lines += [f"> ⏸ **Not applied** — {reason}."]
+
     return lines
 
 

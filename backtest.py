@@ -44,7 +44,8 @@ import pandas as pd
 import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution, param_sweep
-from optimizer import weight_optimizer
+from analysis import veto_analysis
+from optimizer import weight_optimizer, executor_optimizer
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
 
@@ -718,12 +719,25 @@ def main():
     portfolio_stats = None
     sweep_df = None
     weight_result = None
+    veto_result = None
+    executor_rec = None
     predictor_stats = None
     predictor_sweep_df = None
 
     if args.mode in ("signal-quality", "all"):
         sq_result, regime_rows, score_rows, attr_result, df_base = run_signal_quality(config)
         weight_result = run_weight_optimizer(config, df_base)
+
+        # Phase 3: Veto threshold analysis (needs score_performance data)
+        if df_base is not None and not df_base.empty:
+            try:
+                bucket = config.get("signals_bucket", "alpha-engine-research")
+                veto_result = veto_analysis.analyze_veto_effectiveness(df_base, bucket)
+                if veto_result.get("status") == "ok":
+                    veto_result["apply_result"] = veto_analysis.apply(veto_result, bucket)
+            except Exception as e:
+                logger.error("Veto analysis failed: %s", e)
+                veto_result = {"status": "error", "error": str(e)}
     else:
         sq_result = {"status": "skipped"}
         regime_rows = []
@@ -745,6 +759,17 @@ def main():
             logger.error("Param sweep failed: %s", e)
             sweep_df = None
 
+        # Phase 2: Executor parameter optimization from sweep results
+        if sweep_df is not None and not sweep_df.empty:
+            try:
+                executor_rec = executor_optimizer.recommend(sweep_df, config)
+                if executor_rec.get("status") == "ok":
+                    bucket = config.get("signals_bucket", "alpha-engine-research")
+                    executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
+            except Exception as e:
+                logger.error("Executor optimizer failed: %s", e)
+                executor_rec = {"status": "error", "error": str(e)}
+
     if args.mode == "predictor-backtest":
         try:
             predictor_stats, predictor_sweep_df = run_predictor_param_sweep(config)
@@ -765,6 +790,8 @@ def main():
         config=config,
         predictor_stats=predictor_stats,
         predictor_sweep_df=predictor_sweep_df,
+        veto_result=veto_result,
+        executor_rec=executor_rec,
     )
 
     # For predictor-backtest mode, use predictor_sweep_df as the sweep output
