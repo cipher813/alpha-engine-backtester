@@ -439,7 +439,17 @@ def _section_param_sweep_predictor(df) -> list[str]:
 
 
 def _section_param_sweep(df) -> list[str]:
-    lines = ["## Param sweep — top combinations by Sharpe ratio", ""]
+    # Sweep metadata from DataFrame attrs
+    sweep_mode = df.attrs.get("sweep_mode", "grid")
+    sweep_trials = df.attrs.get("sweep_trials", len(df))
+    sweep_total = df.attrs.get("sweep_total_grid", len(df))
+    sweep_coverage = df.attrs.get("sweep_coverage", 1.0)
+
+    title = "## Param sweep — top combinations by Sharpe ratio"
+    if sweep_mode != "grid":
+        title += f" ({sweep_mode}: {sweep_trials}/{sweep_total} combos, {sweep_coverage:.0%} coverage)"
+
+    lines = [title, ""]
     param_cols = [c for c in df.columns if c not in [
         "total_return", "sharpe_ratio", "max_drawdown", "calmar_ratio",
         "total_trades", "win_rate", "status", "dates_simulated", "total_orders",

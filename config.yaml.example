@@ -71,6 +71,18 @@ predictor_backtest:
   top_n_signals_per_day: 20
   min_score: 70
 
+# ── Param sweep settings ───────────────────────────────────────────────────
+# mode: "random" samples from the grid; "grid" runs exhaustive search.
+# Auto-scaling: when max_trials is omitted, samples 30% of the grid clamped
+# to [60, 500]. Floor of 60 guarantees 95% top-5% for any grid size.
+param_sweep_settings:
+  mode: random
+  # max_trials: 100                # omit to auto-scale with params below
+  trial_pct: 0.25                  # sample this fraction of the grid
+  min_trials: 50                   # floor: statistical minimum
+  max_trials_cap: 400              # ceiling: cap runtime for large grids
+  # seed: 42                       # uncomment for reproducible sweeps
+
 # Param sweep grid (Mode 2 + strategy layer)
 param_sweep:
   min_score: [65, 70, 75, 80]

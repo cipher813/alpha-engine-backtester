@@ -554,8 +554,10 @@ def run_param_sweep(config: dict):
         )
 
     grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
-    logger.info("Running param sweep: %s", {k: len(v) for k, v in grid.items()})
-    return param_sweep.sweep(grid, sim_fn, config)
+    sweep_settings = config.get("param_sweep_settings", {})
+
+    logger.info("Running param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
+    return param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
 
 
 def run_predictor_backtest(config: dict) -> dict:
@@ -673,8 +675,10 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 signals_by_date=signals_by_date,
             )
 
-        logger.info("Running predictor param sweep: %s", {k: len(v) for k, v in grid.items()})
-        sweep_df = param_sweep.sweep(grid, sim_fn, config)
+        sweep_settings = config.get("param_sweep_settings", {})
+
+        logger.info("Running predictor param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
+        sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
 
     return single_stats, sweep_df
 
