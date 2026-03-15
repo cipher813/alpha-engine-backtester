@@ -31,9 +31,18 @@ SAFE_PARAMS = [
     "max_position_pct",
 ]
 
-# Guardrails
-MIN_VALID_COMBOS = 3       # need at least 3 combos with sharpe_ratio
-MIN_SHARPE_IMPROVEMENT = 0.05  # best must exceed baseline by 5%+ relative
+# ── Fallback defaults (override via executor_optimizer section in config.yaml) ──
+_MIN_VALID_COMBOS = 5
+_MIN_SHARPE_IMPROVEMENT = 0.10
+
+# Module-level config ref — set by init_config() from backtest.py
+_cfg: dict = {}
+
+
+def init_config(config: dict) -> None:
+    """Load executor_optimizer section from backtester config."""
+    global _cfg
+    _cfg = config.get("executor_optimizer", {})
 
 
 def recommend(sweep_df: pd.DataFrame, base_config: dict) -> dict:
@@ -57,13 +66,14 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict) -> dict:
     if sweep_df is None or sweep_df.empty:
         return {"status": "insufficient_data", "note": "No sweep results available"}
 
+    min_combos = _cfg.get("min_valid_combos", _MIN_VALID_COMBOS)
     valid = sweep_df[sweep_df["sharpe_ratio"].notna()].copy()
-    if len(valid) < MIN_VALID_COMBOS:
+    if len(valid) < min_combos:
         return {
             "status": "insufficient_data",
             "n_valid": len(valid),
-            "min_required": MIN_VALID_COMBOS,
-            "note": f"Only {len(valid)} valid combos (need {MIN_VALID_COMBOS})",
+            "min_required": min_combos,
+            "note": f"Only {len(valid)} valid combos (need {min_combos})",
         }
 
     # Identify param columns (everything that's not a stat column)
@@ -94,7 +104,8 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict) -> dict:
     baseline = {col: valid.iloc[-1][col] for col in param_cols if pd.notna(valid.iloc[-1][col])}
     baseline = {k: float(v) if isinstance(v, (int, float)) else v for k, v in baseline.items()}
 
-    if improvement_pct < MIN_SHARPE_IMPROVEMENT:
+    min_improvement = _cfg.get("min_sharpe_improvement", _MIN_SHARPE_IMPROVEMENT)
+    if improvement_pct < min_improvement:
         return {
             "status": "no_improvement",
             "baseline_params": baseline,
@@ -104,7 +115,7 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict) -> dict:
             "improvement_pct": round(improvement_pct, 4),
             "note": (
                 f"Best Sharpe ({best_sharpe:.4f}) only {improvement_pct:.1%} better than "
-                f"baseline ({baseline_sharpe:.4f}). Need {MIN_SHARPE_IMPROVEMENT:.0%}+ to recommend."
+                f"baseline ({baseline_sharpe:.4f}). Need {min_improvement:.0%}+ to recommend."
             ),
         }
 

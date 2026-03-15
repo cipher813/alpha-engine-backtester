@@ -21,21 +21,26 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_WEIGHTS = {"news": 0.50, "research": 0.50}
 SUB_SCORES = ["news", "research"]
 S3_WEIGHTS_KEY = "config/scoring_weights.json"
 
-# Guardrails for autonomous weight application
-MAX_SINGLE_CHANGE = 0.15   # no weight moves more than 15 percentage points
-MIN_MEANINGFUL_CHANGE = 0.02  # at least one weight must change by 2%+ to be worth updating
+# ── Fallback defaults (override via weight_optimizer section in config.yaml) ──
+_DEFAULT_WEIGHTS = {"news": 0.50, "research": 0.50}
+_MAX_SINGLE_CHANGE = 0.10
+_MIN_MEANINGFUL_CHANGE = 0.03
+_BLEND_FACTOR = 0.20
+_CONFIDENCE_LOW = 100
+_CONFIDENCE_MEDIUM = 300
+_HORIZON_BLEND = {"beat_spy_10d": 0.50, "beat_spy_30d": 0.50}
 
-# Blend factor: how much the correlation signal moves the suggested weight
-# toward the purely data-driven weight. 0.3 = conservative; 1.0 = fully data-driven.
-BLEND_FACTOR = 0.3
+# Module-level config ref — set by init_config() from backtest.py
+_cfg: dict = {}
 
-# Confidence thresholds (number of samples with beat_spy_10d populated)
-CONFIDENCE_LOW = 50
-CONFIDENCE_MEDIUM = 200
+
+def init_config(config: dict) -> None:
+    """Load weight_optimizer section from backtester config."""
+    global _cfg
+    _cfg = config.get("weight_optimizer", {})
 
 
 def load_with_subscores(
@@ -146,7 +151,7 @@ def compute_weights(
         }
     """
     if current_weights is None:
-        current_weights = DEFAULT_WEIGHTS.copy()
+        current_weights = _cfg.get("default_weights", _DEFAULT_WEIGHTS).copy()
 
     populated = df[df["beat_spy_10d"].notna()].copy()
     n = len(populated)
@@ -186,12 +191,15 @@ def compute_weights(
         correlations[label] = corr
 
     # Derive suggested weights
-    # Use 60/40 blend of 10d and 30d correlations; clip negatives to 0
+    # Blend of 10d and 30d correlations (weights from config); clip negatives to 0
+    horizon = _cfg.get("horizon_blend", _HORIZON_BLEND)
+    w10 = horizon.get("beat_spy_10d", 0.50)
+    w30 = horizon.get("beat_spy_30d", 0.50)
     weighted_corrs: dict[str, float] = {}
     for label, corr in correlations.items():
         c10 = corr.get("beat_spy_10d") or 0.0
         c30 = corr.get("beat_spy_30d") or 0.0
-        weighted_corrs[label] = max(0.0, 0.6 * c10 + 0.4 * c30)
+        weighted_corrs[label] = max(0.0, w10 * c10 + w30 * c30)
 
     total_corr = sum(weighted_corrs.values())
     if total_corr == 0:
@@ -201,8 +209,9 @@ def compute_weights(
         pure_suggested = {k: v / total_corr for k, v in weighted_corrs.items()}
 
     # Blend toward data-driven weights conservatively
+    blend = _cfg.get("blend_factor", _BLEND_FACTOR)
     suggested = {
-        k: round(current_weights.get(k, 0.0) * (1 - BLEND_FACTOR) + pure_suggested.get(k, 0.0) * BLEND_FACTOR, 3)
+        k: round(current_weights.get(k, 0.0) * (1 - blend) + pure_suggested.get(k, 0.0) * blend, 3)
         for k in SUB_SCORES
     }
 
@@ -212,9 +221,11 @@ def compute_weights(
 
     changes = {k: round(suggested[k] - current_weights.get(k, 0.0), 3) for k in SUB_SCORES}
 
+    conf_med = _cfg.get("confidence_medium", _CONFIDENCE_MEDIUM)
+    conf_low = _cfg.get("confidence_low", _CONFIDENCE_LOW)
     confidence = (
-        "high" if n >= CONFIDENCE_MEDIUM
-        else "medium" if n >= CONFIDENCE_LOW
+        "high" if n >= conf_med
+        else "medium" if n >= conf_low
         else "low"
     )
 
@@ -260,20 +271,23 @@ def apply_weights(result: dict, bucket: str) -> dict:
     if confidence == "low":
         return {"applied": False, "reason": "confidence too low — need medium or high (50+ samples)"}
 
+    max_single = _cfg.get("max_single_change", _MAX_SINGLE_CHANGE)
+    min_meaningful = _cfg.get("min_meaningful_change", _MIN_MEANINGFUL_CHANGE)
+
     changes = result.get("changes", {})
     max_change = max(abs(v) for v in changes.values()) if changes else 0
-    meaningful = any(abs(v) >= MIN_MEANINGFUL_CHANGE for v in changes.values())
+    meaningful = any(abs(v) >= min_meaningful for v in changes.values())
 
-    if max_change > MAX_SINGLE_CHANGE:
+    if max_change > max_single:
         return {
             "applied": False,
-            "reason": f"largest change {max_change:.1%} exceeds {MAX_SINGLE_CHANGE:.0%} limit — skipping to avoid instability",
+            "reason": f"largest change {max_change:.1%} exceeds {max_single:.0%} limit — skipping to avoid instability",
         }
 
     if not meaningful:
         return {
             "applied": False,
-            "reason": f"all changes < {MIN_MEANINGFUL_CHANGE:.0%} — not worth updating",
+            "reason": f"all changes < {min_meaningful:.0%} — not worth updating",
         }
 
     suggested = result.get("suggested_weights", {})

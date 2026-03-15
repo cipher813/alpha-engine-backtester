@@ -277,7 +277,7 @@ def _read_current_weights(config: dict) -> dict:
             "research_paths not found on disk — using default scoring weights. "
             "Add research repo path to research_paths in config.yaml for accurate readings."
         )
-        return weight_optimizer.DEFAULT_WEIGHTS.copy()
+        return weight_optimizer._cfg.get("default_weights", weight_optimizer._DEFAULT_WEIGHTS).copy()
 
     universe_yaml = os.path.join(research_path, "config", "universe.yaml")
     try:
@@ -290,7 +290,7 @@ def _read_current_weights(config: dict) -> dict:
     except Exception as e:
         logger.warning("Could not read universe.yaml from %s: %s", universe_yaml, e)
 
-    return weight_optimizer.DEFAULT_WEIGHTS.copy()
+    return weight_optimizer._cfg.get("default_weights", weight_optimizer._DEFAULT_WEIGHTS).copy()
 
 
 def run_weight_optimizer(config: dict, df_base: pd.DataFrame) -> dict:
@@ -700,6 +700,11 @@ def main():
     )
 
     config = load_config(args.config)
+
+    # Initialize optimizer modules with config sections
+    weight_optimizer.init_config(config)
+    executor_optimizer.init_config(config)
+    veto_analysis.init_config(config)
 
     # Pull research.db from S3 unless a local path was explicitly provided.
     # research.db lives at s3://{signals_bucket}/research.db — Lambda writes it
