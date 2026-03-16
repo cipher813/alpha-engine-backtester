@@ -207,7 +207,12 @@ def _load_from_s3(bucket: str, price_date: str, prefix: str) -> dict:
         logger.debug("S3 prices for %s: %d tickers", price_date, len(data.get("prices", {})))
         return data
     except ClientError as e:
-        if e.response["Error"]["Code"] == "NoSuchKey":
+        code = e.response["Error"]["Code"]
+        if code in ("NoSuchKey", "AccessDenied", "403"):
+            # AccessDenied can occur when the key does not exist and the caller
+            # lacks s3:ListBucket — S3 returns 403 instead of 404.
+            if code != "NoSuchKey":
+                logger.debug("S3 returned %s for %s (treating as missing)", code, key)
             raise FileNotFoundError(f"No prices found at s3://{bucket}/{key}") from e
         raise
 
@@ -305,7 +310,8 @@ def _tickers_from_signals(bucket: str, signal_date: str, prefix: str = "signals"
         logger.debug("Resolved %d tickers from signals for %s", len(tickers), signal_date)
         return tickers
     except ClientError as e:
-        if e.response["Error"]["Code"] == "NoSuchKey":
-            logger.warning("No signals.json found for %s — cannot resolve tickers", signal_date)
+        code = e.response["Error"]["Code"]
+        if code in ("NoSuchKey", "AccessDenied", "403"):
+            logger.warning("No signals.json found for %s (%s) — cannot resolve tickers", signal_date, code)
             return []
         raise
