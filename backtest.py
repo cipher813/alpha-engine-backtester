@@ -55,7 +55,41 @@ logger = logging.getLogger(__name__)
 
 def load_config(path: str) -> dict:
     with open(path) as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    _validate_config(config, path)
+    return config
+
+
+def _validate_config(config: dict, path: str) -> None:
+    """Validate required config keys exist and warn about common issues."""
+    warnings = []
+    errors = []
+
+    # Required for all modes
+    if not config.get("signals_bucket"):
+        errors.append("signals_bucket is required")
+
+    # Required for simulate/param-sweep modes
+    executor_paths = config.get("executor_paths", [])
+    if isinstance(executor_paths, str):
+        executor_paths = [executor_paths]
+    if not executor_paths:
+        warnings.append("executor_paths not set — simulate/param-sweep modes will fail")
+    elif not any(os.path.isdir(p) for p in executor_paths):
+        warnings.append(
+            f"No executor_paths found on disk: {executor_paths}. "
+            "simulate/param-sweep modes will fail."
+        )
+
+    # Email (optional but flagged)
+    if not config.get("email_sender") or not config.get("email_recipients"):
+        warnings.append("email_sender/email_recipients not set — email reports will be skipped")
+
+    for w in warnings:
+        logger.warning("Config (%s): %s", path, w)
+    if errors:
+        msg = f"Config validation failed ({path}): " + "; ".join(errors)
+        raise ValueError(msg)
 
 
 def pull_research_db(bucket: str, local_path: str, s3_key: str = "research.db") -> bool:
@@ -713,6 +747,31 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     return single_stats, sweep_df
 
 
+def _stop_ec2_instance() -> None:
+    """Stop the current EC2 instance via metadata endpoint. Best-effort."""
+    import urllib.request
+    try:
+        token = urllib.request.urlopen(
+            urllib.request.Request(
+                "http://169.254.169.254/latest/api/token",
+                headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+                method="PUT",
+            ),
+            timeout=5,
+        ).read().decode()
+        instance_id = urllib.request.urlopen(
+            urllib.request.Request(
+                "http://169.254.169.254/latest/meta-data/instance-id",
+                headers={"X-aws-ec2-metadata-token": token},
+            ),
+            timeout=5,
+        ).read().decode()
+        logger.info("Stopping instance %s", instance_id)
+        boto3.client("ec2").stop_instances(InstanceIds=[instance_id])
+    except Exception as e:
+        logger.error("Failed to stop instance: %s", e)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Alpha Engine Backtester")
     parser.add_argument("--mode", choices=["signal-quality", "simulate", "param-sweep", "all", "predictor-backtest"],
@@ -784,16 +843,59 @@ def main():
         attr_result = {"status": "skipped"}
         df_base = None
 
+    # ── Simulate + Param Sweep share the price matrix when both run ────────
+    # _setup_simulation is the most expensive step (S3 downloads + yfinance
+    # fallback for every signal date). Build it once and pass to both modes.
+    _sim_setup = None
+    if args.mode in ("simulate", "param-sweep", "all"):
+        try:
+            _sim_setup = _setup_simulation(config)
+        except Exception as e:
+            logger.error("Simulation setup failed: %s", e)
+            _sim_setup = None
+
     if args.mode in ("simulate", "all"):
         try:
-            portfolio_stats = run_simulate(config)
+            if _sim_setup is None:
+                portfolio_stats = {"status": "error", "error": "Simulation setup failed"}
+            else:
+                executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv = _sim_setup
+                if price_matrix is None:
+                    min_dates = config.get("min_simulation_dates", 5)
+                    portfolio_stats = {
+                        "status": "insufficient_data",
+                        "dates_available": len(dates),
+                        "min_required": min_dates,
+                    }
+                else:
+                    portfolio_stats = _run_simulation_loop(
+                        executor_run, SimulatedIBKRClient, dates, price_matrix, config,
+                        ohlcv_by_ticker=ohlcv,
+                    )
         except Exception as e:
             logger.error("Mode 2 simulation failed: %s", e)
             portfolio_stats = {"status": "error", "error": str(e)}
 
     if args.mode in ("param-sweep", "all"):
         try:
-            sweep_df = run_param_sweep(config)
+            if _sim_setup is None:
+                sweep_df = None
+            else:
+                executor_run, SimulatedIBKRClient, dates, price_matrix, _, ohlcv = _sim_setup
+                if price_matrix is None:
+                    import pandas as _pd
+                    logger.warning("Param sweep skipped: only %d signal dates available", len(dates))
+                    sweep_df = _pd.DataFrame()
+                else:
+                    def sim_fn(combo_config: dict) -> dict:
+                        return _run_simulation_loop(
+                            executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
+                            ohlcv_by_ticker=ohlcv,
+                        )
+                    grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
+                    sweep_settings = config.get("param_sweep_settings", {})
+                    logger.info("Running param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
+                    sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
         except Exception as e:
             logger.error("Param sweep failed: %s", e)
             sweep_df = None
@@ -833,90 +935,76 @@ def main():
                 logger.error("Executor optimizer (predictor sweep) failed: %s", e)
                 executor_rec = {"status": "error", "error": str(e)}
 
-    report_md = build_report(
-        run_date=args.date,
-        signal_quality=sq_result,
-        regime_analysis=regime_rows,
-        score_analysis=score_rows,
-        attribution=attr_result,
-        portfolio_stats=portfolio_stats,
-        sweep_df=sweep_df,
-        weight_result=weight_result,
-        config=config,
-        predictor_stats=predictor_stats,
-        predictor_sweep_df=predictor_sweep_df,
-        veto_result=veto_result,
-        executor_rec=executor_rec,
-    )
-
-    # For predictor-backtest mode, use predictor_sweep_df as the sweep output
-    save_sweep_df = sweep_df
-    if predictor_sweep_df is not None and not predictor_sweep_df.empty:
-        save_sweep_df = predictor_sweep_df
-
-    out_dir = save(
-        report_md=report_md,
-        signal_quality=sq_result,
-        score_analysis=score_rows,
-        sweep_df=save_sweep_df,
-        attribution=attr_result if args.mode in ("signal-quality", "all") else None,
-        run_date=args.date,
-        results_dir=config.get("results_dir", "results"),
-    )
-
-    print(f"\nReport saved to {out_dir}/")
-    print(f"\n{'='*60}")
-    print(report_md[:2000])
-    if len(report_md) > 2000:
-        print(f"\n... (truncated — see {out_dir}/report.md for full report)")
-
-    if args.upload:
-        upload_to_s3(
-            local_dir=out_dir,
-            bucket=config.get("output_bucket", "alpha-engine-research"),
-            prefix=config.get("output_prefix", "backtest"),
+    # ── Report, upload, email, and instance stop ───────────────────────────
+    # Wrapped in try/finally so --stop-instance ALWAYS runs, even if report
+    # generation, S3 upload, or email fails. Leaving EC2 running after a
+    # failed email burns compute indefinitely.
+    try:
+        report_md = build_report(
             run_date=args.date,
+            signal_quality=sq_result,
+            regime_analysis=regime_rows,
+            score_analysis=score_rows,
+            attribution=attr_result,
+            portfolio_stats=portfolio_stats,
+            sweep_df=sweep_df,
+            weight_result=weight_result,
+            config=config,
+            predictor_stats=predictor_stats,
+            predictor_sweep_df=predictor_sweep_df,
+            veto_result=veto_result,
+            executor_rec=executor_rec,
         )
-        print(f"\nUploaded to s3://{config.get('output_bucket')}/{config.get('output_prefix')}/{args.date}/")
 
-    sender = config.get("email_sender")
-    recipients = config.get("email_recipients", [])
-    if sender and recipients:
-        send_report_email(
-            run_date=args.date,
+        # For predictor-backtest mode, use predictor_sweep_df as the sweep output
+        save_sweep_df = sweep_df
+        if predictor_sweep_df is not None and not predictor_sweep_df.empty:
+            save_sweep_df = predictor_sweep_df
+
+        out_dir = save(
             report_md=report_md,
-            status=sq_result.get("status", "unknown"),
-            sender=sender,
-            recipients=recipients,
-            s3_bucket=config.get("output_bucket") if args.upload else None,
-            s3_prefix=config.get("output_prefix", "backtest"),
+            signal_quality=sq_result,
+            score_analysis=score_rows,
+            sweep_df=save_sweep_df,
+            attribution=attr_result if args.mode in ("signal-quality", "all") else None,
+            run_date=args.date,
+            results_dir=config.get("results_dir", "results"),
         )
-    else:
-        logger.warning("No email_sender/email_recipients in config — skipping email")
 
-    if args.stop_instance:
-        import urllib.request
-        try:
-            # Get instance ID from EC2 metadata endpoint
-            token = urllib.request.urlopen(
-                urllib.request.Request(
-                    "http://169.254.169.254/latest/api/token",
-                    headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
-                    method="PUT",
-                ),
-                timeout=2,
-            ).read().decode()
-            instance_id = urllib.request.urlopen(
-                urllib.request.Request(
-                    "http://169.254.169.254/latest/meta-data/instance-id",
-                    headers={"X-aws-ec2-metadata-token": token},
-                ),
-                timeout=2,
-            ).read().decode()
-            logger.info("Stopping instance %s", instance_id)
-            boto3.client("ec2").stop_instances(InstanceIds=[instance_id])
-        except Exception as e:
-            logger.error("Failed to stop instance: %s", e)
+        print(f"\nReport saved to {out_dir}/")
+        print(f"\n{'='*60}")
+        print(report_md[:2000])
+        if len(report_md) > 2000:
+            print(f"\n... (truncated — see {out_dir}/report.md for full report)")
+
+        if args.upload:
+            upload_to_s3(
+                local_dir=out_dir,
+                bucket=config.get("output_bucket", "alpha-engine-research"),
+                prefix=config.get("output_prefix", "backtest"),
+                run_date=args.date,
+            )
+            print(f"\nUploaded to s3://{config.get('output_bucket')}/{config.get('output_prefix')}/{args.date}/")
+
+        sender = config.get("email_sender")
+        recipients = config.get("email_recipients", [])
+        if sender and recipients:
+            send_report_email(
+                run_date=args.date,
+                report_md=report_md,
+                status=sq_result.get("status", "unknown"),
+                sender=sender,
+                recipients=recipients,
+                s3_bucket=config.get("output_bucket") if args.upload else None,
+                s3_prefix=config.get("output_prefix", "backtest"),
+            )
+        else:
+            logger.warning("No email_sender/email_recipients in config — skipping email")
+    except Exception as e:
+        logger.error("Report/upload/email failed: %s", e)
+    finally:
+        if args.stop_instance:
+            _stop_ec2_instance()
 
 
 if __name__ == "__main__":
