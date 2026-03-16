@@ -19,6 +19,13 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_float(v) -> float | None:
+    """Convert to float, returning None for NaN/None."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    return round(float(v), 4)
+
 S3_PARAMS_KEY = "config/executor_params.json"
 
 # Params safe to auto-tune via sweep results.
@@ -78,19 +85,26 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict) -> dict:
 
     # Identify param columns (everything that's not a stat column)
     stat_cols = {
-        "total_return", "sharpe_ratio", "max_drawdown", "calmar_ratio",
-        "total_trades", "win_rate", "error", "status", "dates_simulated",
-        "total_orders", "note",
+        "total_return", "total_alpha", "spy_return", "sharpe_ratio",
+        "max_drawdown", "calmar_ratio", "total_trades", "win_rate",
+        "error", "status", "dates_simulated", "total_orders", "note",
     }
     param_cols = [c for c in valid.columns if c in SAFE_PARAMS]
 
     if not param_cols:
         return {"status": "no_params", "note": "No safe params found in sweep results"}
 
-    # Baseline = first combo matching base_config defaults (or just last row by sharpe)
-    baseline_sharpe = valid.iloc[-1]["sharpe_ratio"]  # worst combo as conservative baseline
-    best_row = valid.iloc[0]  # already sorted desc by sharpe
+    # Re-sort by sharpe_ratio (sweep may be sorted by total_alpha for display)
+    valid = valid.sort_values("sharpe_ratio", ascending=False)
+
+    # Baseline = worst combo by sharpe (conservative); best = top combo
+    baseline_sharpe = valid.iloc[-1]["sharpe_ratio"]
+    best_row = valid.iloc[0]
     best_sharpe = best_row["sharpe_ratio"]
+
+    # Alpha metrics (informational — not used for gating)
+    best_alpha = _safe_float(best_row.get("total_alpha"))
+    baseline_alpha = _safe_float(valid.iloc[-1].get("total_alpha"))
 
     if baseline_sharpe == 0:
         improvement_pct = float("inf") if best_sharpe > 0 else 0.0
@@ -112,6 +126,8 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict) -> dict:
             "recommended_params": recommended,
             "baseline_sharpe": round(float(baseline_sharpe), 4),
             "best_sharpe": round(float(best_sharpe), 4),
+            "best_alpha": best_alpha,
+            "baseline_alpha": baseline_alpha,
             "improvement_pct": round(improvement_pct, 4),
             "note": (
                 f"Best Sharpe ({best_sharpe:.4f}) only {improvement_pct:.1%} better than "
@@ -125,6 +141,8 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict) -> dict:
         "recommended_params": recommended,
         "baseline_sharpe": round(float(baseline_sharpe), 4),
         "best_sharpe": round(float(best_sharpe), 4),
+        "best_alpha": best_alpha,
+        "baseline_alpha": baseline_alpha,
         "improvement_pct": round(improvement_pct, 4),
         "n_combos_tested": len(valid),
         "note": (
@@ -159,6 +177,7 @@ def apply(result: dict, bucket: str) -> dict:
         **recommended,
         "updated_at": str(date.today()),
         "best_sharpe": result.get("best_sharpe"),
+        "best_alpha": result.get("best_alpha"),
         "improvement_pct": result.get("improvement_pct"),
         "n_combos_tested": result.get("n_combos_tested"),
     }
@@ -177,5 +196,6 @@ def apply(result: dict, bucket: str) -> dict:
         "applied": True,
         "params": recommended,
         "best_sharpe": result.get("best_sharpe"),
+        "best_alpha": result.get("best_alpha"),
         "improvement_pct": result.get("improvement_pct"),
     }

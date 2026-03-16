@@ -461,11 +461,11 @@ def _section_param_sweep(df) -> list[str]:
 
     lines = [title, ""]
     param_cols = [c for c in df.columns if c not in [
-        "total_return", "sharpe_ratio", "max_drawdown", "calmar_ratio",
-        "total_trades", "win_rate", "status", "dates_simulated", "total_orders",
-        "note", "error",
+        "total_return", "total_alpha", "spy_return", "sharpe_ratio",
+        "max_drawdown", "calmar_ratio", "total_trades", "win_rate",
+        "status", "dates_simulated", "total_orders", "note", "error",
     ]]
-    stat_cols = [c for c in ["sharpe_ratio", "total_return", "max_drawdown", "win_rate"] if c in df.columns]
+    stat_cols = [c for c in ["total_alpha", "sharpe_ratio", "total_return", "spy_return", "max_drawdown", "win_rate"] if c in df.columns]
     show_cols = param_cols + stat_cols
     header = "| " + " | ".join(show_cols) + " |"
     sep    = "| " + " | ".join("---" for _ in show_cols) + " |"
@@ -474,7 +474,7 @@ def _section_param_sweep(df) -> list[str]:
         cells = []
         for c in show_cols:
             v = row.get(c)
-            if c in ("total_return", "max_drawdown", "win_rate"):
+            if c in ("total_return", "total_alpha", "spy_return", "max_drawdown", "win_rate"):
                 cells.append(_pct(v))
             elif c in ("sharpe_ratio",):
                 cells.append(_fmt(v))
@@ -546,11 +546,15 @@ def _section_executor_recommendations(result: dict) -> list[str]:
     recommended = result.get("recommended_params", {})
     improvement = result.get("improvement_pct", 0)
 
+    best_alpha = result.get("best_alpha")
+    alpha_str = f" | Best alpha: {best_alpha:.1%}" if best_alpha is not None else ""
+
     lines += [
         "",
         f"_Tested {result.get('n_combos_tested', '?')} parameter combinations. "
         f"Sharpe improvement: {improvement:.1%} "
-        f"({result.get('baseline_sharpe', 0):.4f} → {result.get('best_sharpe', 0):.4f})._",
+        f"({result.get('baseline_sharpe', 0):.4f} → {result.get('best_sharpe', 0):.4f})"
+        f"{alpha_str}._",
         "",
         "| Parameter | Baseline | Recommended | Change |",
         "|-----------|----------|-------------|--------|",

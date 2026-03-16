@@ -793,6 +793,22 @@ def main():
             predictor_stats = {"status": "error", "error": str(e)}
             predictor_sweep_df = None
 
+        # Auto-apply executor params from predictor sweep (if signal-based sweep
+        # didn't already produce a recommendation)
+        if (
+            (executor_rec is None or executor_rec.get("status") not in ("ok",))
+            and predictor_sweep_df is not None
+            and not predictor_sweep_df.empty
+        ):
+            try:
+                executor_rec = executor_optimizer.recommend(predictor_sweep_df, config)
+                if executor_rec.get("status") == "ok":
+                    bucket = config.get("signals_bucket", "alpha-engine-research")
+                    executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
+            except Exception as e:
+                logger.error("Executor optimizer (predictor sweep) failed: %s", e)
+                executor_rec = {"status": "error", "error": str(e)}
+
     report_md = build_report(
         run_date=args.date,
         signal_quality=sq_result,
