@@ -6,7 +6,7 @@
 # This ensures the backtester runs against the freshly trained GBM model.
 # (EC2 started at 06:45 UTC by EventBridge ae-backtester-start rule)
 
-CRON_LINE="0 8 * * 1  cd /home/ec2-user/alpha-engine-backtester && GMAIL_APP_PASSWORD=obopkmmizphlfplz .venv/bin/python backtest.py --mode all --upload --stop-instance >> /var/log/backtester.log 2>&1"
+CRON_LINE="0 8 * * 1  cd /home/ec2-user/alpha-engine-backtester && git pull --ff-only >> /var/log/backtester.log 2>&1 && cd /home/ec2-user/alpha-engine && git pull --ff-only >> /var/log/backtester.log 2>&1 && cd /home/ec2-user/alpha-engine-backtester && GMAIL_APP_PASSWORD=obopkmmizphlfplz .venv/bin/python backtest.py --mode all --upload --stop-instance >> /var/log/backtester.log 2>&1"
 
 if crontab -l 2>/dev/null | grep -qF "alpha-engine-backtester"; then
     EXISTING=$(crontab -l 2>/dev/null | grep "alpha-engine-backtester")
