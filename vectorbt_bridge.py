@@ -53,8 +53,10 @@ def orders_to_portfolio(
         entries=entries,
         exits=exits,
         size=sizes,
-        size_type="shares",
+        size_type="Amount",
         init_cash=init_cash,
+        cash_sharing=True,
+        group_by=True,
         fees=0.0,
         freq="D",
     )

@@ -298,6 +298,14 @@ def _section_attribution(attr: dict) -> list[str]:
 
 
 def _section_portfolio(stats: dict) -> list[str]:
+    status = stats.get("status")
+    if status and status != "ok":
+        note = stats.get("note", stats.get("error", "No details available."))
+        return [
+            "## Mode 2 — Portfolio simulation",
+            "",
+            f"> **Skipped.** {note}",
+        ]
     return [
         "## Mode 2 — Portfolio simulation",
         "",

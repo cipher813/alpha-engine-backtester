@@ -249,7 +249,7 @@ def run_inference(
     if predictor_path not in sys.path:
         sys.path.insert(0, predictor_path)
     from model.gbm_scorer import GBMScorer
-    from config import FEATURES
+    from config import GBM_FEATURES
 
     scorer = GBMScorer.load(model_path)
 
@@ -271,7 +271,7 @@ def run_inference(
     feature_arrays: dict[str, dict[str, np.ndarray]] = {}
     for ticker, featured_df in features_by_ticker.items():
         try:
-            arr = featured_df[FEATURES].to_numpy(dtype=np.float32)
+            arr = featured_df[GBM_FEATURES].to_numpy(dtype=np.float32)
             dates = featured_df.index.strftime("%Y-%m-%d")
             # Handle duplicate dates: last value wins (same as iloc[-1])
             feature_arrays[ticker] = dict(zip(dates, arr))

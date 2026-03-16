@@ -779,7 +779,7 @@ def main():
                 logger.error("Executor optimizer failed: %s", e)
                 executor_rec = {"status": "error", "error": str(e)}
 
-    if args.mode == "predictor-backtest":
+    if args.mode in ("predictor-backtest", "all"):
         try:
             predictor_stats, predictor_sweep_df = run_predictor_param_sweep(config)
         except Exception as e:
