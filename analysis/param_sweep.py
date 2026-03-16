@@ -157,7 +157,10 @@ def _run_combos(
             rows.append({**params, "error": str(e)})
 
     df = pd.DataFrame(rows)
-    if "sharpe_ratio" in df.columns:
+    # Sort by total_alpha (primary) then sharpe_ratio (tiebreaker)
+    if "total_alpha" in df.columns:
+        df.sort_values("total_alpha", ascending=False, inplace=True)
+    elif "sharpe_ratio" in df.columns:
         df.sort_values("sharpe_ratio", ascending=False, inplace=True)
 
     return df

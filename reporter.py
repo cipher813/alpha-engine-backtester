@@ -402,7 +402,9 @@ def _section_predictor_backtest(stats: dict) -> list[str]:
         "",
         "| Metric | Value |",
         "|--------|-------|",
+        f"| **Total alpha** | **{_pct(stats.get('total_alpha'))}** |",
         f"| Total return | {_pct(stats.get('total_return'))} |",
+        f"| SPY return | {_pct(stats.get('spy_return'))} |",
         f"| Sharpe ratio | {_fmt(stats.get('sharpe_ratio'))} |",
         f"| Max drawdown | {_pct(stats.get('max_drawdown'))} |",
         f"| Calmar ratio | {_fmt(stats.get('calmar_ratio'))} |",
@@ -420,13 +422,13 @@ def _section_predictor_backtest(stats: dict) -> list[str]:
 
 def _section_param_sweep_predictor(df) -> list[str]:
     """Build report section for predictor-only param sweep results."""
-    lines = ["## Predictor param sweep — top combinations by Sharpe ratio", ""]
+    lines = ["## Predictor param sweep — top combinations by total alpha", ""]
     param_cols = [c for c in df.columns if c not in [
-        "total_return", "sharpe_ratio", "max_drawdown", "calmar_ratio",
-        "total_trades", "win_rate", "status", "dates_simulated", "total_orders",
-        "note", "error",
+        "total_return", "total_alpha", "spy_return", "sharpe_ratio", "max_drawdown",
+        "calmar_ratio", "total_trades", "win_rate", "status", "dates_simulated",
+        "total_orders", "note", "error",
     ]]
-    stat_cols = [c for c in ["sharpe_ratio", "total_return", "max_drawdown", "win_rate"] if c in df.columns]
+    stat_cols = [c for c in ["total_alpha", "sharpe_ratio", "total_return", "spy_return", "max_drawdown", "win_rate"] if c in df.columns]
     show_cols = param_cols + stat_cols
     header = "| " + " | ".join(show_cols) + " |"
     sep    = "| " + " | ".join("---" for _ in show_cols) + " |"
@@ -435,7 +437,7 @@ def _section_param_sweep_predictor(df) -> list[str]:
         cells = []
         for c in show_cols:
             v = row.get(c)
-            if c in ("total_return", "max_drawdown", "win_rate"):
+            if c in ("total_return", "total_alpha", "spy_return", "max_drawdown", "win_rate"):
                 cells.append(_pct(v))
             elif c in ("sharpe_ratio",):
                 cells.append(_fmt(v))

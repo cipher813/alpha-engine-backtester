@@ -379,6 +379,7 @@ def _run_simulation_loop(
     config: dict,
     ohlcv_by_ticker: dict | None = None,
     signals_by_date: dict | None = None,
+    spy_prices: pd.Series | None = None,
 ) -> dict:
     """
     Run one full simulation pass with the given config and pre-built price matrix.
@@ -465,7 +466,7 @@ def _run_simulation_loop(
         }
 
     pf = orders_to_portfolio(all_orders, price_matrix, init_cash=init_cash)
-    stats = compute_portfolio_stats(pf)
+    stats = compute_portfolio_stats(pf, spy_prices=spy_prices)
     stats["status"] = "ok"
     stats["dates_simulated"] = dates_simulated
     stats["total_orders"] = len(all_orders)
@@ -582,6 +583,7 @@ def run_predictor_backtest(config: dict) -> dict:
     signals_by_date = result["signals_by_date"]
     price_matrix = result["price_matrix"]
     ohlcv_by_ticker = result["ohlcv_by_ticker"]
+    spy_prices = result.get("spy_prices")
     metadata = result["metadata"]
 
     # Import executor modules
@@ -606,6 +608,7 @@ def run_predictor_backtest(config: dict) -> dict:
         config=config,
         ohlcv_by_ticker=ohlcv_by_ticker,
         signals_by_date=signals_by_date,
+        spy_prices=spy_prices,
     )
 
     # Merge metadata into stats for reporting
@@ -634,6 +637,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     signals_by_date = result["signals_by_date"]
     price_matrix = result["price_matrix"]
     ohlcv_by_ticker = result["ohlcv_by_ticker"]
+    spy_prices = result.get("spy_prices")
     metadata = result["metadata"]
 
     # Import executor modules
@@ -658,6 +662,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
         config=config,
         ohlcv_by_ticker=ohlcv_by_ticker,
         signals_by_date=signals_by_date,
+        spy_prices=spy_prices,
     )
     single_stats["predictor_metadata"] = metadata
 
@@ -673,6 +678,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 config=combo_config,
                 ohlcv_by_ticker=ohlcv_by_ticker,
                 signals_by_date=signals_by_date,
+                spy_prices=spy_prices,
             )
 
         sweep_settings = config.get("param_sweep_settings", {})

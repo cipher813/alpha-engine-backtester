@@ -543,6 +543,7 @@ def run(config: dict) -> dict:
     # 4. Build price matrix and OHLCV early, then free raw price data
     price_matrix = build_price_matrix(price_data, trading_dates)
     ohlcv_by_ticker = build_ohlcv_by_ticker(price_data)
+    spy_prices = _extract_close(price_data, "SPY")
     del price_data
     gc.collect()
     logger.info("Freed raw price data (memory optimization)")
@@ -598,5 +599,6 @@ def run(config: dict) -> dict:
         "signals_by_date": signals_by_date,
         "price_matrix": price_matrix,
         "ohlcv_by_ticker": ohlcv_by_ticker,
+        "spy_prices": spy_prices,
         "metadata": metadata,
     }
