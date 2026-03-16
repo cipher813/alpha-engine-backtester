@@ -32,6 +32,7 @@ research.db:
 """
 
 import argparse
+import json
 import logging
 import tempfile
 import os
@@ -264,32 +265,55 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
 
 def _read_current_weights(config: dict) -> dict:
     """
-    Read current scoring weights from alpha-engine-research/config/universe.yaml.
-    Falls back to weight_optimizer.DEFAULT_WEIGHTS if the research repo isn't found.
+    Read current scoring weights — the values the system is *actually* using.
+
+    Priority order:
+      1. S3 config/scoring_weights.json  (last backtester-optimized weights)
+      2. Local research repo universe.yaml  (initial config)
+      3. Hardcoded defaults  (bootstrap only)
     """
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+
+    # 1. Try S3 — last known optimal from backtester
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key="config/scoring_weights.json")
+        data = json.loads(obj["Body"].read())
+        weights = {k: float(data[k]) for k in ("news", "research") if k in data}
+        if len(weights) == 2:
+            logger.info(
+                "Current scoring weights from S3 (updated %s): %s",
+                data.get("updated_at", "unknown"), weights,
+            )
+            return weights
+    except Exception as e:
+        logger.info("No scoring weights in S3 (%s), trying local research repo...", e)
+
+    # 2. Try local research repo universe.yaml
     research_paths = config.get("research_paths", [])
     if isinstance(research_paths, str):
         research_paths = [research_paths]
     research_path = next((p for p in research_paths if os.path.isdir(p)), None)
 
-    if not research_path:
+    if research_path:
+        universe_yaml = os.path.join(research_path, "config", "universe.yaml")
+        try:
+            with open(universe_yaml) as f:
+                universe = yaml.safe_load(f)
+            weights = universe.get("scoring_weights", {})
+            if weights:
+                logger.info("Scoring weights read from %s: %s", universe_yaml, weights)
+                return weights
+        except Exception as e:
+            logger.warning("Could not read universe.yaml from %s: %s", universe_yaml, e)
+    else:
         logger.warning(
             "research_paths not found on disk — using default scoring weights. "
             "Add research repo path to research_paths in config.yaml for accurate readings."
         )
-        return weight_optimizer._cfg.get("default_weights", weight_optimizer._DEFAULT_WEIGHTS).copy()
 
-    universe_yaml = os.path.join(research_path, "config", "universe.yaml")
-    try:
-        with open(universe_yaml) as f:
-            universe = yaml.safe_load(f)
-        weights = universe.get("scoring_weights", {})
-        if weights:
-            logger.info("Scoring weights read from %s: %s", universe_yaml, weights)
-            return weights
-    except Exception as e:
-        logger.warning("Could not read universe.yaml from %s: %s", universe_yaml, e)
-
+    # 3. Hardcoded defaults (bootstrap only)
     return weight_optimizer._cfg.get("default_weights", weight_optimizer._DEFAULT_WEIGHTS).copy()
 
 

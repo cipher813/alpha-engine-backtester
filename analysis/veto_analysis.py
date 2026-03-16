@@ -225,6 +225,23 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
     }
 
 
+def _read_current_veto_threshold(bucket: str) -> float | None:
+    """Read the current veto threshold from S3 (last backtester-optimized value)."""
+    try:
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key=S3_PARAMS_KEY)
+        data = json.loads(obj["Body"].read())
+        if "veto_confidence" in data:
+            logger.info(
+                "Current veto threshold from S3: %.2f (updated %s)",
+                data["veto_confidence"], data.get("updated_at", "unknown"),
+            )
+            return float(data["veto_confidence"])
+    except Exception as e:
+        logger.info("No predictor params in S3 (%s), using config default", e)
+    return None
+
+
 def apply(result: dict, bucket: str) -> dict:
     """
     Write recommended veto threshold to S3 if guardrails pass.
@@ -235,11 +252,13 @@ def apply(result: dict, bucket: str) -> dict:
     if result.get("status") != "ok":
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
-    current_default = _cfg.get("current_default_threshold", _CURRENT_DEFAULT_THRESHOLD)
+    config_default = _cfg.get("current_default_threshold", _CURRENT_DEFAULT_THRESHOLD)
     min_change = _cfg.get("min_threshold_change", _MIN_THRESHOLD_CHANGE)
 
     recommended = result.get("recommended_threshold")
-    current = result.get("current_threshold", current_default)
+    # Use S3 value (last known optimal) as the current baseline, not hardcoded default
+    s3_current = _read_current_veto_threshold(bucket)
+    current = s3_current if s3_current is not None else result.get("current_threshold", config_default)
 
     if recommended is None:
         return {"applied": False, "reason": "no recommended threshold"}
