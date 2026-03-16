@@ -1,175 +1,215 @@
-# alpha-engine-backtester
+# Alpha Engine Backtester
 
-Backtesting, signal quality analysis, and autonomous scoring optimization for the [alpha-engine](https://github.com/cipher813/alpha-engine) trading system.
+Signal quality analysis, portfolio simulation, and autonomous parameter optimization for the Alpha Engine trading system. The system's learning mechanism — it validates whether signals actually predict outperformance and feeds optimized parameters back to upstream modules.
 
-Answers four questions the live system cannot:
-
-1. **Do the signals work?** — What % of BUY-rated stocks outperform SPY over 10d and 30d windows?
-2. **Are the risk parameters right?** — Would different `min_score`, `max_position_pct`, or `drawdown_circuit_breaker` values produce better risk-adjusted returns?
-3. **Is signal quality improving or degrading?** — As the research pipeline evolves, are signals getting sharper or noisier?
-4. **Are the scoring weights optimal?** — Which sub-score (technical / news / research) best predicts outperformance, and should the weights be rebalanced?
+> Part of [Nous Ergon: Alpha Engine](https://github.com/cipher813/alpha-engine).
 
 ---
 
-## Architecture
+## Role in the System
 
+The Backtester closes the feedback loop. It reads historical signals and prices, measures accuracy, identifies which sub-scores are most predictive, and writes three auto-optimization config files to S3 that upstream modules pick up on their next cold-start:
+
+| S3 Key | Read By | Controls |
+|--------|---------|----------|
+| `config/scoring_weights.json` | Research | Sub-score composite weights |
+| `config/executor_params.json` | Executor | Risk parameters and sizing |
+| `config/predictor_params.json` | Predictor | Veto confidence threshold |
+
+Without this module, signal generation operates blind to whether its predictions are working.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.11+
+- AWS credentials with S3 read/write and SES send permission
+- `research.db` in S3 (written by Research after each run)
+- `signals/{date}/signals.json` in S3 (at least a few trading days)
+
+### Setup
+
+```bash
+git clone https://github.com/cipher813/alpha-engine-backtester.git
+cd alpha-engine-backtester
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+cp config.yaml.example config.yaml
+# Edit config.yaml — set S3 bucket names, paths, email settings
+
+python backtest.py --mode signal-quality
 ```
-alpha-engine-research (Lambda)
-  └── s3://your-bucket/signals/{date}/signals.json
-  └── s3://your-bucket/prices/{date}/prices.json
-  └── s3://your-bucket/research.db
-
-alpha-engine (executor, EC2)
-  └── executor/ibkr.py        ← SimulatedIBKRClient
-  └── executor/main.py        ← run(simulate=True)
-
-              ↓ reads all of the above ↓
-
-   alpha-engine-backtester
-     ├── backtest.py           CLI entry point
-     ├── loaders/
-     │   ├── signal_loader.py  S3 signals
-     │   └── price_loader.py   S3 prices → yfinance → IBKR fallback chain
-     ├── vectorbt_bridge.py    orders → vbt.Portfolio
-     ├── analysis/
-     │   ├── signal_quality.py
-     │   ├── regime_analysis.py
-     │   ├── score_analysis.py
-     │   ├── attribution.py
-     │   └── param_sweep.py
-     ├── optimizer/
-     │   └── weight_optimizer.py   ← autonomous scoring weight updates
-     ├── reporter.py           markdown + CSV + S3 upload + SES email
-     └── config.yaml
-
-              ↓ outputs ↓
-
-   s3://your-bucket/backtest/{date}/report.md
-   results/{date}/report.md
-   results/{date}/signal_quality.csv
-   results/{date}/param_sweep.csv
-   results/{date}/metrics.json
-
-              ↓ writes back ↓
-
-   s3://your-bucket/config/scoring_weights.json   ← picked up by Lambda on next cold-start
-```
-
-The backtester writes one upstream artifact: `config/scoring_weights.json`, updated autonomously by the weight optimizer when the data supports a change.
 
 ---
 
 ## Modes
 
-### Mode 1 — Signal quality
+### Signal Quality (`--mode signal-quality`)
 
 Reads `score_performance` from `research.db` and computes:
-- % of BUY signals that beat SPY at 10d and 30d
-- Accuracy by score bucket (60–70, 70–80, 80–90, 90+)
-- Accuracy by market regime (bull / neutral / bear / caution)
-- Sub-score attribution (technical vs. news vs. research)
-- **Scoring weight recommendation** — computed automatically; applied to S3 if guardrails pass
+- % of BUY signals that beat SPY at configurable horizons
+- Accuracy by score bucket and by market regime
+- Sub-score attribution (which scores best predict outperformance)
+- **Scoring weight recommendation** — applied to S3 automatically if guardrails pass
 
-### Mode 2 — Portfolio simulation
+### Portfolio Simulation (`--mode simulate`)
 
-Replays all historical signal dates through `executor.main.run(simulate=True)`, converts orders to a `vbt.Portfolio`, and produces Sharpe ratio, max drawdown, Calmar ratio, and win rate.
+Replays historical signal dates through the executor's simulation mode, converts orders to a VectorBT portfolio, and produces Sharpe ratio, max drawdown, Calmar ratio, and win rate.
 
-### Mode: param-sweep
+### Parameter Sweep (`--mode param-sweep`)
 
-Runs Mode 2 across a grid of `min_score`, `max_position_pct`, and `drawdown_circuit_breaker` values to find the risk parameter combination with the best Sharpe ratio. Price matrix is built once and reused across all combinations.
+Runs portfolio simulation across a grid of risk parameters to find the combination with the best Sharpe ratio. Price matrix is built once and reused across all combinations.
 
-See [DOCS.md](DOCS.md) for full details on all modes.
+### All Modes (`--mode all`)
+
+Runs signal quality, simulation, and parameter sweep sequentially. This is what the weekly cron job runs.
 
 ---
 
-## Quick start
+## How It Works
 
-```bash
-git clone https://github.com/cipher813/alpha-engine-backtester.git
-cd alpha-engine-backtester
-python3.11 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp config.yaml.example config.yaml   # edit bucket names, paths, and email
-python backtest.py --mode signal-quality
 ```
-
-AWS credentials must be configured (`aws configure` or IAM role). The S3 bucket must contain `research.db` and at least some `signals/{date}/signals.json` files.
+research.db (S3)
+signals/{date}/signals.json (S3)
+         │
+         ▼
+Signal Quality Analysis
+  ├── Accuracy at 10d / 30d horizons
+  ├── Score bucket analysis (by score range)
+  ├── Regime analysis (bull / neutral / bear / caution)
+  └── Sub-score attribution (technical vs news vs research)
+         │
+         ▼
+Weight Optimizer
+  └── Data-driven weight recommendations (conservative guardrails)
+         │
+         ▼
+Portfolio Simulation (VectorBT)
+  └── Historical replay → Sharpe, drawdown, Calmar
+         │
+         ▼
+Parameter Sweep
+  └── Grid search over risk params → optimal Sharpe
+         │
+         ▼
+S3 Output
+  ├── config/scoring_weights.json    → Research
+  ├── config/executor_params.json    → Executor
+  ├── config/predictor_params.json   → Predictor
+  ├── backtest/{date}/report.md
+  └── backtest/{date}/metrics.json
+```
 
 ---
 
 ## Usage
 
 ```bash
-# Signal quality report + weight optimizer (Mode 1)
+# Signal quality report + weight optimizer
 python backtest.py --mode signal-quality
 
-# Portfolio simulation (Mode 2)
+# Portfolio simulation
 python backtest.py --mode simulate
 
-# Param sweep — grid search over risk parameters
+# Parameter sweep
 python backtest.py --mode param-sweep
 
 # All modes
 python backtest.py --mode all
 
-# Upload results to S3 and send email report
+# Upload results to S3 and send email
 python backtest.py --mode signal-quality --upload
 
 # Override research.db path (local development)
 python backtest.py --mode signal-quality --db ~/path/to/research.db
-
-# Date label for output directory
-python backtest.py --mode signal-quality --date 2026-03-09
-
-# Stop the EC2 instance after completion (used by the Sunday cron job)
-python backtest.py --mode signal-quality --upload --stop-instance
 ```
 
 ---
 
-## Requirements
+## Configuration Reference
 
-- Python 3.11+
-- AWS credentials with access to the research S3 bucket
-- `research.db` in S3 (written by alpha-engine-research after each pipeline run)
-- `signals/{date}/signals.json` in S3 (one file per trading day)
-- `alpha-engine` repo cloned locally (required for Mode 2 / param-sweep)
-- `alpha-engine-research` repo cloned locally (used to read current scoring weights)
+`config.yaml` is gitignored — copy from `config.yaml.example`:
 
-See [DOCS.md](DOCS.md) for full setup, EC2 deployment, IAM policy, and vectorbt metric reference.
+| Section | Controls |
+|---------|----------|
+| `s3` | Bucket names, signal paths, output paths |
+| `analysis` | Accuracy windows, score bucket ranges, regime definitions |
+| `optimizer` | Weight change guardrails, minimum data requirements |
+| `param_sweep` | Risk parameter grid ranges, optimization target |
+| `email` | Sender, recipients, SES region |
 
 ---
 
-## EC2 Schedule
-
-The backtester runs automatically every Sunday via EventBridge + cron on the `alpha-engine-executor` EC2 instance.
-
-### EventBridge (starts the instance)
-
-| Schedule | Time | Action |
-|----------|------|--------|
-| `alpha-engine-sunday-start` | 9:45 AM ET Sunday | Starts EC2 instance |
-
-The instance is normally stopped outside market hours. This schedule boots it in time for the 10:00 AM cron.
-
-### Crontab (runs the backtester)
+## Key Files
 
 ```
-0 14 * * 0  cd /home/ec2-user/alpha-engine-backtester && .venv/bin/python backtest.py --mode signal-quality --upload --stop-instance >> /var/log/backtester.log 2>&1
+alpha-engine-backtester/
+├── backtest.py                  # CLI entry point
+├── loaders/
+│   ├── signal_loader.py         # S3 signals loader
+│   └── price_loader.py          # S3 → yfinance → IBKR fallback chain
+├── analysis/
+│   ├── signal_quality.py        # Accuracy metrics
+│   ├── regime_analysis.py       # Accuracy by market regime
+│   ├── score_analysis.py        # Accuracy by score range
+│   ├── attribution.py           # Sub-score correlation with outperformance
+│   └── param_sweep.py           # Grid search over risk parameters
+├── optimizer/
+│   └── weight_optimizer.py      # Autonomous scoring weight updates
+├── vectorbt_bridge.py           # Orders → vbt.Portfolio
+├── reporter.py                  # Markdown + CSV + S3 upload + email
+├── emailer.py                   # SES email delivery
+├── config.yaml.example          # Template — copy to config.yaml
+└── infrastructure/
+    ├── setup-ec2.sh             # Post-clone EC2 setup
+    └── add-cron.sh              # Idempotent cron registration
 ```
 
-14:00 UTC = 10:00 AM ET. The `--stop-instance` flag stops the EC2 instance automatically when the run completes — no fixed shutdown time needed.
+---
 
-### Sunday flow
+## Deployment (EC2)
 
-1. **9:45 AM ET** — EventBridge starts the instance
-2. **10:00 AM ET** — cron fires, backtester runs
-3. **When done** — `--stop-instance` stops the instance
+The backtester runs weekly on EC2 via cron:
 
-Results are uploaded to S3 and emailed. Scoring weights in S3 are updated automatically if the data supports a change.
+| Step | Time | Action |
+|------|------|--------|
+| EventBridge | Monday ~07:45 UTC | Starts EC2 instance |
+| Cron | Monday 08:00 UTC | Runs `backtest.py --mode all --upload --stop-instance` |
+| Completion | ~08:30 UTC | Instance stops itself |
+
+Results are uploaded to S3 and emailed. Scoring weights and parameter configs are updated automatically if the data supports a change.
+
+```bash
+# Deploy latest code to EC2
+git push origin main && ae "cd ~/alpha-engine-backtester && git pull"
+
+# View logs
+ae "tail -50 /var/log/backtester.log"
+```
+
+---
+
+## Testing
+
+```bash
+pytest tests/ -v
+```
+
+---
+
+## Related Modules
+
+- [`alpha-engine`](https://github.com/cipher813/alpha-engine) — Executor (trade execution + system overview)
+- [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) — Autonomous LLM research pipeline
+- [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) — GBM predictor (5-day alpha predictions)
+- [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) — Streamlit monitoring dashboard
 
 ---
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
