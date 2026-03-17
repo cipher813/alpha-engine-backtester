@@ -544,6 +544,7 @@ def _section_executor_recommendations(result: dict) -> list[str]:
 
     baseline = result.get("baseline_params", {})
     recommended = result.get("recommended_params", {})
+    factory = result.get("factory_defaults", {})
     improvement = result.get("improvement_pct", 0)
 
     best_alpha = result.get("best_alpha")
@@ -556,21 +557,23 @@ def _section_executor_recommendations(result: dict) -> list[str]:
         f"({result.get('baseline_sharpe', 0):.4f} → {result.get('best_sharpe', 0):.4f})"
         f"{alpha_str}._",
         "",
-        "| Parameter | Baseline | Recommended | Change |",
-        "|-----------|----------|-------------|--------|",
+        "| Parameter | Default | Current (S3) | Recommended | Drift from default |",
+        "|-----------|---------|--------------|-------------|-------------------|",
     ]
-    all_keys = sorted(set(list(baseline.keys()) + list(recommended.keys())))
+    all_keys = sorted(set(list(baseline.keys()) + list(recommended.keys()) + list(factory.keys())))
     for k in all_keys:
+        d = factory.get(k)
         b = baseline.get(k)
         r = recommended.get(k)
+        d_str = f"{d:.4f}" if isinstance(d, float) else str(d) if d is not None else "—"
         b_str = f"{b:.4f}" if isinstance(b, float) else str(b) if b is not None else "—"
         r_str = f"{r:.4f}" if isinstance(r, float) else str(r) if r is not None else "—"
-        if b is not None and r is not None and isinstance(b, (int, float)) and isinstance(r, (int, float)):
-            diff = r - b
-            chg_str = f"{'+' if diff >= 0 else ''}{diff:.4f}"
+        if d is not None and r is not None and isinstance(d, (int, float)) and isinstance(r, (int, float)):
+            drift = r - d
+            drift_str = f"{'+' if drift >= 0 else ''}{drift:.4f}"
         else:
-            chg_str = "—"
-        lines.append(f"| {k} | {b_str} | {r_str} | {chg_str} |")
+            drift_str = "—"
+        lines.append(f"| {k} | {d_str} | {b_str} | {r_str} | {drift_str} |")
 
     lines += ["", f"> {result.get('note', '')}"]
 

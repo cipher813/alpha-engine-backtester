@@ -531,6 +531,24 @@ def _run_simulation_loop(
     return stats
 
 
+def _seed_grid_with_current(grid: dict, current_params: dict | None) -> dict:
+    """
+    Inject current S3 executor param values into the sweep grid so the
+    optimizer iterates on last week's best rather than searching from
+    scratch. Values already in the grid are not duplicated.
+    """
+    if not current_params:
+        return grid
+
+    grid = {k: list(v) for k, v in grid.items()}  # shallow copy
+    for key, val in current_params.items():
+        if key in grid and val not in grid[key]:
+            grid[key].append(val)
+            grid[key].sort()
+            logger.info("Seeded grid[%s] with current S3 value: %s", key, val)
+    return grid
+
+
 def _build_config_override(config: dict) -> dict | None:
     """
     Map flat sweep params in config to the nested executor config structure.
@@ -724,10 +742,12 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     )
     single_stats["predictor_metadata"] = metadata
 
-    # Param sweep
+    # Param sweep — seed grid with current S3 params for iterative learning
     sweep_df = pd.DataFrame()
     grid = config.get("param_sweep")
     if grid:
+        bucket = config.get("signals_bucket", "alpha-engine-research")
+        grid = _seed_grid_with_current(grid, executor_optimizer.read_current_params(bucket))
         def sim_fn(combo_config: dict) -> dict:
             return _run_simulation_loop(
                 executor_run, SimulatedIBKRClient,
@@ -792,6 +812,15 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    # Flow Doctor: structured error capture
+    fd = None
+    try:
+        import flow_doctor
+        fd = flow_doctor.init(config_path=os.path.join(
+            os.path.dirname(__file__), "flow-doctor.yaml"))
+    except Exception:
+        pass
+
     config = load_config(args.config)
 
     # Initialize optimizer modules with config sections
@@ -852,6 +881,9 @@ def main():
             _sim_setup = _setup_simulation(config)
         except Exception as e:
             logger.error("Simulation setup failed: %s", e)
+            if fd:
+                fd.report(e, severity="error", context={
+                    "site": "simulation_setup", "mode": args.mode})
             _sim_setup = None
 
     if args.mode in ("simulate", "all"):
@@ -876,6 +908,13 @@ def main():
             logger.error("Mode 2 simulation failed: %s", e)
             portfolio_stats = {"status": "error", "error": str(e)}
 
+    # Read current executor params from S3 for iterative learning (used by
+    # param sweep grid seeding and executor_optimizer baseline comparison).
+    current_executor_params = None
+    if args.mode in ("param-sweep", "all", "predictor-backtest"):
+        bucket = config.get("signals_bucket", "alpha-engine-research")
+        current_executor_params = executor_optimizer.read_current_params(bucket)
+
     if args.mode in ("param-sweep", "all"):
         try:
             if _sim_setup is None:
@@ -893,17 +932,23 @@ def main():
                             ohlcv_by_ticker=ohlcv,
                         )
                     grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
+                    grid = _seed_grid_with_current(grid, current_executor_params)
                     sweep_settings = config.get("param_sweep_settings", {})
                     logger.info("Running param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
                     sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
         except Exception as e:
             logger.error("Param sweep failed: %s", e)
+            if fd:
+                fd.report(e, severity="error", context={
+                    "site": "param_sweep", "mode": args.mode})
             sweep_df = None
 
         # Phase 2: Executor parameter optimization from sweep results
         if sweep_df is not None and not sweep_df.empty:
             try:
-                executor_rec = executor_optimizer.recommend(sweep_df, config)
+                executor_rec = executor_optimizer.recommend(
+                    sweep_df, config, current_params=current_executor_params,
+                )
                 if executor_rec.get("status") == "ok":
                     bucket = config.get("signals_bucket", "alpha-engine-research")
                     executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
@@ -927,7 +972,9 @@ def main():
             and not predictor_sweep_df.empty
         ):
             try:
-                executor_rec = executor_optimizer.recommend(predictor_sweep_df, config)
+                executor_rec = executor_optimizer.recommend(
+                    predictor_sweep_df, config, current_params=current_executor_params,
+                )
                 if executor_rec.get("status") == "ok":
                     bucket = config.get("signals_bucket", "alpha-engine-research")
                     executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
@@ -1002,6 +1049,13 @@ def main():
             logger.warning("No email_sender/email_recipients in config — skipping email")
     except Exception as e:
         logger.error("Report/upload/email failed: %s", e)
+        if fd:
+            fd.report(e, severity="critical", context={
+                "site": "report_upload_email",
+                "mode": args.mode,
+                "run_date": args.date,
+                "upload": args.upload,
+            })
     finally:
         if args.stop_instance:
             _stop_ec2_instance()

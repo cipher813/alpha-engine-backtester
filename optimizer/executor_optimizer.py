@@ -38,6 +38,17 @@ SAFE_PARAMS = [
     "max_position_pct",
 ]
 
+# Factory defaults — the values the executor uses when no S3 config exists.
+# These match executor/strategies/config.py + risk.yaml.example shipped defaults.
+# Used for drift monitoring in weekly reports.
+FACTORY_DEFAULTS = {
+    "atr_multiplier": 2.5,
+    "time_decay_reduce_days": 7,
+    "time_decay_exit_days": 14,
+    "min_score": 70,
+    "max_position_pct": 0.05,
+}
+
 # ── Fallback defaults (override via executor_optimizer section in config.yaml) ──
 _MIN_VALID_COMBOS = 5
 _MIN_SHARPE_IMPROVEMENT = 0.10
@@ -52,19 +63,47 @@ def init_config(config: dict) -> None:
     _cfg = config.get("executor_optimizer", {})
 
 
-def recommend(sweep_df: pd.DataFrame, base_config: dict) -> dict:
+def read_current_params(bucket: str) -> dict:
+    """
+    Read current executor params from S3, falling back to factory defaults.
+
+    Returns a dict of safe-to-tune params only (keys in SAFE_PARAMS).
+    """
+    try:
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key=S3_PARAMS_KEY)
+        data = json.loads(obj["Body"].read())
+        params = {k: data[k] for k in SAFE_PARAMS if k in data}
+        if params:
+            logger.info(
+                "Current executor params from S3 (updated %s): %s",
+                data.get("updated_at", "unknown"), params,
+            )
+            return params
+    except Exception as e:
+        logger.info("No executor params in S3 (%s), using factory defaults", e)
+
+    return FACTORY_DEFAULTS.copy()
+
+
+def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | None = None) -> dict:
     """
     Extract best executor params from param sweep results.
 
     Args:
         sweep_df: DataFrame from param_sweep.sweep(), sorted by sharpe_ratio desc.
         base_config: Base config dict (used for current/baseline values).
+        current_params: Current executor params from S3 (the values the system is
+            actually using). When provided, the sweep baseline is the combo closest
+            to these params — so the optimizer iterates on last week's best rather
+            than comparing against the worst combo.
 
     Returns:
         {
             "status": "ok" | "insufficient_data" | "no_improvement",
             "baseline_params": {...},
             "recommended_params": {...},
+            "factory_defaults": {...},
             "baseline_sharpe": float,
             "best_sharpe": float,
             "improvement_pct": float,
@@ -97,14 +136,20 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict) -> dict:
     # Re-sort by sharpe_ratio (sweep may be sorted by total_alpha for display)
     valid = valid.sort_values("sharpe_ratio", ascending=False)
 
-    # Baseline = worst combo by sharpe (conservative); best = top combo
-    baseline_sharpe = valid.iloc[-1]["sharpe_ratio"]
+    # Baseline: find the combo closest to current S3 params (iterative learning).
+    # Falls back to worst combo by Sharpe if no current_params provided.
+    if current_params:
+        baseline_row = _find_closest_combo(valid, param_cols, current_params)
+    else:
+        baseline_row = valid.iloc[-1]
+
+    baseline_sharpe = baseline_row["sharpe_ratio"]
     best_row = valid.iloc[0]
     best_sharpe = best_row["sharpe_ratio"]
 
     # Alpha metrics (informational — not used for gating)
     best_alpha = _safe_float(best_row.get("total_alpha"))
-    baseline_alpha = _safe_float(valid.iloc[-1].get("total_alpha"))
+    baseline_alpha = _safe_float(baseline_row.get("total_alpha"))
 
     if baseline_sharpe == 0:
         improvement_pct = float("inf") if best_sharpe > 0 else 0.0
@@ -115,20 +160,25 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict) -> dict:
     # Convert numpy types to native Python
     recommended = {k: float(v) if isinstance(v, (int, float)) else v for k, v in recommended.items()}
 
-    baseline = {col: valid.iloc[-1][col] for col in param_cols if pd.notna(valid.iloc[-1][col])}
+    baseline = {col: baseline_row[col] for col in param_cols if pd.notna(baseline_row[col])}
     baseline = {k: float(v) if isinstance(v, (int, float)) else v for k, v in baseline.items()}
+
+    common_fields = {
+        "baseline_params": baseline,
+        "recommended_params": recommended,
+        "factory_defaults": FACTORY_DEFAULTS.copy(),
+        "baseline_sharpe": round(float(baseline_sharpe), 4),
+        "best_sharpe": round(float(best_sharpe), 4),
+        "best_alpha": best_alpha,
+        "baseline_alpha": baseline_alpha,
+        "improvement_pct": round(improvement_pct, 4),
+    }
 
     min_improvement = _cfg.get("min_sharpe_improvement", _MIN_SHARPE_IMPROVEMENT)
     if improvement_pct < min_improvement:
         return {
             "status": "no_improvement",
-            "baseline_params": baseline,
-            "recommended_params": recommended,
-            "baseline_sharpe": round(float(baseline_sharpe), 4),
-            "best_sharpe": round(float(best_sharpe), 4),
-            "best_alpha": best_alpha,
-            "baseline_alpha": baseline_alpha,
-            "improvement_pct": round(improvement_pct, 4),
+            **common_fields,
             "note": (
                 f"Best Sharpe ({best_sharpe:.4f}) only {improvement_pct:.1%} better than "
                 f"baseline ({baseline_sharpe:.4f}). Need {min_improvement:.0%}+ to recommend."
@@ -137,19 +187,34 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict) -> dict:
 
     return {
         "status": "ok",
-        "baseline_params": baseline,
-        "recommended_params": recommended,
-        "baseline_sharpe": round(float(baseline_sharpe), 4),
-        "best_sharpe": round(float(best_sharpe), 4),
-        "best_alpha": best_alpha,
-        "baseline_alpha": baseline_alpha,
-        "improvement_pct": round(improvement_pct, 4),
+        **common_fields,
         "n_combos_tested": len(valid),
         "note": (
             f"Best combo improves Sharpe by {improvement_pct:.1%} "
             f"({baseline_sharpe:.4f} → {best_sharpe:.4f}) across {len(valid)} combos."
         ),
     }
+
+
+def _find_closest_combo(
+    valid: pd.DataFrame, param_cols: list[str], target: dict
+) -> pd.Series:
+    """
+    Find the sweep row whose params are closest to `target` (L2 distance,
+    normalized per-param by range). Returns the closest row.
+    """
+    # Compute normalized distance for each row
+    distances = pd.Series(0.0, index=valid.index)
+    for col in param_cols:
+        if col not in target:
+            continue
+        col_vals = pd.to_numeric(valid[col], errors="coerce")
+        col_range = col_vals.max() - col_vals.min()
+        if col_range == 0:
+            continue
+        distances += ((col_vals - float(target[col])) / col_range) ** 2
+
+    return valid.loc[distances.idxmin()]
 
 
 def apply(result: dict, bucket: str) -> dict:
