@@ -201,6 +201,37 @@ pytest tests/ -v
 
 ---
 
+## Opportunities for Improvement
+
+### Statistical Rigor
+
+- **No multiple testing correction** — across 20-30 test statistics per run, no Bonferroni or Benjamini-Hochberg correction. Expected false positive rate: 30-50%. Plan: apply BH FDR correction at alpha=0.05 across all correlation tests in a single run.
+- **MIN_SAMPLES = 10 is too low** — 10 samples is too small for reliable statistical conclusions. Plan: raise to 30 and flag buckets with <20 samples as "exploratory" in reports.
+- **Score bucket analysis reports small buckets without caveat** — small buckets are unreliable but displayed as definitive. Plan: add sample size badges and suppress buckets below a configurable floor from weight optimization inputs.
+
+### Simulation Realism
+
+- **No slippage simulation** — orders fill at close price on signal date; real execution fills at next-day open with market impact. Plan: add configurable slippage model (fixed bps or volume-based impact function) to VectorBT bridge.
+- **No fill simulation** — assumes 100% fill rate at exact price. Plan: add fill-rate model based on order size vs average daily volume, rejecting simulated orders that would represent >5% of daily volume.
+
+### Optimization Integrity
+
+- **No recommendation stability tracking** — each week's recommendation is independent. System can flip-flop between contradictory recommendations. Plan: maintain a 4-week rolling history of recommendations in S3 and flag as "unstable" if direction reverses (e.g., news weight goes 0.55 → 0.45 → 0.55).
+- **Aggressive blending masks strong signals** — blend factor is 20% data-driven, 80% current. With 200+ samples and strong signal, this is overly conservative. Plan: scale blend factor with sample size (e.g., 20% at n=50, 40% at n=200, 60% at n=500).
+
+### Veto Analysis
+
+- **Precision metric noisy on small samples** — precision=100% on n=1 is meaningless. Plan: require minimum n per threshold before including in recommendation.
+- **No base rate accounting** — if 80% of BUY signals beat SPY anyway, a veto with 30% precision barely beats random. Plan: compare veto precision against the base accuracy rate.
+- **Cost penalty weight is arbitrary** — 0.30 has no justification. Plan: run sensitivity analysis across [0.10, 0.30, 0.50, 0.70] and report recommendation stability.
+
+### Data Quality
+
+- **Forward/backward fill masks price gaps** — if a ticker has a 20-day gap (delisted temporarily), ffill repeats stale prices. Plan: detect gaps >5 days and mark affected rows as invalid rather than filling.
+- **No data freshness validation** — prices from S3 not checked for trading day validity. Plan: validate that price dates align with NYSE trading calendar before simulation.
+
+---
+
 ## Related Modules
 
 - [`alpha-engine`](https://github.com/cipher813/alpha-engine) — Executor (trade execution + system overview)
