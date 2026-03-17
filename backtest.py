@@ -523,7 +523,8 @@ def _run_simulation_loop(
             "note": "No ENTER signals passed risk rules during the simulation period",
         }
 
-    pf = orders_to_portfolio(all_orders, price_matrix, init_cash=init_cash)
+    fees = config.get("simulation_fees", 0.001)
+    pf = orders_to_portfolio(all_orders, price_matrix, init_cash=init_cash, fees=fees)
     stats = compute_portfolio_stats(pf, spy_prices=spy_prices)
     stats["status"] = "ok"
     stats["dates_simulated"] = dates_simulated
@@ -804,6 +805,8 @@ def main():
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--stop-instance", action="store_true",
                         help="Stop this EC2 instance after completion (for scheduled runs)")
+    parser.add_argument("--rollback", action="store_true",
+                        help="Rollback all S3 configs to previous versions and exit")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -822,6 +825,18 @@ def main():
         pass
 
     config = load_config(args.config)
+
+    # Handle --rollback before any other mode
+    if args.rollback:
+        from optimizer.rollback import rollback_all
+        bucket = config.get("signals_bucket", "alpha-engine-research")
+        results = rollback_all(bucket)
+        for r in results:
+            if r.get("rolled_back"):
+                print(f"  Rolled back: {r['config_type']} → {r['key']}")
+            else:
+                print(f"  Skipped: {r.get('reason', 'unknown')}")
+        return
 
     # Initialize optimizer modules with config sections
     weight_optimizer.init_config(config)
@@ -949,6 +964,17 @@ def main():
                 executor_rec = executor_optimizer.recommend(
                     sweep_df, config, current_params=current_executor_params,
                 )
+                if executor_rec.get("status") == "ok" and _sim_setup is not None:
+                    executor_run_fn, SimClientCls, sim_dates, pm, _, ohlcv_data = _sim_setup
+                    if pm is not None:
+                        def holdout_sim_fn(combo_config):
+                            return _run_simulation_loop(
+                                executor_run_fn, SimClientCls, sim_dates, pm, combo_config,
+                                ohlcv_by_ticker=ohlcv_data,
+                            )
+                        executor_rec = executor_optimizer.validate_holdout(
+                            executor_rec, holdout_sim_fn, sim_dates, config,
+                        )
                 if executor_rec.get("status") == "ok":
                     bucket = config.get("signals_bucket", "alpha-engine-research")
                     executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)

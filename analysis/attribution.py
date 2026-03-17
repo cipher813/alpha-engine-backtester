@@ -13,6 +13,7 @@ Data availability: noisy with <200 rows; meaningful at Week 8+ (~500 rows).
 import logging
 
 import pandas as pd
+from scipy.stats import pearsonr
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +65,21 @@ def compute_attribution(df: pd.DataFrame) -> dict:
         }
 
     correlations = {}
+    p_values = {}
     for label, col in sub_score_cols.items():
         corr_row = {}
+        pval_row = {}
         for target in ["beat_spy_10d", "beat_spy_30d", "return_10d", "return_30d"]:
             valid = populated[[col, target]].dropna()
-            corr_row[target] = float(valid[col].corr(valid[target])) if len(valid) >= 10 else None
+            if len(valid) >= 10:
+                r, p = pearsonr(valid[col], valid[target])
+                corr_row[target] = round(float(r), 4)
+                pval_row[target] = round(float(p), 4)
+            else:
+                corr_row[target] = None
+                pval_row[target] = None
         correlations[label] = corr_row
+        p_values[label] = pval_row
 
     ranking_10d = sorted(
         correlations.keys(),
@@ -84,7 +94,9 @@ def compute_attribution(df: pd.DataFrame) -> dict:
 
     # Predictor correlation (optional — only if predictor columns are present)
     predictor_corr = {}
+    predictor_pvals = {}
     predictor_hit_rate = None
+    predictor_hit_rate_ci = None
     if "p_up" in populated.columns and "p_down" in populated.columns:
         populated["_net_pred"] = (
             pd.to_numeric(populated["p_up"], errors="coerce").fillna(0)
@@ -94,22 +106,37 @@ def compute_attribution(df: pd.DataFrame) -> dict:
             if outcome_col in populated.columns:
                 valid = populated[["_net_pred", outcome_col]].dropna()
                 if len(valid) >= 10:
-                    predictor_corr[outcome_col] = float(valid["_net_pred"].corr(valid[outcome_col]))
+                    r, p = pearsonr(valid["_net_pred"], valid[outcome_col])
+                    predictor_corr[outcome_col] = round(float(r), 4)
+                    predictor_pvals[outcome_col] = round(float(p), 4)
     if "correct_5d" in populated.columns:
         resolved = pd.to_numeric(populated["correct_5d"], errors="coerce").dropna()
         if len(resolved) >= 10:
-            predictor_hit_rate = float(resolved.mean())
+            predictor_hit_rate = round(float(resolved.mean()), 4)
+            from analysis.signal_quality import _wilson_ci
+            predictor_hit_rate_ci = _wilson_ci(int(resolved.sum()), len(resolved))
+
+    # Flag non-significant correlations
+    sig_note = []
+    for label, pvals in {**p_values, "predictor": predictor_pvals}.items():
+        for target, p in pvals.items():
+            if p is not None and p > 0.05:
+                sig_note.append(f"{label}.{target} (p={p:.3f})")
 
     return {
         "status": "ok",
         "rows_analyzed": len(populated),
         "correlations": correlations,
+        "p_values": p_values,
         "ranking_10d": ranking_10d,
         "ranking_30d": ranking_30d,
         "predictor_correlation": predictor_corr,
+        "predictor_p_values": predictor_pvals,
         "predictor_hit_rate": predictor_hit_rate,
+        "predictor_hit_rate_ci_95": predictor_hit_rate_ci,
+        "non_significant": sig_note if sig_note else None,
         "note": (
-            "Correlations below 0.1 should be treated as noise at current sample sizes. "
+            "Correlations include p-values; those with p > 0.05 are flagged as non-significant. "
             "Automated weight optimization activates at Month 6+ (500+ rows)."
         ),
     }

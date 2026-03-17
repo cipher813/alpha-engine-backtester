@@ -89,12 +89,33 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
     return result
 
 
+def _wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score confidence interval for a binomial proportion."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    spread = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / denom
+    return (round(max(0.0, centre - spread), 4), round(min(1.0, centre + spread), 4))
+
+
 def _compute_slice_metrics(df_10d: pd.DataFrame, df_30d: pd.DataFrame) -> dict:
     n_10d = len(df_10d)
     n_30d = len(df_30d)
+
+    acc_10d = float(df_10d["beat_spy_10d"].mean()) if n_10d > 0 else None
+    acc_30d = float(df_30d["beat_spy_30d"].mean()) if n_30d > 0 else None
+
+    # Wilson score 95% confidence intervals
+    ci_10d = _wilson_ci(int(df_10d["beat_spy_10d"].sum()), n_10d) if n_10d > 0 else None
+    ci_30d = _wilson_ci(int(df_30d["beat_spy_30d"].sum()), n_30d) if n_30d > 0 else None
+
     return {
-        "accuracy_10d": float(df_10d["beat_spy_10d"].mean()) if n_10d > 0 else None,
-        "accuracy_30d": float(df_30d["beat_spy_30d"].mean()) if n_30d > 0 else None,
+        "accuracy_10d": acc_10d,
+        "accuracy_30d": acc_30d,
+        "ci_95_10d": ci_10d,
+        "ci_95_30d": ci_30d,
         "avg_alpha_10d": float((df_10d["return_10d"] - df_10d["spy_10d_return"]).mean()) if n_10d > 0 else None,
         "avg_alpha_30d": float((df_30d["return_30d"] - df_30d["spy_30d_return"]).mean()) if n_30d > 0 else None,
         "n_10d": n_10d,

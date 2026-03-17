@@ -286,6 +286,9 @@ def apply(result: dict, bucket: str) -> dict:
         "recommendation_reason": result.get("recommendation_reason"),
     }
 
+    from optimizer.rollback import save_previous
+    save_previous(bucket, "predictor_params")
+
     s3 = boto3.client("s3")
     body = json.dumps(payload, indent=2)
 

@@ -15,6 +15,7 @@ results_dir: results
 # Portfolio simulation parameters (Mode 2)
 init_cash: 1_000_000.0
 min_simulation_dates: 5
+simulation_fees: 0.001  # 10 bps round-trip
 
 # Path to alpha-engine repo root — required for Mode 2 (imports executor.main)
 # List as many paths as needed; first existing directory wins.
@@ -110,6 +111,7 @@ weight_optimizer:
 executor_optimizer:
   min_valid_combos: 5            # minimum sweep combos with sharpe_ratio
   min_sharpe_improvement: 0.10   # best must exceed baseline by 10%+
+  drawdown_penalty_weight: 0.50  # penalize max_drawdown in combined ranking score
 
 # ── Veto threshold analysis ─────────────────────────────────────────────────
 veto_analysis:

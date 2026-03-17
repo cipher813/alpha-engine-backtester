@@ -181,12 +181,42 @@ def compute_weights(
             ),
         }
 
-    # Compute correlations with beat_spy outcomes
+    # Train/test split: 70/30 by score_date for out-of-sample validation
+    populated = populated.sort_values("score_date")
+    split_idx = int(len(populated) * 0.7)
+    train_set = populated.iloc[:split_idx]
+    test_set = populated.iloc[split_idx:]
+
+    if len(train_set) < min_samples:
+        return {
+            "status": "insufficient_data",
+            "n_samples": n,
+            "min_required": min_samples,
+            "current_weights": current_weights,
+            "note": (
+                f"Only {len(train_set)} train rows after 70/30 split "
+                f"(need {min_samples}). Weight recommendation deferred."
+            ),
+        }
+
+    if len(test_set) < 10:
+        return {
+            "status": "insufficient_data",
+            "n_samples": n,
+            "min_required": min_samples,
+            "current_weights": current_weights,
+            "note": (
+                f"Only {len(test_set)} test rows after 70/30 split "
+                f"(need 10). Weight recommendation deferred."
+            ),
+        }
+
+    # Compute correlations on TRAIN set only
     correlations: dict[str, dict] = {}
     for label, col in sub_cols.items():
         corr: dict[str, float | None] = {}
         for target in ("beat_spy_10d", "beat_spy_30d"):
-            valid = populated[[col, target]].dropna()
+            valid = train_set[[col, target]].dropna()
             corr[target] = float(valid[col].corr(valid[target])) if len(valid) >= 10 else None
         correlations[label] = corr
 
@@ -229,16 +259,45 @@ def compute_weights(
         else "low"
     )
 
+    # Out-of-sample validation: check correlations hold on test set
+    test_correlations: dict[str, dict] = {}
+    for label, col in sub_cols.items():
+        corr: dict[str, float | None] = {}
+        for target in ("beat_spy_10d", "beat_spy_30d"):
+            valid = test_set[[col, target]].dropna()
+            corr[target] = float(valid[col].corr(valid[target])) if len(valid) >= 10 else None
+        test_correlations[label] = corr
+
+    # Compute weighted train/test correlation sums for degradation check
+    train_total = 0.0
+    test_total = 0.0
+    for label in sub_cols:
+        for target, weight in [("beat_spy_10d", w10), ("beat_spy_30d", w30)]:
+            train_val = correlations.get(label, {}).get(target) or 0.0
+            test_val = test_correlations.get(label, {}).get(target) or 0.0
+            train_total += weight * abs(train_val)
+            test_total += weight * abs(test_val)
+
+    oos_degradation = 1.0 - (test_total / train_total) if train_total > 0 else 0.0
+    oos_passed = oos_degradation < 0.20
+
     return {
         "status": "ok",
         "n_samples": n,
+        "n_train": len(train_set),
+        "n_test": len(test_set),
         "confidence": confidence,
         "current_weights": current_weights,
         "correlations": correlations,
+        "test_correlations": test_correlations,
+        "oos_passed": oos_passed,
+        "oos_degradation": round(oos_degradation, 4),
         "suggested_weights": suggested,
         "changes": changes,
         "note": (
-            f"Based on {n} signals. Confidence: {confidence}. "
+            f"Based on {n} signals (train={len(train_set)}, test={len(test_set)}). "
+            f"Confidence: {confidence}. OOS degradation: {oos_degradation:.1%} "
+            f"({'PASS' if oos_passed else 'FAIL — weights not applied'}). "
             "Suggested weights blend 30% data signal with 70% current weights to avoid instability."
         ),
     }
@@ -266,6 +325,9 @@ def apply_weights(result: dict, bucket: str) -> dict:
     """
     if result.get("status") != "ok":
         return {"applied": False, "reason": f"status={result.get('status')}"}
+
+    if result.get("oos_passed") is False:
+        return {"applied": False, "reason": f"OOS validation failed (degradation={result.get('oos_degradation', 0):.1%})"}
 
     confidence = result.get("confidence", "low")
     if confidence == "low":
@@ -297,6 +359,9 @@ def apply_weights(result: dict, bucket: str) -> dict:
         "n_samples": result.get("n_samples"),
         "confidence": confidence,
     }
+
+    from optimizer.rollback import save_previous
+    save_previous(bucket, "scoring_weights")
 
     s3 = boto3.client("s3")
     body = json.dumps(payload, indent=2)

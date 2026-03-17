@@ -14,6 +14,7 @@ def orders_to_portfolio(
     orders: list[dict],
     prices: pd.DataFrame,
     init_cash: float = 1_000_000.0,
+    fees: float = 0.001,
 ) -> vbt.Portfolio:
     """
     Convert executor order list to a vectorbt Portfolio.
@@ -57,7 +58,7 @@ def orders_to_portfolio(
         init_cash=init_cash,
         cash_sharing=True,
         group_by=True,
-        fees=0.0,
+        fees=fees,
         freq="D",
     )
 

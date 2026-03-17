@@ -133,8 +133,18 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     if not param_cols:
         return {"status": "no_params", "note": "No safe params found in sweep results"}
 
-    # Re-sort by sharpe_ratio (sweep may be sorted by total_alpha for display)
-    valid = valid.sort_values("sharpe_ratio", ascending=False)
+    # Multi-metric ranking: Sharpe is primary, but penalize excessive drawdown.
+    # Combined score = sharpe_ratio - drawdown_penalty_weight * max_drawdown
+    # This prevents promoting fragile param sets where one big win masks many losses.
+    dd_penalty_weight = _cfg.get("drawdown_penalty_weight", 0.5)
+    if "max_drawdown" in valid.columns:
+        valid["_combined_score"] = (
+            valid["sharpe_ratio"]
+            - dd_penalty_weight * valid["max_drawdown"].fillna(0).abs()
+        )
+    else:
+        valid["_combined_score"] = valid["sharpe_ratio"]
+    valid = valid.sort_values("_combined_score", ascending=False)
 
     # Baseline: find the combo closest to current S3 params (iterative learning).
     # Falls back to worst combo by Sharpe if no current_params provided.
@@ -217,6 +227,83 @@ def _find_closest_combo(
     return valid.loc[distances.idxmin()]
 
 
+def validate_holdout(
+    result: dict,
+    sim_fn,
+    dates: list[str],
+    config: dict,
+) -> dict:
+    """
+    Re-run best params on the last 30% of signal dates as a holdout check.
+
+    Compares holdout Sharpe to train Sharpe; requires holdout >= 50% of train.
+    Updates result in-place with holdout metrics.
+
+    Args:
+        result: dict from recommend() with status="ok".
+        sim_fn: callable(combo_config) -> stats dict (same as param sweep sim_fn).
+        dates: full list of signal dates (chronological).
+        config: base config dict.
+
+    Returns:
+        result dict with added holdout_sharpe, holdout_passed fields.
+    """
+    if result.get("status") != "ok":
+        return result
+
+    recommended = result.get("recommended_params", {})
+    if not recommended:
+        return result
+
+    # Split dates 70/30
+    split_idx = int(len(dates) * 0.7)
+    holdout_dates = dates[split_idx:]
+
+    if len(holdout_dates) < 3:
+        result["holdout_passed"] = True
+        result["holdout_note"] = f"Only {len(holdout_dates)} holdout dates — skipped validation"
+        return result
+
+    # Build holdout config with recommended params
+    holdout_config = {**config, **recommended}
+
+    try:
+        holdout_stats = sim_fn(holdout_config)
+        holdout_sharpe = holdout_stats.get("sharpe_ratio")
+    except Exception as e:
+        logger.warning("Holdout validation failed: %s", e)
+        result["holdout_passed"] = True
+        result["holdout_note"] = f"Holdout simulation error: {e}"
+        return result
+
+    if holdout_sharpe is None:
+        result["holdout_passed"] = True
+        result["holdout_note"] = "Holdout produced no Sharpe — skipped validation"
+        return result
+
+    best_sharpe = result.get("best_sharpe", 0)
+    ratio = holdout_sharpe / best_sharpe if best_sharpe != 0 else 0.0
+
+    result["holdout_sharpe"] = round(float(holdout_sharpe), 4)
+    result["holdout_ratio"] = round(ratio, 4)
+    result["holdout_passed"] = ratio >= 0.50
+
+    if not result["holdout_passed"]:
+        result["status"] = "holdout_failed"
+        result["holdout_note"] = (
+            f"Holdout Sharpe ({holdout_sharpe:.4f}) is {ratio:.0%} of train "
+            f"({best_sharpe:.4f}) — need >= 50%"
+        )
+        logger.warning("Executor optimizer holdout failed: %s", result["holdout_note"])
+    else:
+        result["holdout_note"] = (
+            f"Holdout Sharpe ({holdout_sharpe:.4f}) is {ratio:.0%} of train — PASS"
+        )
+        logger.info("Executor optimizer holdout passed: %s", result["holdout_note"])
+
+    return result
+
+
 def apply(result: dict, bucket: str) -> dict:
     """
     Write recommended executor params to S3 if recommendation is valid.
@@ -246,6 +333,9 @@ def apply(result: dict, bucket: str) -> dict:
         "improvement_pct": result.get("improvement_pct"),
         "n_combos_tested": result.get("n_combos_tested"),
     }
+
+    from optimizer.rollback import save_previous
+    save_previous(bucket, "executor_params")
 
     s3 = boto3.client("s3")
     body = json.dumps(payload, indent=2)
