@@ -34,6 +34,17 @@ DEFAULT_GRID = {
     "atr_multiplier": [2.0, 3.0, 4.0],
     "time_decay_reduce_days": [5, 7, 10],
     "time_decay_exit_days": [10, 15, 20],
+    "reduce_fraction": [0.25, 0.33, 0.50],
+    "atr_sizing_target_risk": [0.01, 0.02, 0.03],
+    "confidence_sizing_min": [0.6, 0.7, 0.8],
+    "confidence_sizing_range": [0.4, 0.6, 0.8],
+    "staleness_decay_per_day": [0.02, 0.03, 0.05],
+    "earnings_sizing_reduction": [0.30, 0.50, 0.70],
+    "earnings_proximity_days": [3, 5, 7],
+    "momentum_gate_threshold": [-10.0, -5.0, -2.0],
+    "correlation_block_threshold": [0.70, 0.75, 0.80, 0.85],
+    "profit_take_pct": [0.15, 0.20, 0.25, 0.30],
+    "momentum_exit_threshold": [-20.0, -15.0, -10.0],
 }
 
 # ── Defaults for sweep mode (override via param_sweep_settings in config.yaml) ──

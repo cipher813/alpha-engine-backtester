@@ -36,6 +36,17 @@ SAFE_PARAMS = [
     "time_decay_exit_days",
     "min_score",
     "max_position_pct",
+    "reduce_fraction",
+    "atr_sizing_target_risk",
+    "confidence_sizing_min",
+    "confidence_sizing_range",
+    "staleness_decay_per_day",
+    "earnings_sizing_reduction",
+    "earnings_proximity_days",
+    "momentum_gate_threshold",
+    "correlation_block_threshold",
+    "profit_take_pct",
+    "momentum_exit_threshold",
 ]
 
 # Factory defaults — the values the executor uses when no S3 config exists.
@@ -47,6 +58,17 @@ FACTORY_DEFAULTS = {
     "time_decay_exit_days": 14,
     "min_score": 70,
     "max_position_pct": 0.05,
+    "reduce_fraction": 0.50,
+    "atr_sizing_target_risk": 0.02,
+    "confidence_sizing_min": 0.70,
+    "confidence_sizing_range": 0.60,
+    "staleness_decay_per_day": 0.03,
+    "earnings_sizing_reduction": 0.50,
+    "earnings_proximity_days": 5,
+    "momentum_gate_threshold": -5.0,
+    "correlation_block_threshold": 0.80,
+    "profit_take_pct": 0.25,
+    "momentum_exit_threshold": -15.0,
 }
 
 # ── Fallback defaults (override via executor_optimizer section in config.yaml) ──
