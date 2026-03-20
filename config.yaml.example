@@ -17,6 +17,11 @@ init_cash: 1_000_000.0
 min_simulation_dates: 5
 simulation_fees: 0.001  # 10 bps round-trip
 
+# Simulation realism (Gap #2, #3)
+simulation:
+  slippage_bps: 10              # basis points per side (entry + exit)
+  assume_next_day_fill: true    # shift entry fills to next trading day
+
 # Path to alpha-engine repo root — required for Mode 2 (imports executor.main)
 # List as many paths as needed; first existing directory wins.
 executor_paths:
@@ -49,7 +54,7 @@ score_buckets:
   - [90, 100]
 
 # Minimum samples required for a bucket to be reported
-min_samples: 5
+min_samples: 30
 
 # Email (AWS SES — sender must be verified in SES)
 email_sender: "you@example.com"
@@ -66,32 +71,38 @@ predictor_paths:
   - /home/ec2-user/alpha-engine-predictor
 
 # Predictor backtest settings (--mode predictor-backtest)
+# The predictor-backtest is the PRIMARY param sweep source — it uses the full
+# price cache (up to 10y) for statistically robust optimization.
+# On the always-on EC2, use max_trading_days: 500 (2y, memory-safe).
+# On spot instances, set max_trading_days: 2520 (10y) for full coverage.
 predictor_backtest:
-  min_trading_days: 200
-  max_trading_days: 500
+  min_trading_days: 252             # 1 year minimum for meaningful Sharpe
+  max_trading_days: 2520            # 10y — use spot instance for this
   top_n_signals_per_day: 20
   min_score: 70
+  use_full_cache: true              # load 10y S3 cache instead of 2y slim cache
 
 # ── Param sweep settings ───────────────────────────────────────────────────
 # mode: "random" samples from the grid; "grid" runs exhaustive search.
-# Auto-scaling: when max_trials is omitted, samples 30% of the grid clamped
-# to [60, 500]. Floor of 60 guarantees 95% top-5% for any grid size.
+# 60 random trials = 95% confidence of finding a top-5% combination
+# (Bergstra & Bengio 2012). Core grid of 1,728 combos fits either mode.
 param_sweep_settings:
   mode: random
-  # max_trials: 100                # omit to auto-scale with params below
-  trial_pct: 0.25                  # sample this fraction of the grid
+  max_trials: 60                   # 95% confidence of top-5% for any grid size
   min_trials: 50                   # floor: statistical minimum
   max_trials_cap: 400              # ceiling: cap runtime for large grids
   # seed: 42                       # uncomment for reproducible sweeps
 
-# Param sweep grid (Mode 2 + strategy layer)
+# Core param sweep grid — 6 high-impact parameters (1,728 combinations).
+# These are regime-invariant risk/exit rules that affect every trade.
+# Extended grid (17 params) available in param_sweep.EXTENDED_GRID.
 param_sweep:
   min_score: [65, 70, 75, 80]
   max_position_pct: [0.05, 0.10, 0.15]
-  drawdown_circuit_breaker: [0.10, 0.15, 0.20]
-  atr_multiplier: [2.0, 3.0, 4.0]
+  atr_multiplier: [2.0, 2.5, 3.0, 4.0]
   time_decay_reduce_days: [5, 7, 10]
   time_decay_exit_days: [10, 15, 20]
+  profit_take_pct: [0.15, 0.20, 0.25, 0.30]
 
 # ── Weight optimizer guardrails ──────────────────────────────────────────────
 weight_optimizer:
@@ -100,7 +111,10 @@ weight_optimizer:
     research: 0.50
   max_single_change: 0.10        # max weight move per update
   min_meaningful_change: 0.03    # min change to trigger update
-  blend_factor: 0.20             # conservative: 20% data-driven, 80% current
+  blend_factor: 0.20             # conservative: 20% data-driven, 80% current (used as min when ramp active)
+  blend_factor_min: 0.20         # blend floor at low sample sizes
+  blend_factor_max: 0.50         # blend ceiling at high sample sizes
+  blend_ramp_samples: 500        # n_train at which blend reaches max
   confidence_low: 100            # samples threshold for "low" confidence
   confidence_medium: 300         # samples threshold for "medium"/"high"
   horizon_blend:

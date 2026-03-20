@@ -15,10 +15,12 @@ from pathlib import Path
 
 import pandas as pd
 
+from analysis.stats_utils import benjamini_hochberg
+
 logger = logging.getLogger(__name__)
 
 # Minimum rows needed before reporting results — avoid misleading metrics on tiny samples
-MIN_SAMPLES = 10
+MIN_SAMPLES = 30
 
 
 def load_score_performance(db_path: str) -> pd.DataFrame:
@@ -132,11 +134,41 @@ def _accuracy_by_score_bucket(df_10d: pd.DataFrame, df_30d: pd.DataFrame) -> lis
         slice_30d = df_30d[(df_30d["score"] >= lo) & (df_30d["score"] < hi)]
         if len(slice_10d) == 0:
             continue
+        exploratory_threshold = 20
         rows.append({
             "bucket": label,
+            "exploratory": len(slice_10d) < exploratory_threshold,
             **_compute_slice_metrics(slice_10d, slice_30d),
         })
+
+    # Apply BH FDR correction across bucket accuracy p-values
+    # Derive implied p-values from Wilson CIs: a bucket is "significant" if
+    # the CI excludes 0.50 (coin flip). Use a two-sided z-test approximation.
+    import math
+    p_values = []
+    for row in rows:
+        n = row.get("n_10d", 0)
+        acc = row.get("accuracy_10d")
+        if n > 0 and acc is not None:
+            # Two-sided z-test for proportion vs 0.50
+            z = abs(acc - 0.50) / max(math.sqrt(0.25 / n), 1e-10)
+            # Approximate two-sided p-value using normal CDF
+            p = 2.0 * (1.0 - _norm_cdf(z))
+            p_values.append(p)
+        else:
+            p_values.append(1.0)
+
+    fdr_results = benjamini_hochberg(p_values, alpha=0.05)
+    for i, row in enumerate(rows):
+        row["fdr_exploratory"] = not fdr_results[i]
+
     return rows
+
+
+def _norm_cdf(z: float) -> float:
+    """Standard normal CDF approximation (Abramowitz & Stegun)."""
+    import math
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
 def _accuracy_by_field(df_10d: pd.DataFrame, df_30d: pd.DataFrame, field: str) -> list[dict]:

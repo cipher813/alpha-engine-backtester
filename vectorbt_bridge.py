@@ -15,6 +15,8 @@ def orders_to_portfolio(
     prices: pd.DataFrame,
     init_cash: float = 1_000_000.0,
     fees: float = 0.001,
+    slippage_bps: float = 0.0,
+    assume_next_day_fill: bool = False,
 ) -> vbt.Portfolio:
     """
     Convert executor order list to a vectorbt Portfolio.
@@ -26,6 +28,10 @@ def orders_to_portfolio(
         prices: DataFrame indexed by date (datetime), columns by ticker.
                 Build with price_loader.build_matrix().
         init_cash: Starting portfolio NAV.
+        fees: Base transaction fees (fraction, e.g. 0.001 = 10bps round-trip).
+        slippage_bps: Additional slippage per side in basis points (e.g. 10 = 10bps).
+        assume_next_day_fill: If True, shift ENTER orders forward by 1 trading day
+            to simulate next-day-close fills. EXIT/REDUCE stay same-day (conservative).
 
     Returns:
         vbt.Portfolio with full analytics available via .sharpe_ratio(),
@@ -44,10 +50,21 @@ def orders_to_portfolio(
         if t not in tickers or d not in entries.index:
             continue
         if order["action"] == "ENTER":
-            entries.loc[d, t] = True
-            sizes.loc[d, t]   = float(order.get("shares", 0))
+            fill_date = d
+            if assume_next_day_fill:
+                # Shift to next trading day in the price matrix
+                idx_pos = dates.get_loc(d)
+                if idx_pos + 1 < len(dates):
+                    fill_date = dates[idx_pos + 1]
+                else:
+                    continue  # no next trading day available — skip order
+            entries.loc[fill_date, t] = True
+            sizes.loc[fill_date, t]   = float(order.get("shares", 0))
         elif order["action"] in ("EXIT", "REDUCE"):
             exits.loc[d, t] = True
+
+    # Combine base fees with slippage: total_fees = base_fees + slippage_bps/10000
+    total_fees = fees + slippage_bps / 10_000
 
     return vbt.Portfolio.from_signals(
         close=prices,
@@ -58,7 +75,7 @@ def orders_to_portfolio(
         init_cash=init_cash,
         cash_sharing=True,
         group_by=True,
-        fees=fees,
+        fees=total_fees,
         freq="D",
     )
 

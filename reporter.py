@@ -220,14 +220,28 @@ def _section_signal_quality(sq: dict) -> list[str]:
     buckets = sq.get("by_score_bucket", [])
     if buckets:
         lines += ["", "### By score bucket", ""]
-        lines += ["| Bucket | Acc 10d | Acc 30d | Avg α 10d | n |"]
-        lines += ["|--------|---------|---------|-----------|---|"]
+        lines += ["| Bucket | Acc 10d | Acc 30d | Avg α 10d | n | FDR |"]
+        lines += ["|--------|---------|---------|-----------|---|-----|"]
+        has_exploratory = False
+        has_fdr_exploratory = False
         for b in buckets:
+            star = ""
+            if b.get("exploratory"):
+                star = "*"
+                has_exploratory = True
+            fdr_tag = ""
+            if b.get("fdr_exploratory"):
+                fdr_tag = "†"
+                has_fdr_exploratory = True
             lines.append(
-                f"| {b.get('bucket')} | {_pct(b.get('accuracy_10d'))} | "
-                f"{_pct(b.get('accuracy_30d'))} | {_pct(b.get('avg_alpha_10d'))} | "
-                f"{b.get('n_10d', 0)} |"
+                f"| {b.get('bucket')} | {_pct(b.get('accuracy_10d'))}{star} | "
+                f"{_pct(b.get('accuracy_30d'))}{star} | {_pct(b.get('avg_alpha_10d'))}{star} | "
+                f"{b.get('n_10d', 0)} | {fdr_tag} |"
             )
+        if has_exploratory:
+            lines += ["", "\\* exploratory — fewer than 20 samples, treat with caution"]
+        if has_fdr_exploratory:
+            lines += ["", "† not FDR-significant (Benjamini-Hochberg, α=0.05) — accuracy may not differ from coin flip"]
 
     return lines
 
@@ -281,17 +295,23 @@ def _section_attribution(attr: dict) -> list[str]:
         "",
         "### Correlation with beat_spy_10d",
         "",
-        "| Sub-score | Corr (10d) | Corr (30d) |",
-        "|-----------|------------|------------|",
+        "| Sub-score | Corr (10d) | Corr (30d) | FDR sig (10d) | FDR sig (30d) |",
+        "|-----------|------------|------------|---------------|---------------|",
     ]
     for label, corrs in attr.get("correlations", {}).items():
         c10 = corrs.get("beat_spy_10d")
         c30 = corrs.get("beat_spy_30d")
-        lines.append(f"| {label} | {_fmt(c10)} | {_fmt(c30)} |")
+        fdr_10 = "Yes" if corrs.get("beat_spy_10d_fdr_significant") else "No"
+        fdr_30 = "Yes" if corrs.get("beat_spy_30d_fdr_significant") else "No"
+        lines.append(f"| {label} | {_fmt(c10)} | {_fmt(c30)} | {fdr_10} | {fdr_30} |")
 
     ranking_10d = attr.get("ranking_10d", [])
     if ranking_10d:
         lines += ["", f"**Strongest predictor (10d):** {ranking_10d[0]}"]
+
+    fdr_ns = attr.get("fdr_non_significant")
+    if fdr_ns:
+        lines += ["", f"> FDR non-significant: {', '.join(fdr_ns)}"]
 
     lines += ["", f"> {attr.get('note', '')}"]
     return lines
@@ -306,7 +326,7 @@ def _section_portfolio(stats: dict) -> list[str]:
             "",
             f"> **Skipped.** {note}",
         ]
-    return [
+    lines = [
         "## Mode 2 — Portfolio simulation",
         "",
         "| Metric | Value |",
@@ -318,6 +338,16 @@ def _section_portfolio(stats: dict) -> list[str]:
         f"| Total trades | {stats.get('total_trades', 'N/A')} |",
         f"| Win rate | {_pct(stats.get('win_rate'))} |",
     ]
+    sim_assumptions = stats.get("simulation_assumptions")
+    if sim_assumptions:
+        lines.append(f"| Simulation | {sim_assumptions} |")
+    price_gaps = stats.get("price_gap_warnings")
+    if price_gaps:
+        lines += ["", f"> **Price gap warnings:** {price_gaps}"]
+    staleness = stats.get("staleness_warning")
+    if staleness:
+        lines += [f"> **{staleness}**"]
+    return lines
 
 
 def _section_weight_recommendation(result: dict) -> list[str]:
@@ -335,9 +365,11 @@ def _section_weight_recommendation(result: dict) -> list[str]:
     changes = result.get("changes", {})
     correlations = result.get("correlations", {})
 
+    blend_factor = result.get("blend_factor")
+    blend_str = f" · blend: {blend_factor:.2f}" if blend_factor is not None else ""
     lines += [
         "",
-        f"_n={n} signals · confidence: {confidence}_",
+        f"_n={n} signals · confidence: {confidence}{blend_str}_",
         "",
         "| Sub-score | Current | Corr (10d) | Corr (30d) | Suggested | Change |",
         "|-----------|---------|------------|------------|-----------|--------|",
@@ -367,6 +399,16 @@ def _section_weight_recommendation(result: dict) -> list[str]:
             "",
             f"> ⏸ **Not applied** — {reason}.",
         ]
+
+    # Recommendation stability (Gap #4)
+    stability = result.get("stability", {})
+    if stability.get("weeks_loaded", 0) > 0:
+        if stability.get("stable"):
+            lines += [f"> Recommendation stability: {stability['weeks_loaded'] + 1}/{stability['weeks_loaded'] + 1} weeks consistent"]
+        else:
+            reversals = stability.get("reversals", [])
+            for rev in reversals:
+                lines += [f"> WARNING: {rev}"]
 
     lines += [f"> {result.get('note', '')}"]
     return lines
@@ -489,7 +531,7 @@ def _section_veto_analysis(result: dict) -> list[str]:
     lines = ["## Predictor veto threshold analysis"]
     status = result.get("status", "unknown")
 
-    if status != "ok":
+    if status not in ("ok", "insufficient_lift"):
         note = result.get("note", result.get("error", "Unavailable."))
         lines += ["", f"> **Deferred.** {note}"]
         return lines
@@ -497,13 +539,15 @@ def _section_veto_analysis(result: dict) -> list[str]:
     current = result.get("current_threshold", 0.65)
     recommended = result.get("recommended_threshold")
     n_down = result.get("n_down_predictions", 0)
+    base_rate = result.get("base_rate")
 
+    base_rate_str = f" Base rate (BUY signals beating SPY): {_pct(base_rate)}." if base_rate is not None else ""
     lines += [
         "",
-        f"_Analyzed {n_down} DOWN predictions with resolved outcomes._",
+        f"_Analyzed {n_down} DOWN predictions with resolved outcomes.{base_rate_str}_",
         "",
-        "| Confidence | Vetoes | True neg | False neg | Precision | Missed alpha |",
-        "|------------|--------|----------|-----------|-----------|--------------|",
+        "| Confidence | Vetoes | True neg | False neg | Precision | CI 95% | Lift | Missed α (total) | Missed α/winner |",
+        "|------------|--------|----------|-----------|-----------|--------|------|------------------|-----------------|",
     ]
     for t in result.get("thresholds", []):
         conf = t["confidence"]
@@ -513,12 +557,31 @@ def _section_veto_analysis(result: dict) -> list[str]:
         if conf == recommended:
             marker = " **→**"
         prec = _pct(t["precision"]) if t["precision"] is not None else "—"
+        ci = t.get("precision_ci_95")
+        ci_str = f"[{ci[0]:.0%}–{ci[1]:.0%}]" if ci else "—"
+        if t.get("low_confidence"):
+            ci_str += "†"
+        lift = t.get("lift")
+        lift_str = f"{lift:+.1%}" if lift is not None else "—"
+        missed_pw = t.get("missed_alpha_per_winner", 0)
         lines.append(
             f"| {conf:.2f}{marker} | {t['n_vetoes']} | {t['true_negatives']} "
-            f"| {t['false_negatives']} | {prec} | {t['missed_alpha']:.4f} |"
+            f"| {t['false_negatives']} | {prec} | {ci_str} | {lift_str} "
+            f"| {t['missed_alpha']:.4f} | {missed_pw:.4f} |"
         )
 
-    lines += ["", f"> **Recommended:** {recommended:.2f} — {result.get('recommendation_reason', '')}"]
+    lines += ["", "† Low confidence — fewer than 30 veto decisions"]
+
+    if recommended is not None:
+        lines += ["", f"> **Recommended:** {recommended:.2f} — {result.get('recommendation_reason', '')}"]
+    else:
+        lines += ["", f"> {result.get('recommendation_reason', 'No recommendation.')}"]
+
+    # Cost sensitivity (Gap #10)
+    cost_sens = result.get("cost_sensitivity")
+    if cost_sens:
+        details = result.get("cost_sensitivity_details", {})
+        lines += [f"> Cost sensitivity: **{cost_sens}** — thresholds by cost_weight: {details}"]
 
     apply = result.get("apply_result", {})
     if apply.get("applied"):
@@ -550,12 +613,18 @@ def _section_executor_recommendations(result: dict) -> list[str]:
     best_alpha = result.get("best_alpha")
     alpha_str = f" | Best alpha: {best_alpha:.1%}" if best_alpha is not None else ""
 
+    baseline_rank = result.get("baseline_combo_rank")
+    n_combos = result.get("n_combos_tested", "?")
+    baseline_note = ""
+    if baseline_rank is not None:
+        baseline_note = f" Baseline: combo #{baseline_rank} of {n_combos} (closest to current S3 params)."
+
     lines += [
         "",
-        f"_Tested {result.get('n_combos_tested', '?')} parameter combinations. "
+        f"_Tested {n_combos} parameter combinations. "
         f"Sharpe improvement: {improvement:.1%} "
         f"({result.get('baseline_sharpe', 0):.4f} → {result.get('best_sharpe', 0):.4f})"
-        f"{alpha_str}._",
+        f"{alpha_str}.{baseline_note}_",
         "",
         "| Parameter | Default | Current (S3) | Recommended | Drift from default |",
         "|-----------|---------|--------------|-------------|-------------------|",

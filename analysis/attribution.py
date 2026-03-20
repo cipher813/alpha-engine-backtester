@@ -15,6 +15,8 @@ import logging
 import pandas as pd
 from scipy.stats import pearsonr
 
+from analysis.stats_utils import benjamini_hochberg
+
 logger = logging.getLogger(__name__)
 
 SUB_SCORES = ["news", "research"]
@@ -116,12 +118,31 @@ def compute_attribution(df: pd.DataFrame) -> dict:
             from analysis.signal_quality import _wilson_ci
             predictor_hit_rate_ci = _wilson_ci(int(resolved.sum()), len(resolved))
 
-    # Flag non-significant correlations
-    sig_note = []
+    # Collect all p-values for FDR correction (Benjamini-Hochberg)
+    all_pvals = []
+    pval_keys = []  # track (label, target) for each p-value
     for label, pvals in {**p_values, "predictor": predictor_pvals}.items():
         for target, p in pvals.items():
-            if p is not None and p > 0.05:
-                sig_note.append(f"{label}.{target} (p={p:.3f})")
+            if p is not None:
+                all_pvals.append(p)
+                pval_keys.append((label, target))
+
+    fdr_significant = benjamini_hochberg(all_pvals, alpha=0.05)
+
+    # Build FDR significance map and flag non-significant correlations
+    fdr_map = {}  # {(label, target): bool}
+    fdr_non_significant = []
+    for i, (label, target) in enumerate(pval_keys):
+        fdr_map[(label, target)] = fdr_significant[i]
+        if not fdr_significant[i]:
+            p = all_pvals[i]
+            fdr_non_significant.append(f"{label}.{target} (p={p:.3f})")
+
+    # Tag each correlation with FDR significance
+    for label in correlations:
+        for target in correlations[label]:
+            key = (label, target)
+            correlations[label][f"{target}_fdr_significant"] = fdr_map.get(key, False)
 
     return {
         "status": "ok",
@@ -134,9 +155,9 @@ def compute_attribution(df: pd.DataFrame) -> dict:
         "predictor_p_values": predictor_pvals,
         "predictor_hit_rate": predictor_hit_rate,
         "predictor_hit_rate_ci_95": predictor_hit_rate_ci,
-        "non_significant": sig_note if sig_note else None,
+        "fdr_non_significant": fdr_non_significant if fdr_non_significant else None,
         "note": (
-            "Correlations include p-values; those with p > 0.05 are flagged as non-significant. "
+            "p-values adjusted for multiple comparisons (Benjamini-Hochberg, α=0.05). "
             "Automated weight optimization activates at Month 6+ (500+ rows)."
         ),
     }

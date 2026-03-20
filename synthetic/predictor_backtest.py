@@ -1,24 +1,28 @@
 """
 synthetic/predictor_backtest.py — predictor-only historical backtest pipeline.
 
-Runs GBM inference on 2 years of slim-cache OHLCV data to generate synthetic
+Runs GBM inference on up to 10 years of OHLCV data to generate synthetic
 signals, then feeds them through the full executor pipeline (risk guard,
 position sizing, ATR stops, time decay, graduated drawdown).
 
 This tests everything downstream of Research without any LLM API calls:
-    1. Load 2y OHLCV from predictor's slim cache (~900 tickers)
+    1. Load OHLCV data (10y from S3 full cache, or 2y local slim cache)
     2. Compute 29 technical features per ticker (one full series per ticker)
-    3. Run GBM inference in daily batches (~500 trading days × ~900 tickers)
+    3. Run GBM inference in daily batches (up to ~2520 days × ~900 tickers)
     4. Convert alpha predictions to executor-compatible signals
     5. Build price matrix + OHLCV histories for simulation loop
 
 The caller (backtest.py) then passes these to _run_simulation_loop() with
 the existing executor pipeline.
 
-Performance notes:
-    - Feature computation: ~900 calls to compute_features() (one per ticker)
-    - GBM inference: ~500 batch calls (one per trading day, ~900 vectors each)
-    - Total runtime: ~5-10 min on EC2 (dominated by feature computation)
+Data sources:
+    - Full cache (10y): S3 predictor/price_cache/*.parquet — use on spot instances
+    - Slim cache (2y): local predictor/data/cache/*.parquet — use on always-on EC2
+
+Performance notes (10y on c5.large spot):
+    - Feature computation: ~900 calls to compute_features() (~3-5 min)
+    - GBM inference: ~2500 batch calls (~2-3 min)
+    - Total runtime: ~8-12 min
 """
 
 from __future__ import annotations
@@ -45,6 +49,77 @@ _MACRO_TICKERS = {"SPY", "^VIX", "^TNX", "^IRX", "GLD", "USO"}
 
 # Sector ETF tickers (present in slim cache)
 _SECTOR_ETFS = {"XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC", "XLB"}
+
+
+def load_full_cache_from_s3(
+    bucket: str = "alpha-engine-research",
+    prefix: str = "predictor/price_cache",
+    region: str = "us-east-1",
+) -> dict[str, pd.DataFrame]:
+    """
+    Load 10-year OHLCV parquets from S3 full price cache.
+
+    This is the primary data source for spot instance backtest runs.
+    The full cache contains ~10 years of adjusted OHLCV data for ~900 tickers,
+    refreshed weekly by the predictor training pipeline.
+
+    Returns {ticker: DataFrame} with DatetimeIndex and OHLCV columns.
+    """
+    s3 = boto3.client("s3", region_name=region)
+
+    # List all parquet files in the cache prefix
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".parquet"):
+                keys.append(obj["Key"])
+
+    logger.info("Loading full cache from S3: %d parquet files at s3://%s/%s", len(keys), bucket, prefix)
+
+    price_data: dict[str, pd.DataFrame] = {}
+    tmp_dir = tempfile.mkdtemp(prefix="backtest_cache_")
+
+    for i, key in enumerate(keys):
+        ticker = Path(key).stem  # e.g. "AAPL" from ".../AAPL.parquet"
+        local_path = os.path.join(tmp_dir, f"{ticker}.parquet")
+
+        try:
+            s3.download_file(bucket, key, local_path)
+            df = pd.read_parquet(local_path)
+            if df.empty:
+                continue
+
+            # Ensure DatetimeIndex
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if "Date" in df.columns:
+                    df["Date"] = pd.to_datetime(df["Date"])
+                    df = df.set_index("Date")
+                elif "date" in df.columns:
+                    df["date"] = pd.to_datetime(df["date"])
+                    df = df.set_index("date")
+                else:
+                    df.index = pd.to_datetime(df.index)
+
+            df = df.sort_index()
+            price_data[ticker] = df
+
+            # Clean up temp file immediately to limit disk usage
+            os.unlink(local_path)
+        except Exception as e:
+            logger.debug("Skipping %s: %s", key, e)
+
+        if (i + 1) % 100 == 0:
+            logger.info("  Loaded %d/%d parquets from S3", i + 1, len(keys))
+
+    # Clean up temp directory
+    try:
+        os.rmdir(tmp_dir)
+    except OSError:
+        pass
+
+    logger.info("Loaded %d tickers from S3 full cache (10y)", len(price_data))
+    return price_data
 
 
 def load_slim_cache(predictor_path: str) -> dict[str, pd.DataFrame]:
@@ -480,16 +555,21 @@ def run(config: dict) -> dict:
         )
 
     pb_config = config.get("predictor_backtest", {})
-    min_trading_days = pb_config.get("min_trading_days", 200)
+    min_trading_days = pb_config.get("min_trading_days", 252)
     max_trading_days = pb_config.get("max_trading_days", 500)
     top_n = pb_config.get("top_n_signals_per_day", 20)
     min_score = pb_config.get("min_score", 70)
+    use_full_cache = pb_config.get("use_full_cache", False)
     bucket = config.get("signals_bucket", "alpha-engine-research")
 
-    # 1. Load slim cache
-    price_data = load_slim_cache(predictor_path)
+    # 1. Load price data — full S3 cache (10y) or local slim cache (2y)
+    if use_full_cache:
+        logger.info("Loading full 10y price cache from S3...")
+        price_data = load_full_cache_from_s3(bucket=bucket)
+    else:
+        price_data = load_slim_cache(predictor_path)
 
-    # Trim to recent rows to reduce memory on small instances (t3.small = 2GB).
+    # Trim to recent rows to limit memory.
     # max_trading_days + 300 warmup rows is enough for feature computation.
     trim_rows = max_trading_days + 300
     trimmed = 0

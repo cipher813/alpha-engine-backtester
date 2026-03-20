@@ -125,6 +125,7 @@ def compute_weights(
     df: pd.DataFrame,
     current_weights: dict | None = None,
     min_samples: int = 30,
+    bucket: str | None = None,
 ) -> dict:
     """
     Compute suggested scoring weights from sub-score vs. beat_spy correlations.
@@ -238,8 +239,12 @@ def compute_weights(
     else:
         pure_suggested = {k: v / total_corr for k, v in weighted_corrs.items()}
 
-    # Blend toward data-driven weights conservatively
-    blend = _cfg.get("blend_factor", _BLEND_FACTOR)
+    # Blend toward data-driven weights — scale blend factor with sample size
+    min_blend = _cfg.get("blend_factor_min", _cfg.get("blend_factor", _BLEND_FACTOR))
+    max_blend = _cfg.get("blend_factor_max", 0.50)
+    blend_ramp_samples = _cfg.get("blend_ramp_samples", 500)
+    blend = min(max_blend, min_blend + (max_blend - min_blend) * (len(train_set) / blend_ramp_samples))
+    logger.info("Blend factor: %.3f (n_train=%d, ramp=%d)", blend, len(train_set), blend_ramp_samples)
     suggested = {
         k: round(current_weights.get(k, 0.0) * (1 - blend) + pure_suggested.get(k, 0.0) * blend, 3)
         for k in SUB_SCORES
@@ -281,6 +286,9 @@ def compute_weights(
     oos_degradation = 1.0 - (test_total / train_total) if train_total > 0 else 0.0
     oos_passed = oos_degradation < 0.20
 
+    # Recommendation stability: check prior 3 weeks' recommendations from S3
+    stability = _check_stability(suggested, bucket=bucket)
+
     return {
         "status": "ok",
         "n_samples": n,
@@ -294,12 +302,75 @@ def compute_weights(
         "oos_degradation": round(oos_degradation, 4),
         "suggested_weights": suggested,
         "changes": changes,
+        "blend_factor": round(blend, 3),
+        "stability": stability,
         "note": (
             f"Based on {n} signals (train={len(train_set)}, test={len(test_set)}). "
-            f"Confidence: {confidence}. OOS degradation: {oos_degradation:.1%} "
+            f"Confidence: {confidence}. Blend factor: {blend:.2f}. "
+            f"OOS degradation: {oos_degradation:.1%} "
             f"({'PASS' if oos_passed else 'FAIL — weights not applied'}). "
-            "Suggested weights blend 30% data signal with 70% current weights to avoid instability."
         ),
+    }
+
+
+def _check_stability(suggested: dict, bucket: str | None = None) -> dict:
+    """
+    Load prior 3 weeks' weight recommendations from S3 history and check
+    for direction reversals (e.g., news_score weight increased last week
+    but decreased this week).
+
+    Returns:
+        {"weeks_loaded": N, "reversals": [...], "stable": True/False}
+    """
+    if bucket is None:
+        # Bucket not available at compute time — will be populated by caller
+        return {"weeks_loaded": 0, "reversals": [], "stable": True, "note": "no bucket provided"}
+
+    from datetime import date as _date, timedelta
+    history = []
+    s3 = boto3.client("s3")
+
+    # Load prior 3 weeks' history files
+    for weeks_ago in range(1, 4):
+        d = _date.today() - timedelta(weeks=weeks_ago)
+        key = f"config/scoring_weights_history/{d.isoformat()}.json"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            data = json.loads(obj["Body"].read())
+            history.append({"date": d.isoformat(), "weights": {k: data.get(k) for k in SUB_SCORES}})
+        except Exception:
+            continue
+
+    if not history:
+        return {"weeks_loaded": 0, "reversals": [], "stable": True}
+
+    # Add current suggestion to form the full window
+    all_weeks = history[::-1]  # oldest first
+    all_weeks.append({"date": _date.today().isoformat(), "weights": suggested})
+
+    reversals = []
+    for k in SUB_SCORES:
+        deltas = []
+        for i in range(1, len(all_weeks)):
+            prev = all_weeks[i - 1]["weights"].get(k)
+            curr = all_weeks[i]["weights"].get(k)
+            if prev is not None and curr is not None:
+                deltas.append(curr - prev)
+        # Check for direction reversal (sign change in consecutive deltas)
+        for i in range(1, len(deltas)):
+            if deltas[i - 1] != 0 and deltas[i] != 0:
+                if (deltas[i - 1] > 0) != (deltas[i] > 0):
+                    direction_prev = "↑" if deltas[i - 1] > 0 else "↓"
+                    direction_curr = "↑" if deltas[i] > 0 else "↓"
+                    reversals.append(
+                        f"{k}: {direction_prev} → {direction_curr} "
+                        f"(weeks {i} → {i + 1})"
+                    )
+
+    return {
+        "weeks_loaded": len(history),
+        "reversals": reversals,
+        "stable": len(reversals) == 0,
     }
 
 

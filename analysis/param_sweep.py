@@ -27,13 +27,33 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Core 6 parameters — high-frequency, regime-invariant risk/exit rules that
+# affect every trade.  60 random trials gives 95% confidence of finding a
+# top-5% combination (Bergstra & Bengio).  Grid size: 4×3×4×3×3×4 = 1,728.
+#
+# Deferred parameters (revisit at 6+ months of live data):
+#   reduce_fraction, atr_sizing_target_risk, confidence_sizing_*,
+#   staleness_decay_per_day, earnings_*, momentum_gate/exit_threshold,
+#   correlation_block_threshold, drawdown_circuit_breaker (safety param,
+#   never auto-applied).
 DEFAULT_GRID = {
     "min_score": [65, 70, 75, 80],
     "max_position_pct": [0.05, 0.10, 0.15],
-    "drawdown_circuit_breaker": [0.10, 0.15, 0.20],
-    "atr_multiplier": [2.0, 3.0, 4.0],
+    "atr_multiplier": [2.0, 2.5, 3.0, 4.0],
     "time_decay_reduce_days": [5, 7, 10],
     "time_decay_exit_days": [10, 15, 20],
+    "profit_take_pct": [0.15, 0.20, 0.25, 0.30],
+}
+
+# Extended grid for future use — includes low-frequency params.
+# Activate by setting param_sweep in config.yaml to this grid.
+EXTENDED_GRID = {
+    "min_score": [65, 70, 75, 80],
+    "max_position_pct": [0.05, 0.10, 0.15],
+    "atr_multiplier": [2.0, 2.5, 3.0, 4.0],
+    "time_decay_reduce_days": [5, 7, 10],
+    "time_decay_exit_days": [10, 15, 20],
+    "profit_take_pct": [0.15, 0.20, 0.25, 0.30],
     "reduce_fraction": [0.25, 0.33, 0.50],
     "atr_sizing_target_risk": [0.01, 0.02, 0.03],
     "confidence_sizing_min": [0.6, 0.7, 0.8],
@@ -43,7 +63,6 @@ DEFAULT_GRID = {
     "earnings_proximity_days": [3, 5, 7],
     "momentum_gate_threshold": [-10.0, -5.0, -2.0],
     "correlation_block_threshold": [0.70, 0.75, 0.80, 0.85],
-    "profit_take_pct": [0.15, 0.20, 0.25, 0.30],
     "momentum_exit_threshold": [-20.0, -15.0, -10.0],
 }
 

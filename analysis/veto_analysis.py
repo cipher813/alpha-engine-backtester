@@ -148,6 +148,10 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
     n_down = len(down_df)
     logger.info("Found %d DOWN predictions with outcomes for veto analysis", n_down)
 
+    # Base rate: % of all BUY signals (in populated df) that beat SPY
+    base_rate = float(populated["beat_spy_10d"].mean())
+    logger.info("Veto base rate: %.1f%% of BUY signals beat SPY at 10d", base_rate * 100)
+
     # Sweep thresholds
     thresholds = _cfg.get("confidence_thresholds", _CONFIDENCE_THRESHOLDS)
     current_default = _cfg.get("current_default_threshold", _CURRENT_DEFAULT_THRESHOLD)
@@ -166,7 +170,11 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
                 "true_negatives": 0,
                 "false_negatives": 0,
                 "precision": None,
+                "precision_ci_95": None,
+                "low_confidence": True,
                 "missed_alpha": 0.0,
+                "missed_alpha_per_winner": 0.0,
+                "lift": None,
             })
             continue
 
@@ -175,8 +183,19 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
         # False negative = vetoed signal that actually won (beat_spy_10d == 1)
         false_neg = int((vetoed["beat_spy_10d"] == 1).sum())
         precision = true_neg / n_vetoes if n_vetoes > 0 else 0.0
-        # Missed alpha = sum of positive returns from false negatives
-        missed = float(vetoed[vetoed["beat_spy_10d"] == 1]["return_10d"].sum())
+
+        # Wilson CI on precision (Gap #7)
+        from analysis.signal_quality import _wilson_ci
+        precision_ci = _wilson_ci(true_neg, n_vetoes)
+        low_confidence = n_vetoes < 30
+
+        # Missed alpha: total and mean per vetoed winner (Gap #9)
+        vetoed_winners = vetoed[vetoed["beat_spy_10d"] == 1]
+        missed_total = float(vetoed_winners["return_10d"].sum())
+        missed_per_winner = float(vetoed_winners["return_10d"].mean()) if len(vetoed_winners) > 0 else 0.0
+
+        # Lift = precision - base_rate (Gap #8)
+        lift = precision - base_rate
 
         threshold_results.append({
             "confidence": threshold,
@@ -184,7 +203,11 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
             "true_negatives": true_neg,
             "false_negatives": false_neg,
             "precision": round(precision, 4),
-            "missed_alpha": round(missed, 4),
+            "precision_ci_95": precision_ci,
+            "low_confidence": low_confidence,
+            "missed_alpha": round(missed_total, 4),
+            "missed_alpha_per_winner": round(missed_per_winner, 4),
+            "lift": round(lift, 4),
         })
 
     # Find best threshold: maximize precision while keeping missed_alpha low
@@ -194,6 +217,7 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
         return {
             "status": "insufficient_vetoes",
             "current_threshold": current_default,
+            "base_rate": round(base_rate, 4),
             "n_down_predictions": n_down,
             "thresholds": threshold_results,
             "note": (
@@ -210,18 +234,53 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
     best = max(scoreable, key=lambda t: t["_score"])
     recommended = best["confidence"]
 
+    # Insufficient lift gate (Gap #8): if best lift < 5pp, don't recommend
+    best_lift = best.get("lift", 0.0)
+    if best_lift is not None and best_lift < 0.05:
+        return {
+            "status": "insufficient_lift",
+            "current_threshold": current_default,
+            "base_rate": round(base_rate, 4),
+            "n_down_predictions": n_down,
+            "n_predictions_loaded": sum(len(v) for v in predictions_by_date.values()),
+            "thresholds": threshold_results,
+            "recommended_threshold": recommended,
+            "recommendation_reason": (
+                f"Best threshold {recommended:.2f} has precision {best['precision']:.1%} "
+                f"but lift over base rate is only {best_lift:.1%} (need 5%+). "
+                f"Base rate: {base_rate:.1%}."
+            ),
+        }
+
+    # Cost sensitivity analysis (Gap #10): sweep cost_weight values
+    cost_sensitivity_weights = [0.15, 0.30, 0.50, 0.70]
+    cost_sensitivity_results = {}
+    for cw in cost_sensitivity_weights:
+        for t in scoreable:
+            cp = cw * (abs(t["missed_alpha"]) / max_missed)
+            t[f"_score_{cw}"] = t["precision"] - cp
+        cw_best = max(scoreable, key=lambda t: t[f"_score_{cw}"])
+        cost_sensitivity_results[str(cw)] = cw_best["confidence"]
+
+    unique_thresholds = set(cost_sensitivity_results.values())
+    cost_sensitivity = "high" if len(unique_thresholds) > 2 else "low" if len(unique_thresholds) == 1 else "moderate"
+
     return {
         "status": "ok",
         "current_threshold": current_default,
+        "base_rate": round(base_rate, 4),
         "n_down_predictions": n_down,
         "n_predictions_loaded": sum(len(v) for v in predictions_by_date.values()),
         "thresholds": threshold_results,
         "recommended_threshold": recommended,
         "recommendation_reason": (
             f"Confidence {recommended:.2f}: precision {best['precision']:.1%} "
+            f"(lift +{best_lift:.1%} over {base_rate:.1%} base rate) "
             f"with {best['missed_alpha']:.4f} missed alpha "
             f"({best['n_vetoes']} vetoes, {best['true_negatives']} correct)"
         ),
+        "cost_sensitivity": cost_sensitivity,
+        "cost_sensitivity_details": cost_sensitivity_results,
     }
 
 

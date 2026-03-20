@@ -195,6 +195,23 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     baseline = {col: baseline_row[col] for col in param_cols if pd.notna(baseline_row[col])}
     baseline = {k: float(v) if isinstance(v, (int, float)) else v for k, v in baseline.items()}
 
+    # Baseline diagnostics: rank of baseline combo and distance info
+    baseline_idx = valid.index.get_loc(baseline_row.name) if baseline_row.name in valid.index else len(valid) - 1
+    baseline_combo_rank = int(baseline_idx) + 1  # 1-based rank by combined_score
+
+    # Count combos closer in param space to current S3 params
+    n_closer_combos = 0
+    if current_params:
+        baseline_dist = _l2_distance(baseline_row, param_cols, current_params, valid)
+        for idx, row in valid.iterrows():
+            if idx == baseline_row.name:
+                continue
+            row_dist = _l2_distance(row, param_cols, current_params, valid)
+            if row_dist < baseline_dist:
+                n_closer_combos += 1
+    else:
+        baseline_dist = 0.0
+
     common_fields = {
         "baseline_params": baseline,
         "recommended_params": recommended,
@@ -204,6 +221,9 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
         "best_alpha": best_alpha,
         "baseline_alpha": baseline_alpha,
         "improvement_pct": round(improvement_pct, 4),
+        "baseline_combo_rank": baseline_combo_rank,
+        "baseline_distance": round(float(baseline_dist), 4),
+        "n_closer_combos": n_closer_combos,
     }
 
     min_improvement = _cfg.get("min_sharpe_improvement", _MIN_SHARPE_IMPROVEMENT)
@@ -247,6 +267,21 @@ def _find_closest_combo(
         distances += ((col_vals - float(target[col])) / col_range) ** 2
 
     return valid.loc[distances.idxmin()]
+
+
+def _l2_distance(row: pd.Series, param_cols: list[str], target: dict, valid: pd.DataFrame) -> float:
+    """Compute normalized L2 distance from a single row to target params."""
+    dist = 0.0
+    for col in param_cols:
+        if col not in target:
+            continue
+        col_vals = pd.to_numeric(valid[col], errors="coerce")
+        col_range = col_vals.max() - col_vals.min()
+        if col_range == 0:
+            continue
+        val = float(row[col]) if pd.notna(row[col]) else 0.0
+        dist += ((val - float(target[col])) / col_range) ** 2
+    return dist ** 0.5
 
 
 def validate_holdout(

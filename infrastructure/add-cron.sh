@@ -2,6 +2,10 @@
 # Register the weekly backtester cron job.
 # Safe to run multiple times — replaces existing entry.
 #
+# The backtester runs on a spot instance launched from the always-on EC2.
+# The spot_backtest.sh script handles the full lifecycle:
+#   launch spot → clone repos → install deps → run backtest → terminate
+#
 # Schedule: Mondays at 08:00 UTC (1 hour after predictor training starts at 07:00)
 # This ensures the backtester runs against the freshly trained GBM model.
 #
@@ -22,7 +26,8 @@ fi
 
 SOURCE_ENV=". ${ENV_FILE} &&"
 
-CRON_LINE="0 8 * * 1  cd /home/ec2-user/alpha-engine-backtester && git pull --ff-only >> /var/log/backtester.log 2>&1 && cd /home/ec2-user/alpha-engine && git pull --ff-only >> /var/log/backtester.log 2>&1 && cd /home/ec2-user/alpha-engine-backtester && ${SOURCE_ENV} .venv/bin/python backtest.py --mode all --upload >> /var/log/backtester.log 2>&1"
+# Launch spot instance for the full backtest (10y data, param sweep, upload results)
+CRON_LINE="0 8 * * 1  cd /home/ec2-user/alpha-engine-backtester && git pull --ff-only >> /var/log/backtester.log 2>&1 && ${SOURCE_ENV} bash infrastructure/spot_backtest.sh >> /var/log/backtester.log 2>&1"
 
 # Remove existing backtester entry, then add new one
 EXISTING=$(crontab -l 2>/dev/null || true)
@@ -34,8 +39,8 @@ FILTERED=$(echo "$EXISTING" | grep -v "alpha-engine-backtester" || true)
 } | crontab -
 
 echo "Backtester cron job registered: Mondays 08:00 UTC"
+echo "  Mode: spot instance (launched from always-on EC2)"
 echo "  Secrets: sourced from ${ENV_FILE}"
-echo "  Note: --stop-instance removed (EC2 hosts 24/7 web services)"
 echo ""
 echo "Current crontab:"
 crontab -l

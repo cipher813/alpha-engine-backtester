@@ -191,8 +191,35 @@ def build_matrix(
     df = pd.DataFrame.from_dict(rows, orient="index")
     df.index = pd.to_datetime(df.index)
     df.sort_index(inplace=True)
+
+    # Gap detection (Gap #11): detect ffill'd gaps before filling
+    was_nan = df.isna()
+    gap_lengths = was_nan.sum(axis=0)
+    long_gaps = gap_lengths[gap_lengths > 5]
+    price_gap_warnings = {}
+    if not long_gaps.empty:
+        price_gap_warnings = {str(k): int(v) for k, v in long_gaps.items()}
+        logger.warning("Price gaps detected (will be ffill'd): %s", price_gap_warnings)
+
     df.ffill(inplace=True)
     df.bfill(inplace=True)
+
+    # Freshness validation (Gap #12): check last price date is recent
+    staleness_warning = None
+    if not df.empty:
+        last_price_date = df.index.max()
+        expected = pd.Timestamp.now() - pd.tseries.offsets.BDay(2)
+        if last_price_date < expected:
+            staleness_warning = (
+                f"Stale price data: last date {last_price_date.date()}, "
+                f"expected >= {expected.date()}"
+            )
+            logger.warning(staleness_warning)
+
+    # Store metadata on the DataFrame for downstream reporting
+    df.attrs["price_gap_warnings"] = price_gap_warnings
+    df.attrs["staleness_warning"] = staleness_warning
+
     return df
 
 
