@@ -1,0 +1,204 @@
+"""Unit tests for optimizer.weight_optimizer — guardrail logic, no S3 calls."""
+import pytest
+from unittest.mock import patch, MagicMock
+
+import pandas as pd
+
+from optimizer.weight_optimizer import compute_weights, apply_weights, init_config
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _make_df(n: int = 100, news_corr: float = 0.1, research_corr: float = 0.2):
+    """Create a synthetic score_performance DataFrame with sub-scores.
+
+    Generates data where news_score and research_score have approximate
+    correlations with beat_spy_10d and beat_spy_30d outcomes.
+    """
+    import random
+    random.seed(42)
+
+    rows = []
+    base_date = "2026-01-"
+    for i in range(n):
+        day = (i % 28) + 1
+        score_date = f"{base_date}{day:02d}"
+        news = random.uniform(30, 90)
+        research = random.uniform(30, 90)
+        # Higher sub-scores → higher probability of beating SPY
+        p_beat = 0.3 + news_corr * (news / 100) + research_corr * (research / 100)
+        beat_10d = 1 if random.random() < min(p_beat, 1.0) else 0
+        beat_30d = 1 if random.random() < min(p_beat, 1.0) else 0
+        rows.append({
+            "symbol": f"STOCK{i % 20}",
+            "score_date": score_date,
+            "news_score": news,
+            "research_score": research,
+            "beat_spy_10d": beat_10d,
+            "beat_spy_30d": beat_30d,
+        })
+    return pd.DataFrame(rows)
+
+
+def _init_default_config():
+    """Initialize the module config with default values."""
+    init_config({
+        "weight_optimizer": {
+            "default_weights": {"news": 0.50, "research": 0.50},
+            "max_single_change": 0.10,
+            "min_meaningful_change": 0.03,
+            "blend_factor": 0.20,
+            "confidence_low": 100,
+            "confidence_medium": 300,
+            "horizon_blend": {"beat_spy_10d": 0.50, "beat_spy_30d": 0.50},
+            "blend_factor_min": 0.20,
+            "blend_factor_max": 0.50,
+            "blend_ramp_samples": 500,
+        }
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# compute_weights — guardrail and normalization logic
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestComputeWeights:
+
+    def setup_method(self):
+        _init_default_config()
+
+    def test_weights_normalize_to_one(self):
+        """Suggested weights should always sum to 1.0."""
+        df = _make_df(n=200)
+        result = compute_weights(df, current_weights={"news": 0.50, "research": 0.50})
+        assert result["status"] == "ok"
+        total = sum(result["suggested_weights"].values())
+        assert abs(total - 1.0) < 0.01
+
+    def test_insufficient_data_returns_early(self):
+        """Fewer than min_samples rows → status=insufficient_data."""
+        df = _make_df(n=10)
+        result = compute_weights(df, min_samples=30)
+        assert result["status"] == "insufficient_data"
+
+    def test_no_subscores_returns_status(self):
+        """DataFrame without sub-score columns → status=no_subscores."""
+        df = _make_df(n=100)
+        df = df.drop(columns=["news_score", "research_score"])
+        result = compute_weights(df)
+        assert result["status"] == "no_subscores"
+
+    def test_oos_degradation_computed(self):
+        """Result should include oos_passed and oos_degradation fields."""
+        df = _make_df(n=200)
+        result = compute_weights(df)
+        assert result["status"] == "ok"
+        assert "oos_passed" in result
+        assert "oos_degradation" in result
+        assert isinstance(result["oos_degradation"], float)
+
+    def test_changes_dict_present(self):
+        """Result should include changes dict showing delta from current."""
+        df = _make_df(n=200)
+        result = compute_weights(df, current_weights={"news": 0.50, "research": 0.50})
+        assert "changes" in result
+        assert "news" in result["changes"]
+        assert "research" in result["changes"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# apply_weights — guardrail enforcement
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestApplyWeights:
+
+    def setup_method(self):
+        _init_default_config()
+
+    def test_max_single_weight_change_enforced(self):
+        """If any single weight changes > 10%, apply should reject."""
+        result = {
+            "status": "ok",
+            "confidence": "high",
+            "oos_passed": True,
+            "suggested_weights": {"news": 0.35, "research": 0.65},
+            "changes": {"news": -0.15, "research": 0.15},
+            "n_samples": 500,
+        }
+        outcome = apply_weights(result, bucket="test-bucket")
+        assert outcome["applied"] is False
+        assert "exceeds" in outcome["reason"].lower() or "limit" in outcome["reason"].lower()
+
+    def test_min_meaningful_change_gate(self):
+        """If all changes < 3%, apply should skip as not worth updating."""
+        result = {
+            "status": "ok",
+            "confidence": "high",
+            "oos_passed": True,
+            "suggested_weights": {"news": 0.51, "research": 0.49},
+            "changes": {"news": 0.01, "research": -0.01},
+            "n_samples": 500,
+        }
+        outcome = apply_weights(result, bucket="test-bucket")
+        assert outcome["applied"] is False
+        assert "not worth" in outcome["reason"].lower()
+
+    def test_low_confidence_blocks_apply(self):
+        """Low confidence (< 50 samples) → should not apply."""
+        result = {
+            "status": "ok",
+            "confidence": "low",
+            "oos_passed": True,
+            "suggested_weights": {"news": 0.45, "research": 0.55},
+            "changes": {"news": -0.05, "research": 0.05},
+            "n_samples": 40,
+        }
+        outcome = apply_weights(result, bucket="test-bucket")
+        assert outcome["applied"] is False
+        assert "confidence" in outcome["reason"].lower()
+
+    def test_oos_degradation_blocks_apply(self):
+        """OOS validation failure → should not apply."""
+        result = {
+            "status": "ok",
+            "confidence": "high",
+            "oos_passed": False,
+            "oos_degradation": 0.35,
+            "suggested_weights": {"news": 0.45, "research": 0.55},
+            "changes": {"news": -0.05, "research": 0.05},
+            "n_samples": 500,
+        }
+        outcome = apply_weights(result, bucket="test-bucket")
+        assert outcome["applied"] is False
+        assert "OOS" in outcome["reason"] or "oos" in outcome["reason"].lower()
+
+    def test_non_ok_status_blocks_apply(self):
+        """Non-ok status → should not apply."""
+        result = {"status": "insufficient_data"}
+        outcome = apply_weights(result, bucket="test-bucket")
+        assert outcome["applied"] is False
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.weight_optimizer.save_previous", create=True)
+    def test_valid_changes_applied_to_s3(self, mock_save, mock_boto3):
+        """Changes within all guardrails → applied = True."""
+        # Patch the import inside apply_weights
+        import optimizer.weight_optimizer as wo
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            mock_s3 = MagicMock()
+            mock_boto3.client.return_value = mock_s3
+
+            result = {
+                "status": "ok",
+                "confidence": "medium",
+                "oos_passed": True,
+                "suggested_weights": {"news": 0.45, "research": 0.55},
+                "changes": {"news": -0.05, "research": 0.05},
+                "n_samples": 200,
+            }
+            outcome = apply_weights(result, bucket="test-bucket")
+            assert outcome["applied"] is True
+            assert outcome["weights"] == {"news": 0.45, "research": 0.55}

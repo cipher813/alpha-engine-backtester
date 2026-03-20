@@ -36,6 +36,7 @@ import json
 import logging
 import tempfile
 import os
+import time as _time
 from datetime import date
 from pathlib import Path
 
@@ -834,6 +835,8 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    _health_start = _time.time()
+
     # Flow Doctor: structured error capture
     fd = None
     try:
@@ -1124,6 +1127,31 @@ def main():
                 "upload": args.upload,
             })
     finally:
+        # Write health status
+        try:
+            from health_status import write_health
+            configs_applied = []
+            if weight_result and weight_result.get("apply_result", {}).get("applied"):
+                configs_applied.append("scoring_weights")
+            if executor_rec and executor_rec.get("apply_result", {}).get("applied"):
+                configs_applied.append("executor_params")
+            if veto_result and veto_result.get("apply_result", {}).get("applied"):
+                configs_applied.append("predictor_params")
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            write_health(
+                bucket=bucket,
+                module_name="backtester",
+                status="ok",
+                run_date=args.date,
+                duration_seconds=_time.time() - _health_start,
+                summary={
+                    "mode": args.mode,
+                    "configs_applied": configs_applied,
+                },
+            )
+        except Exception as _he:
+            logger.warning("Health status write failed: %s", _he)
+
         if args.stop_instance:
             _stop_ec2_instance()
 
