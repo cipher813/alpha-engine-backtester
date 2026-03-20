@@ -106,6 +106,99 @@ S3 Output
 
 ---
 
+## Optimization Architecture
+
+The backtester runs three independent optimizers, each writing an S3 config file that the target module reads on cold-start. All optimizers include conservative guardrails to prevent harmful parameter swings.
+
+### Weight Optimizer → `config/scoring_weights.json`
+
+Tunes the balance between Research sub-scores (news vs research) in the composite attractiveness score.
+
+**Approach:** Correlation-based optimization with conservative blending.
+
+1. Split `score_performance` data 70/30 by date (train/test)
+2. Correlate each sub-score with `beat_spy_10d` and `beat_spy_30d` on train set
+3. Blend horizons 50/50 (configurable)
+4. Progressive blend factor: 20% data-driven at low sample sizes → 50% at 500+ samples
+5. Validate on test set: OOS degradation must be < 20%
+6. Stability check: no direction reversals in prior 3 weeks
+
+**Guardrails:**
+- Max single weight change: 10%
+- Min meaningful change: 3%
+- Minimum confidence: "medium" (50+ samples per tier)
+- OOS validation must pass
+- Weights always normalize to sum = 1.0
+
+### Executor Optimizer → `config/executor_params.json`
+
+Recommends the best executor parameter combination from the parameter sweep, ranked by risk-adjusted return.
+
+**Approach:** Random search (Bergstra & Bengio sampling) over a configurable grid.
+
+**Search strategy:**
+- Trial count = 25% of grid size, clamped to [50, 400]
+- 95% confidence of finding a top-5% configuration with ~60 trials
+- Each trial runs a full portfolio simulation via VectorBT
+
+**Ranking function:** `combined_score = Sharpe ratio - 0.5 × max_drawdown`
+
+**Improvement gate:** Best combo must exceed baseline by ≥ 10% Sharpe improvement. Holdout validation (last 30% of dates) must achieve ≥ 50% of training Sharpe.
+
+**Parameter sweep space (16 parameters):**
+
+| Parameter | Grid values | Controls |
+|-----------|-------------|----------|
+| `min_score` | 65, 70, 75, 80 | Minimum research score to enter |
+| `max_position_pct` | 0.05, 0.10, 0.15 | Max single position (% NAV) |
+| `drawdown_circuit_breaker` | 0.10, 0.15, 0.20 | Halt threshold (excluded from auto-tune) |
+| `atr_multiplier` | 2.0, 3.0, 4.0 | ATR trailing stop multiplier |
+| `time_decay_reduce_days` | 5, 7, 10 | Days before position reduction |
+| `time_decay_exit_days` | 10, 15, 20 | Days before full exit |
+| `reduce_fraction` | 0.25, 0.33, 0.50 | Fraction to sell on REDUCE |
+| `atr_sizing_target_risk` | 0.01, 0.02, 0.03 | Target risk per trade (ATR sizing) |
+| `confidence_sizing_min` | 0.6, 0.7, 0.8 | Min p_up for confidence sizing |
+| `confidence_sizing_range` | 0.4, 0.6, 0.8 | p_up range for linear scaling |
+| `staleness_decay_per_day` | 0.02, 0.03, 0.05 | Score decay per day of signal age |
+| `earnings_sizing_reduction` | 0.30, 0.50, 0.70 | Sizing reduction near earnings |
+| `earnings_proximity_days` | 3, 5, 7 | Days before earnings to reduce |
+| `momentum_gate_threshold` | -10.0, -5.0, -2.0 | Min 5d momentum to enter |
+| `correlation_block_threshold` | 0.70, 0.75, 0.80, 0.85 | Max pairwise correlation allowed |
+| `profit_take_pct` | 0.15, 0.20, 0.25, 0.30 | Gain % to trigger profit-taking |
+
+**Safe-to-auto-tune** (all except `drawdown_circuit_breaker`, `max_sector_pct`, `max_equity_pct` which are too dangerous to auto-adjust).
+
+### Veto Analyzer → `config/predictor_params.json`
+
+Calibrates the predictor's veto confidence threshold — the minimum GBM confidence required to override a BUY signal with a DOWN prediction.
+
+**Approach:** Precision-cost tradeoff optimization.
+
+**Thresholds swept:** 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80
+
+**Scoring function:** `score = precision - 0.30 × (missed_alpha / max_missed_alpha)`
+- Precision = % of vetoed signals that actually underperformed (true negatives)
+- Cost = alpha left on the table by false vetoes
+- Cost sensitivity analysis: sweeps penalty weights [0.15, 0.30, 0.50, 0.70]
+
+**Gates to pass:**
+- Min 30 predictions total
+- Min 10 veto decisions per threshold
+- Lift > 5% over base rate (% of BUY signals that already beat SPY)
+- Threshold change ≥ 0.10 from current setting
+
+### Portfolio Simulation (VectorBT)
+
+All parameter sweep trials and the standalone simulation mode use VectorBT:
+
+- `init_cash`: Starting NAV (default $1M)
+- `fees`: Transaction cost (default 10bps round-trip)
+- `slippage_bps`: Additional slippage per side (configurable)
+- `assume_next_day_fill`: Shift ENTER orders to next trading day (conservative)
+- Alpha computed as portfolio return minus SPY return over the simulation period
+
+---
+
 ## Usage
 
 ```bash
@@ -173,13 +266,12 @@ alpha-engine-backtester/
 
 ## Deployment (EC2)
 
-The backtester runs weekly on EC2 via cron:
+The backtester runs weekly on EC2 via cron. The EC2 instance runs 24/7 (hosts nousergon.ai and the private dashboard), so no start/stop orchestration is needed.
 
-| Step | Time | Action |
-|------|------|--------|
-| EventBridge | Monday ~07:45 UTC | Starts EC2 instance |
-| Cron | Monday 08:00 UTC | Runs `backtest.py --mode all --upload --stop-instance` |
-| Completion | ~08:30 UTC | Instance stops itself |
+| Step | Time (UTC) | Time (ET) | Action |
+|------|------------|-----------|--------|
+| Cron | Monday 08:00 | Monday 3:00 AM | Runs `backtest.py --mode all --upload` |
+| Completion | ~08:30 | ~3:30 AM | Results uploaded to S3, email sent |
 
 Results are uploaded to S3 and emailed. Scoring weights and parameter configs are updated automatically if the data supports a change.
 

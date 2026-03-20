@@ -46,7 +46,7 @@ import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution, param_sweep
 from analysis import veto_analysis
-from optimizer import weight_optimizer, executor_optimizer
+from optimizer import weight_optimizer, executor_optimizer, research_optimizer
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
 
@@ -182,8 +182,10 @@ def _push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
         try:
             resp = s3.get_object(Bucket=bucket, Key=metrics_key)
             existing = json.loads(resp["Body"].read())
-        except Exception:
+        except s3.exceptions.NoSuchKey:
             pass  # fresh file or not yet written
+        except Exception as e:
+            logger.warning("Failed to read existing predictor metrics from S3: %s", e)
 
         existing["hit_rate_30d_rolling"] = round(hit_rate, 4)
         existing["ic_30d"] = ic_30d
@@ -368,6 +370,7 @@ def run_weight_optimizer(config: dict, df_base: pd.DataFrame) -> dict:
             df_with_sub,
             current_weights=current_weights,
             min_samples=min_samples,
+            bucket=bucket,
         )
         apply_result = weight_optimizer.apply_weights(result, bucket)
         result["apply_result"] = apply_result
@@ -524,11 +527,27 @@ def _run_simulation_loop(
         }
 
     fees = config.get("simulation_fees", 0.001)
-    pf = orders_to_portfolio(all_orders, price_matrix, init_cash=init_cash, fees=fees)
+    sim_cfg = config.get("simulation", {})
+    slippage_bps = float(sim_cfg.get("slippage_bps", 0))
+    assume_next_day_fill = bool(sim_cfg.get("assume_next_day_fill", False))
+    pf = orders_to_portfolio(
+        all_orders, price_matrix, init_cash=init_cash, fees=fees,
+        slippage_bps=slippage_bps, assume_next_day_fill=assume_next_day_fill,
+    )
     stats = compute_portfolio_stats(pf, spy_prices=spy_prices)
+    # Record simulation assumptions for reporting
+    if slippage_bps > 0 or assume_next_day_fill:
+        fill_type = "next-day close" if assume_next_day_fill else "same-day close"
+        stats["simulation_assumptions"] = f"Fills: {fill_type} + {slippage_bps:.0f}bp slippage"
     stats["status"] = "ok"
     stats["dates_simulated"] = dates_simulated
     stats["total_orders"] = len(all_orders)
+    # Pass through price data quality metadata for reporting
+    if hasattr(price_matrix, 'attrs'):
+        if price_matrix.attrs.get("price_gap_warnings"):
+            stats["price_gap_warnings"] = price_matrix.attrs["price_gap_warnings"]
+        if price_matrix.attrs.get("staleness_warning"):
+            stats["staleness_warning"] = price_matrix.attrs["staleness_warning"]
     return stats
 
 
@@ -821,8 +840,10 @@ def main():
         import flow_doctor
         fd = flow_doctor.init(config_path=os.path.join(
             os.path.dirname(__file__), "flow-doctor.yaml"))
-    except Exception:
-        pass
+    except ImportError:
+        pass  # flow-doctor not installed — optional dependency
+    except Exception as e:
+        logger.warning("flow-doctor init failed: %s", e)
 
     config = load_config(args.config)
 
@@ -842,6 +863,7 @@ def main():
     weight_optimizer.init_config(config)
     executor_optimizer.init_config(config)
     veto_analysis.init_config(config)
+    research_optimizer.init_config(config)
 
     # Pull research.db from S3 unless a local path was explicitly provided.
     # research.db lives at s3://{signals_bucket}/research.db — Lambda writes it
@@ -880,6 +902,25 @@ def main():
             except Exception as e:
                 logger.error("Veto analysis failed: %s", e)
                 veto_result = {"status": "error", "error": str(e)}
+
+        # Phase 4: Research params optimization (boost correlations)
+        research_params_result = {"status": "skipped"}
+        if df_base is not None and not df_base.empty:
+            try:
+                bucket = config.get("signals_bucket", "alpha-engine-research")
+                current_rp = research_optimizer.read_current_params(bucket)
+                corr_result = research_optimizer.compute_boost_correlations(df_base, bucket)
+                if corr_result.get("status") == "ok":
+                    research_params_result = research_optimizer.recommend(corr_result, current_rp)
+                    if research_params_result.get("status") == "ok":
+                        research_params_result["apply_result"] = research_optimizer.apply(
+                            research_params_result, bucket,
+                        )
+                else:
+                    research_params_result = corr_result
+            except Exception as e:
+                logger.error("Research params optimization failed: %s", e)
+                research_params_result = {"status": "error", "error": str(e)}
     else:
         sq_result = {"status": "skipped"}
         regime_rows = []
