@@ -22,6 +22,79 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 
+def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
+    """Data accumulation progress — shows how close each optimizer is to activation."""
+    db_path = config.get("research_db")
+    if not db_path or not os.path.exists(db_path):
+        return []
+
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+
+        # score_performance counts
+        sp_total = conn.execute("SELECT COUNT(*) FROM score_performance").fetchone()[0]
+        sp_with_10d = conn.execute(
+            "SELECT COUNT(*) FROM score_performance WHERE beat_spy_10d IS NOT NULL"
+        ).fetchone()[0]
+        sp_with_30d = conn.execute(
+            "SELECT COUNT(*) FROM score_performance WHERE beat_spy_30d IS NOT NULL"
+        ).fetchone()[0]
+        sp_dates = conn.execute("SELECT COUNT(DISTINCT score_date) FROM score_performance").fetchone()[0]
+        sp_earliest = conn.execute("SELECT MIN(score_date) FROM score_performance").fetchone()[0] or "—"
+        sp_latest = conn.execute("SELECT MAX(score_date) FROM score_performance").fetchone()[0] or "—"
+
+        # predictor_outcomes counts
+        po_total = conn.execute("SELECT COUNT(*) FROM predictor_outcomes").fetchone()[0]
+        po_resolved = conn.execute(
+            "SELECT COUNT(*) FROM predictor_outcomes WHERE correct_5d IS NOT NULL"
+        ).fetchone()[0]
+        po_dates = conn.execute(
+            "SELECT COUNT(DISTINCT prediction_date) FROM predictor_outcomes"
+        ).fetchone()[0]
+
+        conn.close()
+    except Exception as e:
+        logger.debug("Data accumulation section failed: %s", e)
+        return []
+
+    def _bar(current: int, target: int) -> str:
+        pct = min(current / target, 1.0) if target > 0 else 0
+        filled = int(pct * 10)
+        return f"{'█' * filled}{'░' * (10 - filled)} {current}/{target}"
+
+    lines = [
+        "## Data Accumulation",
+        "",
+        f"Score data: **{sp_total}** signals across **{sp_dates}** dates ({sp_earliest} → {sp_latest})",
+        f"Predictor data: **{po_total}** predictions across **{po_dates}** dates, **{po_resolved}** resolved",
+        "",
+        "| Optimizer | Metric | Progress | Status |",
+        "|-----------|--------|----------|--------|",
+        f"| Signal quality | 10d returns | {_bar(sp_with_10d, 5)} | {'**Active**' if sp_with_10d >= 5 else 'Accumulating'} |",
+        f"| Scoring weights | 10d returns | {_bar(sp_with_10d, 30)} | {'**Active**' if sp_with_10d >= 30 else 'Accumulating'} |",
+        f"| Attribution | 10d returns | {_bar(sp_with_10d, 50)} | {'**Active**' if sp_with_10d >= 50 else 'Accumulating'} |",
+        f"| Predictor veto | Resolved outcomes | {_bar(po_resolved, 20)} | {'**Active**' if po_resolved >= 20 else 'Accumulating'} |",
+        f"| Research params | Signals | {_bar(sp_total, 200)} | {'**Active**' if sp_total >= 200 else 'Deferred'} |",
+    ]
+
+    # Add accuracy preview if we have any data
+    if sp_with_10d > 0:
+        try:
+            import sqlite3
+            conn = sqlite3.connect(db_path)
+            beat = conn.execute(
+                "SELECT SUM(beat_spy_10d) FROM score_performance WHERE beat_spy_10d IS NOT NULL"
+            ).fetchone()[0] or 0
+            acc = beat / sp_with_10d * 100
+            lines.append(f"| **10d accuracy** | **Beat SPY** | **{acc:.0f}% ({int(beat)}/{sp_with_10d})** | {'✓ Above 55%' if acc >= 55 else '⚠ Below 55%'} |")
+            conn.close()
+        except Exception:
+            pass
+
+    return lines
+
+
 def build_report(
     run_date: str,
     signal_quality: dict,
@@ -49,6 +122,10 @@ def build_report(
         "---",
         "",
     ]
+
+    # Data accumulation tracker
+    lines += _section_data_accumulation(signal_quality, config or {})
+    lines += [""]
 
     # Signal quality summary
     lines += _section_signal_quality(signal_quality)
