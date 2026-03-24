@@ -208,6 +208,9 @@ if [ -f requirements.txt ]; then
     grep -v '^flow-doctor' requirements.txt | $PIP install -q -r /dev/stdin 2>/dev/null || true
 fi
 
+# Force numpy<2 after all deps (pyarrow compiled against numpy 1.x)
+$PIP install -q 'numpy<2'
+
 echo "Dependencies installed."
 DEPS
 
