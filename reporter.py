@@ -320,7 +320,10 @@ def _section_attribution(attr: dict) -> list[str]:
 def _section_portfolio(stats: dict) -> list[str]:
     status = stats.get("status")
     if status and status != "ok":
-        note = stats.get("note", stats.get("error", "No details available."))
+        note = stats.get("note") or stats.get("error", "No details available.")
+        # Truncate long error messages (e.g. Plotly property dumps)
+        if len(note) > 200:
+            note = note[:200] + "..."
         return [
             "## Mode 2 — Portfolio simulation",
             "",

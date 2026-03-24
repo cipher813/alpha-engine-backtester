@@ -159,14 +159,21 @@ def _build_body(
     s3_prefix: str,
 ) -> tuple[str, str]:
     # Convert minimal markdown to HTML (tables, headers, blockquotes, hr)
+    import re
+    def _md_inline(text: str) -> str:
+        """Convert **bold** and _italic_ to HTML inline."""
+        text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+        text = re.sub(r'_(.+?)_', r'<em>\1</em>', text)
+        return text
+
     html_lines = []
     for line in report_md.splitlines():
         if line.startswith("# "):
-            html_lines.append(f"<h1>{line[2:]}</h1>")
+            html_lines.append(f"<h1>{_md_inline(line[2:])}</h1>")
         elif line.startswith("## "):
-            html_lines.append(f"<h2>{line[3:]}</h2>")
+            html_lines.append(f"<h2>{_md_inline(line[3:])}</h2>")
         elif line.startswith("> "):
-            html_lines.append(f"<blockquote>{line[2:]}</blockquote>")
+            html_lines.append(f"<blockquote>{_md_inline(line[2:])}</blockquote>")
         elif line.startswith("---"):
             html_lines.append("<hr>")
         elif line.startswith("|"):
@@ -176,7 +183,7 @@ def _build_body(
         elif line.strip() == "":
             html_lines.append("")
         else:
-            html_lines.append(f"<p>{line}</p>")
+            html_lines.append(f"<p>{_md_inline(line)}</p>")
 
     s3_link = ""
     if s3_bucket:
