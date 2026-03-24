@@ -208,6 +208,77 @@ def _push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
         logger.warning("_push_predictor_rolling_metrics: S3 write failed: %s", e)
 
 
+def _seed_predictor_outcomes(config: dict) -> None:
+    """Seed predictor_outcomes rows from S3 predictions/*.json files.
+
+    Reads each predictions/{date}.json from S3 and inserts rows that
+    don't already exist in the DB. This bridges the gap between the
+    predictor (which writes to S3) and the backtester (which needs
+    rows in research.db to backfill actual returns).
+    """
+    import sqlite3 as _sqlite3
+    db_path = config.get("research_db")
+    bucket = config.get("signals_bucket")
+    if not db_path or not os.path.exists(db_path) or not bucket:
+        return
+    try:
+        s3 = boto3.client("s3")
+        # List all prediction files
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix="predictor/predictions/", Delimiter="/")
+        keys = [obj["Key"] for obj in resp.get("Contents", [])
+                if obj["Key"].endswith(".json") and "latest" not in obj["Key"]]
+
+        if not keys:
+            logger.info("No prediction files found in S3 — skipping seed")
+            return
+
+        conn = _sqlite3.connect(db_path)
+        existing = {
+            (r[0], r[1]) for r in
+            conn.execute("SELECT symbol, prediction_date FROM predictor_outcomes").fetchall()
+        }
+
+        inserted = 0
+        for key in keys:
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                data = json.loads(obj["Body"].read())
+                pred_date = data.get("date") or key.split("/")[-1].replace(".json", "")
+                for p in data.get("predictions", []):
+                    ticker = p.get("ticker")
+                    if not ticker or (ticker, pred_date) in existing:
+                        continue
+                    conn.execute(
+                        """INSERT INTO predictor_outcomes
+                           (symbol, prediction_date, predicted_direction, prediction_confidence,
+                            p_up, p_flat, p_down, score_modifier_applied)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            ticker, pred_date,
+                            p.get("predicted_direction"),
+                            p.get("prediction_confidence"),
+                            p.get("p_up"),
+                            p.get("p_flat"),
+                            p.get("p_down"),
+                            0.0,
+                        ),
+                    )
+                    existing.add((ticker, pred_date))
+                    inserted += 1
+            except Exception as e:
+                logger.debug("Skipping prediction file %s: %s", key, e)
+                continue
+
+        conn.commit()
+        conn.close()
+        if inserted:
+            logger.info("Seeded %d predictor_outcomes rows from %d S3 prediction files", inserted, len(keys))
+        else:
+            logger.info("All predictor_outcomes already seeded (%d files checked)", len(keys))
+    except Exception as e:
+        logger.warning("_seed_predictor_outcomes: %s", e)
+
+
 def _backfill_predictor_outcomes(config: dict, df_base: pd.DataFrame) -> None:
     """Backfill actual_5d_return and correct_5d for pending predictor_outcomes rows."""
     import sqlite3 as _sqlite3
@@ -294,6 +365,7 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
     )
 
     attr_result = attribution.compute_attribution(df_base)
+    _seed_predictor_outcomes(config)
     _backfill_predictor_outcomes(config, df_base)
     _push_predictor_rolling_metrics(config, config.get("research_db", ""))
 
