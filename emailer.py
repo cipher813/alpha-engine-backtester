@@ -167,7 +167,15 @@ def _build_body(
         return text
 
     html_lines = []
+    in_table = False
     for line in report_md.splitlines():
+        is_table_line = line.startswith("|")
+
+        # Close table if we were in one and this line isn't a table row
+        if in_table and not is_table_line:
+            html_lines.append("</table>")
+            in_table = False
+
         if line.startswith("# "):
             html_lines.append(f"<h1>{_md_inline(line[2:])}</h1>")
         elif line.startswith("## "):
@@ -176,14 +184,28 @@ def _build_body(
             html_lines.append(f"<blockquote>{_md_inline(line[2:])}</blockquote>")
         elif line.startswith("---"):
             html_lines.append("<hr>")
-        elif line.startswith("|"):
-            html_lines.append(_md_table_row(line))
+        elif is_table_line:
+            if not in_table:
+                _table_first_row = True
+                html_lines.append('<table border="1" cellpadding="4" cellspacing="0" '
+                                  'style="border-collapse:collapse; font-size:12px; '
+                                  'border-color:#ddd; margin:8px 0;">')
+                in_table = True
+            else:
+                _table_first_row = False
+            row_html = _md_table_row(line, is_header=_table_first_row)
+            if row_html:  # skip empty separator rows
+                html_lines.append(row_html)
         elif line.startswith("_") and line.endswith("_"):
             html_lines.append(f"<p><em>{line.strip('_')}</em></p>")
         elif line.strip() == "":
             html_lines.append("")
         else:
             html_lines.append(f"<p>{_md_inline(line)}</p>")
+
+    # Close any trailing table
+    if in_table:
+        html_lines.append("</table>")
 
     s3_link = ""
     if s3_bucket:
@@ -198,15 +220,12 @@ def _build_body(
     return html_body, report_md  # plain body is just the markdown
 
 
-def _md_table_row(line: str) -> str:
+def _md_table_row(line: str, is_header: bool = False) -> str:
     """Convert a markdown table row to an HTML table row."""
     cells = [c.strip() for c in line.strip().strip("|").split("|")]
     if all(set(c) <= set("-: ") for c in cells):
         return ""  # separator row
-    tag = "th" if any(c.strip().startswith("**") or line.startswith("| Metric") or
-                      line.startswith("| File") or line.startswith("| Bucket") or
-                      line.startswith("| Min") or line.startswith("| Regime") or
-                      line.startswith("| Sub") or line.startswith("| Threshold")
-                      for c in cells) else "td"
-    inner = "".join(f"<{tag}>{c}</{tag}>" for c in cells)
+    tag = "th" if is_header else "td"
+    style = ' style="background:#f5f5f5; font-weight:bold;"' if is_header else ""
+    inner = "".join(f"<{tag}{style}>{c}</{tag}>" for c in cells)
     return f"<tr>{inner}</tr>"
