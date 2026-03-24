@@ -232,6 +232,18 @@ if [ -f "$EXECUTOR_CONFIG" ]; then
         ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine/config/risk.yaml
 fi
 
+# Bootstrap predictor data cache (sector_map.json required for predictor backtest)
+run_remote bash -s <<'CACHE'
+set -euo pipefail
+CACHE_DIR="/home/ec2-user/alpha-engine-predictor/data/cache"
+mkdir -p "$CACHE_DIR"
+if command -v aws &>/dev/null; then
+    # Download sector_map.json from the predictor's S3 price cache
+    aws s3 cp s3://alpha-engine-research/predictor/price_cache/sector_map.json "$CACHE_DIR/sector_map.json" 2>/dev/null || true
+fi
+echo "Predictor cache dir: $(ls "$CACHE_DIR" 2>/dev/null | wc -l) files"
+CACHE
+
 # ── Build env export command ─────────────────────────────────────────────────
 ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-backtester/.env ] && source /home/ec2-user/alpha-engine-backtester/.env; set +a; export XDG_CACHE_HOME=/tmp;'
 
