@@ -6,8 +6,8 @@
 # The spot_backtest.sh script handles the full lifecycle:
 #   launch spot → clone repos → install deps → run backtest → terminate
 #
-# Schedule: Mondays at 08:00 UTC (1 hour after predictor training starts at 07:00)
-# This ensures the backtester runs against the freshly trained GBM model.
+# Schedule: Saturdays at 08:00 UTC (2 hours after research pipeline starts at 06:00)
+# Saturday gives a weekend buffer to fix pipeline issues before Monday trading.
 #
 # Secrets sourced from ~/.alpha-engine.env (shared with executor).
 #
@@ -27,7 +27,7 @@ fi
 SOURCE_ENV=". ${ENV_FILE} &&"
 
 # Launch spot instance for the full backtest (10y data, param sweep, upload results)
-CRON_LINE="0 8 * * 1  cd /home/ec2-user/alpha-engine-backtester && git pull --ff-only >> /var/log/backtester.log 2>&1 && ${SOURCE_ENV} bash infrastructure/spot_backtest.sh >> /var/log/backtester.log 2>&1"
+CRON_LINE="0 8 * * 6  cd /home/ec2-user/alpha-engine-backtester && git pull --ff-only >> /var/log/backtester.log 2>&1 && ${SOURCE_ENV} bash infrastructure/spot_backtest.sh >> /var/log/backtester.log 2>&1"
 
 # Remove existing backtester entry, then add new one
 EXISTING=$(crontab -l 2>/dev/null || true)
@@ -38,7 +38,7 @@ FILTERED=$(echo "$EXISTING" | grep -v "alpha-engine-backtester" || true)
     echo "$CRON_LINE"
 } | crontab -
 
-echo "Backtester cron job registered: Mondays 08:00 UTC"
+echo "Backtester cron job registered: Saturdays 08:00 UTC"
 echo "  Mode: spot instance (launched from always-on EC2)"
 echo "  Secrets: sourced from ${ENV_FILE}"
 echo ""
