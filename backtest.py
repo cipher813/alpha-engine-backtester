@@ -426,12 +426,10 @@ def _read_current_weights(config: dict) -> dict:
     return weight_optimizer._cfg.get("default_weights", weight_optimizer._DEFAULT_WEIGHTS).copy()
 
 
-def run_weight_optimizer(config: dict, df_base: pd.DataFrame) -> dict:
+def run_weight_optimizer(config: dict, df_base: pd.DataFrame, freeze: bool = False) -> dict:
     """
     Run the weight optimizer: join sub-scores from signals.json in S3 with
     score_performance outcomes, then suggest revised scoring weights.
-
-    Advisory only — no weights are changed. Output included in the weekly report.
     """
     bucket = config.get("signals_bucket", "alpha-engine-research")
     current_weights = _read_current_weights(config)
@@ -445,8 +443,11 @@ def run_weight_optimizer(config: dict, df_base: pd.DataFrame) -> dict:
             min_samples=min_samples,
             bucket=bucket,
         )
-        apply_result = weight_optimizer.apply_weights(result, bucket)
-        result["apply_result"] = apply_result
+        if freeze:
+            result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+        else:
+            apply_result = weight_optimizer.apply_weights(result, bucket)
+            result["apply_result"] = apply_result
         return result
     except Exception as e:
         logger.warning("Weight optimizer failed: %s", e)
@@ -899,6 +900,8 @@ def main():
                         help="Stop this EC2 instance after completion (for scheduled runs)")
     parser.add_argument("--rollback", action="store_true",
                         help="Rollback all S3 configs to previous versions and exit")
+    parser.add_argument("--freeze", action="store_true",
+                        help="Skip all S3 config promotions (guardrails compute + report but never write)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -962,10 +965,11 @@ def main():
     executor_rec = None
     predictor_stats = None
     predictor_sweep_df = None
+    regression_result = None
 
     if args.mode in ("signal-quality", "all"):
         sq_result, regime_rows, score_rows, attr_result, df_base = run_signal_quality(config)
-        weight_result = run_weight_optimizer(config, df_base)
+        weight_result = run_weight_optimizer(config, df_base, freeze=args.freeze)
 
         # Phase 3: Veto threshold analysis (needs score_performance data)
         if df_base is not None and not df_base.empty:
@@ -973,7 +977,10 @@ def main():
                 bucket = config.get("signals_bucket", "alpha-engine-research")
                 veto_result = veto_analysis.analyze_veto_effectiveness(df_base, bucket)
                 if veto_result.get("status") == "ok":
-                    veto_result["apply_result"] = veto_analysis.apply(veto_result, bucket)
+                    if args.freeze:
+                        veto_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                    else:
+                        veto_result["apply_result"] = veto_analysis.apply(veto_result, bucket)
             except Exception as e:
                 logger.error("Veto analysis failed: %s", e)
                 veto_result = {"status": "error", "error": str(e)}
@@ -988,9 +995,12 @@ def main():
                 if corr_result.get("status") == "ok":
                     research_params_result = research_optimizer.recommend(corr_result, current_rp)
                     if research_params_result.get("status") == "ok":
-                        research_params_result["apply_result"] = research_optimizer.apply(
-                            research_params_result, bucket,
-                        )
+                        if args.freeze:
+                            research_params_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                        else:
+                            research_params_result["apply_result"] = research_optimizer.apply(
+                                research_params_result, bucket,
+                            )
                 else:
                     research_params_result = corr_result
             except Exception as e:
@@ -1091,9 +1101,35 @@ def main():
                         executor_rec = executor_optimizer.validate_holdout(
                             executor_rec, holdout_sim_fn, sim_dates, config,
                         )
+
+                # Twin simulation: current vs proposed on same dates
+                if executor_rec.get("status") == "ok" and _sim_setup is not None:
+                    executor_run_fn, SimClientCls, sim_dates, pm, _, ohlcv_data = _sim_setup
+                    if pm is not None and current_executor_params:
+                        from optimizer.twin_sim import run_twin_simulation
+                        from copy import deepcopy
+                        recommended = executor_rec.get("recommended_params", {})
+                        current_cfg = deepcopy(config)
+                        current_cfg.update(current_executor_params)
+                        proposed_cfg = deepcopy(config)
+                        proposed_cfg.update(recommended)
+                        changed_keys = [k for k in recommended if recommended.get(k) != current_executor_params.get(k)]
+
+                        def twin_sim_fn(cfg):
+                            return _run_simulation_loop(
+                                executor_run_fn, SimClientCls, sim_dates, pm, cfg,
+                                ohlcv_by_ticker=ohlcv_data,
+                            )
+                        executor_rec["twin_sim"] = run_twin_simulation(
+                            twin_sim_fn, current_cfg, proposed_cfg, changed_keys,
+                        )
+
                 if executor_rec.get("status") == "ok":
                     bucket = config.get("signals_bucket", "alpha-engine-research")
-                    executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
+                    if args.freeze:
+                        executor_rec["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                    else:
+                        executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
             except Exception as e:
                 logger.error("Executor optimizer failed: %s", e)
                 executor_rec = {"status": "error", "error": str(e)}
@@ -1119,10 +1155,48 @@ def main():
                 )
                 if executor_rec.get("status") == "ok":
                     bucket = config.get("signals_bucket", "alpha-engine-research")
-                    executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
+                    if args.freeze:
+                        executor_rec["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                    else:
+                        executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
             except Exception as e:
                 logger.error("Executor optimizer (predictor sweep) failed: %s", e)
                 executor_rec = {"status": "error", "error": str(e)}
+
+    # ── Regression detection + rolling metrics ──────────────────────────────
+    try:
+        from optimizer.regression_monitor import (
+            extract_metrics, save_rolling_metrics, save_promotion_baseline,
+            check_regression,
+        )
+        bucket = config.get("signals_bucket", "alpha-engine-research")
+        current_metrics = extract_metrics(portfolio_stats, sq_result)
+
+        if current_metrics:
+            save_rolling_metrics(bucket, args.date, current_metrics)
+
+        # Check if any optimizer promoted this run
+        promoted = []
+        for label, res in [
+            ("scoring_weights", weight_result),
+            ("executor_params", executor_rec),
+            ("predictor_params", veto_result),
+        ]:
+            if res and res.get("apply_result", {}).get("applied"):
+                promoted.append(label)
+
+        # Save baseline before promotions take effect (for next week's comparison)
+        if promoted and current_metrics:
+            save_promotion_baseline(bucket, current_metrics, promoted)
+
+        # Check for regression from previous promotions
+        if current_metrics and not args.freeze:
+            regression_result = check_regression(bucket, current_metrics, config)
+        else:
+            regression_result = None
+    except Exception as e:
+        logger.error("Regression monitor failed: %s", e)
+        regression_result = None
 
     # ── Report, upload, email, and instance stop ───────────────────────────
     # Wrapped in try/finally so --stop-instance ALWAYS runs, even if report
@@ -1143,6 +1217,7 @@ def main():
             predictor_sweep_df=predictor_sweep_df,
             veto_result=veto_result,
             executor_rec=executor_rec,
+            regression_result=regression_result,
         )
 
         # For predictor-backtest mode, use predictor_sweep_df as the sweep output

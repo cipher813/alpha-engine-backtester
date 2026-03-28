@@ -109,6 +109,7 @@ def build_report(
     predictor_sweep_df=None,
     veto_result: dict | None = None,
     executor_rec: dict | None = None,
+    regression_result: dict | None = None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
@@ -125,6 +126,15 @@ def build_report(
 
     # Data accumulation tracker
     lines += _section_data_accumulation(signal_quality, config or {})
+    lines += [""]
+
+    # What Changed This Week (promotion decisions, twin sim, regression)
+    lines += _section_what_changed(
+        weight_result=weight_result,
+        veto_result=veto_result,
+        executor_rec=executor_rec,
+        regression_result=regression_result,
+    )
     lines += [""]
 
     # Signal quality summary
@@ -427,6 +437,129 @@ def _section_portfolio(stats: dict) -> list[str]:
     staleness = stats.get("staleness_warning")
     if staleness:
         lines += [f"> **{staleness}**"]
+    return lines
+
+
+def _section_what_changed(
+    weight_result: dict | None = None,
+    veto_result: dict | None = None,
+    executor_rec: dict | None = None,
+    regression_result: dict | None = None,
+) -> list[str]:
+    """Build the 'What Changed This Week' section — promotion decisions + twin sim."""
+    # Collect promotion decisions
+    decisions = []
+    for label, result in [
+        ("Scoring weights", weight_result),
+        ("Executor params", executor_rec),
+        ("Veto threshold", veto_result),
+    ]:
+        if result is None:
+            continue
+        apply = result.get("apply_result", {})
+        if apply.get("applied"):
+            decisions.append((label, "PROMOTED", None))
+        elif apply:
+            decisions.append((label, "REJECTED", apply.get("reason", "guardrails not met")))
+        elif result.get("status") in ("insufficient_data", "skipped", "no_subscores"):
+            decisions.append((label, "DEFERRED", result.get("note", result.get("status"))))
+
+    # If nothing to report, skip the section entirely
+    has_twin_sim = executor_rec and executor_rec.get("twin_sim", {}).get("status") == "ok"
+    has_regression = regression_result and regression_result.get("checked")
+    if not decisions and not has_twin_sim and not has_regression:
+        return []
+
+    lines = ["## What Changed This Week", ""]
+
+    # Twin simulation results
+    if has_twin_sim:
+        twin = executor_rec["twin_sim"]
+        current = twin.get("current_stats", {})
+        proposed = twin.get("proposed_stats", {})
+        delta = twin.get("delta", {})
+
+        lines += [
+            "### Twin Simulation (Current vs Proposed Executor Params)",
+            "",
+            "| Metric | Current | Proposed | Delta |",
+            "|--------|---------|----------|-------|",
+        ]
+
+        from optimizer.twin_sim import _COMPARE_METRICS
+        for key, label, fmt in _COMPARE_METRICS:
+            c = current.get(key)
+            p = proposed.get(key)
+            d = delta.get(key)
+            c_str = f"{c:{fmt}}" if c is not None else "—"
+            p_str = f"{p:{fmt}}" if p is not None else "—"
+            if d is not None:
+                sign = "+" if d >= 0 else ""
+                d_str = f"{sign}{d:{fmt}}"
+            else:
+                d_str = "—"
+            lines.append(f"| {label} | {c_str} | {p_str} | {d_str} |")
+
+        # Param changes
+        param_changes = twin.get("param_changes", {})
+        if param_changes:
+            lines += [
+                "",
+                "**Parameter changes:**",
+                "",
+                "| Parameter | Before | After |",
+                "|-----------|--------|-------|",
+            ]
+            for k, v in param_changes.items():
+                before = v.get("before")
+                after = v.get("after")
+                b_str = f"{before:.4f}" if isinstance(before, float) else str(before) if before is not None else "—"
+                a_str = f"{after:.4f}" if isinstance(after, float) else str(after) if after is not None else "—"
+                lines.append(f"| {k} | {b_str} | {a_str} |")
+
+        lines += [""]
+
+    # Promotion decisions table
+    if decisions:
+        lines += [
+            "### Promotion Decisions",
+            "",
+            "| Optimizer | Decision | Reason |",
+            "|-----------|----------|--------|",
+        ]
+        for label, decision, reason in decisions:
+            reason_str = reason or "—"
+            lines.append(f"| {label} | {decision} | {reason_str} |")
+        lines += [""]
+
+    # Regression detection
+    if has_regression:
+        reg = regression_result
+        if reg.get("regression_detected"):
+            lines += [
+                "### Regression Detected",
+                "",
+            ]
+            details = reg.get("details", {})
+            acc_drop = details.get("accuracy_drop")
+            sharpe_drop = details.get("sharpe_drop_pct")
+            if acc_drop is not None:
+                lines.append(f"> Accuracy dropped {acc_drop:.1f}pp from baseline")
+            if sharpe_drop is not None:
+                lines.append(f"> Sharpe dropped {sharpe_drop:.1%} from baseline")
+            if reg.get("rollback_triggered"):
+                lines.append("> **AUTO-ROLLBACK triggered.** All configs restored to previous versions.")
+            else:
+                lines.append("> Thresholds not breached — no rollback.")
+            lines += [""]
+        else:
+            lines += [
+                "### Regression Monitor",
+                "",
+                "> No regression detected. Metrics within tolerance of promotion baseline.",
+                "",
+            ]
+
     return lines
 
 
