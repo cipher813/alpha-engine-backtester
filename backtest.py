@@ -300,9 +300,10 @@ def _backfill_predictor_outcomes(config: dict, df_base: pd.DataFrame) -> None:
             conn.close()
             return
         for _, row in pending.iterrows():
+            pred_date = str(row["prediction_date"])
             match = df_base[
                 (df_base["symbol"] == row["symbol"]) &
-                (df_base["score_date"] == row["prediction_date"])
+                (df_base["score_date"].astype(str).str[:10] == pred_date)
             ]
             if match.empty:
                 continue
