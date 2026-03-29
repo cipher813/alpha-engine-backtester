@@ -226,13 +226,47 @@ if [ -f "$ENV_FILE" ]; then
         ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-backtester/.env
 fi
 
-# Also copy executor config if it exists (needed for simulation)
-EXECUTOR_CONFIG="$HOME/Development/alpha-engine/config/risk.yaml"
-if [ -f "$EXECUTOR_CONFIG" ]; then
+# Copy executor config (needed for simulation).
+# Try EC2 path first (when launched from always-on EC2), then local dev path.
+EXECUTOR_CONFIG=""
+for candidate in \
+    "$HOME/alpha-engine/config/risk.yaml" \
+    "$HOME/Development/alpha-engine/config/risk.yaml"; do
+    if [ -f "$candidate" ]; then
+        EXECUTOR_CONFIG="$candidate"
+        break
+    fi
+done
+
+if [ -n "$EXECUTOR_CONFIG" ]; then
+    echo "  Uploading risk.yaml from $EXECUTOR_CONFIG"
     run_remote "mkdir -p /home/ec2-user/alpha-engine/config"
     scp $SSH_OPTS -i "$KEY_FILE" \
         "$EXECUTOR_CONFIG" \
         ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine/config/risk.yaml
+else
+    echo "  WARNING: risk.yaml not found — simulation will be skipped"
+fi
+
+# Copy predictor config (needed for predictor backtest).
+PREDICTOR_CONFIG=""
+for candidate in \
+    "$HOME/alpha-engine-predictor/config/predictor.yaml" \
+    "$HOME/Development/alpha-engine-predictor/config/predictor.yaml"; do
+    if [ -f "$candidate" ]; then
+        PREDICTOR_CONFIG="$candidate"
+        break
+    fi
+done
+
+if [ -n "$PREDICTOR_CONFIG" ]; then
+    echo "  Uploading predictor.yaml from $PREDICTOR_CONFIG"
+    run_remote "mkdir -p /home/ec2-user/alpha-engine-predictor/config"
+    scp $SSH_OPTS -i "$KEY_FILE" \
+        "$PREDICTOR_CONFIG" \
+        ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-predictor/config/predictor.yaml
+else
+    echo "  WARNING: predictor.yaml not found — predictor backtest will be skipped"
 fi
 
 # Bootstrap predictor data cache (sector_map.json required for predictor backtest)

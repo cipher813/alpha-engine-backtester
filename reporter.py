@@ -447,30 +447,53 @@ def _section_what_changed(
     regression_result: dict | None = None,
 ) -> list[str]:
     """Build the 'What Changed This Week' section — promotion decisions + twin sim."""
-    # Collect promotion decisions
-    decisions = []
-    for label, result in [
-        ("Scoring weights", weight_result),
-        ("Executor params", executor_rec),
-        ("Veto threshold", veto_result),
-    ]:
+
+    def _decision_for(label: str, result: dict | None) -> tuple:
+        """Classify optimizer result into (label, decision, reason)."""
         if result is None:
-            continue
+            return (label, "NOT RUN", "mode not included in this run")
+        status = result.get("status", "unknown")
         apply = result.get("apply_result", {})
         if apply.get("applied"):
-            decisions.append((label, "PROMOTED", None))
-        elif apply:
-            decisions.append((label, "REJECTED", apply.get("reason", "guardrails not met")))
-        elif result.get("status") in ("insufficient_data", "skipped", "no_subscores"):
-            decisions.append((label, "DEFERRED", result.get("note", result.get("status"))))
+            return (label, "PROMOTED", "guardrails passed — config updated in S3")
+        elif apply.get("reason"):
+            reason = apply["reason"]
+            if "frozen" in reason:
+                return (label, "FROZEN", reason)
+            return (label, "REJECTED", reason)
+        elif status == "ok":
+            return (label, "EVALUATED", "no promotion attempted")
+        elif status == "error":
+            return (label, "ERROR", result.get("error", "unknown error")[:80])
+        elif status in ("insufficient_data", "no_subscores"):
+            note = result.get("note", status)
+            return (label, "DEFERRED", note[:80] if isinstance(note, str) else str(note))
+        elif status == "skipped":
+            return (label, "SKIPPED", result.get("note", "skipped"))
+        else:
+            return (label, "DEFERRED", f"status={status}")
 
-    # If nothing to report, skip the section entirely
+    decisions = [
+        _decision_for("Scoring weights", weight_result),
+        _decision_for("Executor params", executor_rec),
+        _decision_for("Veto threshold", veto_result),
+    ]
+
     has_twin_sim = executor_rec and executor_rec.get("twin_sim", {}).get("status") == "ok"
     has_regression = regression_result and regression_result.get("checked")
-    if not decisions and not has_twin_sim and not has_regression:
-        return []
 
     lines = ["## What Changed This Week", ""]
+
+    # Promotion decisions table — always shown
+    lines += [
+        "### Optimizer Status",
+        "",
+        "| Optimizer | Decision | Detail |",
+        "|-----------|----------|--------|",
+    ]
+    for label, decision, reason in decisions:
+        lines.append(f"| {label} | {decision} | {reason} |")
+    lines += [""]
 
     # Twin simulation results
     if has_twin_sim:
@@ -482,8 +505,8 @@ def _section_what_changed(
         lines += [
             "### Twin Simulation (Current vs Proposed Executor Params)",
             "",
-            "| Metric | Current | Proposed | Delta |",
-            "|--------|---------|----------|-------|",
+            "| Metric | Current Params | Proposed Params | Delta |",
+            "|--------|---------------|-----------------|-------|",
         ]
 
         from optimizer.twin_sim import _COMPARE_METRICS
@@ -500,15 +523,22 @@ def _section_what_changed(
                 d_str = "—"
             lines.append(f"| {label} | {c_str} | {p_str} | {d_str} |")
 
+        # Promotion verdict based on twin sim
+        proposed_better = twin.get("proposed_better", False)
+        if proposed_better:
+            lines += ["", "> Proposed params outperform current — promotion justified."]
+        else:
+            lines += ["", "> Proposed params did NOT outperform current."]
+
         # Param changes
         param_changes = twin.get("param_changes", {})
         if param_changes:
             lines += [
                 "",
-                "**Parameter changes:**",
+                "**Parameter changes (proposed vs current):**",
                 "",
-                "| Parameter | Before | After |",
-                "|-----------|--------|-------|",
+                "| Parameter | Current | Proposed |",
+                "|-----------|---------|----------|",
             ]
             for k, v in param_changes.items():
                 before = v.get("before")
@@ -518,19 +548,13 @@ def _section_what_changed(
                 lines.append(f"| {k} | {b_str} | {a_str} |")
 
         lines += [""]
-
-    # Promotion decisions table
-    if decisions:
+    elif executor_rec and executor_rec.get("status") == "ok":
         lines += [
-            "### Promotion Decisions",
+            "### Twin Simulation",
             "",
-            "| Optimizer | Decision | Reason |",
-            "|-----------|----------|--------|",
+            "> Twin simulation did not run (simulation setup unavailable or no current params in S3).",
+            "",
         ]
-        for label, decision, reason in decisions:
-            reason_str = reason or "—"
-            lines.append(f"| {label} | {decision} | {reason_str} |")
-        lines += [""]
 
     # Regression detection
     if has_regression:
