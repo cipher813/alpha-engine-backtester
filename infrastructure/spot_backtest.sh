@@ -269,16 +269,17 @@ else
     echo "  WARNING: predictor.yaml not found — predictor backtest will be skipped"
 fi
 
-# Bootstrap predictor data cache (sector_map.json required for predictor backtest)
+# Bootstrap predictor data cache (slim cache parquets + sector_map required for backtest)
+echo "==> Downloading predictor slim cache from S3 (~25 MB)..."
 run_remote bash -s <<'CACHE'
 set -euo pipefail
 CACHE_DIR="/home/ec2-user/alpha-engine-predictor/data/cache"
 mkdir -p "$CACHE_DIR"
 if command -v aws &>/dev/null; then
-    # Download sector_map.json from the predictor's S3 price cache
     aws s3 cp s3://alpha-engine-research/predictor/price_cache/sector_map.json "$CACHE_DIR/sector_map.json" 2>/dev/null || true
+    aws s3 sync s3://alpha-engine-research/predictor/price_cache_slim/ "$CACHE_DIR/" --quiet 2>/dev/null || true
 fi
-echo "Predictor cache dir: $(ls "$CACHE_DIR" 2>/dev/null | wc -l) files"
+echo "Predictor cache dir: $(ls "$CACHE_DIR"/*.parquet 2>/dev/null | wc -l) parquet files"
 CACHE
 
 # ── Build env export command ─────────────────────────────────────────────────

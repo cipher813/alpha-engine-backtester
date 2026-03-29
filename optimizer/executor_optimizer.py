@@ -26,6 +26,18 @@ def _safe_float(v) -> float | None:
         return None
     return round(float(v), 4)
 
+
+def _to_native(v):
+    """Convert numpy/pandas scalars to native Python types for JSON serialization."""
+    import numpy as np
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return float(v)
+    if isinstance(v, (np.bool_,)):
+        return bool(v)
+    return v
+
 S3_PARAMS_KEY = "config/executor_params.json"
 
 # Params safe to auto-tune via sweep results.
@@ -190,7 +202,7 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
 
     recommended = {col: best_row[col] for col in param_cols if pd.notna(best_row[col])}
     # Convert numpy types to native Python
-    recommended = {k: float(v) if isinstance(v, (int, float)) else v for k, v in recommended.items()}
+    recommended = {k: _to_native(v) for k, v in recommended.items()}
 
     baseline = {col: baseline_row[col] for col in param_cols if pd.notna(baseline_row[col])}
     baseline = {k: float(v) if isinstance(v, (int, float)) else v for k, v in baseline.items()}
