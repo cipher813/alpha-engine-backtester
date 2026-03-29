@@ -62,6 +62,7 @@ def load(
     try:
         data = _load_from_s3(bucket, price_date, prefix)
         data["source"] = "s3"
+        data["status"] = "ok"
         return data
     except FileNotFoundError:
         pass
@@ -72,7 +73,7 @@ def load(
             "Call build_matrix() or pass tickers= to get fallback data.",
             price_date,
         )
-        return {"date": price_date, "prices": {}, "source": "none"}
+        return {"date": price_date, "prices": {}, "source": "none", "status": "no_data"}
 
     # 2. Try yfinance
     yf_data = _load_from_yfinance(price_date, tickers)
@@ -81,6 +82,7 @@ def load(
     if not missing:
         logger.info("prices for %s: all %d tickers from yfinance", price_date, len(tickers))
         yf_data["source"] = "yfinance"
+        yf_data["status"] = "ok"
         return yf_data
 
     # 3. Fill any yfinance gaps with IBKR
@@ -106,6 +108,10 @@ def load(
                 missing[:10],
             )
         yf_data["source"] = "yfinance" if yf_data["prices"] else "none"
+
+    yf_data["status"] = "ok" if yf_data["prices"] else "no_data"
+    if yf_data["source"] == "none":
+        logger.warning("All price fallbacks failed for %s — no data available", price_date)
 
     return yf_data
 
@@ -187,38 +193,67 @@ def build_matrix(
     from collections import Counter
     src_counts = Counter(sources.values())
     logger.info("build_matrix: %d dates — sources: %s", len(dates), dict(src_counts))
+    no_data_dates = [d for d, s in sources.items() if s == "none"]
 
     df = pd.DataFrame.from_dict(rows, orient="index")
     df.index = pd.to_datetime(df.index)
     df.sort_index(inplace=True)
 
-    # Gap detection (Gap #11): detect ffill'd gaps before filling
+    _MAX_FFILL_DAYS = 5   # max forward-fill window (1 trading week)
+    _MAX_STALENESS_BDAYS = 5  # circuit breaker: halt simulation if data this stale
+
+    # Gap detection: detect gaps before filling
     was_nan = df.isna()
     gap_lengths = was_nan.sum(axis=0)
     long_gaps = gap_lengths[gap_lengths > 5]
     price_gap_warnings = {}
     if not long_gaps.empty:
         price_gap_warnings = {str(k): int(v) for k, v in long_gaps.items()}
-        logger.warning("Price gaps detected (will be ffill'd): %s", price_gap_warnings)
+        logger.warning("Price gaps detected (will be ffill'd up to %d days): %s",
+                        _MAX_FFILL_DAYS, price_gap_warnings)
 
-    df.ffill(inplace=True)
+    # Bounded forward-fill + back-fill for leading NaNs
+    df.ffill(limit=_MAX_FFILL_DAYS, inplace=True)
     df.bfill(inplace=True)
 
-    # Freshness validation (Gap #12): check last price date is recent
+    # Check for remaining NaNs after bounded fill
+    remaining_nans = df.isna().sum(axis=0)
+    unfilled = remaining_nans[remaining_nans > 0]
+    unfilled_dict = {}
+    if not unfilled.empty:
+        unfilled_dict = {str(k): int(v) for k, v in unfilled.items()}
+        logger.warning(
+            "Tickers with unfilled gaps after ffill(limit=%d): %s",
+            _MAX_FFILL_DAYS, unfilled_dict,
+        )
+
+    # Freshness validation: tiered staleness check
     staleness_warning = None
+    stale_circuit_break = False
     if not df.empty:
         last_price_date = df.index.max()
-        expected = pd.Timestamp.now() - pd.tseries.offsets.BDay(2)
-        if last_price_date < expected:
+        expected_recent = pd.Timestamp.now() - pd.tseries.offsets.BDay(2)
+        expected_max = pd.Timestamp.now() - pd.tseries.offsets.BDay(_MAX_STALENESS_BDAYS)
+        if last_price_date < expected_max:
+            staleness_warning = (
+                f"STALE price data: last date {last_price_date.date()}, "
+                f"expected >= {expected_max.date()} — simulation results unreliable"
+            )
+            logger.error(staleness_warning)
+            stale_circuit_break = True
+        elif last_price_date < expected_recent:
             staleness_warning = (
                 f"Stale price data: last date {last_price_date.date()}, "
-                f"expected >= {expected.date()}"
+                f"expected >= {expected_recent.date()}"
             )
             logger.warning(staleness_warning)
 
     # Store metadata on the DataFrame for downstream reporting
     df.attrs["price_gap_warnings"] = price_gap_warnings
+    df.attrs["unfilled_gaps"] = unfilled_dict
     df.attrs["staleness_warning"] = staleness_warning
+    df.attrs["stale_circuit_break"] = stale_circuit_break
+    df.attrs["no_data_dates"] = no_data_dates
 
     return df
 

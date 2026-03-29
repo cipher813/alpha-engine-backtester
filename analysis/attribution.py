@@ -1,10 +1,10 @@
 """
-attribution.py — which sub-score (news / research) drives beat-SPY?
+attribution.py — which sub-score (quant / qual) drives beat-SPY?
 
 Computes correlation between each sub-score and beat_spy_10d/30d.
 This is the primary mechanism for improving research pipeline scoring weights.
 
-Horizon separation: Research uses news + research only (6–12 month fundamental).
+Horizon separation: Research uses quant + qual only (6–12 month fundamental).
 Technical analysis is handled by Predictor (GBM) and Executor (ATR/time exits).
 
 Data availability: noisy with <200 rows; meaningful at Week 8+ (~500 rows).
@@ -19,7 +19,7 @@ from analysis.stats_utils import benjamini_hochberg
 
 logger = logging.getLogger(__name__)
 
-SUB_SCORES = ["news", "research"]
+SUB_SCORES = ["quant", "qual"]
 PREDICTOR_COLS = ["p_up", "p_down", "prediction_confidence", "predicted_direction"]
 
 
@@ -29,16 +29,16 @@ def compute_attribution(df: pd.DataFrame) -> dict:
 
     Expects score_performance rows joined with sub-score columns.
     Sub-scores are assumed to be in a 'sub_scores' JSON column or as separate
-    columns named news_score, research_score.
+    columns named quant_score, qual_score.
 
     Returns:
         {
             "status": "ok" | "insufficient_data",
             "correlations": {
-                "news": {"beat_spy_10d": 0.12, "beat_spy_30d": 0.09, ...},
-                "research": {...},
+                "quant": {"beat_spy_10d": 0.12, "beat_spy_30d": 0.09, ...},
+                "qual": {...},
             },
-            "ranking_10d": ["research", "news"],  # descending by correlation
+            "ranking_10d": ["qual", "quant"],  # descending by correlation
             "ranking_30d": [...],
             "note": "..."
         }
@@ -62,7 +62,7 @@ def compute_attribution(df: pd.DataFrame) -> dict:
             "status": "no_sub_score_columns",
             "note": (
                 "No sub-score columns found. Expected 'sub_scores' JSON column or "
-                "separate technical_score/news_score/research_score columns."
+                "separate quant_score/qual_score columns."
             ),
         }
 
@@ -168,7 +168,7 @@ def _resolve_sub_score_columns(df: pd.DataFrame) -> dict[str, str]:
     Find sub-score columns in the DataFrame.
 
     Checks for:
-    1. Separate columns: technical_score, news_score, research_score
+    1. Separate columns: quant_score, qual_score
     2. Falls back to flattening a 'sub_scores' JSON column if present
 
     Returns dict mapping label → column_name.

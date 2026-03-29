@@ -168,7 +168,21 @@ def _build_body(
 
     html_lines = []
     in_table = False
+    in_code_block = False
     for line in report_md.splitlines():
+        # Code block fences (```)
+        if line.startswith("```"):
+            if in_code_block:
+                html_lines.append("</pre>")
+                in_code_block = False
+            else:
+                in_code_block = True
+                html_lines.append("<pre>")
+            continue
+        if in_code_block:
+            html_lines.append(line)
+            continue
+
         is_table_line = line.startswith("|")
 
         # Close table if we were in one and this line isn't a table row
@@ -176,12 +190,16 @@ def _build_body(
             html_lines.append("</table>")
             in_table = False
 
-        if line.startswith("# "):
-            html_lines.append(f"<h1>{_md_inline(line[2:])}</h1>")
+        if line.startswith("### "):
+            html_lines.append(f"<h3>{_md_inline(line[4:])}</h3>")
         elif line.startswith("## "):
             html_lines.append(f"<h2>{_md_inline(line[3:])}</h2>")
-        elif line.startswith("> "):
-            html_lines.append(f"<blockquote>{_md_inline(line[2:])}</blockquote>")
+        elif line.startswith("# "):
+            html_lines.append(f"<h1>{_md_inline(line[2:])}</h1>")
+        elif line.startswith(">"):
+            # Strip > and optional space
+            content = line[1:].lstrip(" ") if len(line) > 1 else ""
+            html_lines.append(f"<blockquote>{_md_inline(content)}</blockquote>")
         elif line.startswith("---"):
             html_lines.append("<hr>")
         elif is_table_line:
@@ -203,9 +221,11 @@ def _build_body(
         else:
             html_lines.append(f"<p>{_md_inline(line)}</p>")
 
-    # Close any trailing table
+    # Close any trailing table or code block
     if in_table:
         html_lines.append("</table>")
+    if in_code_block:
+        html_lines.append("</pre>")
 
     s3_link = ""
     if s3_bucket:

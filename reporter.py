@@ -95,6 +95,51 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
     return lines
 
 
+def _section_pipeline_health(health: dict) -> list[str]:
+    """Build Pipeline Health section from collected metadata."""
+    lines = ["## Pipeline Health", ""]
+
+    # Data freshness
+    if health.get("staleness_warning"):
+        lines.append(f"> {health['staleness_warning']}")
+        lines.append("")
+
+    # Research DB status
+    db_status = health.get("db_pull_status", "unknown")
+    if db_status == "ok":
+        lines.append("- Research DB: Loaded")
+    elif db_status == "failed":
+        lines.append("- Research DB: **MISSING** — signal quality analysis skipped")
+    else:
+        lines.append(f"- Research DB: {db_status}")
+
+    # Simulation coverage
+    if health.get("coverage") is not None:
+        cov = health["coverage"]
+        sim = health.get("dates_simulated", "?")
+        exp = health.get("dates_expected", "?")
+        lines.append(f"- Simulation coverage: {sim}/{exp} dates ({cov:.0%})")
+
+    # Skip reasons
+    if health.get("skip_reasons"):
+        lines.append(f"- Skipped dates: {health['skip_reasons']}")
+
+    # Price data quality
+    if health.get("price_gap_warnings"):
+        n = len(health["price_gap_warnings"])
+        lines.append(f"- Price gaps (>5 days): {n} tickers")
+    if health.get("unfilled_gaps"):
+        n = len(health["unfilled_gaps"])
+        lines.append(f"- Unfilled gaps after ffill: {n} tickers")
+
+    # Predictor feature skip reasons
+    if health.get("feature_skip_reasons"):
+        lines.append(f"- Predictor feature skips: {health['feature_skip_reasons']}")
+
+    lines.append("")
+    return lines
+
+
 def build_report(
     run_date: str,
     signal_quality: dict,
@@ -110,6 +155,7 @@ def build_report(
     veto_result: dict | None = None,
     executor_rec: dict | None = None,
     regression_result: dict | None = None,
+    pipeline_health: dict | None = None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
@@ -127,6 +173,11 @@ def build_report(
     # Data accumulation tracker
     lines += _section_data_accumulation(signal_quality, config or {})
     lines += [""]
+
+    # Pipeline health (data freshness, coverage, gaps)
+    if pipeline_health:
+        lines += _section_pipeline_health(pipeline_health)
+        lines += [""]
 
     # What Changed This Week (promotion decisions, twin sim, regression)
     lines += _section_what_changed(

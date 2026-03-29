@@ -107,8 +107,8 @@ param_sweep:
 # ── Weight optimizer guardrails ──────────────────────────────────────────────
 weight_optimizer:
   default_weights:
-    news: 0.50
-    research: 0.50
+    quant: 0.50
+    qual: 0.50
   max_single_change: 0.10        # max weight move per update
   min_meaningful_change: 0.03    # min change to trigger update
   blend_factor: 0.20             # conservative: 20% data-driven, 80% current (used as min when ramp active)

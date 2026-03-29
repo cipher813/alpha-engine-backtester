@@ -53,6 +53,9 @@ from reporter import build_report, save, upload_to_s3
 
 logger = logging.getLogger(__name__)
 
+_MIN_IC_SAMPLES = 10     # minimum resolved outcomes before computing Information Coefficient
+_IC_STD_EPSILON = 1e-8   # avoid division by zero in IC/IR computation
+
 
 def load_config(path: str) -> dict:
     with open(path) as f:
@@ -139,7 +142,7 @@ def _push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
             params=(cutoff,),
         )
         conn.close()
-    except Exception as e:
+    except (_sqlite3.Error, FileNotFoundError, KeyError) as e:
         logger.warning("_push_predictor_rolling_metrics: DB read failed: %s", e)
         return
 
@@ -159,7 +162,7 @@ def _push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
     valid = df.dropna(subset=["net_signal", "actual"])
     ic_30d = None
     ic_ir_30d = None
-    if len(valid) >= 10:
+    if len(valid) >= _MIN_IC_SAMPLES:
         from scipy.stats import pearsonr
         ic_val, _ = pearsonr(valid["net_signal"], valid["actual"])
         ic_30d = round(float(ic_val), 4)
@@ -174,7 +177,7 @@ def _push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
             )[0]
             for i in range(n_chunks)
         ])
-        ic_ir_30d = round(float(chunk_ics.mean() / (chunk_ics.std() + 1e-8)), 3)
+        ic_ir_30d = round(float(chunk_ics.mean() / (chunk_ics.std() + _IC_STD_EPSILON)), 3)
 
     try:
         s3 = boto3.client("s3")
@@ -265,8 +268,8 @@ def _seed_predictor_outcomes(config: dict) -> None:
                     )
                     existing.add((ticker, pred_date))
                     inserted += 1
-            except Exception as e:
-                logger.debug("Skipping prediction file %s: %s", key, e)
+            except (ClientError, json.JSONDecodeError, KeyError) as e:
+                logger.info("Skipping prediction file %s: %s", key, e)
                 continue
 
         conn.commit()
@@ -341,7 +344,7 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
     if not db_path:
         logger.error("research_db not set in config and --db not provided")
         sq_result = {"status": "db_not_found", "error": "research_db path not configured"}
-        return sq_result, [], [], {"status": "insufficient_data", "note": "research_db not configured"}
+        return sq_result, [], [], {"status": "insufficient_data", "note": "research_db not configured"}, None
 
     logger.info("Loading score_performance from %s", db_path)
 
@@ -351,7 +354,7 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
     except FileNotFoundError as e:
         logger.error("research.db not found: %s", e)
         sq_result = {"status": "db_not_found", "error": str(e)}
-        return sq_result, [], [], {"status": "insufficient_data", "note": "research.db not found"}
+        return sq_result, [], [], {"status": "insufficient_data", "note": "research.db not found"}, None
 
     try:
         df_regime = regime_analysis.load_with_regime(db_path)
@@ -535,12 +538,21 @@ def _run_simulation_loop(
     init_cash = float(config.get("init_cash", 1_000_000.0))
     bucket = config.get("signals_bucket", "alpha-engine-research")
 
+    # Staleness circuit breaker: halt if price data is too old for reliable simulation
+    if getattr(price_matrix, "attrs", {}).get("stale_circuit_break"):
+        return {
+            "status": "stale_prices",
+            "staleness_warning": price_matrix.attrs.get("staleness_warning"),
+            "note": "Price data too stale for reliable simulation",
+        }
+
     # Build config_override from swept params that need to reach the executor
     config_override = _build_config_override(config)
 
     sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
     all_orders = []
     dates_simulated = 0
+    skip_reasons = {"no_price_index": 0, "empty_prices": 0, "no_signals": 0}
 
     # Use signals_by_date keys as iteration dates when available
     if signals_by_date is not None:
@@ -551,10 +563,12 @@ def _run_simulation_loop(
     for signal_date in sim_dates:
         ts = pd.Timestamp(signal_date)
         if ts not in price_matrix.index:
+            skip_reasons["no_price_index"] += 1
             continue
 
         date_prices = price_matrix.loc[ts].dropna().to_dict()
         if not date_prices:
+            skip_reasons["empty_prices"] += 1
             continue
 
         # Load signals: from pre-built dict or from S3
@@ -565,6 +579,7 @@ def _run_simulation_loop(
             try:
                 signals_raw = signal_loader.load(bucket, signal_date)
             except FileNotFoundError:
+                skip_reasons["no_signals"] += 1
                 continue
 
         sim_client._prices = date_prices
@@ -589,14 +604,36 @@ def _run_simulation_loop(
             all_orders.extend(orders)
         dates_simulated += 1
 
+    _MIN_SIMULATION_COVERAGE = 0.80
+
+    dates_expected = len(sim_dates)
+    coverage = dates_simulated / dates_expected if dates_expected > 0 else 0
+    skipped = {k: v for k, v in skip_reasons.items() if v > 0}
     logger.info(
-        "Simulation loop: %d dates, %d orders", dates_simulated, len(all_orders)
+        "Simulation: %d/%d dates (%.0f%% coverage), %d orders%s",
+        dates_simulated, dates_expected, coverage * 100, len(all_orders),
+        f" — skipped: {skipped}" if skipped else "",
     )
+
+    if dates_expected > 0 and coverage < _MIN_SIMULATION_COVERAGE:
+        return {
+            "status": "insufficient_coverage",
+            "dates_simulated": dates_simulated,
+            "dates_expected": dates_expected,
+            "coverage": round(coverage, 3),
+            "skip_reasons": skipped,
+            "note": (
+                f"Only {dates_simulated}/{dates_expected} dates simulated "
+                f"({coverage:.0%}) — below {_MIN_SIMULATION_COVERAGE:.0%} threshold"
+            ),
+        }
 
     if not all_orders:
         return {
             "status": "no_orders",
             "dates_simulated": dates_simulated,
+            "dates_expected": dates_expected,
+            "coverage": round(coverage, 3),
             "note": "No ENTER signals passed risk rules during the simulation period",
         }
 
@@ -615,13 +652,19 @@ def _run_simulation_loop(
         stats["simulation_assumptions"] = f"Fills: {fill_type} + {slippage_bps:.0f}bp slippage"
     stats["status"] = "ok"
     stats["dates_simulated"] = dates_simulated
+    stats["dates_expected"] = dates_expected
+    stats["coverage"] = round(coverage, 3)
     stats["total_orders"] = len(all_orders)
+    if skipped:
+        stats["skip_reasons"] = skipped
     # Pass through price data quality metadata for reporting
     if hasattr(price_matrix, 'attrs'):
         if price_matrix.attrs.get("price_gap_warnings"):
             stats["price_gap_warnings"] = price_matrix.attrs["price_gap_warnings"]
         if price_matrix.attrs.get("staleness_warning"):
             stats["staleness_warning"] = price_matrix.attrs["staleness_warning"]
+        if price_matrix.attrs.get("unfilled_gaps"):
+            stats["unfilled_gaps"] = price_matrix.attrs["unfilled_gaps"]
     return stats
 
 
@@ -643,6 +686,16 @@ def _seed_grid_with_current(grid: dict, current_params: dict | None) -> dict:
     return grid
 
 
+_DIRECT_RISK_PARAMS = {"min_score", "max_position_pct", "drawdown_circuit_breaker"}
+_STRATEGY_EXIT_PARAMS = {
+    "atr_multiplier": "atr_multiplier",
+    "time_decay_reduce_days": "time_decay_reduce_days",
+    "time_decay_exit_days": "time_decay_exit_days",
+    "profit_take_pct": "profit_take_pct",
+}
+_RECOGNIZED_SWEEP_PARAMS = _DIRECT_RISK_PARAMS | set(_STRATEGY_EXIT_PARAMS)
+
+
 def _build_config_override(config: dict) -> dict | None:
     """
     Map flat sweep params in config to the nested executor config structure.
@@ -654,23 +707,27 @@ def _build_config_override(config: dict) -> dict | None:
     override = {}
 
     # Direct risk params (top-level in executor's risk.yaml)
-    for key in ("min_score", "max_position_pct", "drawdown_circuit_breaker"):
+    for key in _DIRECT_RISK_PARAMS:
         if key in config:
             override[key] = config[key]
 
     # Strategy params → nested under strategy.exit_manager
-    strategy_keys = {
-        "atr_multiplier": "atr_multiplier",
-        "time_decay_reduce_days": "time_decay_reduce_days",
-        "time_decay_exit_days": "time_decay_exit_days",
-    }
     exit_manager_overrides = {}
-    for sweep_key, config_key in strategy_keys.items():
+    for sweep_key, config_key in _STRATEGY_EXIT_PARAMS.items():
         if sweep_key in config:
             exit_manager_overrides[config_key] = config[sweep_key]
 
     if exit_manager_overrides:
         override["strategy"] = {"exit_manager": exit_manager_overrides}
+
+    # Warn about sweep params present in config but not mapped to executor
+    from optimizer.executor_optimizer import SAFE_PARAMS
+    sweep_params_in_config = {k for k in config if k in SAFE_PARAMS}
+    unmapped = sweep_params_in_config - _RECOGNIZED_SWEEP_PARAMS
+    if unmapped:
+        logger.warning(
+            "Sweep params not mapped to executor config (will be ignored): %s", unmapped
+        )
 
     return override if override else None
 
@@ -699,7 +756,7 @@ def run_simulate(config: dict) -> dict:
     )
 
 
-def run_param_sweep(config: dict):
+def run_param_sweep(config: dict) -> pd.DataFrame | None:
     """
     Run Mode 2 across a grid of risk + strategy parameters. Price matrix and
     OHLCV histories are built once and reused for all combinations — only the
@@ -886,7 +943,8 @@ def _stop_ec2_instance() -> None:
         logger.error("Failed to stop instance: %s", e)
 
 
-def main():
+def _parse_args() -> argparse.Namespace:
+    """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description="Alpha Engine Backtester")
     parser.add_argument("--mode", choices=["signal-quality", "simulate", "param-sweep", "all", "predictor-backtest"],
                         default="signal-quality")
@@ -902,50 +960,19 @@ def main():
                         help="Rollback all S3 configs to previous versions and exit")
     parser.add_argument("--freeze", action="store_true",
                         help="Skip all S3 config promotions (guardrails compute + report but never write)")
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-        datefmt="%H:%M:%S",
-    )
 
-    _health_start = _time.time()
+def _init_pipeline(args: argparse.Namespace, config: dict) -> None:
+    """Initialize optimizer modules and pull research DB if needed.
 
-    # Flow Doctor: structured error capture
-    fd = None
-    try:
-        import flow_doctor
-        fd = flow_doctor.init(config_path=os.path.join(
-            os.path.dirname(__file__), "flow-doctor.yaml"))
-    except ImportError:
-        pass  # flow-doctor not installed — optional dependency
-    except Exception as e:
-        logger.warning("flow-doctor init failed: %s", e)
-
-    config = load_config(args.config)
-
-    # Handle --rollback before any other mode
-    if args.rollback:
-        from optimizer.rollback import rollback_all
-        bucket = config.get("signals_bucket", "alpha-engine-research")
-        results = rollback_all(bucket)
-        for r in results:
-            if r.get("rolled_back"):
-                print(f"  Rolled back: {r['config_type']} → {r['key']}")
-            else:
-                print(f"  Skipped: {r.get('reason', 'unknown')}")
-        return
-
-    # Initialize optimizer modules with config sections
+    Mutates config in place (adds research_db, _db_pull_status).
+    """
     weight_optimizer.init_config(config)
     executor_optimizer.init_config(config)
     veto_analysis.init_config(config)
     research_optimizer.init_config(config)
 
-    # Pull research.db from S3 unless a local path was explicitly provided.
-    # research.db lives at s3://{signals_bucket}/research.db — Lambda writes it
-    # after each pipeline run. We pull read-only to a temp file.
     if args.db:
         config["research_db"] = args.db
         logger.info("Using local research.db: %s", args.db)
@@ -953,80 +980,73 @@ def main():
         tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         tmp_db.close()
         bucket = config.get("signals_bucket", "alpha-engine-research")
-        if pull_research_db(bucket, tmp_db.name):
+        db_pulled = pull_research_db(bucket, tmp_db.name)
+        if db_pulled:
             config["research_db"] = tmp_db.name
         else:
-            config["research_db"] = None  # run_signal_quality handles None gracefully
+            config["research_db"] = None
+        config["_db_pull_status"] = "ok" if db_pulled else "failed"
 
+
+def _run_signal_quality_pipeline(
+    args: argparse.Namespace, config: dict,
+) -> tuple[dict, list, list, dict, object, dict | None, dict | None]:
+    """Run signal quality analysis, weight optimizer, veto analysis, and research params.
+
+    Returns (sq_result, regime_rows, score_rows, attr_result, df_base, weight_result, veto_result).
+    """
+    sq_result, regime_rows, score_rows, attr_result, df_base = run_signal_quality(config)
+    weight_result = run_weight_optimizer(config, df_base, freeze=args.freeze)
+
+    veto_result = None
+    if df_base is not None and not df_base.empty:
+        try:
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            veto_result = veto_analysis.analyze_veto_effectiveness(df_base, bucket)
+            if veto_result.get("status") == "ok":
+                if args.freeze:
+                    veto_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                else:
+                    veto_result["apply_result"] = veto_analysis.apply(veto_result, bucket)
+        except Exception as e:
+            logger.error("Veto analysis failed: %s", e)
+            veto_result = {"status": "error", "error": str(e)}
+
+    # Research params optimization (boost correlations)
+    if df_base is not None and not df_base.empty:
+        try:
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            current_rp = research_optimizer.read_current_params(bucket)
+            corr_result = research_optimizer.compute_boost_correlations(df_base, bucket)
+            if corr_result.get("status") == "ok":
+                rp_result = research_optimizer.recommend(corr_result, current_rp)
+                if rp_result.get("status") == "ok":
+                    if args.freeze:
+                        rp_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                    else:
+                        rp_result["apply_result"] = research_optimizer.apply(rp_result, bucket)
+        except Exception as e:
+            logger.error("Research params optimization failed: %s", e)
+
+    return sq_result, regime_rows, score_rows, attr_result, df_base, weight_result, veto_result
+
+
+def _run_simulation_pipeline(
+    args: argparse.Namespace,
+    config: dict,
+    _sim_setup: tuple | None,
+    current_executor_params: dict | None,
+    fd=None,
+) -> tuple[dict | None, object | None, dict | None]:
+    """Run simulate mode, param sweep, executor optimizer, and twin simulation.
+
+    Returns (portfolio_stats, sweep_df, executor_rec).
+    """
     portfolio_stats = None
     sweep_df = None
-    weight_result = None
-    veto_result = None
     executor_rec = None
-    predictor_stats = None
-    predictor_sweep_df = None
-    regression_result = None
 
-    if args.mode in ("signal-quality", "all"):
-        sq_result, regime_rows, score_rows, attr_result, df_base = run_signal_quality(config)
-        weight_result = run_weight_optimizer(config, df_base, freeze=args.freeze)
-
-        # Phase 3: Veto threshold analysis (needs score_performance data)
-        if df_base is not None and not df_base.empty:
-            try:
-                bucket = config.get("signals_bucket", "alpha-engine-research")
-                veto_result = veto_analysis.analyze_veto_effectiveness(df_base, bucket)
-                if veto_result.get("status") == "ok":
-                    if args.freeze:
-                        veto_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
-                    else:
-                        veto_result["apply_result"] = veto_analysis.apply(veto_result, bucket)
-            except Exception as e:
-                logger.error("Veto analysis failed: %s", e)
-                veto_result = {"status": "error", "error": str(e)}
-
-        # Phase 4: Research params optimization (boost correlations)
-        research_params_result = {"status": "skipped"}
-        if df_base is not None and not df_base.empty:
-            try:
-                bucket = config.get("signals_bucket", "alpha-engine-research")
-                current_rp = research_optimizer.read_current_params(bucket)
-                corr_result = research_optimizer.compute_boost_correlations(df_base, bucket)
-                if corr_result.get("status") == "ok":
-                    research_params_result = research_optimizer.recommend(corr_result, current_rp)
-                    if research_params_result.get("status") == "ok":
-                        if args.freeze:
-                            research_params_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
-                        else:
-                            research_params_result["apply_result"] = research_optimizer.apply(
-                                research_params_result, bucket,
-                            )
-                else:
-                    research_params_result = corr_result
-            except Exception as e:
-                logger.error("Research params optimization failed: %s", e)
-                research_params_result = {"status": "error", "error": str(e)}
-    else:
-        sq_result = {"status": "skipped"}
-        regime_rows = []
-        score_rows = []
-        attr_result = {"status": "skipped"}
-        df_base = None
-
-    # ── Simulate + Param Sweep share the price matrix when both run ────────
-    # _setup_simulation is the most expensive step (S3 downloads + yfinance
-    # fallback for every signal date). Build it once and pass to both modes.
-    _sim_setup = None
-    if args.mode in ("simulate", "param-sweep", "all"):
-        try:
-            _sim_setup = _setup_simulation(config)
-        except Exception as e:
-            logger.error("Simulation setup failed: %s", e)
-            if fd:
-                fd.report(e, severity="error", context={
-                    "site": "simulation_setup", "mode": args.mode})
-            _sim_setup = None
-
+    # ── Simulate mode ─────────────────────────────────────────────────────
     if args.mode in ("simulate", "all"):
         try:
             if _sim_setup is None:
@@ -1049,13 +1069,7 @@ def main():
             logger.error("Mode 2 simulation failed: %s", e)
             portfolio_stats = {"status": "error", "error": str(e)}
 
-    # Read current executor params from S3 for iterative learning (used by
-    # param sweep grid seeding and executor_optimizer baseline comparison).
-    current_executor_params = None
-    if args.mode in ("param-sweep", "all", "predictor-backtest"):
-        bucket = config.get("signals_bucket", "alpha-engine-research")
-        current_executor_params = executor_optimizer.read_current_params(bucket)
-
+    # ── Param sweep ───────────────────────────────────────────────────────
     if args.mode in ("param-sweep", "all"):
         try:
             if _sim_setup is None:
@@ -1063,9 +1077,8 @@ def main():
             else:
                 executor_run, SimulatedIBKRClient, dates, price_matrix, _, ohlcv = _sim_setup
                 if price_matrix is None:
-                    import pandas as _pd
                     logger.warning("Param sweep skipped: only %d signal dates available", len(dates))
-                    sweep_df = _pd.DataFrame()
+                    sweep_df = pd.DataFrame()
                 else:
                     def sim_fn(combo_config: dict) -> dict:
                         return _run_simulation_loop(
@@ -1084,7 +1097,7 @@ def main():
                     "site": "param_sweep", "mode": args.mode})
             sweep_df = None
 
-        # Phase 2: Executor parameter optimization from sweep results
+        # Executor parameter optimization from sweep results
         if sweep_df is not None and not sweep_df.empty:
             try:
                 executor_rec = executor_optimizer.recommend(
@@ -1134,36 +1147,63 @@ def main():
                 logger.error("Executor optimizer failed: %s", e)
                 executor_rec = {"status": "error", "error": str(e)}
 
-    if args.mode in ("predictor-backtest", "all"):
+    return portfolio_stats, sweep_df, executor_rec
+
+
+def _run_predictor_pipeline(
+    args: argparse.Namespace,
+    config: dict,
+    executor_rec: dict | None,
+    current_executor_params: dict | None,
+) -> tuple[dict | None, object | None, dict | None]:
+    """Run predictor backtest and auto-apply executor params from predictor sweep.
+
+    Returns (predictor_stats, predictor_sweep_df, executor_rec).
+    """
+    predictor_stats = None
+    predictor_sweep_df = None
+
+    try:
+        predictor_stats, predictor_sweep_df = run_predictor_param_sweep(config)
+    except Exception as e:
+        logger.error("Predictor backtest failed: %s", e)
+        predictor_stats = {"status": "error", "error": str(e)}
+        predictor_sweep_df = None
+
+    # Auto-apply executor params from predictor sweep (if signal-based sweep
+    # didn't already produce a recommendation)
+    if (
+        (executor_rec is None or executor_rec.get("status") not in ("ok",))
+        and predictor_sweep_df is not None
+        and not predictor_sweep_df.empty
+    ):
         try:
-            predictor_stats, predictor_sweep_df = run_predictor_param_sweep(config)
+            executor_rec = executor_optimizer.recommend(
+                predictor_sweep_df, config, current_params=current_executor_params,
+            )
+            if executor_rec.get("status") == "ok":
+                bucket = config.get("signals_bucket", "alpha-engine-research")
+                if args.freeze:
+                    executor_rec["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                else:
+                    executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
         except Exception as e:
-            logger.error("Predictor backtest failed: %s", e)
-            predictor_stats = {"status": "error", "error": str(e)}
-            predictor_sweep_df = None
+            logger.error("Executor optimizer (predictor sweep) failed: %s", e)
+            executor_rec = {"status": "error", "error": str(e)}
 
-        # Auto-apply executor params from predictor sweep (if signal-based sweep
-        # didn't already produce a recommendation)
-        if (
-            (executor_rec is None or executor_rec.get("status") not in ("ok",))
-            and predictor_sweep_df is not None
-            and not predictor_sweep_df.empty
-        ):
-            try:
-                executor_rec = executor_optimizer.recommend(
-                    predictor_sweep_df, config, current_params=current_executor_params,
-                )
-                if executor_rec.get("status") == "ok":
-                    bucket = config.get("signals_bucket", "alpha-engine-research")
-                    if args.freeze:
-                        executor_rec["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
-                    else:
-                        executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
-            except Exception as e:
-                logger.error("Executor optimizer (predictor sweep) failed: %s", e)
-                executor_rec = {"status": "error", "error": str(e)}
+    return predictor_stats, predictor_sweep_df, executor_rec
 
-    # ── Regression detection + rolling metrics ──────────────────────────────
+
+def _run_regression_detection(
+    args: argparse.Namespace,
+    config: dict,
+    portfolio_stats: dict | None,
+    sq_result: dict,
+    weight_result: dict | None,
+    executor_rec: dict | None,
+    veto_result: dict | None,
+) -> dict | None:
+    """Run regression detection and save rolling metrics."""
     try:
         from optimizer.regression_monitor import (
             extract_metrics, save_rolling_metrics, save_promotion_baseline,
@@ -1175,7 +1215,6 @@ def main():
         if current_metrics:
             save_rolling_metrics(bucket, args.date, current_metrics)
 
-        # Check if any optimizer promoted this run
         promoted = []
         for label, res in [
             ("scoring_weights", weight_result),
@@ -1185,24 +1224,122 @@ def main():
             if res and res.get("apply_result", {}).get("applied"):
                 promoted.append(label)
 
-        # Save baseline before promotions take effect (for next week's comparison)
         if promoted and current_metrics:
             save_promotion_baseline(bucket, current_metrics, promoted)
 
-        # Check for regression from previous promotions
         if current_metrics and not args.freeze:
-            regression_result = check_regression(bucket, current_metrics, config)
-        else:
-            regression_result = None
+            return check_regression(bucket, current_metrics, config)
+        return None
     except Exception as e:
         logger.error("Regression monitor failed: %s", e)
-        regression_result = None
+        return None
 
-    # ── Report, upload, email, and instance stop ───────────────────────────
-    # Wrapped in try/finally so --stop-instance ALWAYS runs, even if report
-    # generation, S3 upload, or email fails. Leaving EC2 running after a
-    # failed email burns compute indefinitely.
+
+def main() -> None:
+    args = _parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    _health_start = _time.time()
+
+    # Flow Doctor: structured error capture (optional dependency)
+    fd = None
     try:
+        import flow_doctor
+        fd = flow_doctor.init(config_path=os.path.join(
+            os.path.dirname(__file__), "flow-doctor.yaml"))
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning("flow-doctor init failed: %s", e)
+
+    config = load_config(args.config)
+
+    # Handle --rollback before any other mode
+    if args.rollback:
+        from optimizer.rollback import rollback_all
+        bucket = config.get("signals_bucket", "alpha-engine-research")
+        results = rollback_all(bucket)
+        for r in results:
+            if r.get("rolled_back"):
+                print(f"  Rolled back: {r['config_type']} → {r['key']}")
+            else:
+                print(f"  Skipped: {r.get('reason', 'unknown')}")
+        return
+
+    _init_pipeline(args, config)
+
+    # ── Default results (overwritten by each pipeline stage) ──────────────
+    sq_result: dict = {"status": "skipped"}
+    regime_rows: list = []
+    score_rows: list = []
+    attr_result: dict = {"status": "skipped"}
+    df_base = None
+    weight_result = None
+    veto_result = None
+    portfolio_stats = None
+    sweep_df = None
+    executor_rec = None
+    predictor_stats = None
+    predictor_sweep_df = None
+
+    # ── Signal quality pipeline ───────────────────────────────────────────
+    if args.mode in ("signal-quality", "all"):
+        (sq_result, regime_rows, score_rows, attr_result, df_base,
+         weight_result, veto_result) = _run_signal_quality_pipeline(args, config)
+
+    # ── Simulation setup (shared by simulate + param-sweep) ───────────────
+    _sim_setup = None
+    if args.mode in ("simulate", "param-sweep", "all"):
+        try:
+            _sim_setup = _setup_simulation(config)
+        except Exception as e:
+            logger.error("Simulation setup failed: %s", e)
+            if fd:
+                fd.report(e, severity="error", context={
+                    "site": "simulation_setup", "mode": args.mode})
+
+    current_executor_params = None
+    if args.mode in ("param-sweep", "all", "predictor-backtest"):
+        bucket = config.get("signals_bucket", "alpha-engine-research")
+        current_executor_params = executor_optimizer.read_current_params(bucket)
+
+    # ── Simulate + param sweep + executor optimizer ───────────────────────
+    if args.mode in ("simulate", "param-sweep", "all"):
+        portfolio_stats, sweep_df, executor_rec = _run_simulation_pipeline(
+            args, config, _sim_setup, current_executor_params, fd,
+        )
+
+    # ── Predictor backtest ────────────────────────────────────────────────
+    if args.mode in ("predictor-backtest", "all"):
+        predictor_stats, predictor_sweep_df, executor_rec = _run_predictor_pipeline(
+            args, config, executor_rec, current_executor_params,
+        )
+
+    # ── Regression detection ──────────────────────────────────────────────
+    regression_result = _run_regression_detection(
+        args, config, portfolio_stats, sq_result,
+        weight_result, executor_rec, veto_result,
+    )
+
+    # ── Report, upload, email, and instance stop ──────────────────────────
+    # Wrapped in try/finally so --stop-instance ALWAYS runs.
+    try:
+        pipeline_health = {
+            "db_pull_status": config.get("_db_pull_status"),
+            "staleness_warning": portfolio_stats.get("staleness_warning") if portfolio_stats else None,
+            "coverage": portfolio_stats.get("coverage") if portfolio_stats else None,
+            "dates_simulated": portfolio_stats.get("dates_simulated") if portfolio_stats else None,
+            "dates_expected": portfolio_stats.get("dates_expected") if portfolio_stats else None,
+            "skip_reasons": portfolio_stats.get("skip_reasons") if portfolio_stats else None,
+            "price_gap_warnings": portfolio_stats.get("price_gap_warnings") if portfolio_stats else None,
+            "unfilled_gaps": portfolio_stats.get("unfilled_gaps") if portfolio_stats else None,
+            "feature_skip_reasons": predictor_stats.get("skip_reasons") if predictor_stats else None,
+        }
+
         report_md = build_report(
             run_date=args.date,
             signal_quality=sq_result,
@@ -1218,9 +1355,9 @@ def main():
             veto_result=veto_result,
             executor_rec=executor_rec,
             regression_result=regression_result,
+            pipeline_health=pipeline_health,
         )
 
-        # For predictor-backtest mode, use predictor_sweep_df as the sweep output
         save_sweep_df = sweep_df
         if predictor_sweep_df is not None and not predictor_sweep_df.empty:
             save_sweep_df = predictor_sweep_df
@@ -1274,7 +1411,6 @@ def main():
                 "upload": args.upload,
             })
     finally:
-        # Write health status
         try:
             from health_status import write_health
             configs_applied = []

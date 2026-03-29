@@ -50,6 +50,9 @@ _MACRO_TICKERS = {"SPY", "^VIX", "^TNX", "^IRX", "GLD", "USO"}
 # Sector ETF tickers (present in slim cache)
 _SECTOR_ETFS = {"XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC", "XLB"}
 
+# Minimum OHLCV rows required for feature computation (52-week rolling windows ≈ 260 trading days + buffer)
+_MIN_ROWS_FOR_FEATURES = 265
+
 
 def load_full_cache_from_s3(
     bucket: str = "alpha-engine-research",
@@ -216,14 +219,13 @@ def compute_all_features(
 
     logger.info("Computing features for %d stock tickers...", len(stock_tickers))
     features_by_ticker: dict[str, pd.DataFrame] = {}
-    skipped = 0
+    skip_reasons = {"too_short": 0, "empty_features": 0, "computation_error": 0}
 
     for i, ticker in enumerate(stock_tickers):
         df = price_data[ticker]
 
-        # Need ~265 rows for 52-week rolling windows
-        if len(df) < 265:
-            skipped += 1
+        if len(df) < _MIN_ROWS_FOR_FEATURES:
+            skip_reasons["too_short"] += 1
             continue
 
         # Get the sector ETF series for this ticker
@@ -243,18 +245,23 @@ def compute_all_features(
             )
             if not featured.empty:
                 features_by_ticker[ticker] = featured
+            else:
+                skip_reasons["empty_features"] += 1
         except Exception as e:
-            logger.debug("Feature computation failed for %s: %s", ticker, e)
-            skipped += 1
+            logger.info("Feature computation failed for %s: %s", ticker, e)
+            skip_reasons["computation_error"] += 1
 
         if (i + 1) % 100 == 0:
             logger.info("  Features computed: %d/%d tickers", i + 1, len(stock_tickers))
 
+    skipped = sum(skip_reasons.values())
+    reasons = {k: v for k, v in skip_reasons.items() if v > 0}
     logger.info(
-        "Feature computation complete: %d tickers with features, %d skipped",
+        "Feature computation: %d tickers OK, %d skipped%s",
         len(features_by_ticker), skipped,
+        f" ({reasons})" if reasons else "",
     )
-    return features_by_ticker
+    return features_by_ticker, skip_reasons
 
 
 def download_gbm_model(bucket: str = "alpha-engine-research", region: str = "us-east-1") -> str:
@@ -524,6 +531,44 @@ def _extract_close(price_data: dict[str, pd.DataFrame], ticker: str | None) -> p
     return None
 
 
+def _resolve_trading_dates(
+    features_by_ticker: dict[str, pd.DataFrame],
+    min_trading_days: int,
+    max_trading_days: int,
+) -> list[str] | dict:
+    """Determine common trading dates from feature data.
+
+    Returns sorted date list on success, or error dict if insufficient dates.
+    """
+    all_dates = set()
+    for df in features_by_ticker.values():
+        all_dates.update(df.index.strftime("%Y-%m-%d"))
+    trading_dates = sorted(all_dates)
+
+    if len(trading_dates) < min_trading_days:
+        return {
+            "status": "insufficient_data",
+            "dates_available": len(trading_dates),
+            "min_required": min_trading_days,
+            "note": f"Only {len(trading_dates)} trading dates with features "
+                    f"(need {min_trading_days})",
+        }
+
+    if len(trading_dates) > max_trading_days:
+        trading_dates = trading_dates[-max_trading_days:]
+        logger.info(
+            "Trimmed to most recent %d trading dates (from %s to %s)",
+            len(trading_dates), trading_dates[0], trading_dates[-1],
+        )
+    else:
+        logger.info(
+            "Trading dates: %d (from %s to %s)",
+            len(trading_dates), trading_dates[0], trading_dates[-1],
+        )
+
+    return trading_dates
+
+
 def run(config: dict) -> dict:
     """
     Full predictor-only backtest pipeline.
@@ -584,41 +629,20 @@ def run(config: dict) -> dict:
     sector_map = load_sector_map(predictor_path)
 
     # 3. Compute features
-    features_by_ticker = compute_all_features(price_data, sector_map, predictor_path)
+    features_by_ticker, feature_skip_reasons = compute_all_features(price_data, sector_map, predictor_path)
 
     if not features_by_ticker:
         return {
             "status": "error",
             "error": "No tickers had sufficient data for feature computation",
+            "tickers_loaded": len(price_data),
+            "skip_reasons": feature_skip_reasons,
         }
 
-    # Determine common trading dates (dates where enough tickers have features)
-    all_dates = set()
-    for df in features_by_ticker.values():
-        all_dates.update(df.index.strftime("%Y-%m-%d"))
-    trading_dates = sorted(all_dates)
-
-    if len(trading_dates) < min_trading_days:
-        return {
-            "status": "insufficient_data",
-            "dates_available": len(trading_dates),
-            "min_required": min_trading_days,
-            "note": f"Only {len(trading_dates)} trading dates with features "
-                    f"(need {min_trading_days})",
-        }
-
-    # Limit to most recent N trading days (slim cache may span >2y)
-    if len(trading_dates) > max_trading_days:
-        trading_dates = trading_dates[-max_trading_days:]
-        logger.info(
-            "Trimmed to most recent %d trading dates (from %s to %s)",
-            len(trading_dates), trading_dates[0], trading_dates[-1],
-        )
-    else:
-        logger.info(
-            "Trading dates: %d (from %s to %s)",
-            len(trading_dates), trading_dates[0], trading_dates[-1],
-        )
+    # 3b. Resolve trading dates
+    trading_dates = _resolve_trading_dates(features_by_ticker, min_trading_days, max_trading_days)
+    if isinstance(trading_dates, dict):
+        return trading_dates  # early exit with error dict
 
     # 4. Build price matrix and OHLCV early, then free raw price data
     price_matrix = build_price_matrix(price_data, trading_dates)

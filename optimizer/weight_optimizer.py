@@ -2,13 +2,13 @@
 weight_optimizer.py — scoring weight recommendation based on sub-score attribution.
 
 Joins score_performance outcomes (research.db) with sub-scores from signals.json (S3)
-to compute which sub-scores (news / research) best predict outperformance.
+to compute which sub-scores (quant / qual) best predict outperformance.
 Suggests revised weights and applies them to S3 if guardrails pass.
 
-Horizon separation: Research uses news + research only (6–12 month fundamental
+Horizon separation: Research uses quant + qual only (6–12 month fundamental
 attractiveness). Technical analysis is handled by Predictor (GBM) and Executor.
 
-Current default weights: news=0.50, research=0.50
+Current default weights: quant=0.50, qual=0.50
 """
 
 import json
@@ -21,11 +21,11 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-SUB_SCORES = ["news", "research"]
+SUB_SCORES = ["quant", "qual"]
 S3_WEIGHTS_KEY = "config/scoring_weights.json"
 
 # ── Fallback defaults (override via weight_optimizer section in config.yaml) ──
-_DEFAULT_WEIGHTS = {"news": 0.50, "research": 0.50}
+_DEFAULT_WEIGHTS = {"quant": 0.50, "qual": 0.50}
 _MAX_SINGLE_CHANGE = 0.10
 _MIN_MEANINGFUL_CHANGE = 0.03
 _BLEND_FACTOR = 0.20
@@ -52,8 +52,10 @@ def load_with_subscores(
     Enrich a score_performance DataFrame with sub-scores from signals.json in S3.
 
     For each unique score_date in df, loads the corresponding signals.json and
-    extracts technical/news/research sub-scores per symbol. Merges back by
+    extracts quant/qual sub-scores per symbol. Merges back by
     (symbol, score_date).
+
+    Reads sub_scores from the signals dict in each signals.json file.
 
     Args:
         df:              score_performance DataFrame (from signal_quality.load_score_performance).
@@ -61,7 +63,7 @@ def load_with_subscores(
         signals_prefix:  S3 prefix for signals files (default "signals").
 
     Returns:
-        DataFrame with news_score, research_score columns added.
+        DataFrame with quant_score, qual_score columns added.
         Rows where sub-scores could not be resolved are kept but have NaN sub-scores.
     """
     if df.empty:
@@ -87,9 +89,8 @@ def load_with_subscores(
             continue
 
         by_symbol: dict[str, dict] = {}
-        for stock in data.get("universe", []) + data.get("buy_candidates", []):
-            ticker = stock.get("ticker") or stock.get("symbol")
-            sub = stock.get("sub_scores", {})
+        for ticker, sig in data.get("signals", {}).items():
+            sub = sig.get("sub_scores", {})
             if ticker and sub:
                 by_symbol[ticker] = {k: sub.get(k) for k in SUB_SCORES}
 
@@ -116,44 +117,21 @@ def load_with_subscores(
 
     sub_df = pd.DataFrame(rows)
     merged = df.merge(sub_df, on=["symbol", "score_date"], how="left")
-    filled = merged[["news_score", "research_score"]].notna().any(axis=1).sum()
+    filled = merged[["quant_score", "qual_score"]].notna().any(axis=1).sum()
     logger.info("Sub-scores matched for %d/%d score_performance rows", filled, len(merged))
     return merged
 
 
-def compute_weights(
+def _validate_and_split(
     df: pd.DataFrame,
-    current_weights: dict | None = None,
-    min_samples: int = 30,
-    bucket: str | None = None,
-) -> dict:
+    current_weights: dict,
+    min_samples: int,
+) -> dict | tuple[pd.DataFrame, pd.DataFrame, dict[str, str], int]:
+    """Validate inputs, detect sub-score columns, and split into train/test.
+
+    Returns early-exit dict on validation failure, or
+    (train_set, test_set, sub_cols, n) on success.
     """
-    Compute suggested scoring weights from sub-score vs. beat_spy correlations.
-
-    Args:
-        df:               score_performance DataFrame with news_score,
-                          research_score columns (from load_with_subscores).
-        current_weights:  Current weights dict. Defaults to DEFAULT_WEIGHTS.
-        min_samples:      Minimum rows with beat_spy_10d populated to proceed.
-
-    Returns:
-        {
-            "status": "ok" | "insufficient_data" | "no_subscores",
-            "n_samples": int,
-            "confidence": "low" | "medium" | "high",
-            "current_weights": {"news": 0.50, "research": 0.50},
-            "correlations": {
-                "news":       {"beat_spy_10d": 0.11, "beat_spy_30d": 0.14},
-                "research":   {"beat_spy_10d": 0.18, "beat_spy_30d": 0.22},
-            },
-            "suggested_weights": {"news": 0.48, "research": 0.52},
-            "changes": {"news": -0.02, "research": +0.02},
-            "note": "..."
-        }
-    """
-    if current_weights is None:
-        current_weights = _cfg.get("default_weights", _DEFAULT_WEIGHTS).copy()
-
     populated = df[df["beat_spy_10d"].notna()].copy()
     n = len(populated)
 
@@ -169,7 +147,6 @@ def compute_weights(
             ),
         }
 
-    # Check sub-score columns are present
     sub_cols = {s: f"{s}_score" for s in SUB_SCORES if f"{s}_score" in populated.columns}
     if not sub_cols:
         return {
@@ -182,7 +159,6 @@ def compute_weights(
             ),
         }
 
-    # Train/test split: 70/30 by score_date for out-of-sample validation
     populated = populated.sort_values("score_date")
     split_idx = int(len(populated) * 0.7)
     train_set = populated.iloc[:split_idx]
@@ -212,17 +188,87 @@ def compute_weights(
             ),
         }
 
-    # Compute correlations on TRAIN set only
+    return train_set, test_set, sub_cols, n
+
+
+def _compute_correlations(
+    data: pd.DataFrame, sub_cols: dict[str, str],
+) -> dict[str, dict[str, float | None]]:
+    """Compute correlation between each sub-score and beat_spy targets."""
     correlations: dict[str, dict] = {}
     for label, col in sub_cols.items():
         corr: dict[str, float | None] = {}
         for target in ("beat_spy_10d", "beat_spy_30d"):
-            valid = train_set[[col, target]].dropna()
+            valid = data[[col, target]].dropna()
             corr[target] = float(valid[col].corr(valid[target])) if len(valid) >= 10 else None
         correlations[label] = corr
+    return correlations
 
-    # Derive suggested weights
-    # Blend of 10d and 30d correlations (weights from config); clip negatives to 0
+
+def _validate_oos(
+    train_correlations: dict,
+    test_correlations: dict,
+    sub_cols: dict[str, str],
+    w10: float,
+    w30: float,
+) -> tuple[bool, float]:
+    """Compare train vs test correlations and return (oos_passed, degradation)."""
+    train_total = 0.0
+    test_total = 0.0
+    for label in sub_cols:
+        for target, weight in [("beat_spy_10d", w10), ("beat_spy_30d", w30)]:
+            train_val = train_correlations.get(label, {}).get(target) or 0.0
+            test_val = test_correlations.get(label, {}).get(target) or 0.0
+            train_total += weight * abs(train_val)
+            test_total += weight * abs(test_val)
+
+    degradation = 1.0 - (test_total / train_total) if train_total > 0 else 0.0
+    return degradation < 0.20, degradation
+
+
+def compute_weights(
+    df: pd.DataFrame,
+    current_weights: dict | None = None,
+    min_samples: int = 30,
+    bucket: str | None = None,
+) -> dict:
+    """
+    Compute suggested scoring weights from sub-score vs. beat_spy correlations.
+
+    Args:
+        df:               score_performance DataFrame with quant_score,
+                          qual_score columns (from load_with_subscores).
+        current_weights:  Current weights dict. Defaults to DEFAULT_WEIGHTS.
+        min_samples:      Minimum rows with beat_spy_10d populated to proceed.
+
+    Returns:
+        {
+            "status": "ok" | "insufficient_data" | "no_subscores",
+            "n_samples": int,
+            "confidence": "low" | "medium" | "high",
+            "current_weights": {"quant": 0.50, "qual": 0.50},
+            "correlations": {
+                "quant":   {"beat_spy_10d": 0.11, "beat_spy_30d": 0.14},
+                "qual":    {"beat_spy_10d": 0.18, "beat_spy_30d": 0.22},
+            },
+            "suggested_weights": {"quant": 0.48, "qual": 0.52},
+            "changes": {"quant": -0.02, "qual": +0.02},
+            "note": "..."
+        }
+    """
+    if current_weights is None:
+        current_weights = _cfg.get("default_weights", _DEFAULT_WEIGHTS).copy()
+
+    # Phase 1: Validate inputs and split
+    result = _validate_and_split(df, current_weights, min_samples)
+    if isinstance(result, dict):
+        return result  # early exit
+    train_set, test_set, sub_cols, n = result
+
+    # Phase 2: Compute correlations on train set
+    correlations = _compute_correlations(train_set, sub_cols)
+
+    # Derive suggested weights from horizon-blended correlations
     horizon = _cfg.get("horizon_blend", _HORIZON_BLEND)
     w10 = horizon.get("beat_spy_10d", 0.50)
     w30 = horizon.get("beat_spy_30d", 0.50)
@@ -234,7 +280,6 @@ def compute_weights(
 
     total_corr = sum(weighted_corrs.values())
     if total_corr == 0:
-        # No positive correlations — keep current weights
         pure_suggested = current_weights.copy()
     else:
         pure_suggested = {k: v / total_corr for k, v in weighted_corrs.items()}
@@ -264,29 +309,12 @@ def compute_weights(
         else "low"
     )
 
-    # Out-of-sample validation: check correlations hold on test set
-    test_correlations: dict[str, dict] = {}
-    for label, col in sub_cols.items():
-        corr: dict[str, float | None] = {}
-        for target in ("beat_spy_10d", "beat_spy_30d"):
-            valid = test_set[[col, target]].dropna()
-            corr[target] = float(valid[col].corr(valid[target])) if len(valid) >= 10 else None
-        test_correlations[label] = corr
+    # Phase 3: Out-of-sample validation
+    test_correlations = _compute_correlations(test_set, sub_cols)
+    oos_passed, oos_degradation = _validate_oos(
+        correlations, test_correlations, sub_cols, w10, w30,
+    )
 
-    # Compute weighted train/test correlation sums for degradation check
-    train_total = 0.0
-    test_total = 0.0
-    for label in sub_cols:
-        for target, weight in [("beat_spy_10d", w10), ("beat_spy_30d", w30)]:
-            train_val = correlations.get(label, {}).get(target) or 0.0
-            test_val = test_correlations.get(label, {}).get(target) or 0.0
-            train_total += weight * abs(train_val)
-            test_total += weight * abs(test_val)
-
-    oos_degradation = 1.0 - (test_total / train_total) if train_total > 0 else 0.0
-    oos_passed = oos_degradation < 0.20
-
-    # Recommendation stability: check prior 3 weeks' recommendations from S3
     stability = _check_stability(suggested, bucket=bucket)
 
     return {
@@ -316,7 +344,7 @@ def compute_weights(
 def _check_stability(suggested: dict, bucket: str | None = None) -> dict:
     """
     Load prior 3 weeks' weight recommendations from S3 history and check
-    for direction reversals (e.g., news_score weight increased last week
+    for direction reversals (e.g., quant weight increased last week
     but decreased this week).
 
     Returns:

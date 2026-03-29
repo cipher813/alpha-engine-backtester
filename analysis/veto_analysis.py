@@ -110,20 +110,24 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
             "note": f"Only {len(populated)} rows with outcomes (need {min_preds})",
         }
 
-    # Load predictions from S3
-    dates = populated["score_date"].unique().tolist()
+    # Load predictions from S3 — normalize dates to ISO strings (score_date may be Timestamps)
+    dates = [
+        str(d.date()) if hasattr(d, "date") else str(d)
+        for d in populated["score_date"].unique()
+    ]
     predictions_by_date = _load_predictions_for_dates(dates, bucket)
 
     if not predictions_by_date:
         return {
             "status": "no_predictions",
-            "note": "No predictor predictions found in S3 for the score dates",
+            "dates_searched": dates,
+            "note": f"No predictor predictions found in S3 for {len(dates)} score dates",
         }
 
     # Join predictions with outcomes
     rows = []
     for _, row in populated.iterrows():
-        d = row["score_date"]
+        d = str(row["score_date"].date()) if hasattr(row["score_date"], "date") else str(row["score_date"])
         ticker = row["symbol"]
         preds = predictions_by_date.get(d, {}).get(ticker)
         if preds and preds.get("predicted_direction") == "DOWN":
@@ -152,19 +156,34 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
     base_rate = float(populated["beat_spy_10d"].mean())
     logger.info("Veto base rate: %.1f%% of BUY signals beat SPY at 10d", base_rate * 100)
 
-    # Sweep thresholds
+    # Sweep thresholds and select best
     thresholds = _cfg.get("confidence_thresholds", _CONFIDENCE_THRESHOLDS)
     current_default = _cfg.get("current_default_threshold", _CURRENT_DEFAULT_THRESHOLD)
     min_veto_dec = _cfg.get("min_veto_decisions", _MIN_VETO_DECISIONS)
     cost_weight = _cfg.get("cost_penalty_weight", _COST_PENALTY_WEIGHT)
 
-    threshold_results = []
+    threshold_results = _sweep_thresholds(down_df, base_rate, thresholds)
+    n_preds_loaded = sum(len(v) for v in predictions_by_date.values())
+
+    return _select_best_threshold(
+        threshold_results, base_rate, cost_weight, current_default,
+        min_veto_dec, n_down, n_preds_loaded,
+    )
+
+
+def _sweep_thresholds(
+    down_df: pd.DataFrame, base_rate: float, thresholds: list[float],
+) -> list[dict]:
+    """Evaluate veto precision and missed alpha at each confidence threshold."""
+    from analysis.signal_quality import _wilson_ci
+
+    results = []
     for threshold in thresholds:
         vetoed = down_df[down_df["prediction_confidence"] >= threshold]
         n_vetoes = len(vetoed)
 
         if n_vetoes == 0:
-            threshold_results.append({
+            results.append({
                 "confidence": threshold,
                 "n_vetoes": 0,
                 "true_negatives": 0,
@@ -178,26 +197,20 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
             })
             continue
 
-        # True negative = vetoed signal that actually lost (beat_spy_10d == 0)
         true_neg = int((vetoed["beat_spy_10d"] == 0).sum())
-        # False negative = vetoed signal that actually won (beat_spy_10d == 1)
         false_neg = int((vetoed["beat_spy_10d"] == 1).sum())
-        precision = true_neg / n_vetoes if n_vetoes > 0 else 0.0
+        precision = true_neg / n_vetoes
 
-        # Wilson CI on precision (Gap #7)
-        from analysis.signal_quality import _wilson_ci
         precision_ci = _wilson_ci(true_neg, n_vetoes)
         low_confidence = n_vetoes < 30
 
-        # Missed alpha: total and mean per vetoed winner (Gap #9)
         vetoed_winners = vetoed[vetoed["beat_spy_10d"] == 1]
         missed_total = float(vetoed_winners["return_10d"].sum())
         missed_per_winner = float(vetoed_winners["return_10d"].mean()) if len(vetoed_winners) > 0 else 0.0
 
-        # Lift = precision - base_rate (Gap #8)
         lift = precision - base_rate
 
-        threshold_results.append({
+        results.append({
             "confidence": threshold,
             "n_vetoes": n_vetoes,
             "true_negatives": true_neg,
@@ -210,7 +223,19 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
             "lift": round(lift, 4),
         })
 
-    # Find best threshold: maximize precision while keeping missed_alpha low
+    return results
+
+
+def _select_best_threshold(
+    threshold_results: list[dict],
+    base_rate: float,
+    cost_weight: float,
+    current_default: float,
+    min_veto_dec: int,
+    n_down: int,
+    n_preds_loaded: int,
+) -> dict:
+    """Score thresholds and select recommendation, applying lift gate and cost sensitivity."""
     scoreable = [t for t in threshold_results if t["n_vetoes"] >= min_veto_dec]
 
     if not scoreable:
@@ -234,7 +259,7 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
     best = max(scoreable, key=lambda t: t["_score"])
     recommended = best["confidence"]
 
-    # Insufficient lift gate (Gap #8): if best lift < 5pp, don't recommend
+    # Insufficient lift gate: if best lift < 5pp, don't recommend
     best_lift = best.get("lift", 0.0)
     if best_lift is not None and best_lift < 0.05:
         return {
@@ -242,7 +267,7 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
             "current_threshold": current_default,
             "base_rate": round(base_rate, 4),
             "n_down_predictions": n_down,
-            "n_predictions_loaded": sum(len(v) for v in predictions_by_date.values()),
+            "n_predictions_loaded": n_preds_loaded,
             "thresholds": threshold_results,
             "recommended_threshold": recommended,
             "recommendation_reason": (
@@ -252,7 +277,7 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
             ),
         }
 
-    # Cost sensitivity analysis (Gap #10): sweep cost_weight values
+    # Cost sensitivity analysis: sweep cost_weight values
     cost_sensitivity_weights = [0.15, 0.30, 0.50, 0.70]
     cost_sensitivity_results = {}
     for cw in cost_sensitivity_weights:
@@ -270,7 +295,7 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
         "current_threshold": current_default,
         "base_rate": round(base_rate, 4),
         "n_down_predictions": n_down,
-        "n_predictions_loaded": sum(len(v) for v in predictions_by_date.values()),
+        "n_predictions_loaded": n_preds_loaded,
         "thresholds": threshold_results,
         "recommended_threshold": recommended,
         "recommendation_reason": (

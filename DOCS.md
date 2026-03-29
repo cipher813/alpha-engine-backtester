@@ -120,17 +120,21 @@ Written daily by alpha-engine-research at `s3://{bucket}/signals/{date}/signals.
 ```json
 {
   "date": "2026-03-09",
-  "market_regime": "bull",
-  "universe": [
-    {
+  "market_regime": "neutral",
+  "signals": {
+    "PLTR": {
       "ticker": "PLTR",
       "signal": "ENTER",
       "rating": "BUY",
       "score": 82,
       "conviction": "rising",
-      "sub_scores": {"technical": 85, "news": 78, "research": 83}
+      "quant_score": 85,
+      "qual_score": 79,
+      "sub_scores": {"quant": 85, "qual": 79}
     }
-  ]
+  },
+  "universe": [...],
+  "buy_candidates": [...]
 }
 ```
 
@@ -180,7 +184,7 @@ macro_snapshots (
 -- Full investment thesis per stock per day (includes sub-scores)
 investment_thesis (
     symbol, date, rating, score,
-    technical_score, news_score, research_score,
+    technical_score, quant_score, qual_score,
     conviction, signal, ...
 )
 ```
@@ -226,7 +230,7 @@ Slices computed: overall, by score bucket (60–70, 70–80, 80–90, 90+), by c
 
 ### Attribution
 
-`analysis/attribution.py` computes correlation between each sub-score (technical, news, research) and `beat_spy_10d`. This feeds directly into the weight optimizer — see [§7](#7-weight-optimizer).
+`analysis/attribution.py` computes correlation between each sub-score (quant, qual) and `beat_spy_10d`. This feeds directly into the weight optimizer — see [§7](#7-weight-optimizer).
 
 ---
 
@@ -288,11 +292,11 @@ Output: top 10 combinations in the report, full results in `param_sweep.csv`.
 
 ## 7. Weight optimizer
 
-Automatically updates scoring weights in the research Lambda based on which sub-scores (technical / news / research) best predict outperformance.
+Automatically updates scoring weights in the research Lambda based on which sub-scores (quant / qual) best predict outperformance.
 
 ### How it works
 
-1. **Sub-score join** — `score_performance` outcomes (from `research.db`) are joined with sub-scores from `signals.json` in S3 for each signal date. This gives a dataset of `(symbol, date, technical_score, news_score, research_score, beat_spy_10d, beat_spy_30d)`.
+1. **Sub-score join** — `score_performance` outcomes (from `research.db`) are joined with sub-scores from `signals.json` in S3 for each signal date. This gives a dataset of `(symbol, date, quant_score, qual_score, beat_spy_10d, beat_spy_30d)`.
 
 2. **Correlation** — each sub-score is correlated with `beat_spy_10d` (60% weight) and `beat_spy_30d` (40% weight).
 

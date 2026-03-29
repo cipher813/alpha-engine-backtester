@@ -4,17 +4,24 @@ signal_loader.py — reads signals/{date}/signals.json from S3.
 Signal file format (written by alpha-engine-research pipeline):
 {
     "date": "2026-03-06",
-    "signals": [
-        {
-            "symbol": "PLTR",
-            "rating": "BUY",
+    "signals": {
+        "PLTR": {
+            "ticker": "PLTR",
             "score": 82,
+            "rating": "BUY",
+            "signal": "ENTER",
             "conviction": "rising",
-            "market_regime": "bull",
-            "sub_scores": {"technical": 85, "news": 78, "research": 83}
+            "sector": "Technology",
+            "quant_score": 85,
+            "qual_score": 79,
+            "sub_scores": {"quant": 85, "qual": 79}
         },
         ...
-    ]
+    },
+    "universe": [...],
+    "buy_candidates": [...],
+    "market_regime": "neutral",
+    "sector_ratings": {...}
 }
 """
 
@@ -64,7 +71,7 @@ def load(bucket: str, signal_date: str, prefix: str = "signals") -> dict:
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
         data = json.loads(response["Body"].read())
-        logger.debug("Loaded signals for %s: %d signals", signal_date, len(data.get("signals", [])))
+        logger.debug("Loaded signals for %s: %d signals", signal_date, len(data.get("signals", {})))
         return data
     except ClientError as e:
         if e.response["Error"]["Code"] == "NoSuchKey":
@@ -78,7 +85,9 @@ def load_buy_signals(bucket: str, signal_date: str, min_score: int = 0) -> list[
     with score >= min_score.
     """
     data = load(bucket, signal_date)
-    signals = data.get("signals", [])
+    signals = data.get("signals", {})
+    if isinstance(signals, dict):
+        signals = list(signals.values())
     return [
         s for s in signals
         if s.get("rating") == "BUY" and s.get("score", 0) >= min_score

@@ -10,10 +10,10 @@ from optimizer.weight_optimizer import compute_weights, apply_weights, init_conf
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _make_df(n: int = 100, news_corr: float = 0.1, research_corr: float = 0.2):
+def _make_df(n: int = 100, quant_corr: float = 0.1, qual_corr: float = 0.2):
     """Create a synthetic score_performance DataFrame with sub-scores.
 
-    Generates data where news_score and research_score have approximate
+    Generates data where quant_score and qual_score have approximate
     correlations with beat_spy_10d and beat_spy_30d outcomes.
     """
     import random
@@ -24,17 +24,17 @@ def _make_df(n: int = 100, news_corr: float = 0.1, research_corr: float = 0.2):
     for i in range(n):
         day = (i % 28) + 1
         score_date = f"{base_date}{day:02d}"
-        news = random.uniform(30, 90)
-        research = random.uniform(30, 90)
+        quant = random.uniform(30, 90)
+        qual = random.uniform(30, 90)
         # Higher sub-scores → higher probability of beating SPY
-        p_beat = 0.3 + news_corr * (news / 100) + research_corr * (research / 100)
+        p_beat = 0.3 + quant_corr * (quant / 100) + qual_corr * (qual / 100)
         beat_10d = 1 if random.random() < min(p_beat, 1.0) else 0
         beat_30d = 1 if random.random() < min(p_beat, 1.0) else 0
         rows.append({
             "symbol": f"STOCK{i % 20}",
             "score_date": score_date,
-            "news_score": news,
-            "research_score": research,
+            "quant_score": quant,
+            "qual_score": qual,
             "beat_spy_10d": beat_10d,
             "beat_spy_30d": beat_30d,
         })
@@ -45,7 +45,7 @@ def _init_default_config():
     """Initialize the module config with default values."""
     init_config({
         "weight_optimizer": {
-            "default_weights": {"news": 0.50, "research": 0.50},
+            "default_weights": {"quant": 0.50, "qual": 0.50},
             "max_single_change": 0.10,
             "min_meaningful_change": 0.03,
             "blend_factor": 0.20,
@@ -72,7 +72,7 @@ class TestComputeWeights:
     def test_weights_normalize_to_one(self):
         """Suggested weights should always sum to 1.0."""
         df = _make_df(n=200)
-        result = compute_weights(df, current_weights={"news": 0.50, "research": 0.50})
+        result = compute_weights(df, current_weights={"quant": 0.50, "qual": 0.50})
         assert result["status"] == "ok"
         total = sum(result["suggested_weights"].values())
         assert abs(total - 1.0) < 0.01
@@ -86,7 +86,7 @@ class TestComputeWeights:
     def test_no_subscores_returns_status(self):
         """DataFrame without sub-score columns → status=no_subscores."""
         df = _make_df(n=100)
-        df = df.drop(columns=["news_score", "research_score"])
+        df = df.drop(columns=["quant_score", "qual_score"])
         result = compute_weights(df)
         assert result["status"] == "no_subscores"
 
@@ -102,10 +102,10 @@ class TestComputeWeights:
     def test_changes_dict_present(self):
         """Result should include changes dict showing delta from current."""
         df = _make_df(n=200)
-        result = compute_weights(df, current_weights={"news": 0.50, "research": 0.50})
+        result = compute_weights(df, current_weights={"quant": 0.50, "qual": 0.50})
         assert "changes" in result
-        assert "news" in result["changes"]
-        assert "research" in result["changes"]
+        assert "quant" in result["changes"]
+        assert "qual" in result["changes"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -124,8 +124,8 @@ class TestApplyWeights:
             "status": "ok",
             "confidence": "high",
             "oos_passed": True,
-            "suggested_weights": {"news": 0.35, "research": 0.65},
-            "changes": {"news": -0.15, "research": 0.15},
+            "suggested_weights": {"quant": 0.35, "qual": 0.65},
+            "changes": {"quant": -0.15, "qual": 0.15},
             "n_samples": 500,
         }
         outcome = apply_weights(result, bucket="test-bucket")
@@ -138,8 +138,8 @@ class TestApplyWeights:
             "status": "ok",
             "confidence": "high",
             "oos_passed": True,
-            "suggested_weights": {"news": 0.51, "research": 0.49},
-            "changes": {"news": 0.01, "research": -0.01},
+            "suggested_weights": {"quant": 0.51, "qual": 0.49},
+            "changes": {"quant": 0.01, "qual": -0.01},
             "n_samples": 500,
         }
         outcome = apply_weights(result, bucket="test-bucket")
@@ -152,8 +152,8 @@ class TestApplyWeights:
             "status": "ok",
             "confidence": "low",
             "oos_passed": True,
-            "suggested_weights": {"news": 0.45, "research": 0.55},
-            "changes": {"news": -0.05, "research": 0.05},
+            "suggested_weights": {"quant": 0.45, "qual": 0.55},
+            "changes": {"quant": -0.05, "qual": 0.05},
             "n_samples": 40,
         }
         outcome = apply_weights(result, bucket="test-bucket")
@@ -167,8 +167,8 @@ class TestApplyWeights:
             "confidence": "high",
             "oos_passed": False,
             "oos_degradation": 0.35,
-            "suggested_weights": {"news": 0.45, "research": 0.55},
-            "changes": {"news": -0.05, "research": 0.05},
+            "suggested_weights": {"quant": 0.45, "qual": 0.55},
+            "changes": {"quant": -0.05, "qual": 0.05},
             "n_samples": 500,
         }
         outcome = apply_weights(result, bucket="test-bucket")
@@ -195,10 +195,10 @@ class TestApplyWeights:
                 "status": "ok",
                 "confidence": "medium",
                 "oos_passed": True,
-                "suggested_weights": {"news": 0.45, "research": 0.55},
-                "changes": {"news": -0.05, "research": 0.05},
+                "suggested_weights": {"quant": 0.45, "qual": 0.55},
+                "changes": {"quant": -0.05, "qual": 0.05},
                 "n_samples": 200,
             }
             outcome = apply_weights(result, bucket="test-bucket")
             assert outcome["applied"] is True
-            assert outcome["weights"] == {"news": 0.45, "research": 0.55}
+            assert outcome["weights"] == {"quant": 0.45, "qual": 0.55}
