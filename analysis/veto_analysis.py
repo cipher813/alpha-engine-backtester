@@ -77,6 +77,31 @@ def _load_predictions_for_dates(dates: list[str], bucket: str) -> dict:
     return predictions_by_date
 
 
+def _load_all_predictions(bucket: str) -> dict:
+    """
+    Load ALL predictor predictions from S3 (all dates).
+
+    Returns: {date_str: {ticker: {predicted_direction, prediction_confidence, p_up, p_down}}}
+    """
+    s3 = boto3.client("s3")
+
+    # List all prediction files
+    try:
+        resp = s3.list_objects_v2(
+            Bucket=bucket, Prefix="predictor/predictions/", Delimiter="/",
+        )
+        keys = [
+            obj["Key"] for obj in resp.get("Contents", [])
+            if obj["Key"].endswith(".json") and "latest" not in obj["Key"]
+        ]
+    except ClientError as e:
+        logger.warning("Failed to list prediction files: %s", e)
+        return {}
+
+    dates = [k.split("/")[-1].replace(".json", "") for k in keys]
+    return _load_predictions_for_dates(dates, bucket)
+
+
 def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
     """
     Analyze veto gate effectiveness across confidence thresholds.
@@ -110,26 +135,36 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
             "note": f"Only {len(populated)} rows with outcomes (need {min_preds})",
         }
 
-    # Load predictions from S3 — normalize dates to ISO strings (score_date may be Timestamps)
-    dates = [
-        str(d.date()) if hasattr(d, "date") else str(d)
-        for d in populated["score_date"].unique()
-    ]
-    predictions_by_date = _load_predictions_for_dates(dates, bucket)
+    # Load ALL available prediction dates from S3 (not just score_dates,
+    # since prediction dates rarely match research run dates exactly).
+    predictions_by_date = _load_all_predictions(bucket)
 
     if not predictions_by_date:
         return {
             "status": "no_predictions",
-            "dates_searched": dates,
-            "note": f"No predictor predictions found in S3 for {len(dates)} score dates",
+            "note": "No predictor predictions found in S3",
         }
+
+    # For each score_performance row, find the nearest prediction on or before
+    # the score_date. This is the prediction that would have been active when
+    # the executor made its entry decision.
+    pred_dates_sorted = sorted(predictions_by_date.keys())
+
+    def _nearest_prediction(score_date_str: str, ticker: str) -> dict | None:
+        """Find the prediction closest to (but not after) the score date."""
+        for pd_str in reversed(pred_dates_sorted):
+            if pd_str <= score_date_str:
+                preds = predictions_by_date.get(pd_str, {}).get(ticker)
+                if preds:
+                    return preds
+        return None
 
     # Join predictions with outcomes
     rows = []
     for _, row in populated.iterrows():
         d = str(row["score_date"].date()) if hasattr(row["score_date"], "date") else str(row["score_date"])
         ticker = row["symbol"]
-        preds = predictions_by_date.get(d, {}).get(ticker)
+        preds = _nearest_prediction(d, ticker)
         if preds and preds.get("predicted_direction") == "DOWN":
             rows.append({
                 "symbol": ticker,
@@ -137,8 +172,6 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
                 "prediction_confidence": float(preds["prediction_confidence"]),
                 "beat_spy_10d": float(row["beat_spy_10d"]),
                 "return_10d": float(row.get("return_10d", 0)),
-                # A signal was a BUY if score >= 65 (approximate; we use the presence
-                # in score_performance as proxy for BUY-rated signals)
             })
 
     if not rows:
