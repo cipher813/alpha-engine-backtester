@@ -72,12 +72,14 @@ def load_with_subscores(
     dates = df["score_date"].unique().tolist()
     logger.info("Loading sub-scores for %d signal dates from S3...", len(dates))
 
-    # Build lookup: {score_date: {symbol: {technical: N, news: N, research: N}}}
+    # Build lookup: {score_date: {symbol: {quant: N, qual: N}}}
     subscores_by_date: dict[str, dict] = {}
     s3 = boto3.client("s3")
 
     for d in dates:
-        key = f"{signals_prefix}/{d}/signals.json"
+        # score_dates may be Timestamps — normalize to YYYY-MM-DD string
+        d_str = str(d)[:10]
+        key = f"{signals_prefix}/{d_str}/signals.json"
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
             data = json.loads(obj["Body"].read())
@@ -89,10 +91,32 @@ def load_with_subscores(
             continue
 
         by_symbol: dict[str, dict] = {}
-        for ticker, sig in data.get("signals", {}).items():
+
+        def _extract_subscores(sig: dict) -> dict | None:
+            """Extract quant/qual sub-scores from either nested or flat format."""
+            # Nested: sub_scores: {quant: N, qual: N}
             sub = sig.get("sub_scores", {})
-            if ticker and sub:
-                by_symbol[ticker] = {k: sub.get(k) for k in SUB_SCORES}
+            if sub and any(sub.get(k) is not None for k in SUB_SCORES):
+                return {k: sub.get(k) for k in SUB_SCORES}
+            # Flat: quant_score, qual_score
+            flat = {k: sig.get(f"{k}_score") for k in SUB_SCORES}
+            if any(v is not None for v in flat.values()):
+                return flat
+            return None
+
+        # Check signals dict (v1 format)
+        for ticker, sig in data.get("signals", {}).items():
+            scores = _extract_subscores(sig)
+            if ticker and scores:
+                by_symbol[ticker] = scores
+
+        # Also check universe list (v2 format) for any tickers not yet found
+        for sig in data.get("universe", []):
+            ticker = sig.get("ticker")
+            if ticker and ticker not in by_symbol:
+                scores = _extract_subscores(sig)
+                if scores:
+                    by_symbol[ticker] = scores
 
         subscores_by_date[d] = by_symbol
         logger.debug("Loaded sub-scores for %d symbols on %s", len(by_symbol), d)
