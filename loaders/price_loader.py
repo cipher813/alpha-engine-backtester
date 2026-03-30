@@ -368,7 +368,19 @@ def _tickers_from_signals(bucket: str, signal_date: str, prefix: str = "signals"
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
         data = json.loads(response["Body"].read())
-        tickers = list({s["symbol"] for s in data.get("signals", []) if "symbol" in s})
+        # Signals may be a dict keyed by ticker or a list; universe is always a list.
+        # The per-stock field is "ticker" (not "symbol").
+        sigs = data.get("signals", {})
+        if isinstance(sigs, dict):
+            ticker_set = set(sigs.keys())
+        else:
+            ticker_set = {s["ticker"] for s in sigs if "ticker" in s}
+        # Also pull from universe (v2 format) and buy_candidates
+        for key in ("universe", "buy_candidates"):
+            for s in data.get(key, []):
+                if isinstance(s, dict) and "ticker" in s:
+                    ticker_set.add(s["ticker"])
+        tickers = sorted(ticker_set)
         logger.debug("Resolved %d tickers from signals for %s", len(tickers), signal_date)
         return tickers
     except ClientError as e:

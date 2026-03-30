@@ -282,52 +282,379 @@ def _seed_predictor_outcomes(config: dict) -> None:
         logger.warning("_seed_predictor_outcomes: %s", e)
 
 
-def _backfill_predictor_outcomes(config: dict, df_base: pd.DataFrame) -> None:
-    """Backfill actual_5d_return and correct_5d for pending predictor_outcomes rows."""
+def _seed_score_performance(config: dict) -> None:
+    """
+    Seed score_performance rows from S3 signals/{date}/signals.json files.
+
+    The research pipeline's record_new_buy_scores() should insert these, but
+    it was never wired into the Lambda handler. This function bridges the gap
+    by reading signals from S3 and inserting any BUY-rated stocks that don't
+    already have a score_performance row.
+
+    Prices are fetched via yfinance to record entry price.
+    """
+    import sqlite3 as _sqlite3
+    db_path = config.get("research_db")
+    bucket = config.get("signals_bucket")
+    if not db_path or not os.path.exists(db_path) or not bucket:
+        return
+    try:
+        import yfinance as yf
+        from loaders import signal_loader
+
+        conn = _sqlite3.connect(db_path)
+
+        # Get existing (symbol, score_date) pairs
+        existing = {
+            (r[0], r[1]) for r in
+            conn.execute("SELECT symbol, score_date FROM score_performance").fetchall()
+        }
+
+        # Load all signal dates from S3
+        signal_dates = signal_loader.list_dates(bucket)
+
+        # Collect rows that need inserting
+        rows_to_insert = []
+        for sig_date in signal_dates:
+            try:
+                signals = signal_loader.load(bucket, sig_date)
+            except FileNotFoundError:
+                continue
+
+            # Extract BUY-rated stocks from universe
+            for stock in signals.get("universe", []):
+                ticker = stock.get("ticker")
+                score = stock.get("score", 0)
+                rating = stock.get("rating", "")
+                if not ticker or rating != "BUY" or (ticker, sig_date) in existing:
+                    continue
+                rows_to_insert.append((ticker, sig_date, score))
+
+            # Also check signals dict (v1 format)
+            sigs = signals.get("signals", {})
+            if isinstance(sigs, dict):
+                for ticker, s in sigs.items():
+                    score = s.get("score", 0)
+                    rating = s.get("rating", "")
+                    if rating != "BUY" or (ticker, sig_date) in existing:
+                        continue
+                    rows_to_insert.append((ticker, sig_date, score))
+
+        if not rows_to_insert:
+            conn.close()
+            logger.info("All score_performance rows already seeded")
+            return
+
+        # Fetch entry prices via yfinance
+        unique_tickers = list({r[0] for r in rows_to_insert})
+        min_date = min(r[1] for r in rows_to_insert)
+        price_data = yf.download(
+            tickers=unique_tickers,
+            start=min_date,
+            end=str(date.today()),
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+
+        def _get_close(ticker: str, dt_str: str) -> float | None:
+            """Get closing price on or near the given date."""
+            ts = pd.Timestamp(dt_str)
+            # Try exact date, then next 3 trading days (for weekend signals)
+            for offset in range(4):
+                try_ts = ts + pd.Timedelta(days=offset)
+                try:
+                    if len(unique_tickers) == 1:
+                        return float(price_data["Close"].loc[try_ts])
+                    return float(price_data[ticker]["Close"].loc[try_ts])
+                except (KeyError, TypeError):
+                    continue
+            return None
+
+        inserted = 0
+        for ticker, sig_date, score in rows_to_insert:
+            if score is None:
+                continue
+            price = _get_close(ticker, sig_date)
+            if price is None:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO score_performance (symbol, score_date, score, price_on_date) "
+                "VALUES (?, ?, ?, ?)",
+                (ticker, sig_date, round(float(score), 2), round(price, 2)),
+            )
+            inserted += 1
+
+        conn.commit()
+        conn.close()
+        if inserted:
+            logger.info("Seeded %d score_performance rows from %d signal dates", inserted, len(signal_dates))
+        else:
+            logger.info("No new score_performance rows to insert (prices unavailable)")
+    except Exception as e:
+        logger.warning("_seed_score_performance: %s", e)
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _backfill_score_performance_returns(config: dict) -> None:
+    """
+    Backfill 10d and 30d returns for score_performance rows missing them.
+
+    The research pipeline's run_performance_checks() does this on each Lambda run,
+    but seeded rows (from _seed_score_performance) won't have returns until the
+    next research run. This function fills them in via yfinance so the backtester
+    has complete data.
+    """
     import sqlite3 as _sqlite3
     db_path = config.get("research_db")
     if not db_path or not os.path.exists(db_path):
         return
-    if "symbol" not in df_base.columns or "score_date" not in df_base.columns:
-        return
     try:
+        import yfinance as yf
+
         conn = _sqlite3.connect(db_path)
         pending = pd.read_sql_query(
-            "SELECT * FROM predictor_outcomes WHERE actual_5d_return IS NULL",
+            "SELECT symbol, score_date, price_on_date FROM score_performance "
+            "WHERE return_10d IS NULL OR return_30d IS NULL",
             conn,
         )
         if pending.empty:
             conn.close()
             return
+
+        today_ts = pd.Timestamp(date.today())
+
+        # Only backfill rows where enough time has passed
+        rows_10d = []
+        rows_30d = []
         for _, row in pending.iterrows():
-            pred_date = str(row["prediction_date"])
-            match = df_base[
-                (df_base["symbol"] == row["symbol"]) &
-                (df_base["score_date"].astype(str).str[:10] == pred_date)
-            ]
-            if match.empty:
+            score_ts = pd.Timestamp(row["score_date"])
+            eval_10d = score_ts + pd.offsets.BDay(10)
+            eval_30d = score_ts + pd.offsets.BDay(30)
+            if eval_10d <= today_ts:
+                rows_10d.append(row)
+            if eval_30d <= today_ts:
+                rows_30d.append(row)
+
+        if not rows_10d and not rows_30d:
+            conn.close()
+            logger.info("No score_performance rows eligible for return backfill yet")
+            return
+
+        # Batch yfinance download
+        all_rows = rows_10d + rows_30d
+        tickers = list({r["symbol"] for r in all_rows})
+        all_tickers = tickers + (["SPY"] if "SPY" not in tickers else [])
+        min_date = min(r["score_date"] for r in all_rows)
+
+        price_data = yf.download(
+            tickers=all_tickers,
+            start=min_date,
+            end=str(date.today()),
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+
+        def _get_close(ticker: str, dt: pd.Timestamp) -> float | None:
+            # Try exact date, then next 2 business days
+            for offset in range(3):
+                try_ts = dt + pd.Timedelta(days=offset)
+                try:
+                    if len(all_tickers) == 1:
+                        return float(price_data["Close"].loc[try_ts])
+                    return float(price_data[ticker]["Close"].loc[try_ts])
+                except (KeyError, TypeError):
+                    continue
+            return None
+
+        updated = 0
+        for row in rows_10d:
+            score_ts = pd.Timestamp(row["score_date"])
+            eval_ts = score_ts + pd.offsets.BDay(10)
+            exit_price = _get_close(row["symbol"], eval_ts)
+            spy_entry = _get_close("SPY", score_ts)
+            spy_exit = _get_close("SPY", eval_ts)
+
+            if exit_price is None or row["price_on_date"] is None:
                 continue
-            actual = pd.to_numeric(match.iloc[0].get("return_10d"), errors="coerce")
-            spy = pd.to_numeric(match.iloc[0].get("spy_10d_return", 0), errors="coerce") or 0
-            if pd.isna(actual):
+
+            ret_10d = (exit_price / row["price_on_date"]) - 1
+            spy_ret = (spy_exit / spy_entry) - 1 if spy_entry and spy_exit else None
+            beat = 1 if (spy_ret is not None and ret_10d > spy_ret) else None
+
+            conn.execute(
+                "UPDATE score_performance SET price_10d=?, return_10d=?, "
+                "spy_10d_return=?, beat_spy_10d=?, eval_date_10d=? "
+                "WHERE symbol=? AND score_date=? AND return_10d IS NULL",
+                (
+                    round(exit_price, 2),
+                    round(ret_10d * 100, 2),
+                    round(spy_ret * 100, 2) if spy_ret is not None else None,
+                    beat,
+                    str(eval_ts.date()),
+                    row["symbol"], row["score_date"],
+                ),
+            )
+            updated += 1
+
+        for row in rows_30d:
+            score_ts = pd.Timestamp(row["score_date"])
+            eval_ts = score_ts + pd.offsets.BDay(30)
+            exit_price = _get_close(row["symbol"], eval_ts)
+            spy_entry = _get_close("SPY", score_ts)
+            spy_exit = _get_close("SPY", eval_ts)
+
+            if exit_price is None or row["price_on_date"] is None:
                 continue
+
+            ret_30d = (exit_price / row["price_on_date"]) - 1
+            spy_ret = (spy_exit / spy_entry) - 1 if spy_entry and spy_exit else None
+            beat = 1 if (spy_ret is not None and ret_30d > spy_ret) else None
+
+            conn.execute(
+                "UPDATE score_performance SET price_30d=?, return_30d=?, "
+                "spy_30d_return=?, beat_spy_30d=?, eval_date_30d=? "
+                "WHERE symbol=? AND score_date=? AND return_30d IS NULL",
+                (
+                    round(exit_price, 2),
+                    round(ret_30d * 100, 2),
+                    round(spy_ret * 100, 2) if spy_ret is not None else None,
+                    beat,
+                    str(eval_ts.date()),
+                    row["symbol"], row["score_date"],
+                ),
+            )
+            updated += 1
+
+        conn.commit()
+        conn.close()
+        if updated:
+            logger.info("Backfilled returns for %d score_performance rows via yfinance", updated)
+    except Exception as e:
+        logger.warning("_backfill_score_performance_returns: %s", e)
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _backfill_predictor_outcomes(config: dict, df_base: pd.DataFrame) -> None:
+    """
+    Backfill actual_5d_return and correct_5d for pending predictor_outcomes rows.
+
+    Fetches actual 5-trading-day returns from yfinance for each pending prediction.
+    A prediction is eligible for backfill when 5+ trading days have elapsed since
+    the prediction date.
+    """
+    import sqlite3 as _sqlite3
+    db_path = config.get("research_db")
+    if not db_path or not os.path.exists(db_path):
+        return
+    try:
+        import yfinance as yf
+    except ImportError as ie:
+        logger.warning("_backfill_predictor_outcomes: missing dependency: %s", ie)
+        return
+
+    try:
+        conn = _sqlite3.connect(db_path)
+        pending = pd.read_sql_query(
+            "SELECT id, symbol, prediction_date, predicted_direction "
+            "FROM predictor_outcomes WHERE actual_5d_return IS NULL",
+            conn,
+        )
+        if pending.empty:
+            conn.close()
+            return
+
+        # Determine which predictions are old enough (5 business days elapsed)
+        today_ts = pd.Timestamp(date.today())
+        eligible = []
+        for _, row in pending.iterrows():
+            pred_ts = pd.Timestamp(row["prediction_date"])
+            eval_ts = pred_ts + pd.offsets.BDay(5)
+            if eval_ts <= today_ts:
+                eligible.append({**row, "_eval_date": eval_ts})
+
+        if not eligible:
+            conn.close()
+            logger.info("No predictor outcomes eligible for backfill yet (need 5 trading days)")
+            return
+
+        # Batch yfinance download: all unique tickers + SPY
+        eligible_df = pd.DataFrame(eligible)
+        tickers = list(eligible_df["symbol"].unique())
+        all_tickers = tickers + ["SPY"] if "SPY" not in tickers else tickers
+        min_date = eligible_df["prediction_date"].min()
+
+        price_data = yf.download(
+            tickers=all_tickers,
+            start=min_date,
+            end=str(date.today()),
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+
+        def _get_close(ticker: str, dt: pd.Timestamp) -> float | None:
+            try:
+                if len(all_tickers) == 1:
+                    return float(price_data["Close"].loc[dt])
+                return float(price_data[ticker]["Close"].loc[dt])
+            except (KeyError, TypeError):
+                return None
+
+        resolved = 0
+        for row in eligible:
+            pred_date_ts = pd.Timestamp(row["prediction_date"])
+            eval_date_ts = row["_eval_date"]
+
+            entry_price = _get_close(row["symbol"], pred_date_ts)
+            exit_price = _get_close(row["symbol"], eval_date_ts)
+            spy_entry = _get_close("SPY", pred_date_ts)
+            spy_exit = _get_close("SPY", eval_date_ts)
+
+            if entry_price is None or exit_price is None:
+                continue
+
+            actual_return = (exit_price / entry_price) - 1
+            spy_return = (spy_exit / spy_entry) - 1 if spy_entry and spy_exit else 0
+            # actual_5d_return stored as market-relative (alpha)
+            actual_alpha = actual_return - spy_return
+
             direction = row["predicted_direction"]
             if direction == "UP":
-                correct = 1 if actual > spy else 0
+                correct = 1 if actual_alpha > 0 else 0
             elif direction == "DOWN":
-                correct = 1 if actual < spy else 0
+                correct = 1 if actual_alpha < 0 else 0
             elif direction == "FLAT":
-                correct = 1 if abs(actual - spy) < 0.01 else 0
+                correct = 1 if abs(actual_alpha) < 0.01 else 0
             else:
                 continue
+
             conn.execute(
                 "UPDATE predictor_outcomes SET actual_5d_return=?, correct_5d=? "
                 "WHERE symbol=? AND prediction_date=?",
-                (float(actual), correct, row["symbol"], row["prediction_date"]),
+                (round(actual_alpha * 100, 4), correct, row["symbol"], row["prediction_date"]),
             )
+            resolved += 1
+
         conn.commit()
         conn.close()
-        logger.info("Backfilled predictor outcomes from score_performance data")
+        if resolved:
+            logger.info("Backfilled %d/%d predictor outcomes via yfinance", resolved, len(eligible))
+        else:
+            logger.info("No predictor outcomes could be resolved (price data missing)")
     except Exception as e:
         logger.warning("_backfill_predictor_outcomes: %s", e)
 
@@ -348,6 +675,11 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
         return sq_result, [], [], {"status": "insufficient_data", "note": "research_db not configured"}, None
 
     logger.info("Loading score_performance from %s", db_path)
+
+    # Seed score_performance from S3 signals before loading
+    # (bridges gap where research handler doesn't call record_new_buy_scores)
+    _seed_score_performance(config)
+    _backfill_score_performance_returns(config)
 
     try:
         df_base = signal_quality.load_score_performance(db_path)
@@ -564,8 +896,15 @@ def _run_simulation_loop(
     for signal_date in sim_dates:
         ts = pd.Timestamp(signal_date)
         if ts not in price_matrix.index:
-            skip_reasons["no_price_index"] += 1
-            continue
+            # Weekend/holiday signal dates: use next available trading day's prices
+            later = price_matrix.index[price_matrix.index > ts]
+            if len(later) > 0:
+                ts = later[0]
+                logger.debug("Signal date %s not in price index — using next trading day %s",
+                             signal_date, ts.date())
+            else:
+                skip_reasons["no_price_index"] += 1
+                continue
 
         date_prices = price_matrix.loc[ts].dropna().to_dict()
         if not date_prices:

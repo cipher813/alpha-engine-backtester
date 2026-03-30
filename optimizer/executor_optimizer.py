@@ -86,6 +86,7 @@ FACTORY_DEFAULTS = {
 # ── Fallback defaults (override via executor_optimizer section in config.yaml) ──
 _MIN_VALID_COMBOS = 5
 _MIN_SHARPE_IMPROVEMENT = 0.10
+_MIN_TRADES_TO_PROMOTE = 50
 
 # Module-level config ref — set by init_config() from backtest.py
 _cfg: dict = {}
@@ -167,6 +168,23 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     if not param_cols:
         return {"status": "no_params", "note": "No safe params found in sweep results"}
 
+    # Gate: refuse to promote when the best combo has too few trades.
+    # With small sample sizes the Sharpe is dominated by noise — any
+    # "optimal" params are just overfitting to a handful of outcomes.
+    min_trades = _cfg.get("min_trades_to_promote", _MIN_TRADES_TO_PROMOTE)
+    if "total_trades" in valid.columns:
+        best_trades = valid["total_trades"].max()
+        if best_trades < min_trades:
+            return {
+                "status": "insufficient_trades",
+                "best_trades": int(best_trades),
+                "min_required": min_trades,
+                "note": (
+                    f"Best combo has only {int(best_trades)} trades (need {min_trades}+). "
+                    f"Refusing to promote — sample size too small to trust."
+                ),
+            }
+
     # Multi-metric ranking: Sharpe is primary, but penalize excessive drawdown.
     # Combined score = sharpe_ratio - drawdown_penalty_weight * max_drawdown
     # This prevents promoting fragile param sets where one big win masks many losses.
@@ -237,6 +255,19 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
         "baseline_distance": round(float(baseline_dist), 4),
         "n_closer_combos": n_closer_combos,
     }
+
+    # Guard: never auto-apply params from a negative-Sharpe optimization.
+    # A negative best Sharpe means every combo lost money — the "best" is just
+    # the least bad, and auto-applying it can silently break live trading.
+    if best_sharpe < 0:
+        return {
+            "status": "negative_sharpe",
+            **common_fields,
+            "note": (
+                f"Best Sharpe ({best_sharpe:.4f}) is negative — all combos lost money. "
+                f"Refusing to auto-apply. Review signal quality and backtest data before tuning."
+            ),
+        }
 
     min_improvement = _cfg.get("min_sharpe_improvement", _MIN_SHARPE_IMPROVEMENT)
     if improvement_pct < min_improvement:

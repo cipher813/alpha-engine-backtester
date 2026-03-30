@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 #   correlation_block_threshold, drawdown_circuit_breaker (safety param,
 #   never auto-applied).
 DEFAULT_GRID = {
-    "min_score": [65, 70, 75, 80],
+    "min_score": [45, 50, 55, 60, 65, 70, 75, 80],
     "max_position_pct": [0.05, 0.10, 0.15],
     "atr_multiplier": [2.0, 2.5, 3.0, 4.0],
     "time_decay_reduce_days": [5, 7, 10],
@@ -48,7 +48,7 @@ DEFAULT_GRID = {
 # Extended grid for future use — includes low-frequency params.
 # Activate by setting param_sweep in config.yaml to this grid.
 EXTENDED_GRID = {
-    "min_score": [65, 70, 75, 80],
+    "min_score": [45, 50, 55, 60, 65, 70, 75, 80],
     "max_position_pct": [0.05, 0.10, 0.15],
     "atr_multiplier": [2.0, 2.5, 3.0, 4.0],
     "time_decay_reduce_days": [5, 7, 10],
