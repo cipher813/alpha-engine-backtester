@@ -226,6 +226,7 @@ def compute_all_features(
 
         if len(df) < _MIN_ROWS_FOR_FEATURES:
             skip_reasons["too_short"] += 1
+            logger.debug("Skip %s: too_short (%d rows < %d)", ticker, len(df), _MIN_ROWS_FOR_FEATURES)
             continue
 
         # Get the sector ETF series for this ticker
@@ -247,8 +248,9 @@ def compute_all_features(
                 features_by_ticker[ticker] = featured
             else:
                 skip_reasons["empty_features"] += 1
+                logger.debug("Skip %s: empty_features after compute", ticker)
         except Exception as e:
-            logger.info("Feature computation failed for %s: %s", ticker, e)
+            logger.warning("Feature computation failed for %s: %s", ticker, type(e).__name__)
             skip_reasons["computation_error"] += 1
 
         if (i + 1) % 100 == 0:

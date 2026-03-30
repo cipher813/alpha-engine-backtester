@@ -321,6 +321,10 @@ pytest tests/ -v
 
 These items are documented for future implementation as the system matures and data accumulates.
 
+### Attribution Min-Samples (monitor)
+
+Attribution analysis min_samples raised from 50 to 100 (2026-03-30) to improve FDR robustness. With BH correction on 10+ hypothesis tests across only 50 rows, weak correlations could pass and drive spurious weight changes. At 100+ rows, the power is sufficient for Pearson r to distinguish signal from noise at alpha=0.05. Monitor: if attribution consistently returns `insufficient_data` for too long after system restart, consider lowering back to 75 with stricter per-test alpha (0.01 vs 0.05).
+
 ### Expand to Extended Grid (at 6+ months of live data)
 
 The current core grid has 6 parameters. An `EXTENDED_GRID` with 16 parameters (adding reduce_fraction, confidence_sizing, staleness, earnings, momentum, correlation) is defined in `param_sweep.py` and can be activated via `config.yaml`. Requires sufficient data to avoid overfitting — at 6+ months (~120 signal dates), the holdout validation becomes robust enough to support more parameters.

@@ -64,6 +64,8 @@ def load(bucket: str, signal_date: str, prefix: str = "signals") -> dict:
     Load signals.json for a given date from S3.
 
     Returns the parsed JSON dict, or raises if not found.
+    Validates basic schema: must be a dict with at least one of
+    'signals', 'universe', or 'population'.
     """
     key = f"{prefix}/{signal_date}/signals.json"
     s3 = boto3.client("s3")
@@ -71,12 +73,26 @@ def load(bucket: str, signal_date: str, prefix: str = "signals") -> dict:
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
         data = json.loads(response["Body"].read())
-        logger.debug("Loaded signals for %s: %d signals", signal_date, len(data.get("signals", {})))
-        return data
     except ClientError as e:
         if e.response["Error"]["Code"] == "NoSuchKey":
             raise FileNotFoundError(f"No signals found at s3://{bucket}/{key}") from e
         raise
+
+    if not isinstance(data, dict):
+        raise ValueError(f"signals.json at {key} is not a dict (got {type(data).__name__})")
+
+    has_content = (
+        data.get("signals") or data.get("universe") or data.get("population")
+    )
+    if not has_content:
+        logger.warning(
+            "signals.json at %s has no 'signals', 'universe', or 'population' key — "
+            "may be malformed",
+            key,
+        )
+
+    logger.debug("Loaded signals for %s: %d signals", signal_date, len(data.get("signals", {})))
+    return data
 
 
 def load_buy_signals(bucket: str, signal_date: str, min_score: int = 0) -> list[dict]:

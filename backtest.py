@@ -298,6 +298,7 @@ def _seed_score_performance(config: dict) -> None:
     bucket = config.get("signals_bucket")
     if not db_path or not os.path.exists(db_path) or not bucket:
         return
+    conn = None
     try:
         import yfinance as yf
         from loaders import signal_loader
@@ -357,6 +358,7 @@ def _seed_score_performance(config: dict) -> None:
             progress=False,
             group_by="ticker",
             threads=True,
+            timeout=300,
         )
 
         def _get_close(ticker: str, dt_str: str) -> float | None:
@@ -395,10 +397,11 @@ def _seed_score_performance(config: dict) -> None:
             logger.info("No new score_performance rows to insert (prices unavailable)")
     except Exception as e:
         logger.warning("_seed_score_performance: %s", e)
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _backfill_score_performance_returns(config: dict) -> None:
@@ -461,6 +464,7 @@ def _backfill_score_performance_returns(config: dict) -> None:
             progress=False,
             group_by="ticker",
             threads=True,
+            timeout=300,
         )
 
         def _get_close(ticker: str, dt: pd.Timestamp) -> float | None:
@@ -535,9 +539,27 @@ def _backfill_score_performance_returns(config: dict) -> None:
             updated += 1
 
         conn.commit()
-        conn.close()
+
         if updated:
             logger.info("Backfilled returns for %d score_performance rows via yfinance", updated)
+
+        # Completeness check: warn if eligible rows still lack returns
+        still_pending = pd.read_sql_query(
+            "SELECT COUNT(*) as n FROM score_performance "
+            "WHERE (return_10d IS NULL AND score_date <= date('now', '-14 days')) "
+            "   OR (return_30d IS NULL AND score_date <= date('now', '-45 days'))",
+            conn,
+        )
+        n_stale = int(still_pending.iloc[0]["n"]) if not still_pending.empty else 0
+        if n_stale > 0:
+            logger.warning(
+                "Score performance backfill gap: %d rows still missing returns "
+                "(eligible for backfill but yfinance failed). Accuracy metrics "
+                "may be computed on incomplete data.",
+                n_stale,
+            )
+
+        conn.close()
     except Exception as e:
         logger.warning("_backfill_score_performance_returns: %s", e)
         try:
@@ -604,6 +626,7 @@ def _backfill_predictor_outcomes(config: dict, df_base: pd.DataFrame) -> None:
             progress=False,
             group_by="ticker",
             threads=True,
+            timeout=300,
         )
 
         def _get_close(ticker: str, dt: pd.Timestamp) -> float | None:

@@ -45,13 +45,14 @@ def compute_attribution(df: pd.DataFrame) -> dict:
     """
     populated = df[df["beat_spy_10d"].notna()].copy()
 
-    if len(populated) < 50:
+    if len(populated) < 100:
         return {
             "status": "insufficient_data",
             "rows_populated": len(populated),
             "note": (
-                f"Attribution analysis is noisy with fewer than 50 rows "
-                f"(currently {len(populated)}). Meaningful results at Week 8+ (~500 rows)."
+                f"Attribution analysis requires at least 100 rows for FDR-robust "
+                f"correlations (currently {len(populated)}). Meaningful results at "
+                f"Week 8+ (~500 rows)."
             ),
         }
 

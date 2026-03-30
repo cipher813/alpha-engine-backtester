@@ -218,13 +218,20 @@ def _validate_and_split(
 def _compute_correlations(
     data: pd.DataFrame, sub_cols: dict[str, str],
 ) -> dict[str, dict[str, float | None]]:
-    """Compute correlation between each sub-score and beat_spy targets."""
+    """Compute correlation between each sub-score and beat_spy targets.
+
+    Guards against zero-variance columns (which produce NaN correlations).
+    """
     correlations: dict[str, dict] = {}
     for label, col in sub_cols.items():
         corr: dict[str, float | None] = {}
         for target in ("beat_spy_10d", "beat_spy_30d"):
             valid = data[[col, target]].dropna()
-            corr[target] = float(valid[col].corr(valid[target])) if len(valid) >= 10 else None
+            if len(valid) >= 10 and valid[col].std() > 1e-10 and valid[target].std() > 1e-10:
+                r = float(valid[col].corr(valid[target]))
+                corr[target] = r if not pd.isna(r) else None
+            else:
+                corr[target] = None
         correlations[label] = corr
     return correlations
 
@@ -488,25 +495,32 @@ def apply_weights(result: dict, bucket: str) -> dict:
 
     s3 = boto3.client("s3")
     body = json.dumps(payload, indent=2)
-    s3.put_object(
-        Bucket=bucket,
-        Key=S3_WEIGHTS_KEY,
-        Body=body,
-        ContentType="application/json",
-    )
-    logger.info(
-        "Scoring weights updated in S3: %s (n=%s, confidence=%s)",
-        suggested, payload["n_samples"], confidence,
-    )
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=S3_WEIGHTS_KEY,
+            Body=body,
+            ContentType="application/json",
+        )
+        logger.info(
+            "Scoring weights updated in S3: %s (n=%s, confidence=%s)",
+            suggested, payload["n_samples"], confidence,
+        )
+    except Exception as e:
+        logger.error("CRITICAL: Failed to write scoring weights to S3: %s", e)
+        return {"applied": False, "reason": f"S3 write failed: {e}"}
 
     history_key = f"config/scoring_weights_history/{date.today().isoformat()}.json"
-    s3.put_object(
-        Bucket=bucket,
-        Key=history_key,
-        Body=body,
-        ContentType="application/json",
-    )
-    logger.info("Scoring weights archived to s3://%s/%s", bucket, history_key)
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=history_key,
+            Body=body,
+            ContentType="application/json",
+        )
+        logger.info("Scoring weights archived to s3://%s/%s", bucket, history_key)
+    except Exception as e:
+        logger.warning("Failed to archive scoring weights history (non-fatal): %s", e)
 
     return {
         "applied": True,

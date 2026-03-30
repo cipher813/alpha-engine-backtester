@@ -216,16 +216,18 @@ def build_matrix(
     df.ffill(limit=_MAX_FFILL_DAYS, inplace=True)
     df.bfill(inplace=True)
 
-    # Check for remaining NaNs after bounded fill
+    # Drop tickers with remaining NaNs after bounded fill — VectorBT treats
+    # NaN prices as zero return, which silently distorts backtest results.
     remaining_nans = df.isna().sum(axis=0)
     unfilled = remaining_nans[remaining_nans > 0]
     unfilled_dict = {}
     if not unfilled.empty:
         unfilled_dict = {str(k): int(v) for k, v in unfilled.items()}
         logger.warning(
-            "Tickers with unfilled gaps after ffill(limit=%d): %s",
-            _MAX_FFILL_DAYS, unfilled_dict,
+            "Dropping %d tickers with unfilled gaps after ffill(limit=%d): %s",
+            len(unfilled_dict), _MAX_FFILL_DAYS, unfilled_dict,
         )
+        df.drop(columns=unfilled.index, inplace=True)
 
     # Freshness validation: tiered staleness check
     staleness_warning = None
@@ -296,6 +298,7 @@ def _load_from_yfinance(price_date: str, tickers: list[str]) -> dict:
             interval="1d",
             progress=False,
             auto_adjust=True,
+            timeout=300,
         )
     except Exception as e:
         logger.warning("yfinance download failed for %s: %s", price_date, e)

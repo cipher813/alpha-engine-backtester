@@ -174,11 +174,26 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
                 "return_10d": float(row.get("return_10d", 0)),
             })
 
+    # Diagnostic: track direction distribution for reporting
+    all_directions = []
+    for _, row in populated.iterrows():
+        d = str(row["score_date"].date()) if hasattr(row["score_date"], "date") else str(row["score_date"])
+        preds = _nearest_prediction(d, row["symbol"])
+        if preds:
+            all_directions.append(preds.get("predicted_direction", "UNKNOWN"))
+    direction_counts = {}
+    for d in all_directions:
+        direction_counts[d] = direction_counts.get(d, 0) + 1
+
     if not rows:
         return {
             "status": "no_down_predictions",
             "n_predictions_loaded": sum(len(v) for v in predictions_by_date.values()),
-            "note": "No DOWN predictions found — veto gate has not been triggered",
+            "direction_distribution": direction_counts,
+            "note": (
+                "No DOWN predictions found — veto gate has not been triggered. "
+                f"Direction distribution: {direction_counts}"
+            ),
         }
 
     down_df = pd.DataFrame(rows)
@@ -409,12 +424,19 @@ def apply(result: dict, bucket: str) -> dict:
     s3 = boto3.client("s3")
     body = json.dumps(payload, indent=2)
 
-    s3.put_object(Bucket=bucket, Key=S3_PARAMS_KEY, Body=body, ContentType="application/json")
-    logger.info("Predictor veto threshold updated in S3: %s", recommended)
+    try:
+        s3.put_object(Bucket=bucket, Key=S3_PARAMS_KEY, Body=body, ContentType="application/json")
+        logger.info("Predictor veto threshold updated in S3: %s", recommended)
+    except Exception as e:
+        logger.error("CRITICAL: Failed to write predictor params to S3: %s", e)
+        return {"applied": False, "reason": f"S3 write failed: {e}"}
 
     history_key = f"config/predictor_params_history/{date.today().isoformat()}.json"
-    s3.put_object(Bucket=bucket, Key=history_key, Body=body, ContentType="application/json")
-    logger.info("Predictor params archived to s3://%s/%s", bucket, history_key)
+    try:
+        s3.put_object(Bucket=bucket, Key=history_key, Body=body, ContentType="application/json")
+        logger.info("Predictor params archived to s3://%s/%s", bucket, history_key)
+    except Exception as e:
+        logger.warning("Failed to archive predictor params history (non-fatal): %s", e)
 
     return {
         "applied": True,

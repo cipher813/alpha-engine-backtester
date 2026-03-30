@@ -147,6 +147,13 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     if sweep_df is None or sweep_df.empty:
         return {"status": "insufficient_data", "note": "No sweep results available"}
 
+    if getattr(sweep_df, "attrs", {}).get("sweep_low_completion"):
+        pct = sweep_df.attrs.get("sweep_completion_pct", 0)
+        return {
+            "status": "insufficient_data",
+            "note": f"Sweep completion rate too low ({pct:.0%} < 50%) — results unreliable",
+        }
+
     min_combos = _cfg.get("min_valid_combos", _MIN_VALID_COMBOS)
     valid = sweep_df[sweep_df["sharpe_ratio"].notna()].copy()
     if len(valid) < min_combos:
@@ -382,18 +389,38 @@ def validate_holdout(
         return result
 
     best_sharpe = result.get("best_sharpe", 0)
+
+    # Gate: both train and holdout Sharpe must be positive
+    if best_sharpe < 0:
+        result["holdout_sharpe"] = round(float(holdout_sharpe), 4)
+        result["holdout_ratio"] = 0.0
+        result["holdout_passed"] = False
+        result["status"] = "holdout_failed"
+        result["holdout_note"] = (
+            f"Train Sharpe is negative ({best_sharpe:.4f}) — "
+            f"cannot validate holdout ratio"
+        )
+        logger.warning("Executor optimizer holdout failed: %s", result["holdout_note"])
+        return result
+
     ratio = holdout_sharpe / best_sharpe if best_sharpe != 0 else 0.0
 
     result["holdout_sharpe"] = round(float(holdout_sharpe), 4)
     result["holdout_ratio"] = round(ratio, 4)
-    result["holdout_passed"] = ratio >= 0.50
+    result["holdout_passed"] = ratio >= 0.50 and holdout_sharpe > 0
 
     if not result["holdout_passed"]:
         result["status"] = "holdout_failed"
-        result["holdout_note"] = (
-            f"Holdout Sharpe ({holdout_sharpe:.4f}) is {ratio:.0%} of train "
-            f"({best_sharpe:.4f}) — need >= 50%"
-        )
+        if holdout_sharpe <= 0:
+            result["holdout_note"] = (
+                f"Holdout Sharpe is negative ({holdout_sharpe:.4f}) — "
+                f"strategy is loss-making on holdout set"
+            )
+        else:
+            result["holdout_note"] = (
+                f"Holdout Sharpe ({holdout_sharpe:.4f}) is {ratio:.0%} of train "
+                f"({best_sharpe:.4f}) — need >= 50%"
+            )
         logger.warning("Executor optimizer holdout failed: %s", result["holdout_note"])
     else:
         result["holdout_note"] = (
@@ -440,12 +467,19 @@ def apply(result: dict, bucket: str) -> dict:
     s3 = boto3.client("s3")
     body = json.dumps(payload, indent=2)
 
-    s3.put_object(Bucket=bucket, Key=S3_PARAMS_KEY, Body=body, ContentType="application/json")
-    logger.info("Executor params updated in S3: %s", recommended)
+    try:
+        s3.put_object(Bucket=bucket, Key=S3_PARAMS_KEY, Body=body, ContentType="application/json")
+        logger.info("Executor params updated in S3: %s", recommended)
+    except Exception as e:
+        logger.error("CRITICAL: Failed to write executor params to S3: %s", e)
+        return {"applied": False, "reason": f"S3 write failed: {e}"}
 
     history_key = f"config/executor_params_history/{date.today().isoformat()}.json"
-    s3.put_object(Bucket=bucket, Key=history_key, Body=body, ContentType="application/json")
-    logger.info("Executor params archived to s3://%s/%s", bucket, history_key)
+    try:
+        s3.put_object(Bucket=bucket, Key=history_key, Body=body, ContentType="application/json")
+        logger.info("Executor params archived to s3://%s/%s", bucket, history_key)
+    except Exception as e:
+        logger.warning("Failed to archive executor params history (non-fatal): %s", e)
 
     return {
         "applied": True,

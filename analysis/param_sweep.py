@@ -264,6 +264,21 @@ def sweep(
 
     df = _run_combos(combinations, run_simulation_fn, base_config)
 
+    # Gate: require at least 50% of combos to succeed
+    n_total = len(combinations)
+    if not df.empty and "error" in df.columns:
+        n_failed = df["error"].notna().sum()
+        n_valid = n_total - n_failed
+        completion_pct = n_valid / n_total if n_total > 0 else 0
+        if completion_pct < 0.50:
+            logger.warning(
+                "Param sweep: only %d/%d combos succeeded (%.0f%%) — "
+                "below 50%% threshold, results may be unreliable",
+                n_valid, n_total, completion_pct * 100,
+            )
+            df.attrs["sweep_low_completion"] = True
+            df.attrs["sweep_completion_pct"] = round(completion_pct, 2)
+
     # Add metadata for reporting
     if not df.empty:
         df.attrs["sweep_mode"] = actual_mode
