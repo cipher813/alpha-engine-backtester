@@ -3,8 +3,9 @@ price_loader.py — reads prices/{date}/prices.json from S3, with fallbacks.
 
 Fallback chain (in order):
   1. S3 prices/{date}/prices.json        — canonical source (written by research pipeline)
-  2. yfinance                            — works standalone; tickers resolved from signals.json
-  3. IBKR reqHistoricalData              — optional; only if ibkr_client is passed in
+  2. Polygon grouped-daily               — all US stocks for a single date in 1 API call
+  3. yfinance                            — works standalone; tickers resolved from signals.json
+  4. IBKR reqHistoricalData              — optional; only if ibkr_client is passed in
 
 Price file format (written by alpha-engine-research pipeline):
 {
@@ -75,33 +76,50 @@ def load(
         )
         return {"date": price_date, "prices": {}, "source": "none", "status": "no_data"}
 
-    # 2. Try yfinance
+    # 2. Try polygon grouped-daily (all US stocks in 1 API call)
+    poly_data = _load_from_polygon(price_date, tickers)
+    if poly_data["prices"]:
+        missing_poly = [t for t in tickers if t not in poly_data["prices"]]
+        if not missing_poly:
+            logger.info("prices for %s: all %d tickers from polygon", price_date, len(tickers))
+            poly_data["source"] = "polygon"
+            poly_data["status"] = "ok"
+            return poly_data
+        logger.info("prices for %s: %d/%d from polygon, falling back for %d",
+                     price_date, len(tickers) - len(missing_poly), len(tickers), len(missing_poly))
+
+    # 3. Try yfinance
     yf_data = _load_from_yfinance(price_date, tickers)
+    # Merge polygon + yfinance results
+    if poly_data["prices"]:
+        merged = {**yf_data["prices"], **poly_data["prices"]}  # polygon wins on overlap
+        yf_data["prices"] = merged
     missing = [t for t in tickers if t not in yf_data["prices"]]
 
     if not missing:
-        logger.info("prices for %s: all %d tickers from yfinance", price_date, len(tickers))
-        yf_data["source"] = "yfinance"
+        source = "polygon+yfinance" if poly_data["prices"] else "yfinance"
+        logger.info("prices for %s: all %d tickers from %s", price_date, len(tickers), source)
+        yf_data["source"] = source
         yf_data["status"] = "ok"
         return yf_data
 
-    # 3. Fill any yfinance gaps with IBKR
+    # 4. Fill any remaining gaps with IBKR
     if ibkr_client is not None and missing:
         ibkr_prices = _load_from_ibkr(ibkr_client, price_date, missing)
         filled = len(ibkr_prices)
         yf_data["prices"].update(ibkr_prices)
         logger.info(
-            "prices for %s: %d from yfinance, %d gap-filled from IBKR, %d still missing",
+            "prices for %s: %d fetched, %d gap-filled from IBKR, %d still missing",
             price_date,
             len(tickers) - len(missing),
             filled,
             len(missing) - filled,
         )
-        yf_data["source"] = "yfinance+ibkr" if filled else "yfinance"
+        yf_data["source"] = "polygon+yfinance+ibkr" if poly_data["prices"] else "yfinance+ibkr"
     else:
         if missing:
             logger.warning(
-                "prices for %s: %d/%d tickers missing from yfinance (pass ibkr_client= to fill gaps): %s",
+                "prices for %s: %d/%d tickers missing (pass ibkr_client= to fill gaps): %s",
                 price_date,
                 len(missing),
                 len(tickers),
@@ -279,6 +297,29 @@ def _load_from_s3(bucket: str, price_date: str, prefix: str) -> dict:
                 logger.debug("S3 returned %s for %s (treating as missing)", code, key)
             raise FileNotFoundError(f"No prices found at s3://{bucket}/{key}") from e
         raise
+
+
+def _load_from_polygon(price_date: str, tickers: list[str]) -> dict:
+    """Fetch prices via polygon grouped-daily endpoint (all US stocks, 1 API call)."""
+    try:
+        from polygon_client import polygon_client
+        grouped = polygon_client().get_grouped_daily(price_date)
+        if not grouped:
+            return {"date": price_date, "prices": {}}
+        prices = {}
+        for ticker in tickers:
+            if ticker in grouped:
+                g = grouped[ticker]
+                prices[ticker] = {
+                    "open": g["open"],
+                    "close": g["close"],
+                    "high": g["high"],
+                    "low": g["low"],
+                }
+        return {"date": price_date, "prices": prices}
+    except Exception as e:
+        logger.warning("Polygon grouped-daily failed for %s: %s", price_date, e)
+        return {"date": price_date, "prices": {}}
 
 
 def _load_from_yfinance(price_date: str, tickers: list[str]) -> dict:
