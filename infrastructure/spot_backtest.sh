@@ -26,10 +26,14 @@
 set -euo pipefail
 
 # ── Load .env ────────────────────────────────────────────────────────────────
+# Master .env lives in alpha-engine-data; fall back to local .env
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-ENV_FILE="$REPO_ROOT/.env"
+ENV_FILE="$(dirname "$REPO_ROOT")/alpha-engine-data/.env"
+if [ ! -f "$ENV_FILE" ]; then
+    ENV_FILE="$REPO_ROOT/.env"
+fi
 if [ -f "$ENV_FILE" ]; then
     set -a
     # shellcheck disable=SC1090
@@ -37,7 +41,7 @@ if [ -f "$ENV_FILE" ]; then
     set +a
     echo "Loaded .env from $ENV_FILE"
 else
-    echo "WARNING: No .env file found at $ENV_FILE"
+    echo "WARNING: No .env file found"
 fi
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -333,3 +337,13 @@ echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Backtest complete. Instance will be terminated."
 echo "═══════════════════════════════════════════════════════════════"
+
+# Emit CloudWatch heartbeat on successful completion
+aws cloudwatch put-metric-data \
+  --namespace "AlphaEngine" \
+  --metric-name "Heartbeat" \
+  --dimensions "Process=backtester" \
+  --value 1 --unit "Count" \
+  --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
+  && echo "Heartbeat emitted: backtester" \
+  || echo "WARNING: Failed to emit heartbeat (non-fatal)"
