@@ -49,8 +49,9 @@ def compute_lift_metrics(
         status: "ok" | "insufficient_data" | "error"
         n_dates: number of eval dates analyzed
         scanner_lift: {passing_avg, universe_avg, lift, n_passing, n_universe}
-        team_lift: [{team_id, pick_avg, sector_avg, lift, n_picks}, ...]
+        team_lift: [{team_id, pick_avg, sector_avg, quant_avg, lift, lift_vs_quant, ...}]
         cio_lift: {advance_avg, all_recs_avg, lift, n_advance, n_recs}
+        cio_vs_ranking: {cio_avg, ranking_avg, lift, cio_beats_ranking, ...}
         predictor_lift: {up_avg, all_avg, down_avg, lift, n_up, n_down, n_all}
         executor_lift: {traded_avg, approved_avg, lift, n_traded, n_approved}
         pipeline_lift: {traded_avg, universe_avg, lift}
@@ -109,6 +110,9 @@ def compute_lift_metrics(
 
         # 3. CIO lift
         result["cio_lift"] = _cio_lift(conn, ur, date_filter, params)
+
+        # 3b. CIO vs score-ranking baseline (2e)
+        result["cio_vs_ranking"] = _cio_vs_ranking_lift(conn, ur, date_filter, params)
 
         # 4. Predictor lift
         result["predictor_lift"] = _predictor_lift(conn, ur, date_filter, params)
@@ -298,18 +302,43 @@ def format_lift_report(metrics: dict) -> list[str]:
             f"**{_pct(pipl.get('lift'))}** | — |"
         )
 
-    # Team lift breakdown
+    # CIO vs score-ranking baseline (2e)
+    cvr = metrics.get("cio_vs_ranking", {})
+    if cvr and cvr.get("status") != "skipped":
+        verdict = "CIO outperforms" if cvr.get("cio_beats_ranking") else "Score ranking outperforms"
+        lines.append(
+            f"| CIO vs ranking | {cvr.get('n_picks', '?')} picks | "
+            f"{_pct(cvr.get('cio_avg'))} | {_pct(cvr.get('ranking_avg'))} | "
+            f"{_pct(cvr.get('lift'))} | {verdict} |"
+        )
+
+    # Team lift breakdown (2b: vs sector, 2c: vs quant)
     tl = metrics.get("team_lift", [])
     if tl and not isinstance(tl, dict):
-        lines.append("\n### Sector team lift\n")
-        lines.append("| Team | Pick avg 5d | Sector avg 5d | Lift | n picks |")
-        lines.append("|------|-------------|---------------|------|---------|")
+        lines.append("\n### Sector team lift (2b: picks vs sector, 2c: picks vs quant candidates)\n")
+        lines.append("| Team | Pick avg | Sector avg | Lift vs sector | Quant avg | Lift vs quant | Picks / Candidates |")
+        lines.append("|------|----------|------------|----------------|-----------|---------------|-------------------|")
         for t in tl:
             lines.append(
                 f"| {t.get('team_id', '?')} | {_pct(t.get('pick_avg'))} | "
                 f"{_pct(t.get('sector_avg'))} | {_pct(t.get('lift'))} | "
-                f"{t.get('n_picks', '')} |"
+                f"{_pct(t.get('quant_avg'))} | {_pct(t.get('lift_vs_quant'))} | "
+                f"{t.get('n_picks', 0)} / {t.get('n_candidates', 0)} |"
             )
+
+        # Summary insight
+        if len(tl) > 1:
+            lifts = [t["lift"] for t in tl if t.get("lift") is not None]
+            quant_lifts = [t["lift_vs_quant"] for t in tl if t.get("lift_vs_quant") is not None]
+            if lifts:
+                avg_lift = sum(lifts) / len(lifts)
+                lines.append(f"\n> Avg team lift vs sector: {_pct(avg_lift)}")
+            if quant_lifts:
+                avg_ql = sum(quant_lifts) / len(quant_lifts)
+                if avg_ql > 0:
+                    lines.append(f"> LLM qual/peer review adds {_pct(avg_ql)} over quant alone")
+                else:
+                    lines.append(f"> LLM qual/peer review subtracts {_pct(avg_ql)} vs quant alone — consider simplifying")
 
     return lines
 
@@ -346,7 +375,12 @@ def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dic
 
 
 def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[dict] | dict:
-    """Sector team lift: team picks vs. own sector average."""
+    """Sector team lift (2b): team picks vs. own sector average from full 900.
+
+    The baseline is the average return of ALL stocks in the same sector from
+    universe_returns — not just the quant candidates. This measures whether
+    each team's picks outperform their sector's random baseline.
+    """
     try:
         tc_filter = date_filter.replace("eval_date", "tc.eval_date") if date_filter else ""
         tc = pd.read_sql_query(
@@ -363,17 +397,37 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
             team_data = merged[merged["team_id"] == team_id]
             picks = team_data[team_data["team_recommended"] == 1]
 
-            sector_avg = float(team_data["return_5d"].mean())
+            # Get the sector(s) this team covers from universe_returns
+            pick_sectors = picks["sector"].dropna().unique() if "sector" in picks.columns else []
+
+            # Full sector average from the 900-stock universe (not just quant candidates)
+            if len(pick_sectors) > 0:
+                sector_universe = ur[ur["sector"].isin(pick_sectors)]
+                full_sector_avg = float(sector_universe["return_5d"].mean()) if not sector_universe.empty else None
+                n_sector_universe = len(sector_universe)
+            else:
+                full_sector_avg = None
+                n_sector_universe = 0
+
+            # Quant candidates average (for 2c comparison)
+            quant_avg = float(team_data["return_5d"].mean())
             pick_avg = float(picks["return_5d"].mean()) if not picks.empty else None
-            lift = (pick_avg - sector_avg) if pick_avg is not None else None
+
+            # Primary lift: picks vs full sector (2b)
+            lift_vs_sector = (pick_avg - full_sector_avg) if pick_avg is not None and full_sector_avg is not None else None
+            # Secondary lift: picks vs quant candidates (2c)
+            lift_vs_quant = (pick_avg - quant_avg) if pick_avg is not None else None
 
             results.append({
                 "team_id": team_id,
-                "sector_avg": round(sector_avg, 4),
                 "pick_avg": round(pick_avg, 4) if pick_avg is not None else None,
-                "lift": round(lift, 4) if lift is not None else None,
-                "n_candidates": len(team_data),
+                "sector_avg": round(full_sector_avg, 4) if full_sector_avg is not None else None,
+                "quant_avg": round(quant_avg, 4),
+                "lift": round(lift_vs_sector, 4) if lift_vs_sector is not None else None,
+                "lift_vs_quant": round(lift_vs_quant, 4) if lift_vs_quant is not None else None,
                 "n_picks": len(picks),
+                "n_candidates": len(team_data),
+                "n_sector_universe": n_sector_universe,
             })
 
         return results
@@ -382,11 +436,11 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
 
 
 def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
-    """CIO lift: ADVANCE stocks vs. all sector recommendations."""
+    """CIO lift (2d): ADVANCE stocks vs. all sector recommendations."""
     try:
         ce_filter = date_filter.replace("eval_date", "ce.eval_date") if date_filter else ""
         ce = pd.read_sql_query(
-            f"SELECT ticker, eval_date, cio_decision FROM cio_evaluations ce{ce_filter}",
+            f"SELECT ticker, eval_date, cio_decision, final_score FROM cio_evaluations ce{ce_filter}",
             conn, params=params,
         )
         if ce.empty:
@@ -410,6 +464,73 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
             "n_recs": len(merged),
             "n_advance": len(advance),
             "n_reject": len(reject),
+        }
+    except sqlite3.OperationalError:
+        return {"status": "skipped", "reason": "cio_evaluations table not found"}
+
+
+def _cio_vs_ranking_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
+    """CIO vs score-ranking baseline (2e): does LLM judgment beat mechanical ranking?
+
+    Compares CIO's actual ADVANCE picks vs. a counterfactual where we simply
+    take the top N candidates by final_score (no LLM judgment). If the score-
+    ranking baseline performs equally well, the CIO step can be simplified.
+    """
+    try:
+        ce_filter = date_filter.replace("eval_date", "ce.eval_date") if date_filter else ""
+        ce = pd.read_sql_query(
+            f"SELECT ticker, eval_date, cio_decision, final_score FROM cio_evaluations ce{ce_filter}",
+            conn, params=params,
+        )
+        if ce.empty:
+            return {"status": "skipped", "reason": "cio_evaluations empty"}
+
+        merged = ur.merge(ce, on=["ticker", "eval_date"], how="inner")
+        if merged.empty or "final_score" not in merged.columns:
+            return {"status": "skipped", "reason": "no matched CIO rows with final_score"}
+
+        advance = merged[merged["cio_decision"] == "ADVANCE"]
+        if advance.empty:
+            return {"status": "skipped", "reason": "no ADVANCE decisions"}
+
+        results_by_date = []
+        for eval_date in merged["eval_date"].unique():
+            date_pool = merged[merged["eval_date"] == eval_date]
+            date_advance = date_pool[date_pool["cio_decision"] == "ADVANCE"]
+            n_advance = len(date_advance)
+            if n_advance == 0 or date_pool["final_score"].isna().all():
+                continue
+
+            # Score-ranking baseline: top N by final_score
+            top_n = date_pool.nlargest(n_advance, "final_score")
+
+            results_by_date.append({
+                "cio_avg": float(date_advance["return_5d"].mean()),
+                "ranking_avg": float(top_n["return_5d"].mean()),
+                "n": n_advance,
+                # Overlap: how many of CIO's picks are also in the top-N?
+                "overlap": len(set(date_advance["ticker"]) & set(top_n["ticker"])),
+            })
+
+        if not results_by_date:
+            return {"status": "skipped", "reason": "no dates with valid score ranking data"}
+
+        rdf = pd.DataFrame(results_by_date)
+
+        cio_avg = round(float(rdf["cio_avg"].mean()), 4)
+        ranking_avg = round(float(rdf["ranking_avg"].mean()), 4)
+        lift = round(cio_avg - ranking_avg, 4)
+        avg_overlap = round(float(rdf["overlap"].mean()), 1)
+        total_n = int(rdf["n"].sum())
+
+        return {
+            "cio_avg": cio_avg,
+            "ranking_avg": ranking_avg,
+            "lift": lift,
+            "avg_overlap": avg_overlap,
+            "n_dates": len(rdf),
+            "n_picks": total_n,
+            "cio_beats_ranking": lift > 0,
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "cio_evaluations table not found"}
