@@ -49,6 +49,9 @@ from analysis import signal_quality, regime_analysis, score_analysis, attributio
 from analysis import veto_analysis
 from analysis import universe_returns
 from analysis import end_to_end
+from analysis import trigger_scorecard, alpha_distribution, veto_value
+from analysis import shadow_book as shadow_book_analysis
+from analysis import exit_timing, macro_eval
 from optimizer import weight_optimizer, executor_optimizer, research_optimizer
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
@@ -1786,6 +1789,13 @@ def main() -> None:
     predictor_stats = None
     predictor_sweep_df = None
     e2e_lift = None
+    trigger_result = None
+    alpha_dist_result = None
+    score_cal_result = None
+    veto_val_result = None
+    shadow_result = None
+    exit_timing_result = None
+    macro_result = None
 
     # ── Signal quality pipeline ───────────────────────────────────────────
     if args.mode in ("signal-quality", "all"):
@@ -1794,10 +1804,9 @@ def main() -> None:
 
         # End-to-end pipeline lift metrics (requires universe_returns)
         db_path = config.get("research_db")
+        trades_db = _find_trades_db(config)
         if db_path and os.path.exists(db_path):
             try:
-                # Find trades.db path from executor_paths
-                trades_db = _find_trades_db(config)
                 e2e_lift = end_to_end.compute_lift_metrics(
                     research_db_path=db_path,
                     trades_db_path=trades_db,
@@ -1806,6 +1815,76 @@ def main() -> None:
                     logger.info("End-to-end lift metrics computed across %d dates", e2e_lift.get("n_dates", 0))
             except Exception as e:
                 logger.warning("End-to-end lift metrics failed: %s", e)
+
+        # ── Phase 3: Component-level diagnostics ──────────────────────────
+        # 3a: Entry trigger scorecard
+        if trades_db:
+            try:
+                trigger_result = trigger_scorecard.compute_trigger_scorecard(trades_db)
+                if trigger_result.get("status") == "ok":
+                    logger.info("Trigger scorecard: %d triggers analyzed", len(trigger_result.get("triggers", [])))
+            except Exception as e:
+                logger.warning("Trigger scorecard failed: %s", e)
+
+        # 3g: Alpha magnitude distribution
+        if db_path and os.path.exists(db_path):
+            try:
+                alpha_dist_result = alpha_distribution.compute_alpha_distribution(db_path)
+                if alpha_dist_result.get("status") == "ok":
+                    logger.info("Alpha distribution computed for %d horizons", len(alpha_dist_result.get("distributions", {})))
+            except Exception as e:
+                logger.warning("Alpha distribution failed: %s", e)
+
+            # Score calibration curve
+            try:
+                score_cal_result = alpha_distribution.compute_score_calibration(db_path)
+            except Exception as e:
+                logger.warning("Score calibration failed: %s", e)
+
+        # 3e: Net veto value in dollars
+        if db_path and os.path.exists(db_path):
+            try:
+                veto_val_result = veto_value.compute_veto_value(
+                    research_db_path=db_path,
+                    trades_db_path=trades_db,
+                )
+                if veto_val_result.get("status") == "ok":
+                    logger.info("Net veto value: $%.0f", veto_val_result.get("net_veto_value", 0))
+            except Exception as e:
+                logger.warning("Veto value analysis failed: %s", e)
+
+        # 3b: Shadow book analysis
+        if trades_db:
+            try:
+                shadow_result = shadow_book_analysis.compute_shadow_book_analysis(
+                    trades_db_path=trades_db,
+                    research_db_path=db_path if db_path and os.path.exists(db_path) else None,
+                )
+                if shadow_result.get("status") == "ok":
+                    logger.info("Shadow book: %d blocked, assessment=%s",
+                                shadow_result.get("n_blocked", 0), shadow_result.get("assessment"))
+            except Exception as e:
+                logger.warning("Shadow book analysis failed: %s", e)
+
+        # 3c: Exit timing analysis (MFE/MAE)
+        if trades_db:
+            try:
+                exit_timing_result = exit_timing.compute_exit_timing(trades_db)
+                if exit_timing_result.get("status") == "ok":
+                    logger.info("Exit timing: %d roundtrips, diagnosis=%s",
+                                exit_timing_result.get("n_roundtrips", 0), exit_timing_result.get("diagnosis"))
+            except Exception as e:
+                logger.warning("Exit timing analysis failed: %s", e)
+
+        # 3f: Macro multiplier A/B evaluation
+        if db_path and os.path.exists(db_path):
+            try:
+                macro_result = macro_eval.compute_macro_evaluation(db_path)
+                if macro_result.get("status") == "ok":
+                    logger.info("Macro eval: assessment=%s, lift=%s",
+                                macro_result.get("assessment"), macro_result.get("accuracy_lift"))
+            except Exception as e:
+                logger.warning("Macro multiplier evaluation failed: %s", e)
 
     # ── Simulation setup (shared by simulate + param-sweep) ───────────────
     _sim_setup = None
@@ -1873,6 +1952,13 @@ def main() -> None:
             regression_result=regression_result,
             pipeline_health=pipeline_health,
             e2e_lift=e2e_lift,
+            trigger_scorecard=trigger_result,
+            alpha_dist=alpha_dist_result,
+            score_calibration=score_cal_result,
+            veto_value=veto_val_result,
+            shadow_book=shadow_result,
+            exit_timing=exit_timing_result,
+            macro_eval=macro_result,
         )
 
         save_sweep_df = sweep_df

@@ -55,6 +55,7 @@ def accuracy_by_regime(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> list
     Returns list of dicts, one per regime, each with the same structure as
     signal_quality._compute_slice_metrics().
     """
+    populated_5d = df[df["beat_spy_5d"].notna()] if "beat_spy_5d" in df.columns else pd.DataFrame()
     populated_10d = df[df["beat_spy_10d"].notna()]
     populated_30d = df[df["beat_spy_30d"].notna()]
 
@@ -69,9 +70,10 @@ def accuracy_by_regime(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> list
     results = []
 
     for regime in sorted(regimes):
+        slice_5d = populated_5d[populated_5d["market_regime"] == regime] if not populated_5d.empty else pd.DataFrame()
         slice_10d = populated_10d[populated_10d["market_regime"] == regime]
         slice_30d = populated_30d[populated_30d["market_regime"] == regime]
-        metrics = _compute_slice_metrics(slice_10d, slice_30d)
+        metrics = _compute_slice_metrics(slice_5d, slice_10d, slice_30d)
         results.append({"market_regime": regime, **metrics})
 
     return results

@@ -156,6 +156,14 @@ def build_report(
     executor_rec: dict | None = None,
     regression_result: dict | None = None,
     pipeline_health: dict | None = None,
+    e2e_lift: dict | None = None,
+    trigger_scorecard: dict | None = None,
+    alpha_dist: dict | None = None,
+    score_calibration: dict | None = None,
+    veto_value: dict | None = None,
+    shadow_book: dict | None = None,
+    exit_timing: dict | None = None,
+    macro_eval: dict | None = None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
@@ -204,6 +212,27 @@ def build_report(
     lines += _section_attribution(attribution)
     lines += [""]
 
+    # Alpha magnitude distribution
+    if alpha_dist and alpha_dist.get("status") == "ok":
+        lines += _section_alpha_distribution(alpha_dist)
+        lines += [""]
+
+    # Score calibration
+    if score_calibration and score_calibration.get("status") == "ok":
+        lines += _section_score_calibration(score_calibration)
+        lines += [""]
+
+    # End-to-end pipeline lift
+    if e2e_lift and e2e_lift.get("status") == "ok":
+        from analysis.end_to_end import format_lift_report
+        lines += format_lift_report(e2e_lift)
+        lines += [""]
+
+    # Macro multiplier evaluation
+    if macro_eval and macro_eval.get("status") == "ok":
+        lines += _section_macro_eval(macro_eval)
+        lines += [""]
+
     # Portfolio simulation (Mode 2)
     if portfolio_stats:
         lines += _section_portfolio(portfolio_stats)
@@ -227,6 +256,26 @@ def build_report(
     # Executor parameter recommendations
     if executor_rec:
         lines += _section_executor_recommendations(executor_rec)
+        lines += [""]
+
+    # Entry trigger scorecard
+    if trigger_scorecard and trigger_scorecard.get("status") == "ok":
+        lines += _section_trigger_scorecard(trigger_scorecard)
+        lines += [""]
+
+    # Net veto value in dollars
+    if veto_value and veto_value.get("status") == "ok":
+        lines += _section_veto_value(veto_value)
+        lines += [""]
+
+    # Shadow book analysis
+    if shadow_book and shadow_book.get("status") == "ok":
+        lines += _section_shadow_book(shadow_book)
+        lines += [""]
+
+    # Exit timing analysis (MFE/MAE)
+    if exit_timing and exit_timing.get("status") == "ok":
+        lines += _section_exit_timing(exit_timing)
         lines += [""]
 
     # Predictor-only backtest (2y historical)
@@ -340,17 +389,19 @@ def _section_signal_quality(sq: dict) -> list[str]:
         return lines
 
     overall = sq.get("overall", {})
+    acc_5d = overall.get("accuracy_5d")
     acc_10d = overall.get("accuracy_10d")
     acc_30d = overall.get("accuracy_30d")
+    n_5d = overall.get("n_5d", 0)
     n_10d = overall.get("n_10d", 0)
     n_30d = overall.get("n_30d", 0)
 
     lines += [
         "",
-        f"| Metric | 10d | 30d |",
-        f"|--------|-----|-----|",
-        f"| Accuracy vs SPY | {_pct(acc_10d)} (n={n_10d}) | {_pct(acc_30d)} (n={n_30d}) |",
-        f"| Avg alpha | {_pct(overall.get('avg_alpha_10d'))} | {_pct(overall.get('avg_alpha_30d'))} |",
+        f"| Metric | 5d | 10d | 30d |",
+        f"|--------|-----|-----|-----|",
+        f"| Accuracy vs SPY | {_pct(acc_5d)} (n={n_5d}) | {_pct(acc_10d)} (n={n_10d}) | {_pct(acc_30d)} (n={n_30d}) |",
+        f"| Avg alpha | {_pct(overall.get('avg_alpha_5d'))} | {_pct(overall.get('avg_alpha_10d'))} | {_pct(overall.get('avg_alpha_30d'))} |",
         "",
         "> 50% = coin flip. 55%+ over 30+ signals suggests real alpha.",
     ]
@@ -358,8 +409,8 @@ def _section_signal_quality(sq: dict) -> list[str]:
     buckets = sq.get("by_score_bucket", [])
     if buckets:
         lines += ["", "### By score bucket", ""]
-        lines += ["| Bucket | Acc 10d | Acc 30d | Avg α 10d | n | FDR |"]
-        lines += ["|--------|---------|---------|-----------|---|-----|"]
+        lines += ["| Bucket | Acc 5d | Acc 10d | Acc 30d | Avg α 10d | n | FDR |"]
+        lines += ["|--------|--------|---------|---------|-----------|---|-----|"]
         has_exploratory = False
         has_fdr_exploratory = False
         for b in buckets:
@@ -372,7 +423,8 @@ def _section_signal_quality(sq: dict) -> list[str]:
                 fdr_tag = "†"
                 has_fdr_exploratory = True
             lines.append(
-                f"| {b.get('bucket')} | {_pct(b.get('accuracy_10d'))}{star} | "
+                f"| {b.get('bucket')} | {_pct(b.get('accuracy_5d'))}{star} | "
+                f"{_pct(b.get('accuracy_10d'))}{star} | "
                 f"{_pct(b.get('accuracy_30d'))}{star} | {_pct(b.get('avg_alpha_10d'))}{star} | "
                 f"{b.get('n_10d', 0)} | {fdr_tag} |"
             )
@@ -390,11 +442,12 @@ def _section_score_analysis(rows: list[dict]) -> list[str]:
         lines += ["", "> Deferred until Week 4+ (insufficient data)."]
         return lines
 
-    lines += ["", "| Min score | Acc 10d | Acc 30d | n |"]
-    lines += ["|-----------|---------|---------|---|"]
+    lines += ["", "| Min score | Acc 5d | Acc 10d | Acc 30d | n |"]
+    lines += ["|-----------|--------|---------|---------|---|"]
     for r in rows:
         lines.append(
-            f"| {r.get('threshold')} | {_pct(r.get('accuracy_10d'))} | "
+            f"| {r.get('threshold')} | {_pct(r.get('accuracy_5d'))} | "
+            f"{_pct(r.get('accuracy_10d'))} | "
             f"{_pct(r.get('accuracy_30d'))} | {r.get('n_10d', 0)} |"
         )
     return lines
@@ -406,11 +459,12 @@ def _section_regime(rows: list[dict]) -> list[str]:
         lines += ["", "> Deferred until Week 4+ (insufficient data)."]
         return lines
 
-    lines += ["", "| Regime | Acc 10d | Acc 30d | n |"]
-    lines += ["|--------|---------|---------|---|"]
+    lines += ["", "| Regime | Acc 5d | Acc 10d | Acc 30d | n |"]
+    lines += ["|--------|--------|---------|---------|---|"]
     for r in rows:
         lines.append(
-            f"| {r.get('market_regime')} | {_pct(r.get('accuracy_10d'))} | "
+            f"| {r.get('market_regime')} | {_pct(r.get('accuracy_5d'))} | "
+            f"{_pct(r.get('accuracy_10d'))} | "
             f"{_pct(r.get('accuracy_30d'))} | {r.get('n_10d', 0)} |"
         )
     return lines
@@ -945,6 +999,284 @@ def _section_executor_recommendations(result: dict) -> list[str]:
         lines += [f"> ⏸ **Not applied** — {reason}."]
 
     return lines
+
+
+def _section_trigger_scorecard(result: dict) -> list[str]:
+    """Build entry trigger scorecard section."""
+    lines = ["## Entry trigger scorecard"]
+    summary = result.get("summary", {})
+    lines += [
+        "",
+        f"_{summary.get('total_entries', 0)} total entries analyzed_",
+        "",
+        "| Trigger | n | Avg slip vs signal | Avg slip vs open | Avg alpha | Win rate |",
+        "|---------|---|--------------------|------------------|-----------|---------|",
+    ]
+    for t in result.get("triggers", []):
+        lines.append(
+            f"| {t['trigger']} | {t['n_trades']} | "
+            f"{_pct_pts(t.get('avg_slippage_vs_signal'))} | "
+            f"{_pct_pts(t.get('avg_slippage_vs_open'))} | "
+            f"{_pct_pts(t.get('avg_realized_alpha'))} | "
+            f"{_pct(t.get('win_rate_vs_spy'))} |"
+        )
+    lines.append(
+        f"| **All** | {summary.get('total_entries', 0)} | "
+        f"{_pct_pts(summary.get('avg_slippage_vs_signal'))} | "
+        f"{_pct_pts(summary.get('avg_slippage_vs_open'))} | "
+        f"{_pct_pts(summary.get('avg_realized_alpha'))} | "
+        f"{_pct(summary.get('win_rate_vs_spy'))} |"
+    )
+    lines += [
+        "",
+        "> Negative slippage = fill below signal/open price (favorable). "
+        "Triggers with negative alpha or low win rate are candidates for removal.",
+    ]
+    return lines
+
+
+def _section_alpha_distribution(result: dict) -> list[str]:
+    """Build alpha magnitude distribution section."""
+    lines = ["## Alpha magnitude distribution"]
+
+    for horizon, summary_data in result.get("summary", {}).items():
+        buckets = result.get("distributions", {}).get(horizon, [])
+        if not buckets:
+            continue
+
+        lines += [
+            "",
+            f"### {horizon} horizon (n={summary_data['n']})",
+            "",
+            f"Avg alpha: **{summary_data['avg_alpha']:+.2f}pp** | "
+            f"Median: {summary_data['median_alpha']:+.2f}pp | "
+            f"Std: {summary_data['std_alpha']:.2f}pp | "
+            f"Positive: {_pct(summary_data.get('pct_positive'))}",
+            "",
+            "| Bucket | Count | % | Avg alpha |",
+            "|--------|-------|---|-----------|",
+        ]
+        for b in buckets:
+            lines.append(
+                f"| {b['bucket']} | {b['count']} | {_pct(b['pct'])} | "
+                f"{_pct_pts(b.get('avg_alpha'))} |"
+            )
+
+    return lines
+
+
+def _section_score_calibration(result: dict) -> list[str]:
+    """Build score calibration curve section."""
+    lines = [
+        "## Score calibration curve",
+        "",
+        f"_Horizon: {result.get('horizon', '10d')} — "
+        f"{'Monotonic ✓' if result.get('monotonic') else 'Non-monotonic ✗'}_",
+        "",
+        "| Score range | n | Avg score | Avg alpha (pp) | Beat SPY % |",
+        "|------------|---|-----------|----------------|------------|",
+    ]
+    for c in result.get("calibration", []):
+        lines.append(
+            f"| {c['score_range']} | {c['n']} | {c['avg_score']:.0f} | "
+            f"{c['avg_alpha']:+.2f} | {_pct(c.get('beat_spy_pct'))} |"
+        )
+
+    if not result.get("monotonic"):
+        lines += ["", "> Non-monotonic: higher scores do NOT consistently predict higher alpha. Score calibration may need adjustment."]
+    else:
+        lines += ["", "> Monotonic: higher scores predict higher alpha — scoring is well-calibrated."]
+
+    return lines
+
+
+def _section_veto_value(result: dict) -> list[str]:
+    """Build net veto value in dollars section."""
+    lines = [
+        "## Net veto value",
+        "",
+        f"_{result['n_vetoes']} DOWN predictions evaluated "
+        f"({result['n_correct']} correct, {result['n_incorrect']} incorrect). "
+        f"Precision: {_pct(result.get('precision'))}_",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Losses avoided (correct vetoes) | **${result['total_losses_avoided']:,.0f}** |",
+        f"| Alpha foregone (incorrect vetoes) | ${result['total_alpha_foregone']:,.0f} |",
+        f"| **Net veto value** | **${result['net_veto_value']:,.0f}** |",
+        f"| Avg loss avoided per veto | ${result['avg_loss_avoided']:,.0f} |",
+        f"| Avg alpha foregone per miss | ${result['avg_alpha_foregone']:,.0f} |",
+        f"| Avg vetoed stock alpha (5d) | {result.get('avg_veto_alpha_pct', 0):+.2f}pp |",
+    ]
+
+    by_conf = result.get("by_confidence", [])
+    if by_conf:
+        lines += [
+            "",
+            "### By confidence level",
+            "",
+            "| Confidence | Vetoes | Precision | Losses avoided | Alpha foregone | Net value |",
+            "|------------|--------|-----------|---------------|----------------|-----------|",
+        ]
+        for c in by_conf:
+            lines.append(
+                f"| {c['confidence_range']} | {c['n_vetoes']} | "
+                f"{_pct(c.get('precision'))} | "
+                f"${c['losses_avoided']:,.0f} | ${c['alpha_foregone']:,.0f} | "
+                f"${c['net_value']:,.0f} |"
+            )
+
+    verdict = "positive — vetoes are net beneficial" if result['net_veto_value'] > 0 else "negative — vetoes cost more than they save"
+    lines += ["", f"> Net veto value is **{verdict}**."]
+    return lines
+
+
+def _section_shadow_book(result: dict) -> list[str]:
+    """Build shadow book analysis section."""
+    lines = [
+        "## Risk guard shadow book",
+        "",
+        f"_{result['n_blocked']} blocked entries, {result['n_traded']} traded entries_",
+    ]
+
+    assessment = result.get("assessment", "unknown")
+    if result.get("blocked_avg_return_5d") is not None:
+        lines += [
+            "",
+            "| Cohort | Avg 5d return | n |",
+            "|--------|---------------|---|",
+            f"| Blocked entries | {result['blocked_avg_return_5d']:.2%} | {result.get('blocked_with_returns', '?')} |",
+        ]
+        if result.get("traded_avg_return_5d") is not None:
+            lines.append(f"| Traded entries | {result['traded_avg_return_5d']:.2%} | {result.get('traded_with_returns', '?')} |")
+        if result.get("guard_lift") is not None:
+            lines.append(f"| **Guard lift** | **{result['guard_lift']:.2%}** | — |")
+
+    by_reason = result.get("by_reason", [])
+    if by_reason:
+        lines += [
+            "",
+            "### Blocks by reason",
+            "",
+            "| Reason | Count | % of blocks | Avg score | Avg 5d return |",
+            "|--------|-------|-------------|-----------|---------------|",
+        ]
+        for r in by_reason:
+            ret_str = f"{r['avg_return_5d']:.2%}" if r.get("avg_return_5d") is not None else "—"
+            score_str = f"{r['avg_score']:.0f}" if r.get("avg_score") is not None else "—"
+            lines.append(
+                f"| {r['block_reason']} | {r['count']} | "
+                f"{_pct(r.get('pct_of_blocks'))} | {score_str} | {ret_str} |"
+            )
+
+    verdicts = {
+        "appropriate": "Risk guard is appropriately calibrated — traded entries outperform blocked entries.",
+        "too_tight": "Risk guard may be too conservative — blocked entries would have outperformed traded entries.",
+        "neutral": "Risk guard impact is neutral — blocked and traded entries perform similarly.",
+        "too_loose": "Risk guard may be too loose — blocked entries significantly underperform.",
+    }
+    lines += ["", f"> **Assessment:** {verdicts.get(assessment, assessment)}"]
+    return lines
+
+
+def _section_exit_timing(result: dict) -> list[str]:
+    """Build exit timing (MFE/MAE) section."""
+    summary = result.get("summary", {})
+    lines = [
+        "## Exit timing analysis (MFE/MAE)",
+        "",
+        f"_{summary.get('n_roundtrips', 0)} roundtrip trades analyzed_",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Avg MFE (max gain during hold) | {summary.get('avg_mfe', 0):+.2f}% |",
+        f"| Avg MAE (max loss during hold) | {summary.get('avg_mae', 0):+.2f}% |",
+        f"| Avg realized return | {summary.get('avg_realized_return', 0):+.2f}% |",
+        f"| Avg capture ratio (realized / MFE) | {summary.get('avg_capture_ratio', 0):.0%} |",
+        f"| Median MFE | {summary.get('median_mfe', 0):+.2f}% |",
+        f"| Median MAE | {summary.get('median_mae', 0):+.2f}% |",
+    ]
+
+    by_exit = result.get("by_exit_type", [])
+    if by_exit:
+        lines += [
+            "",
+            "### By exit type",
+            "",
+            "| Exit type | n | Avg MFE | Avg MAE | Avg return | Capture |",
+            "|-----------|---|---------|---------|------------|---------|",
+        ]
+        for e in by_exit:
+            cap_str = f"{e['avg_capture']:.0%}" if e.get("avg_capture") is not None else "—"
+            lines.append(
+                f"| {e['exit_type']} | {e['n']} | "
+                f"{e['avg_mfe']:+.2f}% | {e['avg_mae']:+.2f}% | "
+                f"{e['avg_realized']:+.2f}% | {cap_str} |"
+            )
+
+    diagnosis = result.get("diagnosis", "unknown")
+    diagnosis_text = {
+        "exits_too_early": "Exits are leaving significant gains on the table (low capture ratio). Consider widening trailing stops.",
+        "exits_well_timed": "Exits are well-timed — capturing a good portion of MFE while limiting MAE exposure.",
+        "exits_could_improve": "Exit timing has room for improvement. Review stop levels and profit-take thresholds.",
+        "exits_too_late": "Exits may be triggering too late — MAE is close to realized losses.",
+    }
+    lines += ["", f"> **Diagnosis:** {diagnosis_text.get(diagnosis, diagnosis)}"]
+    return lines
+
+
+def _section_macro_eval(result: dict) -> list[str]:
+    """Build macro multiplier A/B evaluation section."""
+    with_m = result.get("with_macro", {})
+    without_m = result.get("without_macro", {})
+    lines = [
+        "## Macro multiplier evaluation",
+        "",
+        f"_{result.get('n_evaluated', 0)} CIO evaluations analyzed_",
+        "",
+        "| Metric | With macro | Without macro | Lift |",
+        "|--------|-----------|---------------|------|",
+        f"| Accuracy (beat SPY 5d) | {_pct(with_m.get('accuracy'))} | {_pct(without_m.get('accuracy'))} | {_pct(result.get('accuracy_lift'))} |",
+        f"| Avg alpha (5d, pp) | {_pct_pts(with_m.get('avg_alpha'))} | {_pct_pts(without_m.get('avg_alpha'))} | {_pct_pts(result.get('alpha_lift'))} |",
+        f"| n stocks selected | {with_m.get('n', 0)} | {without_m.get('n', 0)} | — |",
+    ]
+
+    impact = result.get("macro_impact", {})
+    if impact.get("n_promoted", 0) > 0 or impact.get("n_demoted", 0) > 0:
+        lines += [
+            "",
+            f"Macro shift changed BUY status for "
+            f"**{impact.get('n_promoted', 0)}** stocks (promoted) and "
+            f"**{impact.get('n_demoted', 0)}** stocks (demoted).",
+        ]
+        if impact.get("promoted_avg_alpha") is not None:
+            lines.append(f"  - Promoted stocks avg alpha: {impact['promoted_avg_alpha']:+.2f}pp")
+        if impact.get("demoted_avg_alpha") is not None:
+            lines.append(f"  - Demoted stocks avg alpha: {impact['demoted_avg_alpha']:+.2f}pp")
+
+    shift_stats = result.get("shift_stats", {})
+    if shift_stats:
+        lines += [
+            "",
+            f"Shift stats: avg {shift_stats.get('avg_shift', 0):+.1f}, "
+            f"range [{shift_stats.get('min_shift', 0):+.1f}, {shift_stats.get('max_shift', 0):+.1f}], "
+            f"positive {shift_stats.get('n_positive', 0)} / negative {shift_stats.get('n_negative', 0)}",
+        ]
+
+    verdicts = {
+        "helps": "Macro shift **improves** accuracy — keep it enabled.",
+        "hurts": "Macro shift **hurts** accuracy — consider disabling or reducing magnitude.",
+        "neutral": "Macro shift has **no measurable effect** — may not be worth the complexity.",
+    }
+    lines += ["", f"> **Assessment:** {verdicts.get(result.get('assessment', ''), result.get('assessment', ''))}"]
+    return lines
+
+
+def _pct_pts(v) -> str:
+    """Format a value as percentage points (already in pct units)."""
+    if v is None:
+        return "—"
+    return f"{v:+.2f}pp"
 
 
 def _pct(v) -> str:

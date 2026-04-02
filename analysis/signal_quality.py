@@ -2,7 +2,7 @@
 signal_quality.py — Mode 1: aggregate score_performance from research.db.
 
 Reads the score_performance table (populated by the research pipeline) and
-computes accuracy metrics: % of BUY signals that beat SPY at 10d and 30d.
+computes accuracy metrics: % of BUY signals that beat SPY at 5d, 10d, and 30d.
 
 Data availability: meaningful results require ~200 populated rows.
 As of 2026-03-06, score_performance has 9 rows with beat_spy_10d = NULL.
@@ -55,11 +55,12 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
     Given score_performance rows, compute accuracy metrics.
 
     Returns a dict with:
-        - overall: {accuracy_10d, accuracy_30d, avg_alpha_10d, avg_alpha_30d, n}
+        - overall: {accuracy_5d, accuracy_10d, accuracy_30d, avg_alpha_5d/10d/30d, n}
         - by_score_bucket: accuracy split into [60-70, 70-80, 80-90, 90+]
         - by_conviction: accuracy split by conviction (rising/stable/declining)
         - status: "insufficient_data" if not enough rows are populated yet
     """
+    populated_5d = df[df["beat_spy_5d"].notna()] if "beat_spy_5d" in df.columns else pd.DataFrame()
     populated_10d = df[df["beat_spy_10d"].notna()]
     populated_30d = df[df["beat_spy_30d"].notna()]
 
@@ -72,6 +73,7 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
         )
         return {
             "status": "insufficient_data",
+            "rows_5d_populated": len(populated_5d),
             "rows_10d_populated": len(populated_10d),
             "rows_30d_populated": len(populated_30d),
             "rows_needed": min_samples,
@@ -79,14 +81,15 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
 
     result = {
         "status": "ok",
+        "rows_5d_populated": len(populated_5d),
         "rows_10d_populated": len(populated_10d),
         "rows_30d_populated": len(populated_30d),
-        "overall": _compute_slice_metrics(populated_10d, populated_30d),
-        "by_score_bucket": _accuracy_by_score_bucket(populated_10d, populated_30d),
+        "overall": _compute_slice_metrics(populated_5d, populated_10d, populated_30d),
+        "by_score_bucket": _accuracy_by_score_bucket(populated_5d, populated_10d, populated_30d),
     }
 
     if "conviction" in df.columns:
-        result["by_conviction"] = _accuracy_by_field(populated_10d, populated_30d, "conviction")
+        result["by_conviction"] = _accuracy_by_field(populated_5d, populated_10d, populated_30d, "conviction")
 
     return result
 
@@ -102,34 +105,42 @@ def _wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (round(max(0.0, centre - spread), 4), round(min(1.0, centre + spread), 4))
 
 
-def _compute_slice_metrics(df_10d: pd.DataFrame, df_30d: pd.DataFrame) -> dict:
+def _compute_slice_metrics(df_5d: pd.DataFrame, df_10d: pd.DataFrame, df_30d: pd.DataFrame) -> dict:
+    n_5d = len(df_5d)
     n_10d = len(df_10d)
     n_30d = len(df_30d)
 
+    acc_5d = float(df_5d["beat_spy_5d"].mean()) if n_5d > 0 else None
     acc_10d = float(df_10d["beat_spy_10d"].mean()) if n_10d > 0 else None
     acc_30d = float(df_30d["beat_spy_30d"].mean()) if n_30d > 0 else None
 
     # Wilson score 95% confidence intervals
+    ci_5d = _wilson_ci(int(df_5d["beat_spy_5d"].sum()), n_5d) if n_5d > 0 else None
     ci_10d = _wilson_ci(int(df_10d["beat_spy_10d"].sum()), n_10d) if n_10d > 0 else None
     ci_30d = _wilson_ci(int(df_30d["beat_spy_30d"].sum()), n_30d) if n_30d > 0 else None
 
     return {
+        "accuracy_5d": acc_5d,
         "accuracy_10d": acc_10d,
         "accuracy_30d": acc_30d,
+        "ci_95_5d": ci_5d,
         "ci_95_10d": ci_10d,
         "ci_95_30d": ci_30d,
+        "avg_alpha_5d": float((df_5d["return_5d"] - df_5d["spy_5d_return"]).mean()) if n_5d > 0 else None,
         "avg_alpha_10d": float((df_10d["return_10d"] - df_10d["spy_10d_return"]).mean()) if n_10d > 0 else None,
         "avg_alpha_30d": float((df_30d["return_30d"] - df_30d["spy_30d_return"]).mean()) if n_30d > 0 else None,
+        "n_5d": n_5d,
         "n_10d": n_10d,
         "n_30d": n_30d,
     }
 
 
-def _accuracy_by_score_bucket(df_10d: pd.DataFrame, df_30d: pd.DataFrame) -> list[dict]:
+def _accuracy_by_score_bucket(df_5d: pd.DataFrame, df_10d: pd.DataFrame, df_30d: pd.DataFrame) -> list[dict]:
     buckets = [(60, 70), (70, 80), (80, 90), (90, 101)]
     rows = []
     for lo, hi in buckets:
         label = f"{lo}-{min(hi, 100)}" if hi <= 100 else f"{lo}+"
+        slice_5d = df_5d[(df_5d["score"] >= lo) & (df_5d["score"] < hi)] if not df_5d.empty else pd.DataFrame()
         slice_10d = df_10d[(df_10d["score"] >= lo) & (df_10d["score"] < hi)]
         slice_30d = df_30d[(df_30d["score"] >= lo) & (df_30d["score"] < hi)]
         if len(slice_10d) == 0:
@@ -138,7 +149,7 @@ def _accuracy_by_score_bucket(df_10d: pd.DataFrame, df_30d: pd.DataFrame) -> lis
         rows.append({
             "bucket": label,
             "exploratory": len(slice_10d) < exploratory_threshold,
-            **_compute_slice_metrics(slice_10d, slice_30d),
+            **_compute_slice_metrics(slice_5d, slice_10d, slice_30d),
         })
 
     # Apply BH FDR correction across bucket accuracy p-values
@@ -171,14 +182,15 @@ def _norm_cdf(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
-def _accuracy_by_field(df_10d: pd.DataFrame, df_30d: pd.DataFrame, field: str) -> list[dict]:
+def _accuracy_by_field(df_5d: pd.DataFrame, df_10d: pd.DataFrame, df_30d: pd.DataFrame, field: str) -> list[dict]:
     values = df_10d[field].dropna().unique()
     rows = []
     for val in sorted(values):
+        slice_5d = df_5d[df_5d[field] == val] if not df_5d.empty and field in df_5d.columns else pd.DataFrame()
         slice_10d = df_10d[df_10d[field] == val]
         slice_30d = df_30d[df_30d[field] == val]
         rows.append({
             field: val,
-            **_compute_slice_metrics(slice_10d, slice_30d),
+            **_compute_slice_metrics(slice_5d, slice_10d, slice_30d),
         })
     return rows

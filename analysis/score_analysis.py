@@ -34,11 +34,13 @@ def accuracy_by_threshold(
     Use this to find the score cutoff that maximises accuracy while maintaining
     a meaningful sample size.
     """
+    populated_5d = df[df["beat_spy_5d"].notna()] if "beat_spy_5d" in df.columns else pd.DataFrame()
     populated_10d = df[df["beat_spy_10d"].notna()]
     populated_30d = df[df["beat_spy_30d"].notna()]
 
     results = []
     for t in sorted(thresholds):
+        slice_5d = populated_5d[populated_5d["score"] >= t] if not populated_5d.empty else pd.DataFrame()
         slice_10d = populated_10d[populated_10d["score"] >= t]
         slice_30d = populated_30d[populated_30d["score"] >= t]
 
@@ -46,7 +48,7 @@ def accuracy_by_threshold(
             logger.debug("Skipping threshold %d — only %d samples", t, len(slice_10d))
             continue
 
-        metrics = _compute_slice_metrics(slice_10d, slice_30d)
+        metrics = _compute_slice_metrics(slice_5d, slice_10d, slice_30d)
         results.append({"threshold": t, **metrics})
 
     if not results:
