@@ -164,6 +164,12 @@ def build_report(
     shadow_book: dict | None = None,
     exit_timing: dict | None = None,
     macro_eval: dict | None = None,
+    trigger_opt: dict | None = None,
+    predictor_sizing: dict | None = None,
+    scanner_opt: dict | None = None,
+    team_opt: dict | None = None,
+    cio_opt: dict | None = None,
+    sizing_ab: dict | None = None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
@@ -231,6 +237,26 @@ def build_report(
     # Macro multiplier evaluation
     if macro_eval and macro_eval.get("status") == "ok":
         lines += _section_macro_eval(macro_eval)
+        lines += [""]
+
+    # ── Phase 4: Self-adjustment mechanisms ──────────────────────────────
+    phase4_sections = []
+    if trigger_opt and trigger_opt.get("status") == "ok":
+        phase4_sections += _section_trigger_opt(trigger_opt)
+    if predictor_sizing and predictor_sizing.get("status") == "ok":
+        phase4_sections += _section_predictor_sizing(predictor_sizing)
+    if scanner_opt:
+        phase4_sections += _section_scanner_opt(scanner_opt)
+    if team_opt:
+        phase4_sections += _section_team_opt(team_opt)
+    if cio_opt and cio_opt.get("status") == "ok":
+        phase4_sections += _section_cio_opt(cio_opt)
+    if sizing_ab and sizing_ab.get("status") == "ok":
+        phase4_sections += _section_sizing_ab(sizing_ab)
+
+    if phase4_sections:
+        lines += ["", "---", "", "# Phase 4: Self-Adjustment Mechanisms", ""]
+        lines += phase4_sections
         lines += [""]
 
     # Portfolio simulation (Mode 2)
@@ -1269,6 +1295,183 @@ def _section_macro_eval(result: dict) -> list[str]:
         "neutral": "Macro shift has **no measurable effect** — may not be worth the complexity.",
     }
     lines += ["", f"> **Assessment:** {verdicts.get(result.get('assessment', ''), result.get('assessment', ''))}"]
+    return lines
+
+
+def _section_trigger_opt(result: dict) -> list[str]:
+    """Build trigger optimizer section."""
+    lines = [
+        "## Trigger optimizer (4e)",
+        "",
+    ]
+    recs = result.get("recommendations", [])
+    disabled = result.get("disabled_triggers", [])
+
+    if disabled:
+        lines.append(f"**Disabled triggers:** {', '.join(disabled)}")
+    else:
+        lines.append("**No triggers disabled** — all performing adequately or insufficient data.")
+    lines += [""]
+
+    if recs:
+        lines += [
+            "| Trigger | Action | Trades | Avg Alpha | Win Rate | Reasons |",
+            "|---------|--------|--------|-----------|----------|---------|",
+        ]
+        for r in recs:
+            alpha_str = f"{r.get('avg_alpha', 0):.3%}" if r.get("avg_alpha") is not None else "—"
+            wr_str = f"{r.get('win_rate', 0):.0%}" if r.get("win_rate") is not None else "—"
+            reasons = ", ".join(r.get("reasons", [])) or r.get("reason", "—")
+            lines.append(
+                f"| {r.get('trigger', '?')} | {r.get('action', '?')} | "
+                f"{r.get('n_trades', 0)} | {alpha_str} | {wr_str} | {reasons} |"
+            )
+
+    apply_r = result.get("apply_result", {})
+    if apply_r.get("applied"):
+        lines += ["", f"> Applied to S3: disabled {disabled}"]
+    elif apply_r:
+        lines += ["", f"> Not applied: {apply_r.get('reason', '—')}"]
+
+    return lines
+
+
+def _section_predictor_sizing(result: dict) -> list[str]:
+    """Build predictor p_up sizing section."""
+    lines = [
+        "## Predictor p_up sizing (4d)",
+        "",
+        f"**Overall rank IC:** {result.get('overall_rank_ic', 0):.4f}",
+        f"**Recent mean IC ({result.get('recent_total_weeks', 0)}w):** {result.get('recent_mean_ic', 0):.4f}",
+        f"**Positive weeks:** {result.get('recent_positive_weeks', 0)}/{result.get('recent_total_weeks', 0)}",
+        f"**Sizing lift:** {result.get('sizing_lift', 0):.4%}",
+        "",
+        f"**Recommendation:** {result.get('recommendation', '?')}",
+    ]
+
+    apply_r = result.get("apply_result", {})
+    if apply_r.get("applied"):
+        lines.append(f"> p_up sizing enabled in S3 (IC={apply_r.get('ic', '?')})")
+    elif apply_r:
+        lines.append(f"> Not applied: {apply_r.get('reason', '—')}")
+
+    return lines
+
+
+def _section_scanner_opt(result: dict) -> list[str]:
+    """Build scanner optimizer section."""
+    lines = ["## Scanner filter optimizer (4a)", ""]
+
+    if result.get("status") == "insufficient_data":
+        note = result.get("note", "")
+        n_weeks = result.get("n_weeks", 0)
+        min_req = result.get("min_required", 8)
+        lines.append(f"Insufficient data ({n_weeks}/{min_req} weeks). {note}")
+        return lines
+
+    analysis = result.get("analysis", result)
+    lines += [
+        f"**Filter leakage:** {analysis.get('leakage_rate', 0):.1%} "
+        f"(threshold: {analysis.get('leakage_threshold', 0):.1%})",
+        f"**Filter lift:** {analysis.get('filter_lift', 0):.4f}" if analysis.get("filter_lift") is not None else "",
+        f"**Weeks analyzed:** {analysis.get('n_weeks', 0)}",
+        "",
+    ]
+
+    gates = analysis.get("gate_analysis", [])
+    if gates:
+        lines += [
+            "| Gate | Rejected | Leakage | Avg Return |",
+            "|------|----------|---------|------------|",
+        ]
+        for g in gates:
+            lines.append(
+                f"| {g.get('gate', '?')} | {g.get('n_rejected', 0)} | "
+                f"{g.get('leakage_rate', 0):.1%} | "
+                f"{g.get('avg_return_5d', 0):.3%} |"
+                if g.get("avg_return_5d") is not None else
+                f"| {g.get('gate', '?')} | {g.get('n_rejected', 0)} | "
+                f"{g.get('leakage_rate', 0):.1%} | — |"
+            )
+
+    if result.get("status") == "ok" and result.get("changes"):
+        lines += ["", f"**Recommended changes:** {result.get('changes')}"]
+        apply_r = result.get("apply_result", {})
+        if apply_r.get("applied"):
+            lines.append("> Applied to S3")
+        elif apply_r:
+            lines.append(f"> Not applied: {apply_r.get('reason', '—')}")
+    elif result.get("status") == "no_change":
+        lines.append(f"> {result.get('note', 'No changes needed')}")
+
+    return lines
+
+
+def _section_team_opt(result: dict) -> list[str]:
+    """Build team slot optimizer section."""
+    lines = ["## Team slot allocation (4b)", ""]
+
+    if result.get("status") == "insufficient_data":
+        lines.append(f"Insufficient data ({result.get('n_weeks', 0)}/{result.get('min_required', 8)} weeks).")
+        return lines
+
+    analysis = result.get("analysis", {})
+    teams = analysis.get("team_analysis", [])
+
+    if teams:
+        lines += [
+            "| Team | Lift vs Sector | Lift vs Quant | Picks | Assessment | Slot Δ |",
+            "|------|---------------|---------------|-------|------------|--------|",
+        ]
+        for t in teams:
+            lift_s = f"{t.get('lift_vs_sector', 0):.3%}" if t.get("lift_vs_sector") is not None else "—"
+            lift_q = f"{t.get('lift_vs_quant', 0):.3%}" if t.get("lift_vs_quant") is not None else "—"
+            change = t.get("recommended_slot_change", 0)
+            change_str = f"{change:+d}" if change != 0 else "—"
+            lines.append(
+                f"| {t.get('team_id', '?')} | {lift_s} | {lift_q} | "
+                f"{t.get('n_picks', 0)} | {t.get('assessment', '?')} | {change_str} |"
+            )
+
+    if result.get("status") == "ok" and result.get("changes"):
+        lines += ["", f"**Slot changes:** {result.get('changes')}"]
+    elif result.get("status") == "no_change":
+        lines += ["", "> No slot changes — all teams performing within bounds."]
+
+    return lines
+
+
+def _section_cio_opt(result: dict) -> list[str]:
+    """Build CIO fallback optimizer section."""
+    lines = [
+        "## CIO mode optimizer (4c)",
+        "",
+        f"**CIO lift:** {result.get('cio_lift', 0):.4f}" if result.get("cio_lift") is not None else "**CIO lift:** —",
+        f"**CIO vs ranking:** {result.get('cio_vs_ranking_lift', 0):.4f}" if result.get("cio_vs_ranking_lift") is not None else "**CIO vs ranking:** —",
+        f"**Recommendation:** {result.get('recommendation', '?')}",
+        "",
+        f"> {result.get('reasoning', '')}",
+    ]
+    return lines
+
+
+def _section_sizing_ab(result: dict) -> list[str]:
+    """Build sizing A/B test section."""
+    current = result.get("current_sizing", {})
+    equal = result.get("equal_weight", {})
+    lines = [
+        "## Position sizing A/B test (4f)",
+        "",
+        "| Metric | Current Sizing | Equal Weight | Difference |",
+        "|--------|---------------|--------------|------------|",
+        f"| Sharpe | {current.get('sharpe', '—')} | {equal.get('sharpe', '—')} | {result.get('sharpe_diff', '—')} |",
+        f"| Total Return | {current.get('total_return', '—')} | {equal.get('total_return', '—')} | {result.get('return_diff', '—')} |",
+        f"| Total Alpha | {current.get('total_alpha', '—')} | {equal.get('total_alpha', '—')} | {result.get('alpha_diff', '—')} |",
+        f"| Max Drawdown | {current.get('max_drawdown', '—')} | {equal.get('max_drawdown', '—')} | — |",
+        f"| Trades | {current.get('total_trades', '—')} | {equal.get('total_trades', '—')} | — |",
+        "",
+        f"> **Assessment:** {result.get('detail', result.get('assessment', '?'))}",
+    ]
     return lines
 
 

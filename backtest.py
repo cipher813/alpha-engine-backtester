@@ -52,7 +52,10 @@ from analysis import end_to_end
 from analysis import trigger_scorecard, alpha_distribution, veto_value
 from analysis import shadow_book as shadow_book_analysis
 from analysis import exit_timing, macro_eval
+from analysis import sizing_ab
 from optimizer import weight_optimizer, executor_optimizer, research_optimizer
+from optimizer import trigger_optimizer, predictor_sizing_optimizer
+from optimizer import scanner_optimizer, pipeline_optimizer
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
 
@@ -1796,6 +1799,12 @@ def main() -> None:
     shadow_result = None
     exit_timing_result = None
     macro_result = None
+    trigger_opt_result = None
+    predictor_sizing_result = None
+    scanner_opt_result = None
+    team_opt_result = None
+    cio_opt_result = None
+    sizing_ab_result = None
 
     # ── Signal quality pipeline ───────────────────────────────────────────
     if args.mode in ("signal-quality", "all"):
@@ -1886,6 +1895,87 @@ def main() -> None:
             except Exception as e:
                 logger.warning("Macro multiplier evaluation failed: %s", e)
 
+        # ── Phase 4: Self-adjustment mechanisms ─────────────────────────────
+        bucket = config.get("signals_bucket", "alpha-engine-research")
+
+        # 4e: Trigger optimizer — disable underperforming triggers
+        if trigger_result and trigger_result.get("status") == "ok":
+            try:
+                trigger_opt_result = trigger_optimizer.analyze(trigger_result)
+                if trigger_opt_result.get("status") == "ok":
+                    if args.freeze:
+                        trigger_opt_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                    else:
+                        trigger_opt_result["apply_result"] = trigger_optimizer.apply(trigger_opt_result, bucket)
+                    logger.info("Trigger optimizer: %d triggers to disable", len(trigger_opt_result.get("disabled_triggers", [])))
+            except Exception as e:
+                logger.warning("Trigger optimizer failed: %s", e)
+
+        # 4d: Predictor p_up → sizing (if IC positive)
+        if db_path and os.path.exists(db_path):
+            try:
+                predictor_sizing_result = predictor_sizing_optimizer.analyze(db_path)
+                if predictor_sizing_result.get("status") == "ok":
+                    if args.freeze:
+                        predictor_sizing_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                    elif predictor_sizing_result.get("recommendation") == "enable":
+                        predictor_sizing_result["apply_result"] = predictor_sizing_optimizer.apply(predictor_sizing_result, bucket)
+                    logger.info("Predictor sizing: IC=%.3f, recommendation=%s",
+                                predictor_sizing_result.get("overall_rank_ic", 0),
+                                predictor_sizing_result.get("recommendation"))
+            except Exception as e:
+                logger.warning("Predictor sizing optimizer failed: %s", e)
+
+        # 4a: Scanner auto-relax (if leakage is high)
+        if db_path and os.path.exists(db_path):
+            try:
+                scanner_analysis = scanner_optimizer.analyze(db_path)
+                if scanner_analysis.get("status") == "ok":
+                    current_scanner = scanner_optimizer.read_current_params(bucket)
+                    scanner_opt_result = scanner_optimizer.recommend(scanner_analysis, current_scanner)
+                    if scanner_opt_result.get("status") == "ok":
+                        if args.freeze:
+                            scanner_opt_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                        else:
+                            scanner_opt_result["apply_result"] = scanner_optimizer.apply(scanner_opt_result, bucket)
+                    scanner_opt_result["analysis"] = scanner_analysis
+                    logger.info("Scanner optimizer: leakage=%.1f%%, high=%s",
+                                scanner_analysis.get("leakage_rate", 0) * 100,
+                                scanner_analysis.get("high_leakage"))
+                else:
+                    scanner_opt_result = scanner_analysis
+            except Exception as e:
+                logger.warning("Scanner optimizer failed: %s", e)
+
+        # 4b: Team slot allocation + 4c: CIO fallback
+        if e2e_lift and e2e_lift.get("status") == "ok":
+            try:
+                team_analysis = pipeline_optimizer.analyze_team_performance(e2e_lift)
+                if team_analysis.get("status") == "ok":
+                    team_opt_result = pipeline_optimizer.recommend_team_slots(team_analysis)
+                    if team_opt_result.get("status") == "ok":
+                        if args.freeze:
+                            team_opt_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                        else:
+                            team_opt_result["apply_result"] = pipeline_optimizer.apply_team_slots(team_opt_result, bucket)
+                    team_opt_result["analysis"] = team_analysis
+                    logger.info("Team optimizer: %s", team_opt_result.get("changes", "no changes"))
+                else:
+                    team_opt_result = team_analysis
+            except Exception as e:
+                logger.warning("Team slot optimizer failed: %s", e)
+
+            try:
+                cio_opt_result = pipeline_optimizer.analyze_cio_performance(e2e_lift)
+                if cio_opt_result.get("status") == "ok":
+                    if args.freeze:
+                        cio_opt_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                    elif cio_opt_result.get("recommendation") == "deterministic":
+                        cio_opt_result["apply_result"] = pipeline_optimizer.apply_cio_mode(cio_opt_result, bucket)
+                    logger.info("CIO optimizer: recommendation=%s", cio_opt_result.get("recommendation"))
+            except Exception as e:
+                logger.warning("CIO optimizer failed: %s", e)
+
     # ── Simulation setup (shared by simulate + param-sweep) ───────────────
     _sim_setup = None
     if args.mode in ("simulate", "param-sweep", "all"):
@@ -1907,6 +1997,24 @@ def main() -> None:
         portfolio_stats, sweep_df, executor_rec = _run_simulation_pipeline(
             args, config, _sim_setup, current_executor_params, fd,
         )
+
+    # ── 4f: Sizing A/B test ──────────────────────────────────────────────
+    if args.mode in ("simulate", "all") and _sim_setup is not None:
+        try:
+            executor_run, SimulatedIBKRClient, dates, price_matrix, _, ohlcv = _sim_setup
+            if price_matrix is not None:
+                def _sizing_sim_fn(combo_config):
+                    return _run_simulation_loop(
+                        executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
+                        ohlcv_by_ticker=ohlcv,
+                    )
+                sizing_ab_result = sizing_ab.run_sizing_ab(_sizing_sim_fn, config)
+                if sizing_ab_result.get("status") == "ok":
+                    logger.info("Sizing A/B: %s (Sharpe diff=%s)",
+                                sizing_ab_result.get("assessment"),
+                                sizing_ab_result.get("sharpe_diff"))
+        except Exception as e:
+            logger.warning("Sizing A/B test failed: %s", e)
 
     # ── Predictor backtest ────────────────────────────────────────────────
     if args.mode in ("predictor-backtest", "all"):
@@ -1959,6 +2067,12 @@ def main() -> None:
             shadow_book=shadow_result,
             exit_timing=exit_timing_result,
             macro_eval=macro_result,
+            trigger_opt=trigger_opt_result,
+            predictor_sizing=predictor_sizing_result,
+            scanner_opt=scanner_opt_result,
+            team_opt=team_opt_result,
+            cio_opt=cio_opt_result,
+            sizing_ab=sizing_ab_result,
         )
 
         save_sweep_df = sweep_df
