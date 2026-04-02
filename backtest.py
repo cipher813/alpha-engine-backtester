@@ -47,6 +47,8 @@ import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution, param_sweep
 from analysis import veto_analysis
+from analysis import universe_returns
+from analysis import end_to_end
 from optimizer import weight_optimizer, executor_optimizer, research_optimizer
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
@@ -404,9 +406,24 @@ def _seed_score_performance(config: dict) -> None:
                 pass
 
 
+def _ensure_5d_columns(conn) -> None:
+    """Add 5d return columns to score_performance if they don't exist yet."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(score_performance)").fetchall()}
+    for col, col_type in [
+        ("price_5d", "REAL"),
+        ("return_5d", "REAL"),
+        ("spy_5d_return", "REAL"),
+        ("beat_spy_5d", "INTEGER"),
+        ("eval_date_5d", "TEXT"),
+    ]:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE score_performance ADD COLUMN {col} {col_type}")
+    conn.commit()
+
+
 def _backfill_score_performance_returns(config: dict) -> None:
     """
-    Backfill 10d and 30d returns for score_performance rows missing them.
+    Backfill 5d, 10d, and 30d returns for score_performance rows missing them.
 
     The research pipeline's run_performance_checks() does this on each Lambda run,
     but seeded rows (from _seed_score_performance) won't have returns until the
@@ -421,9 +438,11 @@ def _backfill_score_performance_returns(config: dict) -> None:
         import yfinance as yf
 
         conn = _sqlite3.connect(db_path)
+        _ensure_5d_columns(conn)
+
         pending = pd.read_sql_query(
             "SELECT symbol, score_date, price_on_date FROM score_performance "
-            "WHERE return_10d IS NULL OR return_30d IS NULL",
+            "WHERE return_5d IS NULL OR return_10d IS NULL OR return_30d IS NULL",
             conn,
         )
         if pending.empty:
@@ -433,24 +452,28 @@ def _backfill_score_performance_returns(config: dict) -> None:
         today_ts = pd.Timestamp(date.today())
 
         # Only backfill rows where enough time has passed
+        rows_5d = []
         rows_10d = []
         rows_30d = []
         for _, row in pending.iterrows():
             score_ts = pd.Timestamp(row["score_date"])
+            eval_5d = score_ts + pd.offsets.BDay(5)
             eval_10d = score_ts + pd.offsets.BDay(10)
             eval_30d = score_ts + pd.offsets.BDay(30)
+            if eval_5d <= today_ts:
+                rows_5d.append(row)
             if eval_10d <= today_ts:
                 rows_10d.append(row)
             if eval_30d <= today_ts:
                 rows_30d.append(row)
 
-        if not rows_10d and not rows_30d:
+        if not rows_5d and not rows_10d and not rows_30d:
             conn.close()
             logger.info("No score_performance rows eligible for return backfill yet")
             return
 
         # Batch yfinance download
-        all_rows = rows_10d + rows_30d
+        all_rows = rows_5d + rows_10d + rows_30d
         tickers = list({r["symbol"] for r in all_rows})
         all_tickers = tickers + (["SPY"] if "SPY" not in tickers else [])
         min_date = min(r["score_date"] for r in all_rows)
@@ -480,6 +503,36 @@ def _backfill_score_performance_returns(config: dict) -> None:
             return None
 
         updated = 0
+
+        for row in rows_5d:
+            score_ts = pd.Timestamp(row["score_date"])
+            eval_ts = score_ts + pd.offsets.BDay(5)
+            exit_price = _get_close(row["symbol"], eval_ts)
+            spy_entry = _get_close("SPY", score_ts)
+            spy_exit = _get_close("SPY", eval_ts)
+
+            if exit_price is None or row["price_on_date"] is None:
+                continue
+
+            ret_5d = (exit_price / row["price_on_date"]) - 1
+            spy_ret = (spy_exit / spy_entry) - 1 if spy_entry and spy_exit else None
+            beat = 1 if (spy_ret is not None and ret_5d > spy_ret) else None
+
+            conn.execute(
+                "UPDATE score_performance SET price_5d=?, return_5d=?, "
+                "spy_5d_return=?, beat_spy_5d=?, eval_date_5d=? "
+                "WHERE symbol=? AND score_date=? AND return_5d IS NULL",
+                (
+                    round(exit_price, 2),
+                    round(ret_5d * 100, 2),
+                    round(spy_ret * 100, 2) if spy_ret is not None else None,
+                    beat,
+                    str(eval_ts.date()),
+                    row["symbol"], row["score_date"],
+                ),
+            )
+            updated += 1
+
         for row in rows_10d:
             score_ts = pd.Timestamp(row["score_date"])
             eval_ts = score_ts + pd.offsets.BDay(10)
@@ -546,7 +599,8 @@ def _backfill_score_performance_returns(config: dict) -> None:
         # Completeness check: warn if eligible rows still lack returns
         still_pending = pd.read_sql_query(
             "SELECT COUNT(*) as n FROM score_performance "
-            "WHERE (return_10d IS NULL AND score_date <= date('now', '-14 days')) "
+            "WHERE (return_5d IS NULL AND score_date <= date('now', '-10 days')) "
+            "   OR (return_10d IS NULL AND score_date <= date('now', '-14 days')) "
             "   OR (return_30d IS NULL AND score_date <= date('now', '-45 days'))",
             conn,
         )
@@ -566,6 +620,88 @@ def _backfill_score_performance_returns(config: dict) -> None:
             conn.close()
         except Exception:
             pass
+
+
+def _populate_universe_returns(config: dict) -> dict | None:
+    """
+    Populate universe_returns table with forward returns for all ~900 S&P stocks.
+
+    Uses polygon.io grouped-daily endpoint (1 API call per date) to fetch
+    close prices for the entire US market. Computes 5d/10d forward returns,
+    SPY benchmark, and sector ETF returns for each evaluation date.
+
+    Only processes dates that have signals but are missing from universe_returns.
+    """
+    db_path = config.get("research_db")
+    bucket = config.get("signals_bucket")
+    if not db_path or not os.path.exists(db_path) or not bucket:
+        return None
+
+    try:
+        from polygon_client import polygon_client as get_polygon_client
+        from loaders import signal_loader
+
+        client = get_polygon_client()
+        signal_dates = signal_loader.list_dates(bucket)
+
+        # Load sector_map if available
+        sector_map = _load_sector_map(config)
+
+        result = universe_returns.build_and_insert(
+            db_path=db_path,
+            eval_dates=signal_dates,
+            polygon_client=client,
+            sector_map=sector_map,
+        )
+        if result.get("rows_inserted", 0) > 0:
+            logger.info(
+                "universe_returns: inserted %d rows across %d dates",
+                result["rows_inserted"], result["dates_processed"],
+            )
+        return result
+    except Exception as e:
+        logger.warning("_populate_universe_returns: %s", e)
+        return {"status": "error", "error": str(e)}
+
+
+def _load_sector_map(config: dict) -> dict[str, str] | None:
+    """Load sector_map.json from predictor repo or S3."""
+    # Try local predictor repo first
+    predictor_paths = config.get("predictor_paths", [])
+    if isinstance(predictor_paths, str):
+        predictor_paths = [predictor_paths]
+    for p in predictor_paths:
+        map_path = Path(p) / "data" / "cache" / "sector_map.json"
+        if map_path.exists():
+            import json as _json
+            with open(map_path) as f:
+                return _json.load(f)
+
+    # Try S3
+    try:
+        import json as _json
+        s3 = boto3.client("s3")
+        bucket = config.get("signals_bucket", "alpha-engine-research")
+        resp = s3.get_object(
+            Bucket=bucket, Key="predictor/price_cache/sector_map.json"
+        )
+        return _json.load(resp["Body"])
+    except Exception as e:
+        logger.warning("Could not load sector_map.json: %s", e)
+        return None
+
+
+def _find_trades_db(config: dict) -> str | None:
+    """Find trades.db from executor_paths config."""
+    executor_paths = config.get("executor_paths", [])
+    if isinstance(executor_paths, str):
+        executor_paths = [executor_paths]
+    for p in executor_paths:
+        db_path = Path(p) / "trades.db"
+        if db_path.exists():
+            return str(db_path)
+    # Try S3-pulled copy in temp dir
+    return None
 
 
 def _backfill_predictor_outcomes(config: dict, df_base: pd.DataFrame) -> None:
@@ -727,6 +863,7 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
     _seed_predictor_outcomes(config)
     _backfill_predictor_outcomes(config, df_base)
     _push_predictor_rolling_metrics(config, config.get("research_db", ""))
+    # universe_returns population now handled by alpha-engine-data (Phase 1)
 
     return sq_result, regime_rows, score_rows, attr_result, df_base
 
@@ -1648,11 +1785,27 @@ def main() -> None:
     executor_rec = None
     predictor_stats = None
     predictor_sweep_df = None
+    e2e_lift = None
 
     # ── Signal quality pipeline ───────────────────────────────────────────
     if args.mode in ("signal-quality", "all"):
         (sq_result, regime_rows, score_rows, attr_result, df_base,
          weight_result, veto_result) = _run_signal_quality_pipeline(args, config)
+
+        # End-to-end pipeline lift metrics (requires universe_returns)
+        db_path = config.get("research_db")
+        if db_path and os.path.exists(db_path):
+            try:
+                # Find trades.db path from executor_paths
+                trades_db = _find_trades_db(config)
+                e2e_lift = end_to_end.compute_lift_metrics(
+                    research_db_path=db_path,
+                    trades_db_path=trades_db,
+                )
+                if e2e_lift.get("status") == "ok":
+                    logger.info("End-to-end lift metrics computed across %d dates", e2e_lift.get("n_dates", 0))
+            except Exception as e:
+                logger.warning("End-to-end lift metrics failed: %s", e)
 
     # ── Simulation setup (shared by simulate + param-sweep) ───────────────
     _sim_setup = None
@@ -1719,6 +1872,7 @@ def main() -> None:
             executor_rec=executor_rec,
             regression_result=regression_result,
             pipeline_health=pipeline_health,
+            e2e_lift=e2e_lift,
         )
 
         save_sweep_df = sweep_df
