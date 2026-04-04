@@ -39,6 +39,10 @@ def list_dates(bucket: str, prefix: str = "signals") -> list[str]:
     """
     Return sorted list of dates (YYYY-MM-DD) that have a signals.json in S3.
 
+    Only includes dates where signals.json actually exists (not just the
+    prefix directory — other files like order_book_summary.json can create
+    prefixes without a signals.json).
+
     s3://{bucket}/{prefix}/{date}/signals.json
     """
     s3 = boto3.client("s3")
@@ -46,12 +50,19 @@ def list_dates(bucket: str, prefix: str = "signals") -> list[str]:
     dates = []
 
     try:
-        for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/", Delimiter="/"):
+        for page in paginator.paginate(
+            Bucket=bucket, Prefix=f"{prefix}/", Delimiter="/"
+        ):
             for cp in page.get("CommonPrefixes", []):
-                # cp["Prefix"] looks like "signals/2026-03-06/"
                 date_str = cp["Prefix"].rstrip("/").split("/")[-1]
-                if _is_valid_date(date_str):
+                if not _is_valid_date(date_str):
+                    continue
+                # Verify signals.json exists (not just the prefix)
+                try:
+                    s3.head_object(Bucket=bucket, Key=f"{prefix}/{date_str}/signals.json")
                     dates.append(date_str)
+                except ClientError:
+                    pass
     except ClientError as e:
         logger.error("Failed to list signal dates from s3://%s/%s/: %s", bucket, prefix, e)
         raise
