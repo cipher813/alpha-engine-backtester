@@ -155,6 +155,11 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
         }
 
     min_combos = _cfg.get("min_valid_combos", _MIN_VALID_COMBOS)
+    if "sharpe_ratio" not in sweep_df.columns:
+        return {
+            "status": "insufficient_data",
+            "note": "No simulations produced sharpe_ratio — all combos failed or had insufficient coverage",
+        }
     valid = sweep_df[sweep_df["sharpe_ratio"].notna()].copy()
     if len(valid) < min_combos:
         return {

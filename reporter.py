@@ -72,7 +72,7 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
         "| Optimizer | Metric | Progress | Status |",
         "|-----------|--------|----------|--------|",
         f"| Signal quality | 10d returns | {_bar(sp_with_10d, 5)} | {'**Active**' if sp_with_10d >= 5 else 'Accumulating'} |",
-        f"| Scoring weights | 10d returns | {_bar(sp_with_10d, 30)} | {'**Active**' if sp_with_10d >= 30 else 'Accumulating'} |",
+        f"| Scoring weights | 10d returns | {_bar(sp_with_10d, 43)} | {'**Active**' if sp_with_10d >= 43 else 'Accumulating'} |",
         f"| Attribution | 10d returns | {_bar(sp_with_10d, 50)} | {'**Active**' if sp_with_10d >= 50 else 'Accumulating'} |",
         f"| Predictor veto | Resolved outcomes | {_bar(po_resolved, 20)} | {'**Active**' if po_resolved >= 20 else 'Accumulating'} |",
         f"| Research params | Signals | {_bar(sp_total, 200)} | {'**Active**' if sp_total >= 200 else 'Deferred'} |",
@@ -427,7 +427,7 @@ def _section_signal_quality(sq: dict) -> list[str]:
         f"| Metric | 5d | 10d | 30d |",
         f"|--------|-----|-----|-----|",
         f"| Accuracy vs SPY | {_pct(acc_5d)} (n={n_5d}) | {_pct(acc_10d)} (n={n_10d}) | {_pct(acc_30d)} (n={n_30d}) |",
-        f"| Avg alpha | {_pct(overall.get('avg_alpha_5d'))} | {_pct(overall.get('avg_alpha_10d'))} | {_pct(overall.get('avg_alpha_30d'))} |",
+        f"| Avg alpha | {_alpha_pp(overall.get('avg_alpha_5d'))} | {_alpha_pp(overall.get('avg_alpha_10d'))} | {_alpha_pp(overall.get('avg_alpha_30d'))} |",
         "",
         "> 50% = coin flip. 55%+ over 30+ signals suggests real alpha.",
     ]
@@ -451,7 +451,7 @@ def _section_signal_quality(sq: dict) -> list[str]:
             lines.append(
                 f"| {b.get('bucket')} | {_pct(b.get('accuracy_5d'))}{star} | "
                 f"{_pct(b.get('accuracy_10d'))}{star} | "
-                f"{_pct(b.get('accuracy_30d'))}{star} | {_pct(b.get('avg_alpha_10d'))}{star} | "
+                f"{_pct(b.get('accuracy_30d'))}{star} | {_alpha_pp(b.get('avg_alpha_10d'))}{star} | "
                 f"{b.get('n_10d', 0)} | {fdr_tag} |"
             )
         if has_exploratory:
@@ -1486,6 +1486,13 @@ def _pct(v) -> str:
     if v is None:
         return "—"
     return f"{v * 100:.1f}%"
+
+
+def _alpha_pp(v) -> str:
+    """Format alpha values that are already in percentage-point form (e.g. 5.0 = 5pp)."""
+    if v is None:
+        return "—"
+    return f"{v:.1f}%"
 
 
 def _fmt(v) -> str:

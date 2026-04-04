@@ -446,6 +446,21 @@ def _backfill_score_performance_returns(config: dict) -> None:
         conn = _sqlite3.connect(db_path)
         _ensure_5d_columns(conn)
 
+        # Repair: fix beat_spy columns where return exists but beat_spy is NULL
+        # (caused by earlier bug that set beat_spy=NULL instead of 0 for losses)
+        for horizon in ("5d", "10d", "30d"):
+            repaired = conn.execute(
+                f"UPDATE score_performance "
+                f"SET beat_spy_{horizon} = CASE "
+                f"  WHEN return_{horizon} > spy_{horizon}_return THEN 1 ELSE 0 END "
+                f"WHERE return_{horizon} IS NOT NULL "
+                f"  AND spy_{horizon}_return IS NOT NULL "
+                f"  AND beat_spy_{horizon} IS NULL",
+            ).rowcount
+            if repaired:
+                logger.info("Repaired %d beat_spy_%s values (NULL→0 for losses)", repaired, horizon)
+        conn.commit()
+
         pending = pd.read_sql_query(
             "SELECT symbol, score_date, price_on_date FROM score_performance "
             "WHERE return_5d IS NULL OR return_10d IS NULL OR return_30d IS NULL",
@@ -522,7 +537,7 @@ def _backfill_score_performance_returns(config: dict) -> None:
 
             ret_5d = (exit_price / row["price_on_date"]) - 1
             spy_ret = (spy_exit / spy_entry) - 1 if spy_entry and spy_exit else None
-            beat = 1 if (spy_ret is not None and ret_5d > spy_ret) else None
+            beat = (1 if ret_5d > spy_ret else 0) if spy_ret is not None else None
 
             conn.execute(
                 "UPDATE score_performance SET price_5d=?, return_5d=?, "
@@ -551,7 +566,7 @@ def _backfill_score_performance_returns(config: dict) -> None:
 
             ret_10d = (exit_price / row["price_on_date"]) - 1
             spy_ret = (spy_exit / spy_entry) - 1 if spy_entry and spy_exit else None
-            beat = 1 if (spy_ret is not None and ret_10d > spy_ret) else None
+            beat = (1 if ret_10d > spy_ret else 0) if spy_ret is not None else None
 
             conn.execute(
                 "UPDATE score_performance SET price_10d=?, return_10d=?, "
@@ -580,7 +595,7 @@ def _backfill_score_performance_returns(config: dict) -> None:
 
             ret_30d = (exit_price / row["price_on_date"]) - 1
             spy_ret = (spy_exit / spy_entry) - 1 if spy_entry and spy_exit else None
-            beat = 1 if (spy_ret is not None and ret_30d > spy_ret) else None
+            beat = (1 if ret_30d > spy_ret else 0) if spy_ret is not None else None
 
             conn.execute(
                 "UPDATE score_performance SET price_30d=?, return_30d=?, "
