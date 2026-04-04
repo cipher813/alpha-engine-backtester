@@ -102,6 +102,15 @@ def load_with_subscores(
             flat = {k: sig.get(f"{k}_score") for k in SUB_SCORES}
             if any(v is not None for v in flat.values()):
                 return flat
+            # Legacy format (pre-2026-03-29): technical ≈ quant, avg(news,research) ≈ qual
+            if sub:
+                tech = sub.get("technical")
+                news = sub.get("news")
+                research = sub.get("research")
+                if tech is not None:
+                    qual_parts = [v for v in (news, research) if v is not None]
+                    qual = sum(qual_parts) / len(qual_parts) if qual_parts else None
+                    return {"quant": tech, "qual": qual}
             return None
 
         # Check signals dict (v1 format)
