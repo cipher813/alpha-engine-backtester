@@ -113,7 +113,7 @@ class TestVetoAnalysis:
             threshold_confs = [t["confidence"] for t in result["thresholds"]]
             assert recommended in threshold_confs
 
-    @patch("analysis.veto_analysis._load_predictions_for_dates")
+    @patch("analysis.veto_analysis._load_all_predictions")
     def test_min_veto_decisions_gate(self, mock_load):
         """Thresholds with fewer than min_veto_decisions are not scoreable."""
         # Use very high confidence range so most predictions have low confidence
@@ -138,7 +138,7 @@ class TestVetoAnalysis:
         # Should get insufficient_vetoes since no threshold has 100+ decisions
         assert result.get("status") in ("insufficient_vetoes", "no_down_predictions", "insufficient_lift")
 
-    @patch("analysis.veto_analysis._load_predictions_for_dates")
+    @patch("analysis.veto_analysis._load_all_predictions")
     def test_lift_over_base_rate_check(self, mock_load):
         """If best lift < 5pp over base rate, status should be insufficient_lift."""
         # Create data where veto precision is close to base rate (no lift)
@@ -174,7 +174,7 @@ class TestVetoAnalysis:
         result = analyze_veto_effectiveness(df, bucket="test-bucket")
         assert result["status"] == "no_predictions"
 
-    @patch("analysis.veto_analysis._load_predictions_for_dates")
+    @patch("analysis.veto_analysis._load_all_predictions")
     def test_no_down_predictions_returns_no_down(self, mock_load):
         """All predictions are UP → status=no_down_predictions."""
         df = _make_score_perf_df(n=50)

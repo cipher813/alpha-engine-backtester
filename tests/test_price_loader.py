@@ -64,7 +64,7 @@ class TestBuildMatrix:
 
     @patch("loaders.price_loader._load_from_s3")
     def test_ffill_limited_to_5_days(self, mock_s3):
-        """Forward-fill should not propagate beyond 5 days."""
+        """Tickers with gaps exceeding 5-day ffill limit are dropped entirely."""
         from loaders.price_loader import build_matrix
 
         # Simulate 10 dates where AAPL only has data on the first date
@@ -79,13 +79,10 @@ class TestBuildMatrix:
         mock_s3.side_effect = fake_s3
         df = build_matrix(dates, bucket="test")
 
-        # AAPL should be filled for 5 days after Mar 2, then NaN
-        aapl = df["AAPL"]
-        filled_count = aapl.notna().sum()
-        # First day (real) + 5 ffill days = 6 non-NaN values
-        assert filled_count <= 6, f"Expected <= 6 filled values, got {filled_count}"
-        # Last few days should be NaN (gap > 5)
-        assert aapl.isna().any(), "Expected some NaN values after ffill limit"
+        # AAPL has 9 NaN days out of 10 — after ffill(limit=5) it still has
+        # unfilled NaNs, so it gets dropped to avoid distorting VectorBT results
+        assert "AAPL" not in df.columns, "AAPL should be dropped (gap > ffill limit)"
+        assert "AAPL" in df.attrs.get("unfilled_gaps", {}), "AAPL should appear in unfilled_gaps"
 
     @patch("loaders.price_loader._load_from_s3")
     def test_gap_warnings_stored_in_attrs(self, mock_s3):
