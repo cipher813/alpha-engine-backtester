@@ -1510,7 +1510,7 @@ def _init_pipeline(args: argparse.Namespace, config: dict) -> None:
 
 
 def _run_signal_quality_pipeline(
-    args: argparse.Namespace, config: dict,
+    args: argparse.Namespace, config: dict, fd=None,
 ) -> tuple[dict, list, list, dict, object, dict | None, dict | None]:
     """Run signal quality analysis, weight optimizer, veto analysis, and research params.
 
@@ -1531,6 +1531,9 @@ def _run_signal_quality_pipeline(
                     veto_result["apply_result"] = veto_analysis.apply(veto_result, bucket)
         except Exception as e:
             logger.error("Veto analysis failed: %s", e)
+            if fd:
+                fd.report(e, severity="error", context={
+                    "site": "veto_analysis", "mode": args.mode})
             veto_result = {"status": "error", "error": str(e)}
 
     # Research params optimization (boost correlations)
@@ -1548,6 +1551,9 @@ def _run_signal_quality_pipeline(
                         rp_result["apply_result"] = research_optimizer.apply(rp_result, bucket)
         except Exception as e:
             logger.error("Research params optimization failed: %s", e)
+            if fd:
+                fd.report(e, severity="error", context={
+                    "site": "research_optimizer", "mode": args.mode})
 
     return sq_result, regime_rows, score_rows, attr_result, df_base, weight_result, veto_result
 
@@ -1588,6 +1594,9 @@ def _run_simulation_pipeline(
                     )
         except Exception as e:
             logger.error("Mode 2 simulation failed: %s", e)
+            if fd:
+                fd.report(e, severity="error", context={
+                    "site": "simulation", "mode": args.mode})
             portfolio_stats = {"status": "error", "error": str(e)}
 
     # ── Param sweep ───────────────────────────────────────────────────────
@@ -1666,6 +1675,9 @@ def _run_simulation_pipeline(
                         executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
             except Exception as e:
                 logger.error("Executor optimizer failed: %s", e)
+                if fd:
+                    fd.report(e, severity="error", context={
+                        "site": "executor_optimizer", "mode": args.mode})
                 executor_rec = {"status": "error", "error": str(e)}
 
     return portfolio_stats, sweep_df, executor_rec
@@ -1676,6 +1688,7 @@ def _run_predictor_pipeline(
     config: dict,
     executor_rec: dict | None,
     current_executor_params: dict | None,
+    fd=None,
 ) -> tuple[dict | None, object | None, dict | None]:
     """Run predictor backtest and auto-apply executor params from predictor sweep.
 
@@ -1688,6 +1701,9 @@ def _run_predictor_pipeline(
         predictor_stats, predictor_sweep_df = run_predictor_param_sweep(config)
     except Exception as e:
         logger.error("Predictor backtest failed: %s", e)
+        if fd:
+            fd.report(e, severity="error", context={
+                "site": "predictor_backtest", "mode": args.mode})
         predictor_stats = {"status": "error", "error": str(e)}
         predictor_sweep_df = None
 
@@ -1710,6 +1726,9 @@ def _run_predictor_pipeline(
                     executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
         except Exception as e:
             logger.error("Executor optimizer (predictor sweep) failed: %s", e)
+            if fd:
+                fd.report(e, severity="error", context={
+                    "site": "executor_optimizer_predictor", "mode": args.mode})
             executor_rec = {"status": "error", "error": str(e)}
 
     return predictor_stats, predictor_sweep_df, executor_rec
@@ -1824,7 +1843,7 @@ def main() -> None:
     # ── Signal quality pipeline ───────────────────────────────────────────
     if args.mode in ("signal-quality", "all"):
         (sq_result, regime_rows, score_rows, attr_result, df_base,
-         weight_result, veto_result) = _run_signal_quality_pipeline(args, config)
+         weight_result, veto_result) = _run_signal_quality_pipeline(args, config, fd)
 
         # End-to-end pipeline lift metrics (requires universe_returns)
         db_path = config.get("research_db")
@@ -2030,11 +2049,14 @@ def main() -> None:
                                 sizing_ab_result.get("sharpe_diff"))
         except Exception as e:
             logger.warning("Sizing A/B test failed: %s", e)
+            if fd:
+                fd.report(e, severity="warning", context={
+                    "site": "sizing_ab", "mode": args.mode})
 
     # ── Predictor backtest ────────────────────────────────────────────────
     if args.mode in ("predictor-backtest", "all"):
         predictor_stats, predictor_sweep_df, executor_rec = _run_predictor_pipeline(
-            args, config, executor_rec, current_executor_params,
+            args, config, executor_rec, current_executor_params, fd,
         )
 
     # ── Regression detection ──────────────────────────────────────────────

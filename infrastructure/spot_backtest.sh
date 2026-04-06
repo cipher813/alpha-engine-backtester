@@ -188,8 +188,8 @@ ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
 BOOTSTRAP
 
 echo "==> Cloning repositories (branch: $BRANCH)..."
-# Clone all 3 repos needed for backtest (backtester imports executor + predictor)
-for REPO in alpha-engine-backtester alpha-engine alpha-engine-predictor; do
+# Clone all repos needed for backtest (backtester imports executor + predictor + flow-doctor)
+for REPO in alpha-engine-backtester alpha-engine alpha-engine-predictor flow-doctor; do
     echo "  Cloning $REPO..."
     ssh -A $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" \
         "git clone --depth 1 --branch $BRANCH git@github.com:cipher813/$REPO.git /home/ec2-user/$REPO" 2>/dev/null || {
@@ -210,13 +210,15 @@ else
 fi
 
 $PIP install --upgrade pip -q
-# Filter out private packages that aren't on PyPI
-grep -v '^flow-doctor' requirements.txt | $PIP install -q -r /dev/stdin
+$PIP install -q -r requirements.txt
+
+# Install flow-doctor from bundled source (not on PyPI)
+$PIP install -q -e /home/ec2-user/flow-doctor
 
 # Also install predictor deps (needed for GBM inference + feature computation)
 cd /home/ec2-user/alpha-engine-predictor
 if [ -f requirements.txt ]; then
-    grep -v '^flow-doctor' requirements.txt | $PIP install -q -r /dev/stdin 2>/dev/null || true
+    $PIP install -q -r requirements.txt 2>/dev/null || true
 fi
 
 # Force numpy<2 after all deps (pyarrow compiled against numpy 1.x)

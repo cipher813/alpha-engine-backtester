@@ -74,8 +74,9 @@ class TestCheckRegression:
         assert result["checked"] is False
         assert "no baseline" in result.get("reason", "")
 
+    @patch("optimizer.regression_monitor.rollback_all", return_value=[])
     @patch("optimizer.regression_monitor._load_baseline")
-    def test_positive_sharpe_detects_large_drop(self, mock_load):
+    def test_positive_sharpe_detects_large_drop(self, mock_load, mock_rollback):
         """Sharpe dropping >20% from positive baseline should trigger regression."""
         mock_load.return_value = {
             "sharpe_ratio": 2.0,
@@ -117,8 +118,9 @@ class TestCheckRegression:
         # Accuracy drop is only 2pp (< 5pp threshold), so no regression
         assert result["regression_detected"] is False
 
+    @patch("optimizer.regression_monitor.rollback_all", return_value=[])
     @patch("optimizer.regression_monitor._load_baseline")
-    def test_accuracy_drop_triggers_regression(self, mock_load):
+    def test_accuracy_drop_triggers_regression(self, mock_load, mock_rollback):
         """Accuracy dropping >5pp should trigger regression."""
         mock_load.return_value = {
             "accuracy_10d": 0.65,
@@ -140,8 +142,9 @@ class TestCheckRegression:
         assert result["checked"] is True
         assert result["regression_detected"] is False
 
+    @patch("optimizer.regression_monitor.rollback_all", return_value=[])
     @patch("optimizer.regression_monitor._load_baseline")
-    def test_custom_thresholds(self, mock_load):
+    def test_custom_thresholds(self, mock_load, mock_rollback):
         """Custom config thresholds should be respected."""
         mock_load.return_value = {"sharpe_ratio": 2.0}
         # 15% drop with a strict 10% threshold → should trigger
