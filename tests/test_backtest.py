@@ -78,8 +78,11 @@ class TestSimulationLoopGates:
         )
         assert result["status"] == "stale_prices"
 
-    def test_no_stale_flag_proceeds(self):
+    @patch("loaders.signal_loader.load")
+    def test_no_stale_flag_proceeds(self, mock_signal_load):
         """Without stale flag, simulation should proceed (may produce no_orders)."""
+        mock_signal_load.side_effect = FileNotFoundError("no signals in test")
+
         price_matrix = pd.DataFrame(
             {"AAPL": [100.0, 101.0]},
             index=pd.to_datetime(["2026-03-01", "2026-03-02"]),
