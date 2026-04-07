@@ -66,9 +66,18 @@ _IC_STD_EPSILON = 1e-8   # avoid division by zero in IC/IR computation
 
 
 def load_config(path: str) -> dict:
-    with open(path) as f:
+    from pathlib import Path
+    search_paths = [
+        Path.home() / "alpha-engine-config" / "backtester" / "config.yaml",
+        Path(__file__).parent.parent / "alpha-engine-config" / "backtester" / "config.yaml",
+        Path(path),
+    ]
+    resolved = next((p for p in search_paths if p.exists()), None)
+    if resolved is None:
+        raise FileNotFoundError(f"Config not found. Searched: {[str(p) for p in search_paths]}")
+    with open(resolved) as f:
         config = yaml.safe_load(f)
-    _validate_config(config, path)
+    _validate_config(config, str(resolved))
     return config
 
 
