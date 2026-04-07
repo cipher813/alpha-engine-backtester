@@ -7,4 +7,5 @@ pyyaml~=6.0
 yfinance~=0.2.54
 pyarrow~=14.0
 ib_insync~=0.9.86
+arcticdb>=6.11
 # flow-doctor: installed from bundled source (not PyPI) — see spot_backtest.sh
