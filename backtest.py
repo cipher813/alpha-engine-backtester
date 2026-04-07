@@ -895,6 +895,17 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
     _push_predictor_rolling_metrics(config, config.get("research_db", ""))
     # universe_returns population now handled by alpha-engine-data (Phase 1)
 
+    # Phase 2: Production model health monitoring
+    try:
+        from analysis.production_health import compute_production_health, compute_calibration_validation
+        _db = config.get("research_db", "")
+        _bucket = config.get("signals_bucket", "alpha-engine-research")
+        if _db and os.path.exists(_db):
+            compute_production_health(_db, _bucket)
+            compute_calibration_validation(_db, _bucket)
+    except Exception as _ph_exc:
+        logger.warning("Production health analysis failed (non-fatal): %s", _ph_exc)
+
     return sq_result, regime_rows, score_rows, attr_result, df_base
 
 
