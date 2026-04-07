@@ -693,47 +693,67 @@ def run(config: dict) -> dict:
     use_full_cache = pb_config.get("use_full_cache", False)
     bucket = config.get("signals_bucket", "alpha-engine-research")
 
-    # 1. Load price data — full S3 cache (10y) or local slim cache (2y)
-    if use_full_cache:
-        logger.info("Loading full 10y price cache from S3...")
-        price_data = load_full_cache_from_s3(bucket=bucket)
-    else:
-        price_data = load_slim_cache(predictor_path)
+    # 1. Load price data + features — try ArcticDB first, fall back to legacy path
+    use_arcticdb = pb_config.get("use_arcticdb", True)
+    features_by_ticker = None
+    feature_skip_reasons = {}
+    price_data = None
+    data_source = "legacy"
 
-    # Trim to recent rows to limit memory.
-    # max_trading_days + 300 warmup rows is enough for feature computation.
-    trim_rows = max_trading_days + 300
-    trimmed = 0
-    for ticker in price_data:
-        if len(price_data[ticker]) > trim_rows:
-            price_data[ticker] = price_data[ticker].iloc[-trim_rows:]
-            trimmed += 1
-    if trimmed:
-        logger.info("Trimmed %d tickers to most recent %d rows (memory optimization)", trimmed, trim_rows)
+    if use_arcticdb:
+        try:
+            from store.arctic_reader import load_universe_from_arctic
+            logger.info("[data_source=arcticdb] Loading universe from ArcticDB...")
+            price_data, features_by_ticker = load_universe_from_arctic(bucket=bucket)
+            if features_by_ticker:
+                data_source = "arcticdb"
+                logger.info("[data_source=arcticdb] %d tickers with pre-computed features — skipped recomputation", len(features_by_ticker))
+            else:
+                logger.warning("[data_source=arcticdb] No features returned — falling back to legacy path")
+                price_data = None
+        except Exception as exc:
+            logger.warning("[data_source=arcticdb] Load failed — falling back to legacy path: %s", exc)
+
+    # Legacy fallback: load from S3 parquets + compute features inline
+    if price_data is None:
+        data_source = "legacy"
+        if use_full_cache:
+            logger.info("[data_source=legacy] Loading full 10y price cache from S3...")
+            price_data = load_full_cache_from_s3(bucket=bucket)
+        else:
+            price_data = load_slim_cache(predictor_path)
+
+        # Trim to recent rows to limit memory
+        trim_rows = max_trading_days + 300
+        trimmed = 0
+        for ticker in price_data:
+            if len(price_data[ticker]) > trim_rows:
+                price_data[ticker] = price_data[ticker].iloc[-trim_rows:]
+                trimmed += 1
+        if trimmed:
+            logger.info("Trimmed %d tickers to most recent %d rows (memory optimization)", trimmed, trim_rows)
 
     # 2. Load sector map
     sector_map = load_sector_map(predictor_path)
 
-    # 3. Compute features — try feature store first, fall back to recomputation
-    use_feature_store = pb_config.get("use_feature_store", True)
-    features_by_ticker = None
-    feature_skip_reasons = {}
-
-    if use_feature_store and not use_full_cache:
-        # Estimate trading dates for feature store lookup
-        all_dates = set()
-        skip_tickers = _MACRO_TICKERS | _SECTOR_ETFS
-        for t, df in price_data.items():
-            if t not in skip_tickers:
-                all_dates.update(df.index.strftime("%Y-%m-%d"))
-        est_dates = sorted(all_dates)[-max_trading_days:] if all_dates else []
-        if est_dates:
-            features_by_ticker = _load_features_from_store(est_dates, bucket)
-            if features_by_ticker:
-                logger.info("Using feature store cache (%d tickers) — skipped recomputation", len(features_by_ticker))
-
+    # 3. Compute features if not already loaded from ArcticDB
     if features_by_ticker is None:
-        features_by_ticker, feature_skip_reasons = compute_all_features(price_data, sector_map, predictor_path)
+        use_feature_store = pb_config.get("use_feature_store", True)
+
+        if use_feature_store and not use_full_cache:
+            all_dates = set()
+            skip_tickers = _MACRO_TICKERS | _SECTOR_ETFS
+            for t, df in price_data.items():
+                if t not in skip_tickers:
+                    all_dates.update(df.index.strftime("%Y-%m-%d"))
+            est_dates = sorted(all_dates)[-max_trading_days:] if all_dates else []
+            if est_dates:
+                features_by_ticker = _load_features_from_store(est_dates, bucket)
+                if features_by_ticker:
+                    logger.info("Using feature store cache (%d tickers) — skipped recomputation", len(features_by_ticker))
+
+        if features_by_ticker is None:
+            features_by_ticker, feature_skip_reasons = compute_all_features(price_data, sector_map, predictor_path)
 
     if not features_by_ticker:
         return {
@@ -792,6 +812,7 @@ def run(config: dict) -> dict:
     )
 
     metadata = {
+        "data_source": data_source,
         "n_tickers": n_feature_tickers,
         "n_dates": len(trading_dates),
         "date_range_start": trading_dates[0],
