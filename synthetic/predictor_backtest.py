@@ -698,24 +698,27 @@ def run(config: dict) -> dict:
     features_by_ticker = None
     feature_skip_reasons = {}
     price_data = None
+    data_source = "legacy"
 
     if use_arcticdb:
         try:
             from store.arctic_reader import load_universe_from_arctic
-            logger.info("Loading universe from ArcticDB...")
+            logger.info("[data_source=arcticdb] Loading universe from ArcticDB...")
             price_data, features_by_ticker = load_universe_from_arctic(bucket=bucket)
             if features_by_ticker:
-                logger.info("ArcticDB: %d tickers with pre-computed features — skipped recomputation", len(features_by_ticker))
+                data_source = "arcticdb"
+                logger.info("[data_source=arcticdb] %d tickers with pre-computed features — skipped recomputation", len(features_by_ticker))
             else:
-                logger.warning("ArcticDB returned no features — falling back to legacy path")
+                logger.warning("[data_source=arcticdb] No features returned — falling back to legacy path")
                 price_data = None
         except Exception as exc:
-            logger.warning("ArcticDB load failed — falling back to legacy path: %s", exc)
+            logger.warning("[data_source=arcticdb] Load failed — falling back to legacy path: %s", exc)
 
     # Legacy fallback: load from S3 parquets + compute features inline
     if price_data is None:
+        data_source = "legacy"
         if use_full_cache:
-            logger.info("Loading full 10y price cache from S3...")
+            logger.info("[data_source=legacy] Loading full 10y price cache from S3...")
             price_data = load_full_cache_from_s3(bucket=bucket)
         else:
             price_data = load_slim_cache(predictor_path)
@@ -809,6 +812,7 @@ def run(config: dict) -> dict:
     )
 
     metadata = {
+        "data_source": data_source,
         "n_tickers": n_feature_tickers,
         "n_dates": len(trading_dates),
         "date_range_start": trading_dates[0],
