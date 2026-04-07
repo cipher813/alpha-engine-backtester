@@ -33,3 +33,8 @@ results/
 .idea/
 .vscode/
 CLAUDE.md
+
+# Gitleaks config (symlink to shared config)
+.gitleaks.toml
+
+.gitleaksbaseline.json
