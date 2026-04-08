@@ -43,6 +43,20 @@ def load_score_performance(db_path: str) -> pd.DataFrame:
             conn,
             parse_dates=["score_date", "eval_date_10d", "eval_date_30d"],
         )
+
+        # Enrich with sector from universe_returns (if table exists)
+        if "sector" not in df.columns:
+            try:
+                ur_sectors = pd.read_sql_query(
+                    "SELECT DISTINCT ticker, sector FROM universe_returns WHERE sector IS NOT NULL AND sector != ''",
+                    conn,
+                )
+                if not ur_sectors.empty:
+                    df = df.merge(ur_sectors, left_on="symbol", right_on="ticker", how="left")
+                    df.drop(columns=["ticker"], inplace=True, errors="ignore")
+                    logger.info("Enriched score_performance with sector from universe_returns (%d mapped)", df["sector"].notna().sum())
+            except Exception:
+                pass  # universe_returns may not exist yet
     finally:
         conn.close()
 
@@ -91,6 +105,9 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
     if "conviction" in df.columns:
         result["by_conviction"] = _accuracy_by_field(populated_5d, populated_10d, populated_30d, "conviction")
 
+    if "sector" in df.columns and df["sector"].notna().any():
+        result["by_sector"] = _accuracy_by_field(populated_5d, populated_10d, populated_30d, "sector")
+
     return result
 
 
@@ -119,6 +136,12 @@ def _compute_slice_metrics(df_5d: pd.DataFrame, df_10d: pd.DataFrame, df_30d: pd
     ci_10d = _wilson_ci(int(df_10d["beat_spy_10d"].sum()), n_10d) if n_10d > 0 else None
     ci_30d = _wilson_ci(int(df_30d["beat_spy_30d"].sum()), n_30d) if n_30d > 0 else None
 
+    # Classification metrics at 10d horizon
+    # For BUY signals: precision = % that beat SPY (same as accuracy)
+    # Recall is not computable here (requires universe-level data from end_to_end.py)
+    tp_10d = int(df_10d["beat_spy_10d"].sum()) if n_10d > 0 else 0
+    fp_10d = n_10d - tp_10d
+
     return {
         "accuracy_5d": acc_5d,
         "accuracy_10d": acc_10d,
@@ -132,6 +155,9 @@ def _compute_slice_metrics(df_5d: pd.DataFrame, df_10d: pd.DataFrame, df_30d: pd
         "n_5d": n_5d,
         "n_10d": n_10d,
         "n_30d": n_30d,
+        "precision_10d": round(tp_10d / n_10d, 4) if n_10d > 0 else None,
+        "tp_10d": tp_10d,
+        "fp_10d": fp_10d,
     }
 
 

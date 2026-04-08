@@ -156,6 +156,25 @@ def compute_shadow_book_analysis(
     else:
         result["assessment"] = "insufficient_return_data"
 
+    # Classification: selected=blocked, positive=would have lost (didn't beat SPY)
+    # TP = blocked AND didn't beat SPY (correct block)
+    # FP = blocked AND beat SPY (incorrectly blocked a winner)
+    # FN = traded AND didn't beat SPY (should have been blocked)
+    # TN = traded AND beat SPY (correctly allowed)
+    if (blocked_returns is not None and not blocked_returns.empty
+            and traded_returns is not None and not traded_returns.empty
+            and "beat_spy_5d" in blocked_returns.columns
+            and "beat_spy_5d" in traded_returns.columns):
+        from analysis.classification_metrics import compute_binary_metrics
+        b = blocked_returns[blocked_returns["beat_spy_5d"].notna()]
+        t = traded_returns[traded_returns["beat_spy_5d"].notna()]
+        if not b.empty and not t.empty:
+            tp = int((b["beat_spy_5d"] == 0).sum())
+            fp = int((b["beat_spy_5d"] == 1).sum())
+            fn = int((t["beat_spy_5d"] == 0).sum())
+            tn = int((t["beat_spy_5d"] == 1).sum())
+            result["classification"] = compute_binary_metrics(tp, fp, fn, tn)
+
     # Breakdown by block reason
     by_reason = []
     for reason in sorted(shadow["block_reason"].unique()):

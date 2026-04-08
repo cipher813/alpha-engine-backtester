@@ -1955,6 +1955,7 @@ def main() -> None:
     team_opt_result = None
     cio_opt_result = None
     sizing_ab_result = None
+    confusion_result = None
 
     # ── Signal quality pipeline ───────────────────────────────────────────
     if args.mode in ("signal-quality", "all"):
@@ -2011,6 +2012,17 @@ def main() -> None:
                     logger.info("Net veto value: $%.0f", veto_val_result.get("net_veto_value", 0))
             except Exception as e:
                 logger.warning("Veto value analysis failed: %s", e)
+
+        # 3h: Predictor confusion matrix
+        if db_path and os.path.exists(db_path):
+            try:
+                from analysis.predictor_confusion import compute_confusion_matrix
+                confusion_result = compute_confusion_matrix(db_path)
+                if confusion_result.get("status") == "ok":
+                    logger.info("Predictor confusion matrix: %d predictions, accuracy=%.1f%%",
+                                confusion_result.get("n", 0), (confusion_result.get("accuracy", 0) or 0) * 100)
+            except Exception as e:
+                logger.warning("Predictor confusion matrix failed: %s", e)
 
         # 3b: Shadow book analysis
         if trades_db:
@@ -2196,6 +2208,25 @@ def main() -> None:
             "feature_skip_reasons": predictor_stats.get("skip_reasons") if predictor_stats else None,
         }
 
+        # Compute unified scorecard grades
+        from analysis.grading import compute_scorecard
+        grading_result = compute_scorecard(
+            signal_quality=sq_result,
+            e2e_lift=e2e_lift,
+            macro_eval=macro_result,
+            score_calibration=score_cal_result,
+            veto_result=veto_result,
+            veto_value=veto_val_result,
+            trigger_scorecard=trigger_result,
+            shadow_book=shadow_result,
+            exit_timing=exit_timing_result,
+            sizing_ab=sizing_ab_result,
+            predictor_sizing=predictor_sizing_result,
+            portfolio_stats=portfolio_stats,
+            scanner_opt=scanner_opt_result,
+            cio_opt=cio_opt_result,
+        )
+
         report_md = build_report(
             run_date=args.date,
             signal_quality=sq_result,
@@ -2226,6 +2257,8 @@ def main() -> None:
             team_opt=team_opt_result,
             cio_opt=cio_opt_result,
             sizing_ab=sizing_ab_result,
+            grading=grading_result,
+            confusion_matrix=confusion_result,
         )
 
         save_sweep_df = sweep_df
@@ -2240,6 +2273,13 @@ def main() -> None:
             attribution=attr_result if args.mode in ("signal-quality", "all") else None,
             run_date=args.date,
             results_dir=config.get("results_dir", "results"),
+            grading=grading_result,
+            trigger_scorecard=trigger_result,
+            shadow_book=shadow_result,
+            exit_timing=exit_timing_result,
+            e2e_lift=e2e_lift,
+            veto_result=veto_result,
+            confusion_matrix=confusion_result,
         )
 
         print(f"\nReport saved to {out_dir}/")
@@ -2256,6 +2296,16 @@ def main() -> None:
                 run_date=args.date,
             )
             print(f"\nUploaded to s3://{config.get('output_bucket')}/{config.get('output_prefix')}/{args.date}/")
+
+            # Append grades to S3 history for trend tracking
+            if grading_result and grading_result.get("status") in ("ok", "partial"):
+                try:
+                    from analysis.grade_history import append_grades
+                    gh_result = append_grades(grading_result, args.date, config.get("output_bucket", "alpha-engine-research"))
+                    if gh_result.get("status") == "ok":
+                        logger.info("Grade history updated: %d entries", gh_result.get("n_entries", 0))
+                except Exception as e:
+                    logger.warning("Grade history update failed (non-fatal): %s", e)
 
         sender = config.get("email_sender")
         recipients = config.get("email_recipients", [])

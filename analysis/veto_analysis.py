@@ -160,19 +160,23 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
         return None
 
     # Join predictions with outcomes
+    has_sector = "sector" in populated.columns
     rows = []
     for _, row in populated.iterrows():
         d = str(row["score_date"].date()) if hasattr(row["score_date"], "date") else str(row["score_date"])
         ticker = row["symbol"]
         preds = _nearest_prediction(d, ticker)
         if preds and preds.get("predicted_direction") == "DOWN":
-            rows.append({
+            entry = {
                 "symbol": ticker,
                 "score_date": d,
                 "prediction_confidence": float(preds["prediction_confidence"]),
                 "beat_spy_10d": float(row["beat_spy_10d"]),
                 "return_10d": float(row.get("return_10d", 0)),
-            })
+            }
+            if has_sector and pd.notna(row.get("sector")):
+                entry["sector"] = row["sector"]
+            rows.append(entry)
 
     # Diagnostic: track direction distribution for reporting
     all_directions = []
@@ -213,17 +217,46 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
     threshold_results = _sweep_thresholds(down_df, base_rate, thresholds)
     n_preds_loaded = sum(len(v) for v in predictions_by_date.values())
 
-    return _select_best_threshold(
+    result = _select_best_threshold(
         threshold_results, base_rate, cost_weight, current_default,
         min_veto_dec, n_down, n_preds_loaded,
     )
+
+    # Per-sector veto precision at the recommended threshold
+    if "sector" in down_df.columns and down_df["sector"].notna().any():
+        rec_thresh = result.get("recommended_threshold", current_default)
+        by_sector = []
+        for sector in sorted(down_df["sector"].dropna().unique()):
+            s_df = down_df[down_df["sector"] == sector]
+            vetoed = s_df[s_df["prediction_confidence"] >= rec_thresh]
+            n_vetoes = len(vetoed)
+            if n_vetoes == 0:
+                by_sector.append({"sector": sector, "n_down": len(s_df), "n_vetoes": 0, "precision": None, "recall": None})
+                continue
+            tn = int((vetoed["beat_spy_10d"] == 0).sum())
+            total_under = int((s_df["beat_spy_10d"] == 0).sum())
+            precision = tn / n_vetoes if n_vetoes > 0 else None
+            recall = tn / total_under if total_under > 0 else None
+            by_sector.append({
+                "sector": sector,
+                "n_down": len(s_df),
+                "n_vetoes": n_vetoes,
+                "precision": round(precision, 4) if precision is not None else None,
+                "recall": round(recall, 4) if recall is not None else None,
+            })
+        result["by_sector"] = by_sector
+
+    return result
 
 
 def _sweep_thresholds(
     down_df: pd.DataFrame, base_rate: float, thresholds: list[float],
 ) -> list[dict]:
-    """Evaluate veto precision and missed alpha at each confidence threshold."""
+    """Evaluate veto precision, recall, F1, and missed alpha at each threshold."""
     from analysis.signal_quality import _wilson_ci
+
+    # Total actual underperformers across ALL DOWN predictions (for recall denominator)
+    total_actual_underperformers = int((down_df["beat_spy_10d"] == 0).sum())
 
     results = []
     for threshold in thresholds:
@@ -237,6 +270,8 @@ def _sweep_thresholds(
                 "true_negatives": 0,
                 "false_negatives": 0,
                 "precision": None,
+                "recall": None,
+                "f1": None,
                 "precision_ci_95": None,
                 "low_confidence": True,
                 "missed_alpha": 0.0,
@@ -248,6 +283,14 @@ def _sweep_thresholds(
         true_neg = int((vetoed["beat_spy_10d"] == 0).sum())
         false_neg = int((vetoed["beat_spy_10d"] == 1).sum())
         precision = true_neg / n_vetoes
+
+        # Recall: of all actual underperformers, how many did we veto?
+        recall = true_neg / total_actual_underperformers if total_actual_underperformers > 0 else None
+        # F1: harmonic mean of precision and recall
+        if recall is not None and (precision + recall) > 0:
+            f1 = 2 * precision * recall / (precision + recall)
+        else:
+            f1 = None
 
         precision_ci = _wilson_ci(true_neg, n_vetoes)
         low_confidence = n_vetoes < 30
@@ -264,6 +307,8 @@ def _sweep_thresholds(
             "true_negatives": true_neg,
             "false_negatives": false_neg,
             "precision": round(precision, 4),
+            "recall": round(recall, 4) if recall is not None else None,
+            "f1": round(f1, 4) if f1 is not None else None,
             "precision_ci_95": precision_ci,
             "low_confidence": low_confidence,
             "missed_alpha": round(missed_total, 4),

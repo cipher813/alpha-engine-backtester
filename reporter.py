@@ -95,6 +95,144 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
     return lines
 
 
+def _section_scorecard(grading: dict) -> list[str]:
+    """Build the System Report Card section from grading results."""
+    lines = ["## System Report Card", ""]
+
+    overall = grading.get("overall", {})
+    og = overall.get("grade")
+    ol = overall.get("letter", "N/A")
+    if og is not None:
+        lines.append(f"**OVERALL SYSTEM GRADE: {ol} ({og:.0f}/100)**")
+    else:
+        lines.append("**OVERALL SYSTEM GRADE: N/A** (insufficient data)")
+    lines.append("")
+
+    # Module summary table
+    lines.append("| Module | Grade | Score | Key Metric |")
+    lines.append("|--------|-------|-------|------------|")
+
+    for module_key, label in [("research", "Research"), ("predictor", "Predictor"), ("executor", "Executor")]:
+        mod = grading.get(module_key, {})
+        mg = mod.get("grade")
+        ml = mod.get("letter", "N/A")
+        # Pick a single key metric for the summary row
+        key_metric = _scorecard_key_metric(mod)
+        if mg is not None:
+            lines.append(f"| **{label}** | **{ml}** | {mg:.0f} | {key_metric} |")
+        else:
+            lines.append(f"| **{label}** | N/A | — | insufficient data |")
+
+    lines.append("")
+
+    # Research detail
+    research = grading.get("research", {})
+    r_comps = research.get("components", {})
+    lines.append("### Research Components")
+    lines.append("")
+    lines.append("| Component | Grade | Score | Detail |")
+    lines.append("|-----------|-------|-------|--------|")
+
+    for comp_key, comp_label in [
+        ("scanner", "Scanner"),
+        ("macro_agent", "Macro Agent"),
+        ("cio", "CIO"),
+        ("composite_scoring", "Composite Scoring"),
+    ]:
+        c = r_comps.get(comp_key, {})
+        _append_component_row(lines, comp_label, c)
+
+    # Sector teams
+    teams = r_comps.get("sector_teams", [])
+    avg = r_comps.get("sector_teams_avg", {})
+    if teams:
+        avg_g = avg.get("grade")
+        avg_l = avg.get("letter", "N/A")
+        if avg_g is not None:
+            lines.append(f"| **Sector Teams (avg)** | **{avg_l}** | {avg_g:.0f} | |")
+        for t in teams:
+            tid = t.get("team_id", "?").replace("_", " ").title()
+            _append_component_row(lines, f"  {tid}", t)
+
+    lines.append("")
+
+    # Predictor detail
+    predictor = grading.get("predictor", {})
+    p_comps = predictor.get("components", {})
+    lines.append("### Predictor Components")
+    lines.append("")
+    lines.append("| Component | Grade | Score | Detail |")
+    lines.append("|-----------|-------|-------|--------|")
+    for comp_key, comp_label in [("gbm_model", "GBM Model"), ("veto_gate", "Veto Gate")]:
+        c = p_comps.get(comp_key, {})
+        _append_component_row(lines, comp_label, c)
+    lines.append("")
+
+    # Executor detail
+    executor = grading.get("executor", {})
+    e_comps = executor.get("components", {})
+    lines.append("### Executor Components")
+    lines.append("")
+    lines.append("| Component | Grade | Score | Detail |")
+    lines.append("|-----------|-------|-------|--------|")
+    for comp_key, comp_label in [
+        ("entry_triggers", "Entry Triggers"),
+        ("risk_guard", "Risk Guard"),
+        ("exit_rules", "Exit Rules"),
+        ("position_sizing", "Position Sizing"),
+        ("portfolio", "Portfolio"),
+    ]:
+        c = e_comps.get(comp_key, {})
+        _append_component_row(lines, comp_label, c)
+    lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    return lines
+
+
+def _append_component_row(lines: list[str], label: str, comp: dict):
+    """Append a single component row to the scorecard table."""
+    g = comp.get("grade")
+    l = comp.get("letter", "N/A")
+    detail = comp.get("detail", {})
+    reason = comp.get("reason")
+
+    if g is not None:
+        detail_str = ", ".join(f"{k}: {v}" for k, v in detail.items()
+                               if k != "per_trigger" and not isinstance(v, list))
+        lines.append(f"| {label} | {l} | {g:.0f} | {detail_str} |")
+    else:
+        lines.append(f"| {label} | N/A | — | {reason or 'insufficient data'} |")
+
+
+def _scorecard_key_metric(mod: dict) -> str:
+    """Extract a single key metric string for the module summary row."""
+    comps = mod.get("components", {})
+
+    # Research: show composite scoring accuracy
+    cs = comps.get("composite_scoring", {})
+    cs_detail = cs.get("detail", {})
+    if "accuracy_10d" in cs_detail:
+        return f"10d accuracy: {cs_detail['accuracy_10d']}"
+
+    # Predictor: show IC
+    gbm = comps.get("gbm_model", {})
+    gbm_detail = gbm.get("detail", {})
+    if "rank_ic" in gbm_detail:
+        return f"IC: {gbm_detail['rank_ic']}"
+
+    # Executor: show portfolio detail
+    pf = comps.get("portfolio", {})
+    pf_detail = pf.get("detail", {})
+    if "sharpe" in pf_detail:
+        return f"Sharpe: {pf_detail['sharpe']}"
+    if "accuracy_10d" in pf_detail:
+        return f"accuracy: {pf_detail['accuracy_10d']}"
+
+    return ""
+
+
 def _section_pipeline_health(health: dict) -> list[str]:
     """Build Pipeline Health section from collected metadata."""
     lines = ["## Pipeline Health", ""]
@@ -170,6 +308,8 @@ def build_report(
     team_opt: dict | None = None,
     cio_opt: dict | None = None,
     sizing_ab: dict | None = None,
+    grading: dict | None = None,
+    confusion_matrix: dict | None = None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
@@ -192,6 +332,10 @@ def build_report(
     if pipeline_health:
         lines += _section_pipeline_health(pipeline_health)
         lines += [""]
+
+    # System Report Card (component grades)
+    if grading and grading.get("status") in ("ok", "partial"):
+        lines += _section_scorecard(grading)
 
     # What Changed This Week (promotion decisions, twin sim, regression)
     lines += _section_what_changed(
@@ -304,6 +448,11 @@ def build_report(
         lines += _section_exit_timing(exit_timing)
         lines += [""]
 
+    # Predictor confusion matrix
+    if confusion_matrix and confusion_matrix.get("status") == "ok":
+        lines += _section_confusion_matrix(confusion_matrix)
+        lines += [""]
+
     # Predictor-only backtest (2y historical)
     if predictor_stats:
         lines += _section_predictor_backtest(predictor_stats)
@@ -330,6 +479,13 @@ def save(
     attribution: dict | None = None,
     run_date: str | None = None,
     results_dir: str = "results",
+    grading: dict | None = None,
+    trigger_scorecard: dict | None = None,
+    shadow_book: dict | None = None,
+    exit_timing: dict | None = None,
+    e2e_lift: dict | None = None,
+    veto_result: dict | None = None,
+    confusion_matrix: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -352,13 +508,15 @@ def save(
         df.to_csv(out_dir / "signal_quality.csv", index=False)
         logger.info("Wrote %s", out_dir / "signal_quality.csv")
 
-    # Metrics JSON (overall summary)
+    # Metrics JSON (overall summary + report card)
     overall = signal_quality.get("overall", {})
     metrics = {
         "run_date": run_date,
         "status": signal_quality.get("status"),
         **overall,
     }
+    if grading and grading.get("status") in ("ok", "partial"):
+        metrics["report_card"] = grading
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
     logger.info("Wrote %s", out_dir / "metrics.json")
 
@@ -371,6 +529,20 @@ def save(
     if attribution and attribution.get("status") == "ok":
         (out_dir / "attribution.json").write_text(json.dumps(attribution, indent=2, default=str))
         logger.info("Wrote %s", out_dir / "attribution.json")
+
+    # Structured analysis files for dashboard consumption
+    for filename, data in [
+        ("grading.json", grading),
+        ("trigger_scorecard.json", trigger_scorecard),
+        ("shadow_book.json", shadow_book),
+        ("exit_timing.json", exit_timing),
+        ("e2e_lift.json", e2e_lift),
+        ("veto_analysis.json", veto_result),
+        ("confusion_matrix.json", confusion_matrix),
+    ]:
+        if data and data.get("status") in ("ok", "partial", "insufficient_lift"):
+            (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
+            logger.info("Wrote %s", out_dir / filename)
 
     return out_dir
 
@@ -458,6 +630,19 @@ def _section_signal_quality(sq: dict) -> list[str]:
             lines += ["", "\\* exploratory — fewer than 20 samples, treat with caution"]
         if has_fdr_exploratory:
             lines += ["", "† not FDR-significant (Benjamini-Hochberg, α=0.05) — accuracy may not differ from coin flip"]
+
+    sectors = sq.get("by_sector", [])
+    if sectors:
+        lines += ["", "### By sector", ""]
+        lines += ["| Sector | Acc 5d | Acc 10d | Acc 30d | Avg α 10d | n |"]
+        lines += ["|--------|--------|---------|---------|-----------|---|"]
+        for s in sectors:
+            lines.append(
+                f"| {s.get('sector', '?')} | {_pct(s.get('accuracy_5d'))} | "
+                f"{_pct(s.get('accuracy_10d'))} | "
+                f"{_pct(s.get('accuracy_30d'))} | {_alpha_pp(s.get('avg_alpha_10d'))} | "
+                f"{s.get('n_10d', 0)} |"
+            )
 
     return lines
 
@@ -782,6 +967,52 @@ def _section_weight_recommendation(result: dict) -> list[str]:
     return lines
 
 
+def _section_confusion_matrix(result: dict) -> list[str]:
+    """Build the predictor confusion matrix section."""
+    lines = ["## Predictor confusion matrix (UP / FLAT / DOWN)"]
+    n = result.get("n", 0)
+    acc = result.get("accuracy")
+    lines += [
+        "",
+        f"_{n} resolved predictions. Overall directional accuracy: {_pct(acc)}_",
+        "",
+    ]
+
+    matrix = result.get("matrix", {})
+    directions = ["UP", "FLAT", "DOWN"]
+
+    lines.append("| Predicted \\ Actual | UP | FLAT | DOWN | Total |")
+    lines.append("|--------------------|-----|------|------|-------|")
+    for pred in directions:
+        row = matrix.get(pred, {})
+        counts = [row.get(a, 0) for a in directions]
+        total = sum(counts)
+        cells = " | ".join(
+            f"**{c}**" if pred == a else str(c)
+            for c, a in zip(counts, directions)
+        )
+        lines.append(f"| {pred} | {cells} | {total} |")
+
+    # Per-class metrics
+    per_class = result.get("per_class", {})
+    if per_class:
+        lines += [
+            "",
+            "### Per-direction precision / recall / F1",
+            "",
+            "| Direction | Precision | Recall | F1 | Predicted | Actual |",
+            "|-----------|-----------|--------|----|-----------|--------|",
+        ]
+        for d in directions:
+            c = per_class.get(d, {})
+            p = _pct(c.get("precision")) if c.get("precision") is not None else "—"
+            r = _pct(c.get("recall")) if c.get("recall") is not None else "—"
+            f = f"{c['f1']:.3f}" if c.get("f1") is not None else "—"
+            lines.append(f"| {d} | {p} | {r} | {f} | {c.get('n_predicted', 0)} | {c.get('n_actual', 0)} |")
+
+    return lines
+
+
 def _section_predictor_backtest(stats: dict) -> list[str]:
     """Build report section for predictor-only backtest results."""
     lines = ["## Predictor-Only Backtest (2y historical)"]
@@ -914,8 +1145,8 @@ def _section_veto_analysis(result: dict) -> list[str]:
         "",
         f"_Analyzed {n_down} DOWN predictions with resolved outcomes.{base_rate_str}_",
         "",
-        "| Confidence | Vetoes | True neg | False neg | Precision | CI 95% | Lift | Missed α (total) | Missed α/winner |",
-        "|------------|--------|----------|-----------|-----------|--------|------|------------------|-----------------|",
+        "| Confidence | Vetoes | True neg | False neg | Precision | Recall | F1 | CI 95% | Lift | Missed α |",
+        "|------------|--------|----------|-----------|-----------|--------|----|--------|------|----------|",
     ]
     for t in result.get("thresholds", []):
         conf = t["confidence"]
@@ -925,17 +1156,18 @@ def _section_veto_analysis(result: dict) -> list[str]:
         if conf == recommended:
             marker = " **→**"
         prec = _pct(t["precision"]) if t["precision"] is not None else "—"
+        recall_str = _pct(t.get("recall")) if t.get("recall") is not None else "—"
+        f1_str = f"{t['f1']:.3f}" if t.get("f1") is not None else "—"
         ci = t.get("precision_ci_95")
         ci_str = f"[{ci[0]:.0%}–{ci[1]:.0%}]" if ci else "—"
         if t.get("low_confidence"):
             ci_str += "†"
         lift = t.get("lift")
         lift_str = f"{lift:+.1%}" if lift is not None else "—"
-        missed_pw = t.get("missed_alpha_per_winner", 0)
         lines.append(
             f"| {conf:.2f}{marker} | {t['n_vetoes']} | {t['true_negatives']} "
-            f"| {t['false_negatives']} | {prec} | {ci_str} | {lift_str} "
-            f"| {t['missed_alpha']:.4f} | {missed_pw:.4f} |"
+            f"| {t['false_negatives']} | {prec} | {recall_str} | {f1_str} | {ci_str} | {lift_str} "
+            f"| {t['missed_alpha']:.4f} |"
         )
 
     lines += ["", "† Low confidence — fewer than 30 veto decisions"]
@@ -960,6 +1192,18 @@ def _section_veto_analysis(result: dict) -> list[str]:
     else:
         reason = apply.get("reason", "guardrails not met")
         lines += [f"> ⏸ **Not applied** — {reason}."]
+
+    by_sector = result.get("by_sector", [])
+    if by_sector:
+        lines += ["", "### Veto precision by sector", ""]
+        lines += ["| Sector | DOWN preds | Vetoes | Precision | Recall |"]
+        lines += ["|--------|-----------|--------|-----------|--------|"]
+        for s in by_sector:
+            p = _pct(s.get("precision")) if s.get("precision") is not None else "—"
+            r = _pct(s.get("recall")) if s.get("recall") is not None else "—"
+            lines.append(
+                f"| {s['sector']} | {s['n_down']} | {s['n_vetoes']} | {p} | {r} |"
+            )
 
     return lines
 
@@ -1194,6 +1438,24 @@ def _section_shadow_book(result: dict) -> list[str]:
                 f"| {r['block_reason']} | {r['count']} | "
                 f"{_pct(r.get('pct_of_blocks'))} | {score_str} | {ret_str} |"
             )
+
+    # Classification metrics (if available)
+    clf = result.get("classification")
+    if clf:
+        p = _pct(clf.get("precision")) if clf.get("precision") is not None else "—"
+        r = _pct(clf.get("recall")) if clf.get("recall") is not None else "—"
+        f = f"{clf['f1']:.3f}" if clf.get("f1") is not None else "—"
+        lines += [
+            "",
+            "### Classification (blocked=predicted loser)",
+            "",
+            f"| Metric | Value |",
+            f"|--------|-------|",
+            f"| Precision (% of blocks that were actual losers) | {p} |",
+            f"| Recall (% of all losers that were blocked) | {r} |",
+            f"| F1 | {f} |",
+            f"| TP={clf.get('tp', 0)}, FP={clf.get('fp', 0)}, FN={clf.get('fn', 0)}, TN={clf.get('tn', 0)} | n={clf.get('n', 0)} |",
+        ]
 
     verdicts = {
         "appropriate": "Risk guard is appropriately calibrated — traded entries outperform blocked entries.",
