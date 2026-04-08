@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from analysis.classification_metrics import compute_binary_metrics
+
 logger = logging.getLogger(__name__)
 
 
@@ -340,6 +342,39 @@ def format_lift_report(metrics: dict) -> list[str]:
                 else:
                     lines.append(f"> LLM qual/peer review subtracts {_pct(avg_ql)} vs quant alone — consider simplifying")
 
+    # Classification metrics summary table (precision/recall/F1 per decision boundary)
+    clf_rows = []
+    for label, key in [
+        ("Scanner", "scanner_lift"),
+        ("CIO", "cio_lift"),
+        ("Predictor (UP)", "predictor_lift"),
+        ("Executor", "executor_lift"),
+    ]:
+        sub = metrics.get(key, {})
+        clf = sub.get("classification") if isinstance(sub, dict) else None
+        if clf:
+            clf_rows.append((label, clf))
+
+    # Per-team classification
+    if tl and not isinstance(tl, dict):
+        for t in tl:
+            clf = t.get("classification")
+            if clf:
+                clf_rows.append((f"  {t.get('team_id', '?')}", clf))
+
+    if clf_rows:
+        lines.append("\n### Classification metrics (precision / recall / F1)\n")
+        lines.append("| Decision | Precision | Recall | F1 | TP | FP | FN | TN | n |")
+        lines.append("|----------|-----------|--------|----|----|----|----|----|---|")
+        for label, c in clf_rows:
+            p = _pct(c.get("precision")) if c.get("precision") is not None else "—"
+            r = _pct(c.get("recall")) if c.get("recall") is not None else "—"
+            f = f"{c['f1']:.3f}" if c.get("f1") is not None else "—"
+            lines.append(
+                f"| {label} | {p} | {r} | {f} | "
+                f"{c.get('tp', '—')} | {c.get('fp', '—')} | {c.get('fn', '—')} | {c.get('tn', '—')} | {c.get('n', '—')} |"
+            )
+
     return lines
 
 
@@ -363,12 +398,28 @@ def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dic
         passing_avg = float(passing["return_5d"].mean()) if not passing.empty else None
         lift = (passing_avg - universe_avg) if passing_avg is not None else None
 
+        # Classification metrics: selected=passed filter, positive=beat SPY
+        clf = None
+        if "beat_spy_5d" in merged.columns:
+            has_outcome = merged["beat_spy_5d"].notna()
+            if has_outcome.any():
+                m = merged[has_outcome]
+                selected = (m["quant_filter_pass"] == 1).tolist()
+                positive = (m["beat_spy_5d"] == 1).tolist()
+                clf = compute_binary_metrics(
+                    tp=sum(s and p for s, p in zip(selected, positive)),
+                    fp=sum(s and not p for s, p in zip(selected, positive)),
+                    fn=sum(not s and p for s, p in zip(selected, positive)),
+                    tn=sum(not s and not p for s, p in zip(selected, positive)),
+                )
+
         return {
             "universe_avg": round(universe_avg, 4),
             "passing_avg": round(passing_avg, 4) if passing_avg is not None else None,
             "lift": round(lift, 4) if lift is not None else None,
             "n_universe": len(merged),
             "n_passing": len(passing),
+            "classification": clf,
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "scanner_evaluations table not found"}
@@ -418,6 +469,22 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
             # Secondary lift: picks vs quant candidates (2c)
             lift_vs_quant = (pick_avg - quant_avg) if pick_avg is not None else None
 
+            # Classification: selected=team picked, positive=beat sector ETF
+            clf = None
+            beat_col = "beat_sector_5d" if "beat_sector_5d" in team_data.columns else "beat_spy_5d"
+            if beat_col in team_data.columns:
+                has_outcome = team_data[beat_col].notna()
+                if has_outcome.any():
+                    m = team_data[has_outcome]
+                    selected = (m["team_recommended"] == 1).tolist()
+                    positive = (m[beat_col] == 1).tolist()
+                    clf = compute_binary_metrics(
+                        tp=sum(s and p for s, p in zip(selected, positive)),
+                        fp=sum(s and not p for s, p in zip(selected, positive)),
+                        fn=sum(not s and p for s, p in zip(selected, positive)),
+                        tn=sum(not s and not p for s, p in zip(selected, positive)),
+                    )
+
             results.append({
                 "team_id": team_id,
                 "pick_avg": round(pick_avg, 4) if pick_avg is not None else None,
@@ -428,6 +495,7 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
                 "n_picks": len(picks),
                 "n_candidates": len(team_data),
                 "n_sector_universe": n_sector_universe,
+                "classification": clf,
             })
 
         return results
@@ -456,6 +524,21 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
         reject = merged[merged["cio_decision"] == "REJECT"]
         reject_avg = float(reject["return_5d"].mean()) if not reject.empty else None
 
+        # Classification: selected=CIO advanced, positive=beat SPY
+        clf = None
+        if "beat_spy_5d" in merged.columns:
+            has_outcome = merged["beat_spy_5d"].notna()
+            if has_outcome.any():
+                m = merged[has_outcome]
+                selected = (m["cio_decision"] == "ADVANCE").tolist()
+                positive = (m["beat_spy_5d"] == 1).tolist()
+                clf = compute_binary_metrics(
+                    tp=sum(s and p for s, p in zip(selected, positive)),
+                    fp=sum(s and not p for s, p in zip(selected, positive)),
+                    fn=sum(not s and p for s, p in zip(selected, positive)),
+                    tn=sum(not s and not p for s, p in zip(selected, positive)),
+                )
+
         return {
             "all_recs_avg": round(all_recs_avg, 4),
             "advance_avg": round(advance_avg, 4) if advance_avg is not None else None,
@@ -464,6 +547,7 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
             "n_recs": len(merged),
             "n_advance": len(advance),
             "n_reject": len(reject),
+            "classification": clf,
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "cio_evaluations table not found"}
@@ -561,6 +645,21 @@ def _predictor_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> d
         down_avg = float(down["return_5d"].mean()) if not down.empty else None
         lift = (up_avg - all_avg) if up_avg is not None else None
 
+        # Classification: selected=predicted UP, positive=beat SPY
+        clf = None
+        if "beat_spy_5d" in merged.columns:
+            has_outcome = merged["beat_spy_5d"].notna()
+            if has_outcome.any():
+                m = merged[has_outcome]
+                selected = (m["predicted_direction"] == "UP").tolist()
+                positive = (m["beat_spy_5d"] == 1).tolist()
+                clf = compute_binary_metrics(
+                    tp=sum(s and p for s, p in zip(selected, positive)),
+                    fp=sum(s and not p for s, p in zip(selected, positive)),
+                    fn=sum(not s and p for s, p in zip(selected, positive)),
+                    tn=sum(not s and not p for s, p in zip(selected, positive)),
+                )
+
         return {
             "all_avg": round(all_avg, 4),
             "up_avg": round(up_avg, 4) if up_avg is not None else None,
@@ -569,6 +668,7 @@ def _predictor_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> d
             "n_all": len(merged),
             "n_up": len(up),
             "n_down": len(down),
+            "classification": clf,
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "predictor_outcomes table not found"}
@@ -615,12 +715,32 @@ def _executor_lift(trades_db_path: str, ur: pd.DataFrame) -> dict:
         approved_avg = float(approved["return_5d"].mean()) if not approved.empty else None
         lift = (traded_avg - approved_avg) if traded_avg is not None and approved_avg is not None else None
 
+        # Classification: selected=traded (not blocked), positive=beat SPY
+        clf = None
+        if not shadow.empty and "beat_spy_5d" in approved.columns:
+            has_outcome = approved["beat_spy_5d"].notna()
+            if has_outcome.any():
+                m = approved[has_outcome]
+                traded_tickers = set(zip(traded["ticker"], traded["eval_date"]))
+                selected = [
+                    (r["ticker"], r["eval_date"]) in traded_tickers
+                    for _, r in m.iterrows()
+                ]
+                positive = (m["beat_spy_5d"] == 1).tolist()
+                clf = compute_binary_metrics(
+                    tp=sum(s and p for s, p in zip(selected, positive)),
+                    fp=sum(s and not p for s, p in zip(selected, positive)),
+                    fn=sum(not s and p for s, p in zip(selected, positive)),
+                    tn=sum(not s and not p for s, p in zip(selected, positive)),
+                )
+
         return {
             "traded_avg": round(traded_avg, 4) if traded_avg is not None else None,
             "approved_avg": round(approved_avg, 4) if approved_avg is not None else None,
             "lift": round(lift, 4) if lift is not None else None,
             "n_traded": len(traded),
             "n_approved": len(approved),
+            "classification": clf,
         }
     except Exception as e:
         return {"status": "skipped", "reason": str(e)}

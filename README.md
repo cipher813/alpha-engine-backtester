@@ -1,8 +1,27 @@
-# Alpha Engine Backtester
+# alpha-engine-backtester
 
-Signal quality analysis, portfolio simulation, and autonomous parameter optimization for the Alpha Engine trading system. The system's learning mechanism — validates whether signals predict outperformance and feeds optimized parameters back to upstream modules.
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-189_passing-brightgreen.svg)]()
 
-> Part of [Nous Ergon: Alpha Engine](https://github.com/cipher813/alpha-engine).
+> Signal quality analysis, evaluation framework (component grades + P/R/F1), portfolio simulation, and autonomous parameter optimization. The system's learning mechanism — validates whether signals predict outperformance and feeds optimized parameters back to upstream modules.
+
+**Part of the [Nous Ergon](https://nousergon.ai) autonomous trading system.**
+See the [system overview](https://github.com/cipher813/alpha-engine#readme) for how all modules connect, or the [full documentation index](https://github.com/cipher813/alpha-engine-docs#readme).
+
+## Table of Contents
+
+- [Role in the System](#role-in-the-system)
+- [Quick Start](#quick-start)
+- [Modes](#modes)
+- [How It Works](#how-it-works)
+- [Optimization Architecture](#optimization-architecture)
+- [Configuration Reference](#configuration-reference)
+- [Key Files](#key-files)
+- [Deployment](#deployment)
+- [S3 Contract](#s3-contract)
+- [Testing](#testing)
+- [Related Modules](#related-modules)
 
 ---
 
@@ -52,13 +71,18 @@ python backtest.py --mode signal-quality
 ### Signal Quality (`--mode signal-quality`)
 
 Reads `score_performance` from `research.db` and computes:
-- % of BUY signals that beat SPY at 10d and 30d horizons (Wilson CI, BH FDR correction)
+- % of BUY signals that beat SPY at 5d/10d/30d horizons (Wilson CI, BH FDR correction)
 - Accuracy by score bucket (60-70, 70-80, 80-90, 90+) with exploratory flags for small samples
 - Accuracy by market regime (bull / neutral / bear / caution)
-- Sub-score attribution (news vs research correlation with outperformance)
+- **Accuracy by sector** (joined from universe_returns)
+- **Precision/recall/F1** at every decision boundary (scanner, teams, CIO, predictor, executor)
+- Sub-score attribution (quant vs qual correlation with outperformance)
+- **Unified scorecard** — A-F grades for every component (scanner, 6 sector teams, CIO, macro, predictor, veto, triggers, risk guard, exits, sizing, portfolio)
+- **Predictor confusion matrix** — 3x3 UP/FLAT/DOWN with per-direction precision/recall/F1
 - **Scoring weight recommendation** — applied to S3 automatically if guardrails pass
-- **Veto threshold analysis** — sweeps predictor confidence thresholds with precision/cost tradeoff
+- **Veto threshold analysis** — sweeps confidence thresholds with precision/recall/cost tradeoff, per-sector breakdown
 - **Predictor rolling metrics** — backfills outcomes, pushes 30-day hit rate + IC to S3
+- **Grade history** — weekly grades appended to S3 for trend tracking (52-week rolling)
 
 ### Portfolio Simulation (`--mode simulate`)
 
@@ -108,7 +132,15 @@ Runs signal quality, simulation, param sweep, and predictor backtest sequentiall
                               ├─ config/executor_params.json
                               ├─ config/predictor_params.json
                               ├─ config/research_params.json
-                              └─ backtest/{date}/report.md
+                              ├─ backtest/{date}/report.md
+                              ├─ backtest/{date}/grading.json
+                              ├─ backtest/{date}/confusion_matrix.json
+                              ├─ backtest/{date}/trigger_scorecard.json
+                              ├─ backtest/{date}/shadow_book.json
+                              ├─ backtest/{date}/exit_timing.json
+                              ├─ backtest/{date}/e2e_lift.json
+                              ├─ backtest/{date}/veto_analysis.json
+                              └─ backtest/grade_history.json
 ```
 
 ---
@@ -312,57 +344,48 @@ ae "tail -50 /var/log/backtester.log"
 ## Testing
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v  # 189 tests
 ```
 
 ---
 
-## Deferred Opportunities
+## S3 Contract
 
-These items are documented for future implementation as the system matures and data accumulates.
+### Reads
+| Path | Source | Content |
+|------|--------|---------|
+| `signals/{date}/signals.json` | Research | Historical signals for accuracy analysis |
+| `research.db` | Research | score_performance, predictor_outcomes, universe_returns, scanner/team/CIO evaluations |
+| `trades.db` | Executor | Trade history, shadow book, EOD P&L (via SCP from trading EC2) |
+| ArcticDB `universe` | Data | 10y OHLCV for synthetic predictor backtest |
 
-### Attribution Min-Samples (monitor)
-
-Attribution analysis min_samples raised from 50 to 100 (2026-03-30) to improve FDR robustness. With BH correction on 10+ hypothesis tests across only 50 rows, weak correlations could pass and drive spurious weight changes. At 100+ rows, the power is sufficient for Pearson r to distinguish signal from noise at alpha=0.05. Monitor: if attribution consistently returns `insufficient_data` for too long after system restart, consider lowering back to 75 with stricter per-test alpha (0.01 vs 0.05).
-
-### Expand to Extended Grid (at 6+ months of live data)
-
-The current core grid has 6 parameters. An `EXTENDED_GRID` with 16 parameters (adding reduce_fraction, confidence_sizing, staleness, earnings, momentum, correlation) is defined in `param_sweep.py` and can be activated via `config.yaml`. Requires sufficient data to avoid overfitting — at 6+ months (~120 signal dates), the holdout validation becomes robust enough to support more parameters.
-
-### Research Boost Optimizer (at 200+ samples)
-
-`optimizer/research_optimizer.py` tunes 10 signal boost parameters (short interest thresholds, institutional boost, consistency scoring). Currently gated behind 200 samples minimum because boost correlations are too noisy with fewer observations. The heuristic approach (±15% nudges based on correlation direction) should be upgraded to a proper grid search when data supports it.
-
-### Volume-Based Fill Simulation
-
-Currently assumes 100% fill rate. A fill-rate model based on order size vs average daily volume would reject simulated orders representing >5% of daily volume, improving simulation realism for small-cap positions.
-
-### Walk-Forward Cross-Validation
-
-The current 70/30 holdout split is a single evaluation. Walk-forward validation (rolling 70/30 windows advancing by 20% each) would provide more robust OOS estimates and reduce the risk of a lucky holdout split.
-
-### Executor Parameter Stability Tracking
-
-Like the weight optimizer's 3-week direction reversal check, the executor optimizer could track whether optimal parameters flip-flop week over week (e.g., `atr_multiplier` alternating between 2.0 and 4.0). This would flag when the optimization is fitting noise rather than finding stable structure.
-
-### 10-Year Rolling-Window Analysis
-
-The current 10y backtest uses the full window as one block. Rolling-window analysis (e.g., 3-year train / 1-year test, advancing by 6 months) would reveal how parameter stability varies across market regimes and identify regime-dependent parameters that should be excluded from auto-tuning.
-
-### Downsize Always-On EC2
-
-With bursty compute (backtester, predictor training) moved to spot instances, the always-on EC2 only needs nginx + Streamlit + IB Gateway. A t3.micro ($7.57/month) may be sufficient, saving ~$10-30/month vs a larger instance.
+### Writes
+| Path | Content |
+|------|---------|
+| `config/scoring_weights.json` | Auto-optimized quant/qual weights → Research |
+| `config/executor_params.json` | Auto-optimized risk params → Executor |
+| `config/predictor_params.json` | Auto-optimized veto threshold → Predictor |
+| `config/research_params.json` | Signal boost params → Research (deferred) |
+| `backtest/{date}/report.md` | Weekly markdown report |
+| `backtest/{date}/grading.json` | Component grades (A-F scorecard) |
+| `backtest/{date}/confusion_matrix.json` | Predictor 3x3 confusion matrix |
+| `backtest/{date}/trigger_scorecard.json` | Entry trigger effectiveness |
+| `backtest/{date}/shadow_book.json` | Risk guard analysis |
+| `backtest/{date}/exit_timing.json` | MFE/MAE exit analysis |
+| `backtest/{date}/e2e_lift.json` | Pipeline decision boundary lift |
+| `backtest/{date}/veto_analysis.json` | Veto threshold sweep |
+| `backtest/grade_history.json` | 52-week rolling component grades |
 
 ---
 
 ## Related Modules
 
-- [`alpha-engine`](https://github.com/cipher813/alpha-engine) — Executor (trade execution, intraday daemon, system overview)
+- [`alpha-engine`](https://github.com/cipher813/alpha-engine) — Executor + system overview
 - [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) — Autonomous LLM research pipeline
-- [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) — GBM predictor (5-day alpha predictions)
+- [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) — Meta-model predictor
 - [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) — Streamlit monitoring dashboard
-
----
+- [`alpha-engine-data`](https://github.com/cipher813/alpha-engine-data) — Centralized data collection and ArcticDB
+- [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs) — Documentation index
 
 ## License
 

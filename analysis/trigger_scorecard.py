@@ -100,6 +100,11 @@ def compute_trigger_scorecard(trades_db_path: str, min_trades: int = 3) -> dict:
         if n < min_trades:
             continue
 
+        # Classification: positive outcome = realized_alpha > 0
+        alpha_valid = subset["realized_alpha_pct"].dropna()
+        tp = int((alpha_valid > 0).sum())
+        fp = int((alpha_valid <= 0).sum())
+
         trigger_data = {
             "trigger": cat,
             "n_trades": n,
@@ -109,6 +114,9 @@ def compute_trigger_scorecard(trades_db_path: str, min_trades: int = 3) -> dict:
             "avg_realized_return": _safe_mean(subset["realized_return_pct"]),
             "avg_days_held": _safe_mean(subset["days_held"]),
             "win_rate_vs_spy": _win_rate(subset["realized_alpha_pct"]),
+            "precision": round(tp / (tp + fp), 4) if (tp + fp) > 0 else None,
+            "tp": tp,
+            "fp": fp,
         }
         triggers.append(trigger_data)
 
@@ -119,6 +127,10 @@ def compute_trigger_scorecard(trades_db_path: str, min_trades: int = 3) -> dict:
             "total_entries": len(df),
         }
 
+    all_alpha = df["realized_alpha_pct"].dropna()
+    all_tp = int((all_alpha > 0).sum())
+    all_fp = int((all_alpha <= 0).sum())
+
     summary = {
         "total_entries": len(df),
         "avg_slippage_vs_signal": _safe_mean(df["slippage_vs_signal_pct"]),
@@ -126,6 +138,9 @@ def compute_trigger_scorecard(trades_db_path: str, min_trades: int = 3) -> dict:
         "avg_realized_alpha": _safe_mean(df["realized_alpha_pct"]),
         "avg_realized_return": _safe_mean(df["realized_return_pct"]),
         "win_rate_vs_spy": _win_rate(df["realized_alpha_pct"]),
+        "precision": round(all_tp / (all_tp + all_fp), 4) if (all_tp + all_fp) > 0 else None,
+        "tp": all_tp,
+        "fp": all_fp,
     }
 
     return {
