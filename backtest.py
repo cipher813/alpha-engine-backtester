@@ -1956,6 +1956,8 @@ def main() -> None:
     cio_opt_result = None
     sizing_ab_result = None
     confusion_result = None
+    post_trade_result = None
+    monte_carlo_result = None
 
     # ── Signal quality pipeline ───────────────────────────────────────────
     if args.mode in ("signal-quality", "all"):
@@ -2047,6 +2049,19 @@ def main() -> None:
             except Exception as e:
                 logger.warning("Exit timing analysis failed: %s", e)
 
+        # 3i: Unified post-trade analysis
+        if trades_db:
+            try:
+                from analysis.post_trade import compute_post_trade_analysis
+                post_trade_result = compute_post_trade_analysis(trades_db)
+                if post_trade_result.get("status") == "ok":
+                    summary = post_trade_result.get("summary", {})
+                    logger.info("Post-trade analysis: %d entries, %d exits, best trigger=%s",
+                                summary.get("n_entries", 0), summary.get("n_exits", 0),
+                                summary.get("best_trigger", "—"))
+            except Exception as e:
+                logger.warning("Post-trade analysis failed: %s", e)
+
         # 3f: Macro multiplier A/B evaluation
         if db_path and os.path.exists(db_path):
             try:
@@ -2056,6 +2071,23 @@ def main() -> None:
                                 macro_result.get("assessment"), macro_result.get("accuracy_lift"))
             except Exception as e:
                 logger.warning("Macro multiplier evaluation failed: %s", e)
+
+        # 3j: Monte Carlo significance test (only when sufficient data)
+        if db_path and os.path.exists(db_path):
+            try:
+                from analysis.monte_carlo import run_monte_carlo
+                monte_carlo_result = run_monte_carlo(
+                    research_db_path=db_path,
+                    price_data={},
+                    n_permutations=config.get("monte_carlo_permutations", 200),
+                )
+                if monte_carlo_result.get("status") == "ok":
+                    logger.info("Monte Carlo: p=%.3f, percentile=%.1f%%, conclusion=%s",
+                                monte_carlo_result.get("p_value", 0),
+                                monte_carlo_result.get("percentile", 0),
+                                monte_carlo_result.get("conclusion", "—"))
+            except Exception as e:
+                logger.warning("Monte Carlo analysis failed (non-fatal): %s", e)
 
         # ── Phase 4: Self-adjustment mechanisms ─────────────────────────────
         bucket = config.get("signals_bucket", "alpha-engine-research")
@@ -2259,6 +2291,8 @@ def main() -> None:
             sizing_ab=sizing_ab_result,
             grading=grading_result,
             confusion_matrix=confusion_result,
+            post_trade=post_trade_result,
+            monte_carlo=monte_carlo_result,
         )
 
         save_sweep_df = sweep_df
@@ -2280,6 +2314,8 @@ def main() -> None:
             e2e_lift=e2e_lift,
             veto_result=veto_result,
             confusion_matrix=confusion_result,
+            post_trade=post_trade_result,
+            monte_carlo=monte_carlo_result,
         )
 
         print(f"\nReport saved to {out_dir}/")

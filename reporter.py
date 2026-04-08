@@ -310,6 +310,8 @@ def build_report(
     sizing_ab: dict | None = None,
     grading: dict | None = None,
     confusion_matrix: dict | None = None,
+    post_trade: dict | None = None,
+    monte_carlo: dict | None = None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
@@ -448,6 +450,16 @@ def build_report(
         lines += _section_exit_timing(exit_timing)
         lines += [""]
 
+    # Post-trade analysis (unified triggers + exits + holding periods)
+    if post_trade and post_trade.get("status") == "ok":
+        lines += _section_post_trade(post_trade)
+        lines += [""]
+
+    # Monte Carlo significance test
+    if monte_carlo and monte_carlo.get("status") == "ok":
+        lines += _section_monte_carlo(monte_carlo)
+        lines += [""]
+
     # Predictor confusion matrix
     if confusion_matrix and confusion_matrix.get("status") == "ok":
         lines += _section_confusion_matrix(confusion_matrix)
@@ -486,6 +498,8 @@ def save(
     e2e_lift: dict | None = None,
     veto_result: dict | None = None,
     confusion_matrix: dict | None = None,
+    post_trade: dict | None = None,
+    monte_carlo: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -539,6 +553,8 @@ def save(
         ("e2e_lift.json", e2e_lift),
         ("veto_analysis.json", veto_result),
         ("confusion_matrix.json", confusion_matrix),
+        ("post_trade.json", post_trade),
+        ("monte_carlo.json", monte_carlo),
     ]:
         if data and data.get("status") in ("ok", "partial", "insufficient_lift"):
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
@@ -964,6 +980,88 @@ def _section_weight_recommendation(result: dict) -> list[str]:
                 lines += [f"> WARNING: {rev}"]
 
     lines += [f"> {result.get('note', '')}"]
+    return lines
+
+
+def _section_post_trade(result: dict) -> list[str]:
+    """Build unified post-trade analysis section."""
+    summary = result.get("summary", {})
+    lines = [
+        "## Post-trade analysis",
+        "",
+        f"_{summary.get('n_entries', 0)} entries, {summary.get('n_exits', 0)} exits, "
+        f"{summary.get('n_roundtrips', 0)} roundtrips_",
+        "",
+    ]
+
+    # Trigger effectiveness
+    triggers = result.get("trigger_effectiveness", [])
+    if triggers:
+        lines += ["### Trigger effectiveness", ""]
+        lines += ["| Trigger | Trades | Avg Alpha | Avg Slippage | Win Rate |"]
+        lines += ["|---------|--------|-----------|-------------|----------|"]
+        for t in triggers:
+            lines.append(
+                f"| {t.get('trigger', '?')} | {t.get('n_trades', 0)} | "
+                f"{_pct(t.get('avg_alpha_pct'))} | {_pct(t.get('avg_slippage_pct'))} | "
+                f"{_pct(t.get('win_rate_vs_spy'))} |"
+            )
+        lines.append("")
+
+    # Holding period
+    holding = result.get("holding_period", [])
+    if holding:
+        lines += ["### Alpha by holding period", ""]
+        lines += ["| Period | Trades | Avg Alpha | Win Rate |"]
+        lines += ["|--------|--------|-----------|----------|"]
+        for h in holding:
+            lines.append(
+                f"| {h.get('bucket', '?')} | {h.get('n_trades', 0)} | "
+                f"{_pct(h.get('avg_alpha_pct'))} | {_pct(h.get('win_rate_vs_spy'))} |"
+            )
+        lines.append("")
+
+    # Summary
+    best_trigger = summary.get("best_trigger")
+    best_exit = summary.get("best_exit_rule")
+    if best_trigger or best_exit:
+        parts = []
+        if best_trigger:
+            parts.append(f"best trigger: **{best_trigger}**")
+        if best_exit:
+            parts.append(f"best exit rule: **{best_exit}**")
+        lines.append(f"> {', '.join(parts)}")
+
+    return lines
+
+
+def _section_monte_carlo(result: dict) -> list[str]:
+    """Build Monte Carlo significance test section."""
+    lines = [
+        "## Monte Carlo significance test",
+        "",
+        f"_{result.get('n_permutations', 0)} permutations, "
+        f"{result.get('n_signals', 0)} signals_",
+        "",
+    ]
+
+    actual = result.get("actual_alpha")
+    p_value = result.get("p_value")
+    percentile = result.get("percentile")
+    conclusion = result.get("conclusion", "unknown")
+
+    lines += [
+        f"| Metric | Value |",
+        f"|--------|-------|",
+        f"| Actual alpha | {_pct(actual)} |",
+        f"| p-value | {p_value:.3f} |" if p_value is not None else "| p-value | — |",
+        f"| Percentile | {percentile:.1f}% |" if percentile is not None else "| Percentile | — |",
+        f"| Null mean | {_pct(result.get('null_mean'))} |",
+        f"| Null std | {_pct(result.get('null_std'))} |",
+        "",
+        f"> **Conclusion:** {conclusion}",
+    ]
+
     return lines
 
 
