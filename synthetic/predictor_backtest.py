@@ -655,7 +655,7 @@ def _resolve_trading_dates(
     return trading_dates
 
 
-def run(config: dict) -> dict:
+def run(config: dict, keep_features: bool = False) -> dict:
     """
     Full predictor-only backtest pipeline.
 
@@ -785,10 +785,11 @@ def run(config: dict) -> dict:
         features_by_ticker, model_path, predictor_path, trading_dates,
     )
 
-    # Free features and model (no longer needed)
-    del features_by_ticker
-    gc.collect()
-    logger.info("Freed feature data (memory optimization)")
+    # Free features and model (no longer needed unless caller needs them)
+    if not keep_features:
+        del features_by_ticker
+        gc.collect()
+        logger.info("Freed feature data (memory optimization)")
 
     # Clean up temp model file
     try:
@@ -823,7 +824,7 @@ def run(config: dict) -> dict:
     }
     logger.info("Predictor backtest data ready: %s", metadata)
 
-    return {
+    result = {
         "status": "ok",
         "signals_by_date": signals_by_date,
         "price_matrix": price_matrix,
@@ -831,3 +832,11 @@ def run(config: dict) -> dict:
         "spy_prices": spy_prices,
         "metadata": metadata,
     }
+
+    if keep_features:
+        result["features_by_ticker"] = features_by_ticker
+        result["sector_map"] = sector_map
+        result["trading_dates"] = trading_dates
+        result["predictions_by_date"] = predictions_by_date
+
+    return result

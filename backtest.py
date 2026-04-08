@@ -896,15 +896,40 @@ def run_signal_quality(config: dict) -> tuple[dict, list, list, dict]:
     # universe_returns population now handled by alpha-engine-data (Phase 1)
 
     # Phase 2: Production model health monitoring
+    _production_health = None
+    _calibration = None
     try:
         from analysis.production_health import compute_production_health, compute_calibration_validation
         _db = config.get("research_db", "")
         _bucket = config.get("signals_bucket", "alpha-engine-research")
         if _db and os.path.exists(_db):
-            compute_production_health(_db, _bucket)
-            compute_calibration_validation(_db, _bucket)
+            _production_health = compute_production_health(_db, _bucket)
+            _calibration = compute_calibration_validation(_db, _bucket)
     except Exception as _ph_exc:
         logger.warning("Production health analysis failed (non-fatal): %s", _ph_exc)
+
+    # Phase 3: Feature importance drift detection
+    _feature_drift = None
+    try:
+        from analysis.feature_drift import compute_feature_drift
+        _db = config.get("research_db", "")
+        _bucket = config.get("signals_bucket", "alpha-engine-research")
+        if _db and os.path.exists(_db):
+            _feature_drift = compute_feature_drift(_db, _bucket)
+    except Exception as _fd_exc:
+        logger.warning("Feature drift analysis failed (non-fatal): %s", _fd_exc)
+
+    # Phase 5: Retrain alert evaluation
+    try:
+        from analysis.retrain_alert import evaluate_retrain_triggers, send_retrain_alert
+        _bucket = config.get("signals_bucket", "alpha-engine-research")
+        alert = evaluate_retrain_triggers(_production_health, _feature_drift, _calibration)
+        if alert.get("triggered"):
+            send_retrain_alert(alert, config, _bucket)
+        else:
+            logger.info("Retrain alert: %s", alert.get("summary", "no triggers"))
+    except Exception as _ra_exc:
+        logger.warning("Retrain alert evaluation failed (non-fatal): %s", _ra_exc)
 
     return sq_result, regime_rows, score_rows, attr_result, df_base
 
@@ -1389,15 +1414,16 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     Run predictor-only backtest with param sweep.
 
     Loads data once (features, GBM inference, signal generation), then runs
-    the simulation loop for each parameter combination.
+    the simulation loop for each parameter combination. Also runs Phase 4
+    evaluations (ensemble mode, feature pruning) if features are available.
 
     Returns (single_run_stats, sweep_df).
     """
     import sys
     from synthetic.predictor_backtest import run as run_predictor_pipeline
 
-    # Prepare data once
-    result = run_predictor_pipeline(config)
+    # Prepare data once — keep features for Phase 4 evaluations
+    result = run_predictor_pipeline(config, keep_features=True)
 
     if result.get("status") != "ok":
         return result, pd.DataFrame()
@@ -1407,6 +1433,9 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     ohlcv_by_ticker = result["ohlcv_by_ticker"]
     spy_prices = result.get("spy_prices")
     metadata = result["metadata"]
+    features_by_ticker = result.get("features_by_ticker")
+    sector_map = result.get("sector_map", {})
+    trading_dates = result.get("trading_dates", [])
 
     # Import executor modules
     executor_paths = config.get("executor_paths", [])
@@ -1433,6 +1462,73 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
         spy_prices=spy_prices,
     )
     single_stats["predictor_metadata"] = metadata
+
+    # ── Phase 4: Predictor hyperparameter feedback ───────────────────────
+    predictions_by_date = result.get("predictions_by_date", {})
+    if features_by_ticker and trading_dates:
+        try:
+            from optimizer.predictor_optimizer import (
+                evaluate_ensemble_modes,
+                evaluate_signal_thresholds,
+                evaluate_feature_pruning,
+                apply_recommendations,
+            )
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+
+            # Phase 4a: Ensemble mode evaluation
+            ensemble_result = None
+            try:
+                ensemble_result = evaluate_ensemble_modes(
+                    features_by_ticker, price_matrix, ohlcv_by_ticker,
+                    spy_prices, sector_map, trading_dates,
+                    config, single_stats,
+                )
+                single_stats["ensemble_eval"] = ensemble_result
+            except Exception as exc:
+                logger.warning("Ensemble mode evaluation failed (non-fatal): %s", exc)
+
+            # Phase 4b: Signal threshold sweep
+            threshold_result = None
+            if predictions_by_date:
+                try:
+                    threshold_result = evaluate_signal_thresholds(
+                        predictions_by_date, sector_map, ohlcv_by_ticker,
+                        price_matrix, spy_prices, trading_dates,
+                        config, single_stats,
+                    )
+                    single_stats["threshold_eval"] = threshold_result
+                except Exception as exc:
+                    logger.warning("Signal threshold evaluation failed (non-fatal): %s", exc)
+
+            # Phase 4c: Feature pruning evaluation
+            pruning_result = None
+            try:
+                pruning_result = evaluate_feature_pruning(
+                    features_by_ticker, price_matrix, ohlcv_by_ticker,
+                    spy_prices, sector_map, trading_dates,
+                    config, single_stats,
+                )
+                single_stats["pruning_eval"] = pruning_result
+            except Exception as exc:
+                logger.warning("Feature pruning evaluation failed (non-fatal): %s", exc)
+
+            # Apply recommendations to S3 (if any)
+            try:
+                apply_result = apply_recommendations(
+                    ensemble_result, pruning_result, bucket,
+                    threshold_result=threshold_result,
+                )
+                single_stats["predictor_optimizer_apply"] = apply_result
+            except Exception as exc:
+                logger.warning("Predictor optimizer apply failed (non-fatal): %s", exc)
+
+        except ImportError as exc:
+            logger.warning("Phase 4 optimizer not available: %s", exc)
+
+        # Free features now that Phase 4 is done
+        del features_by_ticker
+        import gc
+        gc.collect()
 
     # Param sweep — seed grid with current S3 params for iterative learning
     sweep_df = pd.DataFrame()
