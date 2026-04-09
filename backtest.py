@@ -58,6 +58,8 @@ from optimizer import trigger_optimizer, predictor_sizing_optimizer
 from optimizer import scanner_optimizer, pipeline_optimizer
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
+# pipeline_common: shared utilities also used by evaluate.py
+import pipeline_common  # noqa: F401 — imported for evaluate.py reuse
 
 logger = logging.getLogger(__name__)
 
@@ -1850,6 +1852,50 @@ def _run_predictor_pipeline(
     return predictor_stats, predictor_sweep_df, executor_rec
 
 
+def _export_simulation_artifacts(
+    config: dict,
+    run_date: str,
+    sweep_df=None,
+    predictor_sweep_df=None,
+    portfolio_stats: dict | None = None,
+    predictor_stats: dict | None = None,
+) -> None:
+    """Write simulation artifacts to S3 for downstream evaluator consumption.
+
+    The evaluator reads these artifacts to run executor optimization and
+    include simulation results in its report. If the backtester fails,
+    the evaluator runs without them (degraded mode).
+    """
+    import io
+    bucket = config.get("output_bucket", config.get("signals_bucket", "alpha-engine-research"))
+    prefix = f"backtest/{run_date}"
+    s3 = boto3.client("s3")
+    exported = []
+
+    if sweep_df is not None and not sweep_df.empty:
+        buf = io.BytesIO()
+        sweep_df.to_parquet(buf, index=False)
+        s3.put_object(Bucket=bucket, Key=f"{prefix}/sweep_df.parquet", Body=buf.getvalue())
+        exported.append("sweep_df.parquet")
+
+    if predictor_sweep_df is not None and not predictor_sweep_df.empty:
+        buf = io.BytesIO()
+        predictor_sweep_df.to_parquet(buf, index=False)
+        s3.put_object(Bucket=bucket, Key=f"{prefix}/predictor_sweep_df.parquet", Body=buf.getvalue())
+        exported.append("predictor_sweep_df.parquet")
+
+    if portfolio_stats:
+        s3.put_object(Bucket=bucket, Key=f"{prefix}/portfolio_stats.json", Body=json.dumps(portfolio_stats, indent=2, default=str).encode())
+        exported.append("portfolio_stats.json")
+
+    if predictor_stats:
+        s3.put_object(Bucket=bucket, Key=f"{prefix}/predictor_stats.json", Body=json.dumps(predictor_stats, indent=2, default=str).encode())
+        exported.append("predictor_stats.json")
+
+    if exported:
+        logger.info("Exported simulation artifacts to s3://%s/%s/: %s", bucket, prefix, ", ".join(exported))
+
+
 def _run_regression_detection(
     args: argparse.Namespace,
     config: dict,
@@ -2186,6 +2232,13 @@ def main() -> None:
         predictor_stats, predictor_sweep_df, executor_rec = _run_predictor_pipeline(
             args, config, executor_rec, current_executor_params, fd,
         )
+
+    # ── Export simulation artifacts for evaluator ────────────────────────
+    if args.mode in ("simulate", "param-sweep", "all", "predictor-backtest"):
+        try:
+            _export_simulation_artifacts(config, args.date, sweep_df=sweep_df, predictor_sweep_df=predictor_sweep_df, portfolio_stats=portfolio_stats, predictor_stats=predictor_stats)
+        except Exception as e:
+            logger.warning("Simulation artifact export failed (non-fatal): %s", e)
 
     # ── Regression detection ──────────────────────────────────────────────
     regression_result = _run_regression_detection(
