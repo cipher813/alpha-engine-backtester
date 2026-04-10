@@ -8,4 +8,10 @@ yfinance~=0.2.54
 pyarrow~=14.0
 ib_insync~=0.9.86
 arcticdb>=6.11
-# flow-doctor: installed from bundled source (not PyPI) — see spot_backtest.sh
+# flow-doctor: PyPI install for CI and fresh clones. The spot instance's
+# boot script (infrastructure/spot_backtest.sh) installs a bundled editable
+# copy from /home/ec2-user/flow-doctor AFTER this requirements.txt pass,
+# which overrides the PyPI version so the spot instance can pick up
+# unreleased flow-doctor changes without waiting for a PyPI bump. Either
+# path satisfies the module-level `import flow_doctor` in log_config.py.
+flow-doctor[diagnosis]>=0.2.0,<0.4.0
