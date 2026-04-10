@@ -14,4 +14,4 @@ arcticdb>=6.11
 # which overrides the PyPI version so the spot instance can pick up
 # unreleased flow-doctor changes without waiting for a PyPI bump. Either
 # path satisfies the module-level `import flow_doctor` in log_config.py.
-flow-doctor[diagnosis]>=0.2.0,<0.4.0
+flow-doctor[diagnosis]>=0.3.0,<0.4.0
