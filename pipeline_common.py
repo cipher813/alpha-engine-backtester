@@ -179,24 +179,34 @@ def push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
         ])
         ic_ir_30d = round(float(chunk_ics.mean() / (chunk_ics.std() + _IC_STD_EPSILON)), 3)
 
+    s3 = boto3.client("s3")
+    existing: dict = {}
     try:
-        s3 = boto3.client("s3")
-        existing: dict = {}
-        try:
-            resp = s3.get_object(Bucket=bucket, Key=metrics_key)
-            existing = json.loads(resp["Body"].read())
-        except s3.exceptions.NoSuchKey:
-            pass
-        except Exception as e:
-            logger.warning("Failed to read existing predictor metrics from S3: %s", e)
+        resp = s3.get_object(Bucket=bucket, Key=metrics_key)
+        existing = json.loads(resp["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        # Expected on first run — metrics file doesn't exist yet.
+        logger.info("%s not found in S3 — initializing new metrics file", metrics_key)
+    except Exception as e:
+        # Non-NoSuchKey errors (S3 permissions, network, parse errors) mean
+        # we might be overwriting valid existing metrics with a partial set,
+        # or the entire metrics pipeline is broken. Raise so flow-doctor
+        # captures it and downstream rolling-window updates don't silently
+        # corrupt the metrics history.
+        logger.error(
+            "Failed to read existing predictor metrics from s3://%s/%s: %s",
+            bucket, metrics_key, e, exc_info=True,
+        )
+        raise
 
-        from datetime import datetime
-        existing["hit_rate_30d_rolling"] = round(hit_rate, 4)
-        existing["ic_30d"] = ic_30d
-        existing["ic_ir_30d"] = ic_ir_30d
-        existing["rolling_metrics_updated_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        existing["rolling_n"] = len(df)
+    from datetime import datetime
+    existing["hit_rate_30d_rolling"] = round(hit_rate, 4)
+    existing["ic_30d"] = ic_30d
+    existing["ic_ir_30d"] = ic_ir_30d
+    existing["rolling_metrics_updated_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    existing["rolling_n"] = len(df)
 
+    try:
         s3.put_object(
             Bucket=bucket,
             Key=metrics_key,
@@ -208,7 +218,16 @@ def push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
             hit_rate, ic_30d, len(df),
         )
     except Exception as e:
-        logger.warning("push_predictor_rolling_metrics: S3 write failed: %s", e)
+        # Write failure means the rolling metrics never get persisted — next
+        # run reads stale values and the retrain alert evaluator bases its
+        # decision on week-old IC / hit-rate. Raise so flow-doctor captures
+        # it; previously this was a silent warning that kept the pipeline
+        # green even when metrics went stale for weeks.
+        logger.error(
+            "push_predictor_rolling_metrics: S3 write failed for s3://%s/%s: %s",
+            bucket, metrics_key, e, exc_info=True,
+        )
+        raise
 
 
 # ── Sector map ────────────────────────────────────────────────────────────────

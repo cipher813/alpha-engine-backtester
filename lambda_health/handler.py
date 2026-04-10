@@ -204,14 +204,41 @@ def _download_research_db(bucket: str) -> str | None:
 
 
 def _load_last_feature_drift(bucket: str) -> dict | None:
-    """Read the most recent feature_drift.json from S3 (weekly output)."""
+    """Read the most recent feature_drift.json from S3 (weekly output).
+
+    Distinguishes NoSuchKey (expected — feature_drift.json hasn't been
+    written yet or is produced elsewhere) from real errors (S3 permissions,
+    network, corrupt JSON) so the latter surface via flow-doctor instead
+    of silently returning None. Still returns None in both cases to
+    preserve the retrain-alert caller's None-handling contract; the
+    visibility improvement is the log level.
+    """
     import boto3
+    from botocore.exceptions import ClientError
+
+    key = "predictor/metrics/feature_drift.json"
     try:
         s3 = boto3.client("s3")
-        obj = s3.get_object(Bucket=bucket, Key="predictor/metrics/feature_drift.json")
+        obj = s3.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
-    except Exception:
-        log.debug("No feature_drift.json available — skipping drift input for retrain alert")
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            log.info(
+                "No feature_drift.json at s3://%s/%s — retrain alert will "
+                "run without drift input",
+                bucket, key,
+            )
+            return None
+        log.error(
+            "Failed to load feature_drift from s3://%s/%s (ClientError): %s",
+            bucket, key, e, exc_info=True,
+        )
+        return None
+    except Exception as e:
+        log.error(
+            "Failed to parse feature_drift from s3://%s/%s: %s",
+            bucket, key, e, exc_info=True,
+        )
         return None
 
 

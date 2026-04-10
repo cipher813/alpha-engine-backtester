@@ -104,6 +104,8 @@ def read_current_params(bucket: str) -> dict:
 
     Returns a dict of safe-to-tune params only (keys in SAFE_PARAMS).
     """
+    from botocore.exceptions import ClientError
+
     try:
         s3 = boto3.client("s3")
         obj = s3.get_object(Bucket=bucket, Key=S3_PARAMS_KEY)
@@ -115,8 +117,35 @@ def read_current_params(bucket: str) -> dict:
                 data.get("updated_at", "unknown"), params,
             )
             return params
+    except ClientError as e:
+        # NoSuchKey is expected on the first run (no params have been
+        # auto-applied yet) — fall back to factory defaults cleanly.
+        # Any other ClientError (permissions, network) means the optimizer
+        # would compare sweep results against the wrong baseline and may
+        # oscillate params week-over-week. Raise so the run fails loud
+        # instead of silently making decisions on FACTORY_DEFAULTS.
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            logger.info(
+                "No executor params in s3://%s/%s yet (first run?) — "
+                "using factory defaults",
+                bucket, S3_PARAMS_KEY,
+            )
+        else:
+            logger.error(
+                "Failed to read current executor params from s3://%s/%s: %s. "
+                "Optimizer cannot safely run without a valid baseline.",
+                bucket, S3_PARAMS_KEY, e, exc_info=True,
+            )
+            raise
     except Exception as e:
-        logger.info("No executor params in S3 (%s), using factory defaults", e)
+        # JSON parse error, type error, etc. The params file exists but is
+        # corrupted — optimizer should not proceed.
+        logger.error(
+            "Failed to parse current executor params from s3://%s/%s: %s. "
+            "Optimizer cannot safely run against a corrupt baseline.",
+            bucket, S3_PARAMS_KEY, e, exc_info=True,
+        )
+        raise
 
     return FACTORY_DEFAULTS.copy()
 
