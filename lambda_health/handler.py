@@ -49,10 +49,13 @@ def handler(event: dict, context) -> dict:
         date     (str)  : Override date YYYY-MM-DD (default: today UTC)
         dry_run  (bool) : If True, skip S3 writes and email (for canary tests)
     """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
-    )
+    # Structured logging + flow-doctor owned by log_config.py. When
+    # FLOW_DOCTOR_ENABLED=1 the root logger gets a handler that captures
+    # ERROR+ records — every log.error() call in the phases below is
+    # automatically routed to flow-doctor without explicit fd.report() plumbing.
+    from log_config import setup_logging, get_flow_doctor
+    setup_logging("lambda_health")
+    fd = get_flow_doctor()
 
     t0 = time.time()
     bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
@@ -60,6 +63,13 @@ def handler(event: dict, context) -> dict:
     dry_run = event.get("dry_run", False)
 
     log.info("Predictor health check starting: bucket=%s date=%s dry_run=%s", bucket, run_date, dry_run)
+
+    # Track critical errors across phases. If any phase fails, return 500
+    # so the Lambda caller (EventBridge scheduler / monitoring) sees the
+    # failure instead of a misleading 200 OK. The previous behavior
+    # returned 200 regardless of per-phase exceptions, which meant
+    # degradations and calibration drift went unnoticed.
+    phase_errors: list[str] = []
 
     # ── Download research.db from S3 ─────────────────────────────────────
     db_path = _download_research_db(bucket)
@@ -80,8 +90,9 @@ def handler(event: dict, context) -> dict:
         results["production_health"] = production_health
         log.info("Production health: %s", _summarize(production_health))
     except Exception as exc:
-        log.error("Production health failed: %s", exc)
+        log.error("Production health failed: %s", exc, exc_info=True)
         results["production_health"] = {"status": "error", "error": str(exc)}
+        phase_errors.append(f"production_health: {exc}")
 
     # ── Phase 2b: Calibration validation ─────────────────────────────────
     calibration = None
@@ -95,8 +106,9 @@ def handler(event: dict, context) -> dict:
         results["calibration"] = calibration
         log.info("Calibration: %s", _summarize(calibration))
     except Exception as exc:
-        log.error("Calibration validation failed: %s", exc)
+        log.error("Calibration validation failed: %s", exc, exc_info=True)
         results["calibration"] = {"status": "error", "error": str(exc)}
+        phase_errors.append(f"calibration: {exc}")
 
     # ── Load last weekly feature drift (read-only, not recomputed) ───────
     feature_drift = _load_last_feature_drift(bucket)
@@ -118,14 +130,18 @@ def handler(event: dict, context) -> dict:
         elif dry_run:
             log.info("[dry_run] Skipping retrain alert email")
     except Exception as exc:
-        log.error("Retrain alert evaluation failed: %s", exc)
+        log.error("Retrain alert evaluation failed: %s", exc, exc_info=True)
         results["retrain_alert"] = {"status": "error", "error": str(exc)}
+        phase_errors.append(f"retrain_alert: {exc}")
 
     # ── Write health status to S3 ────────────────────────────────────────
     elapsed = time.time() - t0
     status = "ok"
     warnings = []
 
+    if phase_errors:
+        status = "error"
+        warnings.extend(phase_errors)
     if production_health and production_health.get("degradation_flag"):
         status = "degraded"
         warnings.append("IC degradation detected")
@@ -148,9 +164,22 @@ def handler(event: dict, context) -> dict:
                 warnings=warnings,
             )
         except Exception as exc:
-            log.warning("Failed to write health status: %s", exc)
+            log.error("Failed to write health status: %s", exc, exc_info=True)
+            phase_errors.append(f"write_health: {exc}")
 
     log.info("Health check complete in %.1fs: status=%s warnings=%s", elapsed, status, warnings)
+
+    # Return 500 when any critical phase failed, so callers see the
+    # failure. Returning 200 here is what hid the 2026-04-10 predictor
+    # degradation for 3 hours — Lambda dashboards showed green while the
+    # underlying checks were throwing exceptions.
+    if phase_errors:
+        return _response(500, {
+            "status": "error",
+            "duration_seconds": round(elapsed, 1),
+            "phase_errors": phase_errors,
+            "results": results,
+        })
 
     return _response(200, {
         "status": status,

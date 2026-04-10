@@ -117,6 +117,7 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
     prefix = f"backtest/{args.date}"
     s3 = boto3.client("s3")
 
+    missing_artifacts: list[str] = []
     for artifact, loader in [
         ("sweep_df.parquet", lambda body: pd.read_parquet(io.BytesIO(body))),
         ("predictor_sweep_df.parquet", lambda body: pd.read_parquet(io.BytesIO(body))),
@@ -135,10 +136,42 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
             elif artifact == "predictor_stats.json":
                 predictor_stats = data
             logger.info("Loaded simulation artifact: %s", artifact)
-        except ClientError:
-            logger.info("Simulation artifact not available: %s (evaluator will run without it)", artifact)
+        except ClientError as e:
+            # NoSuchKey is an expected state when backtest.py hasn't run
+            # for this date (e.g., first run after --mode param-sweep was
+            # skipped). Other ClientErrors are real S3 problems.
+            if e.response.get("Error", {}).get("Code") == "NoSuchKey":
+                logger.warning(
+                    "Simulation artifact not found in S3: %s/%s — evaluator "
+                    "will run without it (backtest.py may not have run)",
+                    prefix, artifact,
+                )
+                missing_artifacts.append(artifact)
+            else:
+                logger.error(
+                    "S3 ClientError loading %s/%s: %s — evaluator cannot "
+                    "trust results", prefix, artifact, e,
+                )
+                raise
         except Exception as e:
-            logger.warning("Failed to load %s: %s", artifact, e)
+            logger.error(
+                "Failed to parse simulation artifact %s/%s: %s — evaluator "
+                "cannot trust results", prefix, artifact, e, exc_info=True,
+            )
+            raise
+
+    # If ALL critical optimizer artifacts are missing, downstream optimizers
+    # will run against zero data and produce garbage config recommendations.
+    # Block the run by raising — operators must see the failure loudly so
+    # the Saturday pipeline does not auto-promote bad configs.
+    critical = {"sweep_df.parquet", "portfolio_stats.json"}
+    if critical.issubset(set(missing_artifacts)):
+        raise RuntimeError(
+            f"All critical simulation artifacts missing from "
+            f"s3://{bucket}/{prefix}/: {sorted(critical)}. "
+            f"backtest.py must run before evaluate.py in the Saturday "
+            f"pipeline. Check the upstream step status."
+        )
 
     config["_sweep_df"] = sweep_df
     config["_predictor_sweep_df"] = predictor_sweep_df
@@ -726,13 +759,15 @@ def _run_regression(
 def main() -> None:
     args = _parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    # Structured logging + flow-doctor singleton owned by log_config.py.
+    # setup_logging() configures the root logger and attaches flow-doctor's
+    # ERROR handler when FLOW_DOCTOR_ENABLED=1.
+    from log_config import setup_logging, get_flow_doctor
+    setup_logging("evaluate")
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
     _health_start = _time.time()
 
+    fd = get_flow_doctor()
     config = load_config(args.config)
 
     # Initialize optimizer modules

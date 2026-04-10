@@ -336,9 +336,19 @@ cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
 
 echo "Starting backtest at \$(date)"
-$REMOTE_PYTHON backtest.py --mode $BACKTEST_MODE --upload --log-level INFO 2>&1 || {
-    echo "WARNING: Backtest exited with code \$? — continuing to evaluator"
-}
+# If backtest.py fails, do NOT continue to evaluator — the evaluator
+# would consume stale or missing simulation artifacts and auto-promote
+# garbage params to S3. Fail loud and exit non-zero so the spot-instance
+# run is marked as failed, the heartbeat metric is not emitted, and
+# the Step Function catches it. Replaces the previous || { echo WARNING }
+# swallow which silently let the evaluator run against invalid sweep
+# results and was the root cause of multiple undetected param oscillations.
+if ! $REMOTE_PYTHON backtest.py --mode $BACKTEST_MODE --upload --log-level INFO 2>&1; then
+    echo "ERROR: backtest.py failed. Skipping evaluator to prevent" >&2
+    echo "       auto-promotion of unvalidated configs. Spot run is" >&2
+    echo "       marked FAILED — check flow-doctor alerts." >&2
+    exit 1
+fi
 
 echo ""
 echo "Backtest complete at \$(date). Starting evaluator..."
