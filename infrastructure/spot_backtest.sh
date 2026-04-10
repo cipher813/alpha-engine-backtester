@@ -313,7 +313,7 @@ set -euo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
 
-$REMOTE_PYTHON backtest.py --mode signal-quality --log-level INFO 2>&1 | tail -30
+$REMOTE_PYTHON evaluate.py --mode diagnostics --freeze --log-level INFO 2>&1 | tail -30
 
 echo ""
 echo "Smoke test complete."
@@ -336,10 +336,16 @@ cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
 
 echo "Starting backtest at \$(date)"
-$REMOTE_PYTHON backtest.py --mode $BACKTEST_MODE --upload --log-level INFO 2>&1
+$REMOTE_PYTHON backtest.py --mode $BACKTEST_MODE --upload --log-level INFO 2>&1 || {
+    echo "WARNING: Backtest exited with code \$? — continuing to evaluator"
+}
 
 echo ""
-echo "Backtest complete at \$(date)"
+echo "Backtest complete at \$(date). Starting evaluator..."
+$REMOTE_PYTHON evaluate.py --mode all --upload --log-level INFO 2>&1
+
+echo ""
+echo "Evaluator complete at \$(date)"
 BACKTEST
 
 echo ""

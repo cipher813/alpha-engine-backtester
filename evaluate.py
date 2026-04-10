@@ -1,0 +1,1002 @@
+"""
+evaluate.py — CLI entry point for the Alpha Engine evaluator.
+
+Runs all evaluation modules (signal quality analysis, component diagnostics,
+self-adjustment optimizers) independently of simulation. Reads research.db
+and trades.db directly; optionally reads simulation artifacts from S3
+(sweep_df, portfolio_stats) if available.
+
+Each module reports its data completeness — whether it had all inputs or
+ran in degraded mode. The completeness manifest is saved alongside the
+evaluation report.
+
+Usage:
+    python evaluate.py --mode all                     # run everything
+    python evaluate.py --mode diagnostics             # analysis modules only (no config promotion)
+    python evaluate.py --mode optimize                # optimizer modules only
+    python evaluate.py --module signal-quality        # single module
+    python evaluate.py --upload --freeze              # upload results, skip S3 config writes
+    python evaluate.py --db /path/to/research.db      # local DB override
+    python evaluate.py --trades-db /path/to/trades.db # local trades.db override
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import logging
+import os
+import time as _time
+from datetime import date
+from pathlib import Path
+
+import boto3
+from botocore.exceptions import ClientError
+import pandas as pd
+import yaml
+
+from analysis import signal_quality, regime_analysis, score_analysis, attribution
+from analysis import veto_analysis
+from analysis import end_to_end
+from analysis import trigger_scorecard, alpha_distribution, veto_value
+from analysis import shadow_book as shadow_book_analysis
+from analysis import exit_timing, macro_eval
+from optimizer import weight_optimizer, executor_optimizer, research_optimizer
+from optimizer import trigger_optimizer, predictor_sizing_optimizer
+from optimizer import scanner_optimizer, pipeline_optimizer
+from emailer import send_report_email
+from reporter import build_report, save, upload_to_s3
+from completeness import CompletenessTracker
+from pipeline_common import (
+    load_config,
+    pull_research_db,
+    init_research_db,
+    find_trades_db,
+    seed_score_performance,
+    seed_predictor_outcomes,
+    backfill_score_performance_returns,
+    backfill_predictor_outcomes,
+    push_predictor_rolling_metrics,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Alpha Engine Evaluator")
+    parser.add_argument(
+        "--mode", choices=["all", "diagnostics", "optimize"],
+        default="all",
+        help="all: run everything. diagnostics: analysis only. optimize: optimizers only.",
+    )
+    parser.add_argument(
+        "--module",
+        help="Run a single named module (e.g., signal-quality, weight-optimizer)",
+    )
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--db", help="Override research_db path from config")
+    parser.add_argument("--trades-db", help="Override trades.db path")
+    parser.add_argument("--upload", action="store_true", help="Upload results to S3")
+    parser.add_argument("--date", default=date.today().isoformat(), help="Run date label")
+    parser.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    parser.add_argument(
+        "--freeze", action="store_true",
+        help="Compute recommendations but skip all S3 config promotions",
+    )
+    parser.add_argument(
+        "--stop-instance", action="store_true",
+        help="Stop this EC2 instance after completion (for scheduled runs)",
+    )
+    return parser.parse_args()
+
+
+# ── Data source initialization ───────────────────────────────────────────────
+
+
+def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
+    """Initialize all data sources. Returns availability map."""
+    # Research DB
+    init_research_db(args.db, config)
+    db_path = config.get("research_db")
+    has_research_db = db_path is not None and os.path.exists(db_path)
+
+    # Trades DB
+    trades_db = getattr(args, "trades_db", None) or find_trades_db(config)
+    config["_trades_db"] = trades_db
+    has_trades_db = trades_db is not None and os.path.exists(trades_db)
+
+    # Simulation artifacts from S3 (written by backtest.py)
+    sweep_df = None
+    predictor_sweep_df = None
+    portfolio_stats = None
+    predictor_stats = None
+    bucket = config.get("output_bucket", config.get("signals_bucket", "alpha-engine-research"))
+    prefix = f"backtest/{args.date}"
+    s3 = boto3.client("s3")
+
+    for artifact, loader in [
+        ("sweep_df.parquet", lambda body: pd.read_parquet(io.BytesIO(body))),
+        ("predictor_sweep_df.parquet", lambda body: pd.read_parquet(io.BytesIO(body))),
+        ("portfolio_stats.json", lambda body: json.loads(body)),
+        ("predictor_stats.json", lambda body: json.loads(body)),
+    ]:
+        try:
+            resp = s3.get_object(Bucket=bucket, Key=f"{prefix}/{artifact}")
+            data = loader(resp["Body"].read())
+            if artifact == "sweep_df.parquet":
+                sweep_df = data
+            elif artifact == "predictor_sweep_df.parquet":
+                predictor_sweep_df = data
+            elif artifact == "portfolio_stats.json":
+                portfolio_stats = data
+            elif artifact == "predictor_stats.json":
+                predictor_stats = data
+            logger.info("Loaded simulation artifact: %s", artifact)
+        except ClientError:
+            logger.info("Simulation artifact not available: %s (evaluator will run without it)", artifact)
+        except Exception as e:
+            logger.warning("Failed to load %s: %s", artifact, e)
+
+    config["_sweep_df"] = sweep_df
+    config["_predictor_sweep_df"] = predictor_sweep_df
+    config["_portfolio_stats"] = portfolio_stats
+    config["_predictor_stats"] = predictor_stats
+
+    return {
+        "research_db": has_research_db,
+        "trades_db": has_trades_db,
+        "sweep_df": sweep_df is not None,
+        "predictor_sweep_df": predictor_sweep_df is not None,
+        "portfolio_stats": portfolio_stats is not None,
+        "predictor_stats": predictor_stats is not None,
+    }
+
+
+# ── Signal quality pipeline ──────────────────────────────────────────────────
+
+
+def _run_signal_quality(config: dict, tracker: CompletenessTracker, avail: dict) -> tuple:
+    """Run signal quality analysis with seeding and backfilling.
+
+    Returns (sq_result, regime_rows, score_rows, attr_result, df_base).
+    """
+    db_path = config.get("research_db")
+
+    # Seed and backfill
+    if avail["research_db"]:
+        seed_score_performance(config)
+        backfill_score_performance_returns(config)
+
+    sq_result = tracker.run_module(
+        "signal_quality",
+        lambda: _compute_signal_quality(config),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    if sq_result.get("status") in ("skipped", "error", "db_not_found"):
+        return sq_result, [], [], {"status": "skipped"}, None
+
+    # Load df_base for downstream modules
+    try:
+        df_base = signal_quality.load_score_performance(db_path)
+    except Exception:
+        df_base = None
+
+    regime_rows = tracker.run_module(
+        "regime_analysis",
+        lambda: _compute_regime(config),
+        required_inputs={"research_db": avail["research_db"]},
+    )
+    if not isinstance(regime_rows, list):
+        regime_rows = regime_rows.get("rows", []) if isinstance(regime_rows, dict) else []
+
+    score_rows = []
+    if df_base is not None:
+        thresholds = config.get("score_thresholds", [60, 65, 70, 75, 80, 85, 90])
+        min_samples = config.get("min_samples", 5)
+        score_rows = score_analysis.accuracy_by_threshold(
+            df_base, thresholds=thresholds, min_samples=min_samples,
+        )
+
+    attr_result = tracker.run_module(
+        "attribution",
+        lambda: attribution.compute_attribution(df_base) if df_base is not None else {"status": "skipped"},
+        required_inputs={"research_db": avail["research_db"], "df_base": df_base is not None},
+        skip_if_missing=["df_base"],
+    )
+
+    # Seed and backfill predictor outcomes
+    if avail["research_db"]:
+        seed_predictor_outcomes(config)
+        if df_base is not None:
+            backfill_predictor_outcomes(config, df_base)
+            push_predictor_rolling_metrics(config, db_path or "")
+
+    return sq_result, regime_rows, score_rows, attr_result, df_base
+
+
+def _compute_signal_quality(config: dict) -> dict:
+    db_path = config.get("research_db")
+    min_samples = config.get("min_samples", 5)
+    if not db_path:
+        return {"status": "db_not_found"}
+    df_base = signal_quality.load_score_performance(db_path)
+    return signal_quality.compute_accuracy(df_base, min_samples=min_samples)
+
+
+def _compute_regime(config: dict) -> dict:
+    db_path = config.get("research_db")
+    min_samples = config.get("min_samples", 5)
+    if not db_path:
+        return {"status": "skipped", "rows": []}
+    df_regime = regime_analysis.load_with_regime(db_path)
+    rows = regime_analysis.accuracy_by_regime(df_regime, min_samples=min_samples)
+    return {"status": "ok", "rows": rows}
+
+
+# ── Diagnostics ──────────────────────────────────────────────────────────────
+
+
+def _run_diagnostics(
+    config: dict,
+    tracker: CompletenessTracker,
+    avail: dict,
+    df_base,
+) -> dict:
+    """Run all diagnostic modules. Returns dict of results."""
+    db_path = config.get("research_db")
+    trades_db = config.get("_trades_db")
+    results = {}
+
+    # End-to-end lift metrics
+    results["e2e_lift"] = tracker.run_module(
+        "end_to_end_lift",
+        lambda: end_to_end.compute_lift_metrics(
+            research_db_path=db_path, trades_db_path=trades_db,
+        ),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Entry trigger scorecard
+    results["trigger_scorecard"] = tracker.run_module(
+        "trigger_scorecard",
+        lambda: trigger_scorecard.compute_trigger_scorecard(trades_db),
+        required_inputs={"trades_db": avail["trades_db"]},
+        skip_if_missing=["trades_db"],
+    )
+
+    # Alpha magnitude distribution
+    results["alpha_dist"] = tracker.run_module(
+        "alpha_distribution",
+        lambda: alpha_distribution.compute_alpha_distribution(db_path),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Score calibration curve
+    results["score_calibration"] = tracker.run_module(
+        "score_calibration",
+        lambda: alpha_distribution.compute_score_calibration(db_path),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Net veto value
+    results["veto_value"] = tracker.run_module(
+        "veto_value",
+        lambda: veto_value.compute_veto_value(
+            research_db_path=db_path, trades_db_path=trades_db,
+        ),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Predictor confusion matrix
+    results["confusion_matrix"] = tracker.run_module(
+        "predictor_confusion",
+        lambda: _run_confusion_matrix(db_path),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Shadow book analysis
+    results["shadow_book"] = tracker.run_module(
+        "shadow_book",
+        lambda: shadow_book_analysis.compute_shadow_book_analysis(
+            trades_db_path=trades_db,
+            research_db_path=db_path if avail["research_db"] else None,
+        ),
+        required_inputs={"trades_db": avail["trades_db"]},
+        skip_if_missing=["trades_db"],
+    )
+
+    # Exit timing analysis
+    results["exit_timing"] = tracker.run_module(
+        "exit_timing",
+        lambda: exit_timing.compute_exit_timing(trades_db),
+        required_inputs={"trades_db": avail["trades_db"]},
+        skip_if_missing=["trades_db"],
+    )
+
+    # Post-trade analysis
+    results["post_trade"] = tracker.run_module(
+        "post_trade",
+        lambda: _run_post_trade(trades_db),
+        required_inputs={"trades_db": avail["trades_db"]},
+        skip_if_missing=["trades_db"],
+    )
+
+    # Macro multiplier evaluation
+    results["macro_eval"] = tracker.run_module(
+        "macro_eval",
+        lambda: macro_eval.compute_macro_evaluation(db_path),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Monte Carlo significance test
+    results["monte_carlo"] = tracker.run_module(
+        "monte_carlo",
+        lambda: _run_monte_carlo(config),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Production health monitoring
+    results["production_health"] = tracker.run_module(
+        "production_health",
+        lambda: _run_production_health(config),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Feature drift detection
+    results["feature_drift"] = tracker.run_module(
+        "feature_drift",
+        lambda: _run_feature_drift(config),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    return results
+
+
+def _run_confusion_matrix(db_path: str) -> dict:
+    from analysis.predictor_confusion import compute_confusion_matrix
+    return compute_confusion_matrix(db_path)
+
+
+def _run_post_trade(trades_db: str) -> dict:
+    from analysis.post_trade import compute_post_trade_analysis
+    return compute_post_trade_analysis(trades_db)
+
+
+def _run_monte_carlo(config: dict) -> dict:
+    from analysis.monte_carlo import run_monte_carlo
+    db_path = config.get("research_db")
+    return run_monte_carlo(
+        research_db_path=db_path,
+        price_data={},
+        n_permutations=config.get("monte_carlo_permutations", 200),
+    )
+
+
+def _run_production_health(config: dict) -> dict:
+    from analysis.production_health import compute_production_health
+    db_path = config.get("research_db", "")
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    return compute_production_health(db_path, bucket)
+
+
+def _run_feature_drift(config: dict) -> dict:
+    from analysis.feature_drift import compute_feature_drift
+    db_path = config.get("research_db", "")
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    return compute_feature_drift(db_path, bucket)
+
+
+# ── Optimizers ───────────────────────────────────────────────────────────────
+
+
+def _read_current_weights(config: dict) -> dict:
+    """Read current scoring weights from S3, local config, or defaults."""
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    try:
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key="config/scoring_weights.json")
+        data = json.loads(obj["Body"].read())
+        weights = {k: float(data[k]) for k in ("news", "research") if k in data}
+        if len(weights) == 2:
+            return weights
+    except Exception:
+        pass
+
+    research_paths = config.get("research_paths", [])
+    if isinstance(research_paths, str):
+        research_paths = [research_paths]
+    research_path = next((p for p in research_paths if os.path.isdir(p)), None)
+    if research_path:
+        universe_yaml = os.path.join(research_path, "config", "universe.yaml")
+        try:
+            with open(universe_yaml) as f:
+                universe = yaml.safe_load(f)
+            weights = universe.get("scoring_weights", {})
+            if weights:
+                return weights
+        except Exception:
+            pass
+
+    return weight_optimizer._cfg.get("default_weights", weight_optimizer._DEFAULT_WEIGHTS).copy()
+
+
+def _run_optimizers(
+    config: dict,
+    tracker: CompletenessTracker,
+    avail: dict,
+    df_base,
+    freeze: bool,
+    diagnostics: dict,
+) -> dict:
+    """Run all optimizer modules. Returns dict of results."""
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    db_path = config.get("research_db")
+    results = {}
+
+    # Weight optimizer
+    results["weight_result"] = tracker.run_module(
+        "weight_optimizer",
+        lambda: _run_weight_opt(config, df_base, freeze),
+        required_inputs={"research_db": avail["research_db"], "df_base": df_base is not None},
+        skip_if_missing=["df_base"],
+    )
+
+    # Veto analysis optimizer
+    results["veto_result"] = tracker.run_module(
+        "veto_optimizer",
+        lambda: _run_veto_opt(config, df_base, freeze),
+        required_inputs={"research_db": avail["research_db"], "df_base": df_base is not None},
+        skip_if_missing=["df_base"],
+    )
+
+    # Research params optimizer
+    results["research_params"] = tracker.run_module(
+        "research_optimizer",
+        lambda: _run_research_opt(config, df_base, freeze),
+        required_inputs={"research_db": avail["research_db"], "df_base": df_base is not None},
+        skip_if_missing=["df_base"],
+    )
+
+    # Trigger optimizer
+    trigger_result = diagnostics.get("trigger_scorecard")
+    results["trigger_opt"] = tracker.run_module(
+        "trigger_optimizer",
+        lambda: _run_trigger_opt(trigger_result, freeze, bucket),
+        required_inputs={"trigger_scorecard": trigger_result is not None and trigger_result.get("status") == "ok"},
+        skip_if_missing=["trigger_scorecard"],
+    )
+
+    # Predictor sizing optimizer
+    results["predictor_sizing"] = tracker.run_module(
+        "predictor_sizing",
+        lambda: _run_predictor_sizing(db_path, freeze, bucket),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Scanner optimizer
+    results["scanner_opt"] = tracker.run_module(
+        "scanner_optimizer",
+        lambda: _run_scanner_opt(config, db_path, freeze, bucket),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Pipeline optimizer (team slots + CIO)
+    e2e_lift = diagnostics.get("e2e_lift")
+    has_e2e = e2e_lift is not None and e2e_lift.get("status") == "ok"
+
+    results["team_opt"] = tracker.run_module(
+        "team_slot_optimizer",
+        lambda: _run_team_opt(e2e_lift, freeze, bucket),
+        required_inputs={"e2e_lift": has_e2e},
+        skip_if_missing=["e2e_lift"],
+    )
+
+    results["cio_opt"] = tracker.run_module(
+        "cio_optimizer",
+        lambda: _run_cio_opt(e2e_lift, freeze, bucket),
+        required_inputs={"e2e_lift": has_e2e},
+        skip_if_missing=["e2e_lift"],
+    )
+
+    # Executor optimizer (needs sweep_df from simulation)
+    sweep_df = config.get("_sweep_df")
+    predictor_sweep_df = config.get("_predictor_sweep_df")
+    effective_sweep = sweep_df if sweep_df is not None else predictor_sweep_df
+
+    results["executor_rec"] = tracker.run_module(
+        "executor_optimizer",
+        lambda: _run_executor_opt(config, effective_sweep, freeze),
+        required_inputs={
+            "sweep_df": sweep_df is not None,
+            "predictor_sweep_df": predictor_sweep_df is not None,
+        },
+        skip_if_missing=None,  # runs in degraded mode, doesn't skip
+    )
+
+    return results
+
+
+def _run_weight_opt(config: dict, df_base, freeze: bool) -> dict:
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    current_weights = _read_current_weights(config)
+    min_samples = config.get("weight_optimizer_min_samples", 30)
+
+    df_with_sub = weight_optimizer.load_with_subscores(df_base, bucket)
+    result = weight_optimizer.compute_weights(
+        df_with_sub, current_weights=current_weights,
+        min_samples=min_samples, bucket=bucket,
+    )
+    if freeze:
+        result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+    else:
+        result["apply_result"] = weight_optimizer.apply_weights(result, bucket)
+    return result
+
+
+def _run_veto_opt(config: dict, df_base, freeze: bool) -> dict:
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    result = veto_analysis.analyze_veto_effectiveness(df_base, bucket)
+    if result.get("status") == "ok":
+        if freeze:
+            result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+        else:
+            result["apply_result"] = veto_analysis.apply(result, bucket)
+    return result
+
+
+def _run_research_opt(config: dict, df_base, freeze: bool) -> dict:
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    current_rp = research_optimizer.read_current_params(bucket)
+    corr_result = research_optimizer.compute_boost_correlations(df_base, bucket)
+    if corr_result.get("status") != "ok":
+        return corr_result
+    rp_result = research_optimizer.recommend(corr_result, current_rp)
+    if rp_result.get("status") == "ok":
+        if freeze:
+            rp_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+        else:
+            rp_result["apply_result"] = research_optimizer.apply(rp_result, bucket)
+    return rp_result
+
+
+def _run_trigger_opt(trigger_result: dict, freeze: bool, bucket: str) -> dict:
+    result = trigger_optimizer.analyze(trigger_result)
+    if result.get("status") == "ok":
+        if freeze:
+            result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+        else:
+            result["apply_result"] = trigger_optimizer.apply(result, bucket)
+    return result
+
+
+def _run_predictor_sizing(db_path: str, freeze: bool, bucket: str) -> dict:
+    result = predictor_sizing_optimizer.analyze(db_path)
+    if result.get("status") == "ok":
+        if freeze:
+            result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+        elif result.get("recommendation") == "enable":
+            result["apply_result"] = predictor_sizing_optimizer.apply(result, bucket)
+    return result
+
+
+def _run_scanner_opt(config: dict, db_path: str, freeze: bool, bucket: str) -> dict:
+    analysis = scanner_optimizer.analyze(db_path)
+    if analysis.get("status") != "ok":
+        return analysis
+    current = scanner_optimizer.read_current_params(bucket)
+    result = scanner_optimizer.recommend(analysis, current)
+    if result.get("status") == "ok":
+        if freeze:
+            result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+        else:
+            result["apply_result"] = scanner_optimizer.apply(result, bucket)
+    result["analysis"] = analysis
+    return result
+
+
+def _run_team_opt(e2e_lift: dict, freeze: bool, bucket: str) -> dict:
+    analysis = pipeline_optimizer.analyze_team_performance(e2e_lift)
+    if analysis.get("status") != "ok":
+        return analysis
+    result = pipeline_optimizer.recommend_team_slots(analysis)
+    if result.get("status") == "ok":
+        if freeze:
+            result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+        else:
+            result["apply_result"] = pipeline_optimizer.apply_team_slots(result, bucket)
+    result["analysis"] = analysis
+    return result
+
+
+def _run_cio_opt(e2e_lift: dict, freeze: bool, bucket: str) -> dict:
+    result = pipeline_optimizer.analyze_cio_performance(e2e_lift)
+    if result.get("status") == "ok":
+        if freeze:
+            result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+        elif result.get("recommendation") == "deterministic":
+            result["apply_result"] = pipeline_optimizer.apply_cio_mode(result, bucket)
+    return result
+
+
+def _run_executor_opt(config: dict, sweep_df, freeze: bool) -> dict:
+    if sweep_df is None or (hasattr(sweep_df, "empty") and sweep_df.empty):
+        return {
+            "status": "degraded",
+            "degradation_reason": "no sweep_df available (simulation did not run or failed)",
+        }
+
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    current_params = executor_optimizer.read_current_params(bucket)
+    result = executor_optimizer.recommend(sweep_df, config, current_params=current_params)
+    if result.get("status") == "ok":
+        if freeze:
+            result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+        else:
+            result["apply_result"] = executor_optimizer.apply(result, bucket)
+    return result
+
+
+# ── Regression detection ─────────────────────────────────────────────────────
+
+
+def _run_regression(
+    config: dict,
+    tracker: CompletenessTracker,
+    sq_result: dict,
+    portfolio_stats: dict | None,
+    weight_result: dict | None,
+    executor_rec: dict | None,
+    veto_result: dict | None,
+    freeze: bool,
+    run_date: str,
+) -> dict | None:
+    """Run regression detection and save rolling metrics."""
+    def _do_regression() -> dict:
+        from optimizer.regression_monitor import (
+            extract_metrics, save_rolling_metrics, save_promotion_baseline,
+            check_regression,
+        )
+        bucket = config.get("signals_bucket", "alpha-engine-research")
+        current_metrics = extract_metrics(portfolio_stats, sq_result)
+
+        if current_metrics:
+            save_rolling_metrics(bucket, run_date, current_metrics)
+
+        promoted = []
+        for label, res in [
+            ("scoring_weights", weight_result),
+            ("executor_params", executor_rec),
+            ("predictor_params", veto_result),
+        ]:
+            if res and res.get("apply_result", {}).get("applied"):
+                promoted.append(label)
+
+        if promoted and current_metrics:
+            save_promotion_baseline(bucket, current_metrics, promoted)
+
+        if current_metrics and not freeze:
+            return check_regression(bucket, current_metrics, config) or {"status": "ok"}
+        return {"status": "ok", "note": "frozen or no metrics"}
+
+    return tracker.run_module(
+        "regression_monitor",
+        _do_regression,
+        required_inputs={"signal_quality": sq_result.get("status") == "ok"},
+    )
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    args = _parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    _health_start = _time.time()
+
+    config = load_config(args.config)
+
+    # Initialize optimizer modules
+    weight_optimizer.init_config(config)
+    executor_optimizer.init_config(config)
+    veto_analysis.init_config(config)
+    research_optimizer.init_config(config)
+
+    # Initialize data sources and check availability
+    avail = _init_data_sources(args, config)
+    logger.info("Data availability: %s", {k: v for k, v in avail.items()})
+
+    tracker = CompletenessTracker()
+
+    # ── Default results ──────────────────────────────────────────────────
+    sq_result: dict = {"status": "skipped"}
+    regime_rows: list = []
+    score_rows: list = []
+    attr_result: dict = {"status": "skipped"}
+    df_base = None
+    diagnostics: dict = {}
+    opt_results: dict = {}
+
+    run_diagnostics = args.mode in ("all", "diagnostics") or args.module
+    run_optimizers = args.mode in ("all", "optimize") or args.module
+
+    # ── Signal quality pipeline ──────────────────────────────────────────
+    if run_diagnostics and (not args.module or args.module == "signal-quality"):
+        sq_result, regime_rows, score_rows, attr_result, df_base = _run_signal_quality(
+            config, tracker, avail,
+        )
+
+    # ── Component diagnostics ────────────────────────────────────────────
+    if run_diagnostics and not args.module:
+        diagnostics = _run_diagnostics(config, tracker, avail, df_base)
+
+    # ── Single module mode ───────────────────────────────────────────────
+    if args.module and args.module != "signal-quality":
+        # Run just the requested module
+        if args.module in ("weight-optimizer", "veto-optimizer", "research-optimizer",
+                           "trigger-optimizer", "predictor-sizing", "scanner-optimizer",
+                           "team-optimizer", "cio-optimizer", "executor-optimizer"):
+            run_optimizers = True
+        # For diagnostic modules, they'd need to be run individually
+        # This is handled by the diagnostics dict being empty
+
+    # ── Optimizers ───────────────────────────────────────────────────────
+    if run_optimizers:
+        opt_results = _run_optimizers(
+            config, tracker, avail, df_base,
+            freeze=args.freeze,
+            diagnostics=diagnostics,
+        )
+
+    # ── Regression detection ─────────────────────────────────────────────
+    regression_result = _run_regression(
+        config, tracker, sq_result,
+        config.get("_portfolio_stats"),
+        opt_results.get("weight_result"),
+        opt_results.get("executor_rec"),
+        opt_results.get("veto_result"),
+        args.freeze, args.date,
+    )
+
+    # ── Report ───────────────────────────────────────────────────────────
+    try:
+        portfolio_stats = config.get("_portfolio_stats")
+        predictor_stats = config.get("_predictor_stats")
+
+        pipeline_health = {
+            "db_pull_status": config.get("_db_pull_status"),
+            "staleness_warning": portfolio_stats.get("staleness_warning") if portfolio_stats else None,
+            "coverage": portfolio_stats.get("coverage") if portfolio_stats else None,
+        }
+
+        # Compute grading scorecard
+        from analysis.grading import compute_scorecard
+        grading_result = compute_scorecard(
+            signal_quality=sq_result,
+            e2e_lift=diagnostics.get("e2e_lift"),
+            macro_eval=diagnostics.get("macro_eval"),
+            score_calibration=diagnostics.get("score_calibration"),
+            veto_result=opt_results.get("veto_result"),
+            veto_value=diagnostics.get("veto_value"),
+            trigger_scorecard=diagnostics.get("trigger_scorecard"),
+            shadow_book=diagnostics.get("shadow_book"),
+            exit_timing=diagnostics.get("exit_timing"),
+            sizing_ab=None,  # simulation-only
+            predictor_sizing=opt_results.get("predictor_sizing"),
+            portfolio_stats=portfolio_stats,
+            scanner_opt=opt_results.get("scanner_opt"),
+            cio_opt=opt_results.get("cio_opt"),
+        )
+
+        # Build report using existing reporter (includes completeness)
+        report_md = build_report(
+            run_date=args.date,
+            signal_quality=sq_result,
+            regime_analysis=regime_rows,
+            score_analysis=score_rows,
+            attribution=attr_result,
+            portfolio_stats=portfolio_stats,
+            sweep_df=config.get("_sweep_df"),
+            weight_result=opt_results.get("weight_result"),
+            config=config,
+            predictor_stats=predictor_stats,
+            predictor_sweep_df=config.get("_predictor_sweep_df"),
+            veto_result=opt_results.get("veto_result"),
+            executor_rec=opt_results.get("executor_rec"),
+            regression_result=regression_result,
+            pipeline_health=pipeline_health,
+            e2e_lift=diagnostics.get("e2e_lift"),
+            trigger_scorecard=diagnostics.get("trigger_scorecard"),
+            alpha_dist=diagnostics.get("alpha_dist"),
+            score_calibration=diagnostics.get("score_calibration"),
+            veto_value=diagnostics.get("veto_value"),
+            shadow_book=diagnostics.get("shadow_book"),
+            exit_timing=diagnostics.get("exit_timing"),
+            macro_eval=diagnostics.get("macro_eval"),
+            trigger_opt=opt_results.get("trigger_opt"),
+            predictor_sizing=opt_results.get("predictor_sizing"),
+            scanner_opt=opt_results.get("scanner_opt"),
+            team_opt=opt_results.get("team_opt"),
+            cio_opt=opt_results.get("cio_opt"),
+            grading=grading_result,
+            confusion_matrix=diagnostics.get("confusion_matrix"),
+            post_trade=diagnostics.get("post_trade"),
+            monte_carlo=diagnostics.get("monte_carlo"),
+        )
+
+        # Prepend completeness summary to report
+        completeness = tracker.summary()
+        completeness_header = [
+            "## Evaluator Completeness",
+            "",
+            f"| Status | Count |",
+            f"|--------|-------|",
+            f"| OK | {completeness.get('ok', 0)} |",
+            f"| Degraded | {completeness.get('degraded', 0)} |",
+            f"| Skipped | {completeness.get('skipped', 0)} |",
+            f"| Error | {completeness.get('error', 0)} |",
+            f"| **Total** | **{completeness.get('total', 0)}** |",
+            "",
+        ]
+        degraded = tracker.degraded_modules()
+        if degraded:
+            completeness_header.append(f"**Degraded modules:** {', '.join(degraded)}")
+            completeness_header.append("")
+        failed = tracker.failed_modules()
+        if failed:
+            completeness_header.append(f"**Failed modules:** {', '.join(failed)}")
+            completeness_header.append("")
+
+        report_md = "\n".join(completeness_header) + "\n" + report_md
+
+        # Save
+        out_dir = save(
+            report_md=report_md,
+            signal_quality=sq_result,
+            score_analysis=score_rows,
+            sweep_df=config.get("_sweep_df"),
+            attribution=attr_result if attr_result.get("status") not in ("skipped",) else None,
+            run_date=args.date,
+            results_dir=config.get("results_dir", "results"),
+            grading=grading_result,
+            trigger_scorecard=diagnostics.get("trigger_scorecard"),
+            shadow_book=diagnostics.get("shadow_book"),
+            exit_timing=diagnostics.get("exit_timing"),
+            e2e_lift=diagnostics.get("e2e_lift"),
+            veto_result=opt_results.get("veto_result"),
+            confusion_matrix=diagnostics.get("confusion_matrix"),
+            post_trade=diagnostics.get("post_trade"),
+            monte_carlo=diagnostics.get("monte_carlo"),
+        )
+
+        # Save completeness manifest
+        completeness_path = out_dir / "completeness.json"
+        completeness_path.write_text(tracker.to_json())
+        logger.info("Wrote %s", completeness_path)
+
+        print(f"\nEvaluation report saved to {out_dir}/")
+        print(f"\n{'='*60}")
+        print(report_md[:2000])
+        if len(report_md) > 2000:
+            print(f"\n... (truncated — see {out_dir}/report.md for full report)")
+
+        if args.upload:
+            upload_to_s3(
+                local_dir=out_dir,
+                bucket=config.get("output_bucket", "alpha-engine-research"),
+                prefix=config.get("output_prefix", "evaluation"),
+                run_date=args.date,
+            )
+            print(f"\nUploaded to s3://{config.get('output_bucket')}/{config.get('output_prefix', 'evaluation')}/{args.date}/")
+
+            # Grade history
+            if grading_result and grading_result.get("status") in ("ok", "partial"):
+                try:
+                    from analysis.grade_history import append_grades
+                    append_grades(grading_result, args.date, config.get("output_bucket", "alpha-engine-research"))
+                except Exception as e:
+                    logger.warning("Grade history update failed (non-fatal): %s", e)
+
+        # Email
+        sender = config.get("email_sender")
+        recipients = config.get("email_recipients", [])
+        if sender and recipients:
+            send_report_email(
+                run_date=args.date,
+                report_md=report_md,
+                status=sq_result.get("status", "unknown"),
+                sender=sender,
+                recipients=recipients,
+                s3_bucket=config.get("output_bucket") if args.upload else None,
+                s3_prefix=config.get("output_prefix", "evaluation"),
+            )
+
+    except Exception as e:
+        logger.error("Report/upload/email failed: %s", e)
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Health status
+        try:
+            from health_status import write_health
+            summary = tracker.summary()
+            configs_applied = []
+            for label, key in [
+                ("scoring_weights", "weight_result"),
+                ("executor_params", "executor_rec"),
+                ("predictor_params", "veto_result"),
+            ]:
+                res = opt_results.get(key)
+                if res and res.get("apply_result", {}).get("applied"):
+                    configs_applied.append(label)
+
+            status = "ok"
+            if summary.get("error", 0) > 0:
+                status = "degraded"
+            if summary.get("ok", 0) == 0:
+                status = "failed"
+
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            write_health(
+                bucket=bucket,
+                module_name="evaluator",
+                status=status,
+                run_date=args.date,
+                duration_seconds=_time.time() - _health_start,
+                summary={
+                    "mode": args.mode,
+                    "completeness": summary,
+                    "configs_applied": configs_applied,
+                },
+            )
+        except Exception as _he:
+            logger.warning("Health status write failed: %s", _he)
+
+        if args.stop_instance:
+            import urllib.request
+            try:
+                token = urllib.request.urlopen(
+                    urllib.request.Request(
+                        "http://169.254.169.254/latest/api/token",
+                        headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+                        method="PUT",
+                    ), timeout=5,
+                ).read().decode()
+                instance_id = urllib.request.urlopen(
+                    urllib.request.Request(
+                        "http://169.254.169.254/latest/meta-data/instance-id",
+                        headers={"X-aws-ec2-metadata-token": token},
+                    ), timeout=5,
+                ).read().decode()
+                logger.info("Stopping instance %s", instance_id)
+                boto3.client("ec2").stop_instances(InstanceIds=[instance_id])
+            except Exception as e:
+                logger.error("Failed to stop instance: %s", e)
+
+
+if __name__ == "__main__":
+    main()

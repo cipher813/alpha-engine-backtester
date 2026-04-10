@@ -32,5 +32,5 @@ bash "$REPO_DIR/infrastructure/add-cron.sh"
 
 echo ""
 echo "=== Setup complete ==="
-echo "Test: cd $REPO_DIR && .venv/bin/python backtest.py --mode signal-quality"
+echo "Test: cd $REPO_DIR && .venv/bin/python evaluate.py --mode diagnostics --freeze"
 echo "Logs: tail -f /var/log/backtester.log"
