@@ -61,14 +61,17 @@ pip install -r requirements.txt
 cp config.yaml.example config.yaml
 # Edit config.yaml — set S3 bucket names, paths, email settings
 
-python backtest.py --mode signal-quality
+python evaluate.py --mode diagnostics --freeze   # evaluation only (signal quality, diagnostics)
+python backtest.py --mode simulate               # simulation only
 ```
+
+> **Note:** This repo has two entry points. `backtest.py` runs simulation (param sweep, predictor backtest). `evaluate.py` runs evaluation (signal quality, diagnostics, config optimization). See `evaluate.py --help` for all options.
 
 ---
 
 ## Modes
 
-### Signal Quality (`--mode signal-quality`)
+### Signal Quality (`evaluate.py --mode diagnostics`)
 
 Reads `score_performance` from `research.db` and computes:
 - % of BUY signals that beat SPY at 5d/10d/30d horizons (Wilson CI, BH FDR correction)
