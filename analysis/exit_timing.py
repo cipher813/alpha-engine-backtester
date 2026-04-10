@@ -7,8 +7,8 @@ For each completed trade (with entry and exit), computes:
   - Capture ratio: realized return / MFE (are we capturing gains?)
   - Stop efficiency: |realized loss| / MAE (are stops placed well?)
 
-Requires intraday/daily price data during the hold period. Uses yfinance
-for historical prices when analyzing completed trades.
+Requires daily OHLCV price data during the hold period. Reads from
+predictor/price_cache_slim parquets in S3 (no external API calls).
 
 Data source: trades table in trades.db (roundtrip trades with entry_trade_id).
 """
@@ -70,49 +70,29 @@ def compute_exit_timing(
             "error": f"need >= {min_roundtrips} roundtrips, have {len(exits)}",
         }
 
-    # Fetch price history for MFE/MAE calculation
-    try:
-        import yfinance as yf
-    except ImportError:
-        return {"status": "error", "error": "yfinance not installed"}
-
+    # Load price history from S3 price cache (no external API calls)
     tickers = exits["ticker"].unique().tolist()
-    min_date = exits["entry_date"].min()
-    max_date = exits["exit_date"].max()
-
-    try:
-        price_data = yf.download(
-            tickers=tickers,
-            start=min_date,
-            end=pd.Timestamp(max_date) + pd.Timedelta(days=3),
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            group_by="ticker",
-            threads=True,
-            timeout=120,
-        )
-    except Exception as e:
-        return {"status": "error", "error": f"yfinance download failed: {e}"}
-
-    multi_ticker = len(tickers) > 1
+    price_cache = _load_price_cache(tickers)
+    if not price_cache:
+        return {"status": "error", "error": "no price cache data available from S3"}
 
     results = []
     for _, trade in exits.iterrows():
         entry_ts = pd.Timestamp(trade["entry_date"])
         exit_ts = pd.Timestamp(trade["exit_date"])
+        ticker_df = price_cache.get(trade["ticker"])
+        if ticker_df is None:
+            continue
 
         try:
-            if multi_ticker:
-                highs = price_data[trade["ticker"]]["High"].loc[entry_ts:exit_ts]
-                lows = price_data[trade["ticker"]]["Low"].loc[entry_ts:exit_ts]
-            else:
-                highs = price_data["High"].loc[entry_ts:exit_ts]
-                lows = price_data["Low"].loc[entry_ts:exit_ts]
+            mask = (ticker_df.index >= entry_ts) & (ticker_df.index <= exit_ts)
+            period = ticker_df.loc[mask]
+            highs = period["High"] if "High" in period.columns else None
+            lows = period["Low"] if "Low" in period.columns else None
         except (KeyError, TypeError):
             continue
 
-        if highs.empty or lows.empty:
+        if highs is None or lows is None or highs.empty or lows.empty:
             continue
 
         entry_px = trade["entry_price"]
@@ -204,3 +184,33 @@ def compute_exit_timing(
         "by_exit_type": by_exit_type,
         "diagnosis": diagnosis,
     }
+
+
+def _load_price_cache(tickers: list[str], bucket: str = "alpha-engine-research") -> dict[str, pd.DataFrame]:
+    """Load OHLCV parquets from S3 price cache for the given tickers.
+
+    Returns {ticker: DataFrame} with DatetimeIndex and OHLCV columns.
+    Silently skips tickers that don't have cache files.
+    """
+    import io
+    import boto3
+
+    s3 = boto3.client("s3")
+    cache = {}
+    for ticker in tickers:
+        # Try slim cache first (smaller, 2y), then full cache (10y)
+        for prefix in ("predictor/price_cache_slim", "predictor/price_cache"):
+            key = f"{prefix}/{ticker}.parquet"
+            try:
+                resp = s3.get_object(Bucket=bucket, Key=key)
+                df = pd.read_parquet(io.BytesIO(resp["Body"].read()))
+                if not df.empty:
+                    if not isinstance(df.index, pd.DatetimeIndex):
+                        if "Date" in df.columns:
+                            df = df.set_index("Date")
+                        df.index = pd.to_datetime(df.index)
+                    cache[ticker] = df
+                    break
+            except Exception:
+                continue
+    return cache

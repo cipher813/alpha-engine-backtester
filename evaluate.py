@@ -53,10 +53,6 @@ from pipeline_common import (
     pull_research_db,
     init_research_db,
     find_trades_db,
-    seed_score_performance,
-    seed_predictor_outcomes,
-    backfill_score_performance_returns,
-    backfill_predictor_outcomes,
     push_predictor_rolling_metrics,
 )
 
@@ -163,16 +159,17 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
 
 
 def _run_signal_quality(config: dict, tracker: CompletenessTracker, avail: dict) -> tuple:
-    """Run signal quality analysis with seeding and backfilling.
+    """Run signal quality analysis. Data seeding/backfilling is handled by
+    alpha-engine-data's signal_returns collector — the evaluator reads
+    research.db as-is.
 
     Returns (sq_result, regime_rows, score_rows, attr_result, df_base).
     """
     db_path = config.get("research_db")
 
-    # Seed and backfill
+    # Check data completeness — warn if data module hasn't populated returns
     if avail["research_db"]:
-        seed_score_performance(config)
-        backfill_score_performance_returns(config)
+        _check_data_freshness(db_path)
 
     sq_result = tracker.run_module(
         "signal_quality",
@@ -213,14 +210,32 @@ def _run_signal_quality(config: dict, tracker: CompletenessTracker, avail: dict)
         skip_if_missing=["df_base"],
     )
 
-    # Seed and backfill predictor outcomes
-    if avail["research_db"]:
-        seed_predictor_outcomes(config)
-        if df_base is not None:
-            backfill_predictor_outcomes(config, df_base)
-            push_predictor_rolling_metrics(config, db_path or "")
+    # Compute and push predictor rolling metrics (evaluation output, not data collection)
+    if avail["research_db"] and df_base is not None:
+        push_predictor_rolling_metrics(config, db_path or "")
 
     return sq_result, regime_rows, score_rows, attr_result, df_base
+
+
+def _check_data_freshness(db_path: str) -> None:
+    """Warn if score_performance has stale rows that should have been backfilled by data module."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(db_path)
+        stale = conn.execute(
+            "SELECT COUNT(*) FROM score_performance "
+            "WHERE (return_5d IS NULL AND score_date <= date('now', '-10 days')) "
+            "   OR (return_10d IS NULL AND score_date <= date('now', '-14 days')) "
+            "   OR (return_30d IS NULL AND score_date <= date('now', '-45 days'))"
+        ).fetchone()[0]
+        conn.close()
+        if stale > 0:
+            logger.warning(
+                "Data freshness: %d score_performance rows have missing returns "
+                "(data module may not have run signal_returns collector)", stale,
+            )
+    except Exception:
+        pass
 
 
 def _compute_signal_quality(config: dict) -> dict:
