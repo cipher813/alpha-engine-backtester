@@ -251,7 +251,13 @@ def _run_signal_quality(config: dict, tracker: CompletenessTracker, avail: dict)
 
 
 def _check_data_freshness(db_path: str) -> None:
-    """Warn if score_performance has stale rows that should have been backfilled by data module."""
+    """Warn if score_performance has stale rows that should have been backfilled by data module.
+
+    Non-fatal diagnostic: failures log at ERROR level so flow-doctor sees
+    them (corrupt DB, missing table, etc.) but do not raise — the caller's
+    main pipeline should continue. Previously this caught all exceptions
+    silently with ``pass``, which hid real DB corruption and SQL errors.
+    """
     import sqlite3
     try:
         conn = sqlite3.connect(db_path)
@@ -267,8 +273,11 @@ def _check_data_freshness(db_path: str) -> None:
                 "Data freshness: %d score_performance rows have missing returns "
                 "(data module may not have run signal_returns collector)", stale,
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error(
+            "Data freshness check failed against %s: %s (non-fatal, "
+            "continuing with main pipeline)", db_path, exc, exc_info=True,
+        )
 
 
 def _compute_signal_quality(config: dict) -> dict:

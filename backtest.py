@@ -598,7 +598,16 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 )
                 single_stats["ensemble_eval"] = ensemble_result
             except Exception as exc:
-                logger.warning("Ensemble mode evaluation failed (non-fatal): %s", exc)
+                # Bumped from warning to error so flow-doctor captures it.
+                # Previously logged at warning and the spot run stayed
+                # green even when the optimizer couldn't evaluate ensemble
+                # mode, which meant param recommendations were based on
+                # partial sweep data.
+                logger.error(
+                    "Phase 4a ensemble mode evaluation failed: %s — "
+                    "optimizer recommendations may be incomplete",
+                    exc, exc_info=True,
+                )
 
             # Phase 4b: Signal threshold sweep
             threshold_result = None
@@ -611,7 +620,10 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                     )
                     single_stats["threshold_eval"] = threshold_result
                 except Exception as exc:
-                    logger.warning("Signal threshold evaluation failed (non-fatal): %s", exc)
+                    logger.error(
+                        "Phase 4b signal threshold evaluation failed: %s",
+                        exc, exc_info=True,
+                    )
 
             # Phase 4c: Feature pruning evaluation
             pruning_result = None
@@ -623,7 +635,10 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 )
                 single_stats["pruning_eval"] = pruning_result
             except Exception as exc:
-                logger.warning("Feature pruning evaluation failed (non-fatal): %s", exc)
+                logger.error(
+                    "Phase 4c feature pruning evaluation failed: %s",
+                    exc, exc_info=True,
+                )
 
             # Apply recommendations to S3 (if any)
             try:
@@ -633,10 +648,19 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 )
                 single_stats["predictor_optimizer_apply"] = apply_result
             except Exception as exc:
-                logger.warning("Predictor optimizer apply failed (non-fatal): %s", exc)
+                # This one is especially important — if the apply fails,
+                # the optimizer's recommendations don't get persisted to
+                # S3, so the predictor keeps running on stale params.
+                logger.error(
+                    "Predictor optimizer apply failed (recommendations "
+                    "not persisted to S3): %s", exc, exc_info=True,
+                )
 
         except ImportError as exc:
-            logger.warning("Phase 4 optimizer not available: %s", exc)
+            logger.error(
+                "Phase 4 optimizer not available (import failed): %s",
+                exc, exc_info=True,
+            )
 
         # Free features now that Phase 4 is done
         del features_by_ticker
