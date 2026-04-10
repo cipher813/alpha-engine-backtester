@@ -957,23 +957,17 @@ def _export_simulation_artifacts(
 def main() -> None:
     args = _parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    # Structured logging + flow-doctor are owned by log_config.py as a
+    # singleton. setup_logging() configures the root logger and, when
+    # FLOW_DOCTOR_ENABLED=1, initializes the shared FlowDoctor instance
+    # and attaches its log handler at ERROR level. See log_config.py
+    # docstring for details. Respects the --log-level CLI flag.
+    from log_config import setup_logging, get_flow_doctor
+    setup_logging("backtest")
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
     _health_start = _time.time()
 
-    # Flow Doctor: structured error capture (optional dependency)
-    fd = None
-    try:
-        import flow_doctor
-        fd = flow_doctor.init(config_path=os.path.join(
-            os.path.dirname(__file__), "flow-doctor.yaml"))
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.warning("flow-doctor init failed: %s", e)
+    fd = get_flow_doctor()
 
     config = load_config(args.config)
 

@@ -25,5 +25,12 @@ COPY analysis/production_health.py analysis/
 COPY analysis/retrain_alert.py analysis/
 COPY lambda_health/handler.py handler.py
 
+# Flow-doctor integration: log_config.py owns the shared FlowDoctor
+# instance and the root logger setup; flow-doctor.yaml is the config
+# that load_config reads. Both are required for handler.py's
+# setup_logging("lambda_health") call to succeed.
+COPY log_config.py .
+COPY flow-doctor.yaml .
+
 # Lambda handler entry point
 CMD ["handler.handler"]

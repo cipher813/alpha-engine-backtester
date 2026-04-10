@@ -10,6 +10,7 @@ notify:
     smtp_password: ${GMAIL_APP_PASSWORD}
   - type: github
     repo: cipher813/alpha-engine-backtester
+    token: ${FLOW_DOCTOR_GITHUB_TOKEN}
 store:
   type: sqlite
   path: /tmp/flow_doctor.db
