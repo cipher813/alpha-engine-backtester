@@ -842,6 +842,12 @@ def main() -> None:
     )
 
     # ── Report ───────────────────────────────────────────────────────────
+    # Track whether the report/upload/email block actually completed so the
+    # health status and process exit code reflect reality. A prior version
+    # swallowed exceptions in the try block below and still wrote
+    # `evaluator → ok` in the finally block — silently masking crashes like
+    # the grading.compute_scorecard AttributeError on 2026-04-11.
+    report_ok = False
     try:
         portfolio_stats = config.get("_portfolio_stats")
         predictor_stats = config.get("_predictor_stats")
@@ -994,10 +1000,16 @@ def main() -> None:
                 s3_prefix=config.get("output_prefix", "evaluation"),
             )
 
+        report_ok = True
+
     except Exception as e:
         logger.error("Report/upload/email failed: %s", e)
         import traceback
         traceback.print_exc()
+        # Do NOT swallow — we still need the finally block to write health
+        # status (reflecting the failure) and then we raise at the end of
+        # main() so the spot-run's exit code is non-zero and SSM reports
+        # Failed to the Step Function.
     finally:
         # Health status
         try:
@@ -1017,6 +1029,12 @@ def main() -> None:
             if summary.get("error", 0) > 0:
                 status = "degraded"
             if summary.get("ok", 0) == 0:
+                status = "failed"
+            if not report_ok:
+                # Report build / upload / email crashed. The tracker's
+                # per-stage summary doesn't capture this because the crash
+                # happens after all [OK] stages finish. Mark the run failed
+                # so the health marker matches reality.
                 status = "failed"
 
             bucket = config.get("signals_bucket", "alpha-engine-research")
@@ -1055,6 +1073,14 @@ def main() -> None:
                 boto3.client("ec2").stop_instances(InstanceIds=[instance_id])
             except Exception as e:
                 logger.error("Failed to stop instance: %s", e)
+
+    # Hard-fail the process if the report/upload/email block crashed.
+    # Happens AFTER the finally block writes the health marker and stops
+    # the spot instance (if requested), so monitoring sees the failure and
+    # we don't leak compute. Matches the no-silent-fails and
+    # hard-fail-until-stable preferences.
+    if not report_ok:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

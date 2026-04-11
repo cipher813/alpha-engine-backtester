@@ -425,12 +425,18 @@ def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dic
         return {"status": "skipped", "reason": "scanner_evaluations table not found"}
 
 
-def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[dict] | dict:
+def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[dict]:
     """Sector team lift (2b): team picks vs. own sector average from full 900.
 
     The baseline is the average return of ALL stocks in the same sector from
     universe_returns — not just the quant candidates. This measures whether
     each team's picks outperform their sector's random baseline.
+
+    Returns a list of team-lift dicts. Returns an empty list on skip/error
+    conditions (missing table, empty data) — downstream consumers iterate
+    team_lift and the empty-list case is handled naturally. A prior version
+    returned a status dict in these cases, which violated the list contract
+    and crashed grading._grade_sector_team on 2026-04-11.
     """
     try:
         tc_filter = date_filter.replace("eval_date", "tc.eval_date") if date_filter else ""
@@ -439,7 +445,8 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
             conn, params=params,
         )
         if tc.empty:
-            return {"status": "skipped", "reason": "team_candidates empty"}
+            logger.info("team_lift: team_candidates table empty — returning []")
+            return []
 
         merged = ur.merge(tc, on=["ticker", "eval_date"], how="inner")
         results = []
@@ -500,7 +507,8 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
 
         return results
     except sqlite3.OperationalError:
-        return {"status": "skipped", "reason": "team_candidates table not found"}
+        logger.info("team_lift: team_candidates table not found — returning []")
+        return []
 
 
 def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
