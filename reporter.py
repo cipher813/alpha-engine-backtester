@@ -752,7 +752,12 @@ def _section_portfolio(stats: dict) -> list[str]:
     if sim_assumptions:
         lines.append(f"| Simulation | {sim_assumptions} |")
     price_gaps = stats.get("price_gap_warnings")
-    if price_gaps:
+    if price_gaps and isinstance(price_gaps, dict):
+        n_gaps = len(price_gaps)
+        worst = sorted(price_gaps.items(), key=lambda x: -x[1])[:5]
+        worst_str = ", ".join(f"{t} ({d}d)" for t, d in worst)
+        lines += ["", f"> **Price gaps (>5 days):** {n_gaps} tickers — worst: {worst_str}"]
+    elif price_gaps:
         lines += ["", f"> **Price gap warnings:** {price_gaps}"]
     staleness = stats.get("staleness_warning")
     if staleness:
