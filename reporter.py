@@ -1101,11 +1101,35 @@ def _section_param_sweep(df) -> list[str]:
         title += f" ({sweep_mode}: {sweep_trials}/{sweep_total} combos, {sweep_coverage:.0%} coverage)"
 
     lines = [title, ""]
-    param_cols = [c for c in df.columns if c not in [
+    # Columns that aren't sweep params — exclude from the param column list.
+    # Includes stat cols (shown separately) AND metadata cols that leak into
+    # the sweep_df (dates_expected, coverage, total_orders, skip_reasons,
+    # price_gap_warnings, unfilled_gaps) — some of these are dict-valued
+    # and would blow out the table layout. Discovered 2026-04-11 when a
+    # 60-trial sweep rendered as a 60+ page email because `price_gap_warnings`
+    # (a dict of ticker→gap_days) was str()-ified into every row.
+    _NON_PARAM_COLS = {
+        # stat cols (rendered separately as stat_cols)
         "total_return", "total_alpha", "spy_return", "sharpe_ratio",
         "max_drawdown", "calmar_ratio", "total_trades", "win_rate",
-        "status", "dates_simulated", "total_orders", "note", "error",
-    ]]
+        # metadata leaked from sweep infra — not real params
+        "status", "dates_simulated", "dates_expected", "coverage",
+        "total_orders", "skip_reasons", "price_gap_warnings",
+        "unfilled_gaps", "note", "error",
+    }
+    # Defensive: also drop any column whose values are non-scalar
+    # (dict/list/set) — catches future leaks without needing to maintain
+    # the exclude list.
+    def _is_scalar_col(col: str) -> bool:
+        sample = df[col].dropna()
+        if sample.empty:
+            return True
+        return not isinstance(sample.iloc[0], (dict, list, set))
+
+    param_cols = [
+        c for c in df.columns
+        if c not in _NON_PARAM_COLS and _is_scalar_col(c)
+    ]
     stat_cols = [c for c in ["total_alpha", "sharpe_ratio", "total_return", "spy_return", "max_drawdown", "win_rate"] if c in df.columns]
     show_cols = param_cols + stat_cols
     header = "| " + " | ".join(show_cols) + " |"
