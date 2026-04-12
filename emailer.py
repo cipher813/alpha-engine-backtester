@@ -138,8 +138,10 @@ def _send_via_ses(
         logger.info("Backtest report email sent via SES: '%s' → %s", subject, recipients)
     except ClientError as e:
         logger.error("SES send failed: %s", e.response["Error"]["Message"])
+        raise
     except Exception as e:
         logger.error("Email error: %s", e)
+        raise
 
 
 def _build_subject(run_date: str, status: str) -> str:

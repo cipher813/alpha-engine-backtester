@@ -344,18 +344,13 @@ echo "Starting backtest at \$(date)"
 # swallow which silently let the evaluator run against invalid sweep
 # results and was the root cause of multiple undetected param oscillations.
 if ! $REMOTE_PYTHON backtest.py --mode $BACKTEST_MODE --upload --log-level INFO 2>&1; then
-    echo "ERROR: backtest.py failed. Skipping evaluator to prevent" >&2
-    echo "       auto-promotion of unvalidated configs. Spot run is" >&2
-    echo "       marked FAILED — check flow-doctor alerts." >&2
+    echo "ERROR: backtest.py failed. Spot run is marked FAILED." >&2
     exit 1
 fi
 
 echo ""
-echo "Backtest complete at \$(date). Starting evaluator..."
-$REMOTE_PYTHON evaluate.py --mode all --upload --log-level INFO 2>&1
-
-echo ""
-echo "Evaluator complete at \$(date)"
+echo "Backtest complete at \$(date)."
+echo "evaluate.py is run as a separate Evaluator step in the Saturday Step Function."
 BACKTEST
 
 echo ""
