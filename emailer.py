@@ -41,7 +41,7 @@ _HTML = """\
 </head>
 <body>
 {body}
-<div class="foot">Alpha Engine Backtester | {date}{s3_link}</div>
+<div class="foot">Alpha Engine {product_name} | {date}{s3_link}</div>
 </body>
 </html>
 """
@@ -56,9 +56,10 @@ def send_report_email(
     s3_bucket: str | None = None,
     s3_prefix: str = "backtest",
     region: str = "us-east-1",
+    product_name: str = "Backtester",
 ) -> None:
     """
-    Send the weekly backtest report via SES.
+    Send the weekly backtest/evaluator report via SES.
 
     Args:
         run_date:    Date string for subject line and footer.
@@ -70,8 +71,8 @@ def send_report_email(
         s3_prefix:   S3 prefix for report location (default "backtest").
         region:      AWS region for SES.
     """
-    subject = _build_subject(run_date, status)
-    html_body, plain_body = _build_body(run_date, report_md, s3_bucket, s3_prefix)
+    subject = _build_subject(run_date, status, product_name)
+    html_body, plain_body = _build_body(run_date, report_md, s3_bucket, s3_prefix, product_name)
 
     gmail_pw = os.environ.get("GMAIL_APP_PASSWORD", "") or _ssm_gmail_pw(region)
     if gmail_pw:
@@ -142,14 +143,14 @@ def _send_via_ses(
         logger.error("Email error: %s", e)
 
 
-def _build_subject(run_date: str, status: str) -> str:
+def _build_subject(run_date: str, status: str, product_name: str = "Backtester") -> str:
     label = {
         "ok": "results ready",
         "insufficient_data": "insufficient data (accumulating)",
         "db_not_found": "ERROR — research.db not found",
         "error": "ERROR",
     }.get(status, status)
-    return f"Alpha Engine Backtester | {run_date} | {label}"
+    return f"Alpha Engine {product_name} | {run_date} | {label}"
 
 
 def _build_body(
@@ -157,6 +158,7 @@ def _build_body(
     report_md: str,
     s3_bucket: str | None,
     s3_prefix: str,
+    product_name: str = "Backtester",
 ) -> tuple[str, str]:
     # Convert minimal markdown to HTML (tables, headers, blockquotes, hr)
     import re
@@ -236,6 +238,7 @@ def _build_body(
         body="\n".join(html_lines),
         date=run_date,
         s3_link=s3_link,
+        product_name=product_name,
     )
     return html_body, report_md  # plain body is just the markdown
 
