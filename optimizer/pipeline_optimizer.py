@@ -61,13 +61,11 @@ def analyze_team_performance(e2e_lift: dict) -> dict:
     if not team_lift:
         return {"status": "insufficient_data", "note": "No team lift data"}
 
-    # team_lift is a list of dicts or a dict keyed by team_id
-    if isinstance(team_lift, dict):
-        teams = [team_lift]
-    elif isinstance(team_lift, list):
-        teams = team_lift
-    else:
-        return {"status": "error", "note": "Unexpected team_lift format"}
+    # `team_lift` is always a list[dict] after the producer-side
+    # normalization in end_to_end._team_lift (#13). The old dict-handling
+    # branch wrapped a status dict as `[status_dict]`, which then tried
+    # to grade a ghost "team" with None lift — semantically wrong.
+    teams = team_lift
 
     n_dates = e2e_lift.get("n_dates", 0)
     min_weeks = _cfg.get("min_weeks", _MIN_WEEKS)

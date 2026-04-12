@@ -314,9 +314,12 @@ def format_lift_report(metrics: dict) -> list[str]:
             f"{_pct(cvr.get('lift'))} | {verdict} |"
         )
 
-    # Team lift breakdown (2b: vs sector, 2c: vs quant)
+    # Team lift breakdown (2b: vs sector, 2c: vs quant).
+    # `team_lift` is always a list[dict] after the producer-side
+    # normalization in _team_lift (#13) — the old `isinstance(tl, dict)`
+    # guard is dead code and dropped here.
     tl = metrics.get("team_lift", [])
-    if tl and not isinstance(tl, dict):
+    if tl:
         lines.append("\n### Sector team lift (2b: picks vs sector, 2c: picks vs quant candidates)\n")
         lines.append("| Team | Pick avg | Sector avg | Lift vs sector | Quant avg | Lift vs quant | Picks / Candidates |")
         lines.append("|------|----------|------------|----------------|-----------|---------------|-------------------|")
