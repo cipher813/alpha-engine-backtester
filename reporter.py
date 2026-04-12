@@ -310,6 +310,8 @@ def build_report(
     sizing_ab: dict | None = None,
     grading: dict | None = None,
     confusion_matrix: dict | None = None,
+    post_trade: dict | None = None,
+    monte_carlo: dict | None = None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
