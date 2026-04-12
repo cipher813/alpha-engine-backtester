@@ -998,6 +998,7 @@ def main() -> None:
                 recipients=recipients,
                 s3_bucket=config.get("output_bucket") if args.upload else None,
                 s3_prefix=config.get("output_prefix", "evaluation"),
+                product_name="Evaluator",
             )
 
         report_ok = True

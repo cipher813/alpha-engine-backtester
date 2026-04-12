@@ -351,11 +351,11 @@ if ! $REMOTE_PYTHON backtest.py --mode $BACKTEST_MODE --upload --log-level INFO 
 fi
 
 echo ""
-echo "Backtest complete at \$(date). Starting evaluator..."
-$REMOTE_PYTHON evaluate.py --mode all --upload --log-level INFO 2>&1
-
-echo ""
-echo "Evaluator complete at \$(date)"
+echo "Backtest complete at \$(date)"
+# NOTE: evaluate.py is no longer run on the spot instance. It runs as an
+# independent Step Function step ("Evaluator") on the always-on EC2 after
+# the Backtester step completes. Split 2026-04-12 so eval can run at a
+# different cadence than simulation. See alpha-engine-data PR #23.
 BACKTEST
 
 echo ""
