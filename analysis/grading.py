@@ -776,7 +776,14 @@ def compute_scorecard(
     composite = _grade_composite_scoring(signal_quality, score_calibration)
 
     # Sector teams
+    # team_lift is contractually a list[dict] (see end_to_end._team_lift).
+    # Defensive isinstance check here guards against producer regressions
+    # where a status dict leaks through — iterating a dict yields its keys
+    # (strings), which crashes _grade_sector_team.get() with AttributeError.
+    # That's exactly what happened on 2026-04-11.
     team_lift_list = _safe_get(e2e_lift, "team_lift") or []
+    if not isinstance(team_lift_list, list):
+        team_lift_list = []
     teams = [_grade_sector_team(t) for t in team_lift_list]
 
     # Average team grade
