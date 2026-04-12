@@ -488,6 +488,8 @@ def save(
     e2e_lift: dict | None = None,
     veto_result: dict | None = None,
     confusion_matrix: dict | None = None,
+    post_trade: dict | None = None,
+    monte_carlo: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
