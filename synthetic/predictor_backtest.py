@@ -417,9 +417,23 @@ def run_inference(
     if predictor_path not in sys.path:
         sys.path.insert(0, predictor_path)
     from model.gbm_scorer import GBMScorer
-    from config import GBM_FEATURES
 
     scorer = GBMScorer.load(model_path)
+
+    # Use the model's own trained feature list rather than the current
+    # GBM_FEATURES config — they drift when new features land in config.py
+    # before a fresh training run promotes weights. Slicing by the model's
+    # feature_names guarantees the input matrix matches regardless of config
+    # drift; a fresh training run will update this list automatically.
+    GBM_FEATURES = scorer.feature_names
+    if not GBM_FEATURES:
+        raise RuntimeError(
+            "Loaded model has no feature_names metadata — cannot align "
+            "input features. Retrain with a newer GBMScorer that persists "
+            "feature_names in the metadata JSON."
+        )
+    logger.info("Predictor backtest using %d model features: %s",
+                len(GBM_FEATURES), GBM_FEATURES)
 
     # Determine trading dates from feature data if not provided
     if trading_dates is None:
