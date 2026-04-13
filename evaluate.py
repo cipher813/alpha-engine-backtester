@@ -31,6 +31,10 @@ import time as _time
 from datetime import date
 from pathlib import Path
 
+from ssm_secrets import load_secrets
+
+load_secrets()
+
 import boto3
 from botocore.exceptions import ClientError
 import pandas as pd
