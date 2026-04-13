@@ -43,7 +43,6 @@ from ssm_secrets import load_secrets
 load_secrets()
 
 import boto3
-from botocore.exceptions import ClientError
 import pandas as pd
 import yaml
 
@@ -51,77 +50,9 @@ from analysis import param_sweep
 from optimizer import executor_optimizer
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
-# pipeline_common: shared utilities also used by evaluate.py
-import pipeline_common  # noqa: F401 — imported for evaluate.py reuse
+from pipeline_common import load_config, pull_research_db
 
 logger = logging.getLogger(__name__)
-
-
-def load_config(path: str) -> dict:
-    from pathlib import Path
-    search_paths = [
-        Path.home() / "alpha-engine-config" / "backtester" / "config.yaml",
-        Path(__file__).parent.parent / "alpha-engine-config" / "backtester" / "config.yaml",
-        Path(path),
-    ]
-    resolved = next((p for p in search_paths if p.exists()), None)
-    if resolved is None:
-        raise FileNotFoundError(f"Config not found. Searched: {[str(p) for p in search_paths]}")
-    with open(resolved) as f:
-        config = yaml.safe_load(f)
-    _validate_config(config, str(resolved))
-    return config
-
-
-def _validate_config(config: dict, path: str) -> None:
-    """Validate required config keys exist and warn about common issues."""
-    warnings = []
-    errors = []
-
-    # Required for all modes
-    if not config.get("signals_bucket"):
-        errors.append("signals_bucket is required")
-
-    # Required for simulate/param-sweep modes
-    executor_paths = config.get("executor_paths", [])
-    if isinstance(executor_paths, str):
-        executor_paths = [executor_paths]
-    if not executor_paths:
-        warnings.append("executor_paths not set — simulate/param-sweep modes will fail")
-    elif not any(os.path.isdir(p) for p in executor_paths):
-        warnings.append(
-            f"No executor_paths found on disk: {executor_paths}. "
-            "simulate/param-sweep modes will fail."
-        )
-
-    # Email (optional but flagged)
-    if not config.get("email_sender") or not config.get("email_recipients"):
-        warnings.append("email_sender/email_recipients not set — email reports will be skipped")
-
-    for w in warnings:
-        logger.warning("Config (%s): %s", path, w)
-    if errors:
-        msg = f"Config validation failed ({path}): " + "; ".join(errors)
-        raise ValueError(msg)
-
-
-def pull_research_db(bucket: str, local_path: str, s3_key: str = "research.db") -> bool:
-    """
-    Pull research.db from S3 to local_path. Returns True on success.
-    research.db is written to S3 by the Lambda research pipeline after each run.
-    """
-    s3 = boto3.client("s3")
-    try:
-        s3.download_file(bucket, s3_key, local_path)
-        size = os.path.getsize(local_path)
-        logger.info("Pulled research.db from s3://%s/%s (%s bytes)", bucket, s3_key, f"{size:,}")
-        return True
-    except ClientError as e:
-        if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
-            logger.warning("research.db not found in S3 — signal quality analysis will be skipped")
-        else:
-            logger.error("Failed to pull research.db: %s", e)
-        return False
 
 
 # ── Simulation setup and execution ──────────────────────────────────────────
