@@ -148,6 +148,36 @@ def compute_score_calibration(
     try:
         conn = sqlite3.connect(db_path)
         df = pd.read_sql_query("SELECT * FROM score_performance", conn)
+
+        # Enrich with sector (universe_returns) + regime (macro_snapshots)
+        # so non-monotonic calibration buckets can be diagnosed by
+        # sector/regime concentration rather than sample noise alone.
+        try:
+            sectors = pd.read_sql_query(
+                "SELECT DISTINCT ticker, sector FROM universe_returns "
+                "WHERE sector IS NOT NULL AND sector != ''",
+                conn,
+            )
+            if not sectors.empty:
+                df = df.merge(
+                    sectors, left_on="symbol", right_on="ticker", how="left",
+                )
+        except Exception as _e:
+            logger.debug("universe_returns sector join skipped: %s", _e)
+
+        try:
+            regimes = pd.read_sql_query(
+                "SELECT date, market_regime FROM macro_snapshots "
+                "WHERE market_regime IS NOT NULL",
+                conn,
+            )
+            if not regimes.empty:
+                df = df.merge(
+                    regimes, left_on="score_date", right_on="date", how="left",
+                )
+        except Exception as _e:
+            logger.debug("macro_snapshots regime join skipped: %s", _e)
+
         conn.close()
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -157,7 +187,12 @@ def compute_score_calibration(
         if c not in df.columns:
             return {"status": "insufficient_data", "error": f"column {c} not found"}
 
-    sub = df[["score", ret_col, spy_col]].dropna()
+    keep_cols = ["score", ret_col, spy_col, "symbol", "score_date"]
+    if "sector" in df.columns:
+        keep_cols.append("sector")
+    if "market_regime" in df.columns:
+        keep_cols.append("market_regime")
+    sub = df[keep_cols].dropna(subset=["score", ret_col, spy_col])
     if len(sub) < n_buckets * min_per_bucket:
         return {"status": "insufficient_data", "error": f"need {n_buckets * min_per_bucket} rows, have {len(sub)}"}
 
@@ -174,12 +209,38 @@ def compute_score_calibration(
         group = sub[sub["bucket"] == bucket]
         if len(group) < min_per_bucket:
             continue
+
+        # Per-bucket diagnostics: surface sector / regime / date concentration
+        # so a non-monotonic pattern can be distinguished from small-sample
+        # noise (e.g., one bad Healthcare week dominating the 59–65 bucket).
+        top_sectors = []
+        if "sector" in group.columns and group["sector"].notna().any():
+            top_sectors = [
+                {"sector": str(k), "n": int(v)}
+                for k, v in group["sector"].value_counts().head(3).items()
+            ]
+        regime_counts = []
+        if "market_regime" in group.columns and group["market_regime"].notna().any():
+            regime_counts = [
+                {"regime": str(k), "n": int(v)}
+                for k, v in group["market_regime"].value_counts().items()
+            ]
+        dates = group["score_date"].dropna().unique() if "score_date" in group.columns else []
+        tickers = group["symbol"].dropna().unique() if "symbol" in group.columns else []
+
         calibration.append({
             "score_range": str(bucket),
             "n": len(group),
             "avg_score": round(float(group["score"].mean()), 1),
             "avg_alpha": round(float(group["alpha"].mean()), 2),
             "beat_spy_pct": round(float((group["alpha"] > 0).mean()), 4),
+            "top_sectors": top_sectors,
+            "regime_breakdown": regime_counts,
+            "n_unique_dates": len(dates),
+            "n_unique_tickers": len(tickers),
+            "date_range": (
+                [str(min(dates)), str(max(dates))] if len(dates) else []
+            ),
         })
 
     if len(calibration) < 2:

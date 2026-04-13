@@ -1390,6 +1390,37 @@ def _section_score_calibration(result: dict) -> list[str]:
     else:
         lines += ["", "> Monotonic: higher scores predict higher alpha — scoring is well-calibrated."]
 
+    # Per-bucket diagnostics: surface sector / regime / date concentration so
+    # a non-monotonic curve can be distinguished from small-sample noise
+    # (e.g., one bad Healthcare week dominating the mid-range bucket).
+    diag_rows = [
+        c for c in result.get("calibration", [])
+        if c.get("top_sectors") or c.get("regime_breakdown") or c.get("n_unique_dates")
+    ]
+    if diag_rows:
+        lines += [
+            "",
+            "### Bucket diagnostics",
+            "",
+            "_A bucket dominated by one sector or regime hints the non-monotonicity is compositional, not a scoring flaw._",
+            "",
+            "| Score range | n | Dates | Tickers | Top sectors | Regime mix |",
+            "|-------------|---|-------|---------|-------------|------------|",
+        ]
+        for c in diag_rows:
+            sectors = ", ".join(
+                f"{s['sector']}({s['n']})" for s in c.get("top_sectors", [])
+            ) or "—"
+            regimes = ", ".join(
+                f"{r['regime']}({r['n']})" for r in c.get("regime_breakdown", [])
+            ) or "—"
+            lines.append(
+                f"| {c['score_range']} | {c['n']} | "
+                f"{c.get('n_unique_dates', '—')} | "
+                f"{c.get('n_unique_tickers', '—')} | "
+                f"{sectors} | {regimes} |"
+            )
+
     return lines
 
 
