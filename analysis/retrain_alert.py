@@ -186,7 +186,7 @@ def send_retrain_alert(
     plain_body = _build_plain_body(alert)
 
     region = config.get("aws_region", "us-east-1")
-    gmail_pw = os.environ.get("GMAIL_APP_PASSWORD", "") or _ssm_gmail_pw(region)
+    gmail_pw = os.environ.get("GMAIL_APP_PASSWORD", "")
 
     try:
         if gmail_pw:
@@ -318,15 +318,6 @@ def _build_plain_body(alert: dict) -> str:
 
 
 # ── Email transport (same pattern as emailer.py) ─────────────────────────────
-
-def _ssm_gmail_pw(region: str) -> str:
-    try:
-        ssm = boto3.client("ssm", region_name=region)
-        resp = ssm.get_parameter(Name="/alpha-engine/gmail_app_password", WithDecryption=True)
-        return resp["Parameter"]["Value"]
-    except Exception:
-        return ""
-
 
 def _send_smtp(subject, plain, html, sender, recipients, gmail_pw):
     msg = MIMEMultipart("alternative")

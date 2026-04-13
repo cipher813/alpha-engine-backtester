@@ -74,21 +74,11 @@ def send_report_email(
     subject = _build_subject(run_date, status, product_name)
     html_body, plain_body = _build_body(run_date, report_md, s3_bucket, s3_prefix, product_name)
 
-    gmail_pw = os.environ.get("GMAIL_APP_PASSWORD", "") or _ssm_gmail_pw(region)
+    gmail_pw = os.environ.get("GMAIL_APP_PASSWORD", "")
     if gmail_pw:
         _send_via_smtp(subject, plain_body, html_body, sender, recipients, gmail_pw)
     else:
         _send_via_ses(subject, plain_body, html_body, sender, recipients, region)
-
-
-def _ssm_gmail_pw(region: str) -> str:
-    """Fetch Gmail App Password from SSM Parameter Store (silent on failure)."""
-    try:
-        ssm = boto3.client("ssm", region_name=region)
-        resp = ssm.get_parameter(Name="/alpha-engine/gmail_app_password", WithDecryption=True)
-        return resp["Parameter"]["Value"]
-    except Exception:
-        return ""
 
 
 def _send_via_smtp(
