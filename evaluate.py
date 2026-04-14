@@ -785,6 +785,15 @@ def main() -> None:
     fd = get_flow_doctor()
     config = load_config(args.config)
 
+    # Preflight: AWS_REGION + S3 bucket reachable. Evaluation reads
+    # simulation artifacts from S3 (no ArcticDB), so keep the check
+    # cheap and fail fast before any optimizer runs.
+    from preflight import BacktesterPreflight
+    BacktesterPreflight(
+        bucket=config.get("signals_bucket", "alpha-engine-research"),
+        mode="evaluate",
+    ).run()
+
     # Initialize optimizer modules
     weight_optimizer.init_config(config)
     executor_optimizer.init_config(config)

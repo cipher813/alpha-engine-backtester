@@ -65,6 +65,13 @@ def handler(event: dict, context) -> dict:
     run_date = event.get("date")
     dry_run = event.get("dry_run", False)
 
+    # Preflight: AWS_REGION + S3 bucket reachable. Fail fast so the
+    # Lambda surfaces a 500 instead of a misleading 200 when the bucket
+    # is unreachable mid-run. Mirrors the handler's own belt-and-braces
+    # error handling below (phase_errors → 500).
+    from preflight import BacktesterPreflight
+    BacktesterPreflight(bucket=bucket, mode="lambda_health").run()
+
     log.info("Predictor health check starting: bucket=%s date=%s dry_run=%s", bucket, run_date, dry_run)
 
     # Track critical errors across phases. If any phase fails, return 500

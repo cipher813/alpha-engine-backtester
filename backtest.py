@@ -931,6 +931,18 @@ def main() -> None:
 
     config = load_config(args.config)
 
+    # Preflight: external-world handshakes must pass before any 90-min
+    # spot run starts. Raises RuntimeError (propagates to non-zero exit)
+    # on missing env vars, unreachable S3, or stale ArcticDB macro/SPY.
+    # Kept out of --rollback path because rollback touches S3 configs
+    # only, not ArcticDB.
+    if not args.rollback:
+        from preflight import BacktesterPreflight
+        BacktesterPreflight(
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            mode="backtest",
+        ).run()
+
     # Handle --rollback before any other mode
     if args.rollback:
         from optimizer.rollback import rollback_all
