@@ -328,12 +328,39 @@ if [ "$RUN_MODE" = "smoke-only" ]; then
     echo "  SMOKE TEST"
     echo "═══════════════════════════════════════════════════════════════"
 
+    # Exercises BOTH entrypoints end-to-end on a fresh spot instance:
+    #   1. backtest.py --mode signal-quality — validates
+    #      BacktesterPreflight(mode="backtest") including the ArcticDB
+    #      SPY freshness check plus backtest.py's alpha_engine_lib
+    #      import chain. signal-quality is the cheapest backtest mode
+    #      (reads research.db, no predictor inference, no vbt sim).
+    #   2. evaluate.py --mode diagnostics --freeze --date <latest> —
+    #      validates BacktesterPreflight(mode="evaluate") + the
+    #      artifact-reader path. --date is pinned to the most recent
+    #      backtest/{YYYY-MM-DD}/ prefix with artifacts so non-Saturday
+    #      smoke runs don't hit the hard-fail guard in _init_data_sources.
     run_remote bash -s <<SMOKE
 set -euo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
 
-$REMOTE_PYTHON evaluate.py --mode diagnostics --freeze --log-level INFO 2>&1 | tail -30
+BUCKET="\${OUTPUT_BUCKET:-alpha-engine-research}"
+
+echo "==> Smoke: backtest.py --mode signal-quality"
+$REMOTE_PYTHON backtest.py --mode signal-quality --log-level INFO 2>&1 | tail -20
+
+echo ""
+echo "==> Resolving most recent backtest artifact date from s3://\${BUCKET}/backtest/..."
+LATEST_DATE=\$(aws s3 ls "s3://\${BUCKET}/backtest/" | awk '/PRE / {print \$2}' | tr -d '/' | sort | tail -1)
+if [ -z "\$LATEST_DATE" ]; then
+    echo "ERROR: no backtest/{date}/ prefix found in s3://\${BUCKET}/backtest/"
+    exit 1
+fi
+echo "Using backtest date: \$LATEST_DATE"
+
+echo ""
+echo "==> Smoke: evaluate.py --mode diagnostics --freeze --date \$LATEST_DATE"
+$REMOTE_PYTHON evaluate.py --mode diagnostics --freeze --date "\$LATEST_DATE" --log-level INFO 2>&1 | tail -30
 
 echo ""
 echo "Smoke test complete."
