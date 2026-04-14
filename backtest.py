@@ -1001,6 +1001,8 @@ def main() -> None:
             "feature_skip_reasons": predictor_stats.get("skip_reasons") if predictor_stats else None,
         }
 
+        # Eval-only kwargs (weight_result, veto_result, grading, etc.) default
+        # to None in build_report — they are populated by evaluate.py, not here.
         report_md = build_report(
             run_date=args.date,
             signal_quality={"status": "skipped"},
@@ -1009,30 +1011,11 @@ def main() -> None:
             attribution={"status": "skipped"},
             portfolio_stats=portfolio_stats,
             sweep_df=sweep_df,
-            weight_result=None,
             config=config,
             predictor_stats=predictor_stats,
             predictor_sweep_df=predictor_sweep_df,
-            veto_result=None,
             executor_rec=executor_rec,
-            regression_result=None,
             pipeline_health=pipeline_health,
-            e2e_lift=None,
-            trigger_scorecard=None,
-            alpha_dist=None,
-            score_calibration=None,
-            veto_value=None,
-            shadow_book=None,
-            exit_timing=None,
-            macro_eval=None,
-            trigger_opt=None,
-            predictor_sizing=None,
-            scanner_opt=None,
-            team_opt=None,
-            cio_opt=None,
-            sizing_ab=None,
-            grading=None,
-            confusion_matrix=None,
         )
 
         save_sweep_df = sweep_df
@@ -1044,16 +1027,8 @@ def main() -> None:
             signal_quality={"status": "skipped"},
             score_analysis=[],
             sweep_df=save_sweep_df,
-            attribution=None,
             run_date=args.date,
             results_dir=config.get("results_dir", "results"),
-            grading=None,
-            trigger_scorecard=None,
-            shadow_book=None,
-            exit_timing=None,
-            e2e_lift=None,
-            veto_result=None,
-            confusion_matrix=None,
         )
 
         print(f"\nReport saved to {out_dir}/")
