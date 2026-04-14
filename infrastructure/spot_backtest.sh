@@ -328,17 +328,18 @@ if [ "$RUN_MODE" = "smoke-only" ]; then
     echo "  SMOKE TEST"
     echo "═══════════════════════════════════════════════════════════════"
 
-    # Exercises BOTH entrypoints end-to-end on a fresh spot instance:
-    #   1. backtest.py --mode signal-quality — validates
-    #      BacktesterPreflight(mode="backtest") including the ArcticDB
-    #      SPY freshness check plus backtest.py's alpha_engine_lib
-    #      import chain. signal-quality is the cheapest backtest mode
-    #      (reads research.db, no predictor inference, no vbt sim).
+    # Exercises BOTH entrypoint code paths end-to-end on a fresh spot:
+    #   1. A Python one-liner that imports backtest, calls setup_logging
+    #      and BacktesterPreflight(mode="backtest"). backtest.py has no
+    #      "validate-and-exit" mode; all real modes (simulate, param-
+    #      sweep, predictor-backtest) are heavyweight. This validates
+    #      the module-level import chain, alpha_engine_lib.logging, and
+    #      the ArcticDB SPY freshness check without spending compute.
     #   2. evaluate.py --mode diagnostics --freeze --date <latest> —
     #      validates BacktesterPreflight(mode="evaluate") + the
     #      artifact-reader path. --date is pinned to the most recent
-    #      backtest/{YYYY-MM-DD}/ prefix with artifacts so non-Saturday
-    #      smoke runs don't hit the hard-fail guard in _init_data_sources.
+    #      backtest/{YYYY-MM-DD}/ prefix so non-Saturday smoke runs
+    #      don't hit the hard-fail guard in _init_data_sources.
     run_remote bash -s <<SMOKE
 set -euo pipefail
 cd /home/ec2-user/alpha-engine-backtester
@@ -346,8 +347,18 @@ ${ENV_SOURCE}
 
 BUCKET="\${OUTPUT_BUCKET:-alpha-engine-research}"
 
-echo "==> Smoke: backtest.py --mode signal-quality"
-$REMOTE_PYTHON backtest.py --mode signal-quality --log-level INFO 2>&1 | tail -20
+echo "==> Smoke: backtest.py import + BacktesterPreflight(mode=\"backtest\")"
+$REMOTE_PYTHON - <<'PY'
+import os
+os.chdir("/home/ec2-user/alpha-engine-backtester")
+from alpha_engine_lib.logging import setup_logging
+setup_logging("backtest-smoke")
+import backtest  # noqa: F401 — validate top-level import chain
+from preflight import BacktesterPreflight
+bucket = os.environ.get("OUTPUT_BUCKET", "alpha-engine-research")
+BacktesterPreflight(bucket=bucket, mode="backtest").run()
+print("backtest smoke: imports + preflight OK")
+PY
 
 echo ""
 echo "==> Resolving most recent backtest artifact date from s3://\${BUCKET}/backtest/..."
