@@ -916,13 +916,14 @@ def _export_simulation_artifacts(
 def main() -> None:
     args = _parse_args()
 
-    # Structured logging + flow-doctor are owned by log_config.py as a
-    # singleton. setup_logging() configures the root logger and, when
-    # FLOW_DOCTOR_ENABLED=1, initializes the shared FlowDoctor instance
-    # and attaches its log handler at ERROR level. See log_config.py
-    # docstring for details. Respects the --log-level CLI flag.
-    from log_config import setup_logging, get_flow_doctor
-    setup_logging("backtest")
+    # Structured logging + flow-doctor singleton come from
+    # alpha_engine_lib. setup_logging() configures the root logger and,
+    # when FLOW_DOCTOR_ENABLED=1, initializes the shared FlowDoctor
+    # instance using the config at flow-doctor.yaml and attaches its
+    # ERROR-level log handler. Respects the --log-level CLI flag.
+    from alpha_engine_lib.logging import setup_logging, get_flow_doctor
+    _flow_doctor_yaml = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
+    setup_logging("backtest", flow_doctor_yaml=_flow_doctor_yaml)
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     _health_start = _time.time()
 

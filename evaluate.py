@@ -772,11 +772,13 @@ def _run_regression(
 def main() -> None:
     args = _parse_args()
 
-    # Structured logging + flow-doctor singleton owned by log_config.py.
-    # setup_logging() configures the root logger and attaches flow-doctor's
-    # ERROR handler when FLOW_DOCTOR_ENABLED=1.
-    from log_config import setup_logging, get_flow_doctor
-    setup_logging("evaluate")
+    # Structured logging + flow-doctor singleton are provided by
+    # alpha_engine_lib. setup_logging() configures the root logger and,
+    # when FLOW_DOCTOR_ENABLED=1, attaches flow-doctor's ERROR handler
+    # using the config at flow-doctor.yaml.
+    from alpha_engine_lib.logging import setup_logging, get_flow_doctor
+    _flow_doctor_yaml = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
+    setup_logging("evaluate", flow_doctor_yaml=_flow_doctor_yaml)
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     _health_start = _time.time()
 

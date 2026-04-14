@@ -49,12 +49,15 @@ def handler(event: dict, context) -> dict:
         date     (str)  : Override date YYYY-MM-DD (default: today UTC)
         dry_run  (bool) : If True, skip S3 writes and email (for canary tests)
     """
-    # Structured logging + flow-doctor owned by log_config.py. When
-    # FLOW_DOCTOR_ENABLED=1 the root logger gets a handler that captures
-    # ERROR+ records — every log.error() call in the phases below is
-    # automatically routed to flow-doctor without explicit fd.report() plumbing.
-    from log_config import setup_logging, get_flow_doctor
-    setup_logging("lambda_health")
+    # Structured logging + flow-doctor singleton come from
+    # alpha_engine_lib. When FLOW_DOCTOR_ENABLED=1 the root logger gets
+    # a handler that captures ERROR+ records — every log.error() call
+    # in the phases below is automatically routed to flow-doctor
+    # without explicit fd.report() plumbing. The yaml ships alongside
+    # this handler in the Lambda container (see Dockerfile COPY).
+    from alpha_engine_lib.logging import setup_logging, get_flow_doctor
+    _flow_doctor_yaml = os.path.join(os.environ.get("LAMBDA_TASK_ROOT", os.path.dirname(os.path.abspath(__file__))), "flow-doctor.yaml")
+    setup_logging("lambda_health", flow_doctor_yaml=_flow_doctor_yaml)
     fd = get_flow_doctor()
 
     t0 = time.time()
