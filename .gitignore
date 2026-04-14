@@ -7,6 +7,10 @@ dist/
 build/
 *.so
 
+# Docker vendor staging (alpha-engine-lib copied here by
+# infrastructure/deploy_health.sh before build, cleaned up on exit).
+vendor/
+
 # Virtual environment
 .venv/
 venv/

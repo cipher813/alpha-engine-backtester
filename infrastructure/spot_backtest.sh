@@ -188,8 +188,9 @@ ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
 BOOTSTRAP
 
 echo "==> Cloning repositories (branch: $BRANCH)..."
-# Clone all repos needed for backtest (backtester imports executor + predictor + flow-doctor)
-for REPO in alpha-engine-backtester alpha-engine alpha-engine-predictor flow-doctor; do
+# flow-doctor is now pulled in via alpha-engine-lib[flow_doctor] from
+# requirements.txt — no bundled editable install needed.
+for REPO in alpha-engine-backtester alpha-engine alpha-engine-predictor; do
     echo "  Cloning $REPO..."
     ssh -A $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" \
         "git clone --depth 1 --branch $BRANCH git@github.com:cipher813/$REPO.git /home/ec2-user/$REPO" 2>/dev/null || {
@@ -198,10 +199,38 @@ for REPO in alpha-engine-backtester alpha-engine alpha-engine-predictor flow-doc
     }
 done
 
+# ── Upload .env BEFORE pip install ─────────────────────────────────────────────
+# pip install needs ALPHA_ENGINE_LIB_TOKEN from .env to clone the private
+# alpha-engine-lib repo via git. Uploading .env after pip install (as the
+# script did before) meant the first run on a fresh spot instance failed
+# to install the lib. Same fix the predictor spot_train.sh got on 2026-04-14.
+if [ ! -f "$ENV_FILE" ]; then
+    echo "ERROR: .env not found (checked alpha-engine-data/.env, ~/.alpha-engine.env, ./.env)"
+    exit 1
+fi
+echo "==> Uploading .env to spot instance (required before pip install)..."
+scp $SSH_OPTS -i "$KEY_FILE" \
+    "$ENV_FILE" \
+    ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-backtester/.env
+
 echo "==> Installing Python dependencies..."
 run_remote bash -s <<'DEPS'
 set -euo pipefail
 cd /home/ec2-user/alpha-engine-backtester
+
+# Source .env so ALPHA_ENGINE_LIB_TOKEN is available for the git URL
+# rewrite below. Hard-fail if the token is missing — the
+# alpha-engine-lib pip install will fail anonymously with a cryptic
+# error otherwise.
+set -a
+# shellcheck disable=SC1091
+source /home/ec2-user/alpha-engine-backtester/.env
+set +a
+if [ -z "${ALPHA_ENGINE_LIB_TOKEN:-}" ]; then
+    echo "ERROR: ALPHA_ENGINE_LIB_TOKEN not set in .env — required to pip install private alpha-engine-lib"
+    exit 1
+fi
+git config --global url."https://x-access-token:${ALPHA_ENGINE_LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
 
 if command -v python3.12 &>/dev/null; then
     PIP="python3.12 -m pip"
@@ -211,9 +240,6 @@ fi
 
 $PIP install --upgrade pip -q
 $PIP install -q -r requirements.txt
-
-# Install flow-doctor from bundled source (not on PyPI)
-$PIP install -q -e /home/ec2-user/flow-doctor
 
 # Also install predictor deps (needed for GBM inference + feature computation)
 cd /home/ec2-user/alpha-engine-predictor
@@ -227,17 +253,11 @@ $PIP install -q 'numpy<2'
 echo "Dependencies installed."
 DEPS
 
-# ── Copy config files ──────────────────────────────────────────────────────────
-echo "==> Uploading config.yaml and .env..."
+# ── Copy remaining config files ─────────────────────────────────────────────────
+echo "==> Uploading config.yaml..."
 scp $SSH_OPTS -i "$KEY_FILE" \
     "$REPO_ROOT/config.yaml" \
     ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-backtester/config.yaml
-
-if [ -f "$ENV_FILE" ]; then
-    scp $SSH_OPTS -i "$KEY_FILE" \
-        "$ENV_FILE" \
-        ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-backtester/.env
-fi
 
 # Copy executor config (needed for simulation).
 # Try EC2 path first (when launched from always-on EC2), then local dev path.

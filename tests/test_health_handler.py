@@ -16,6 +16,21 @@ from lambda_health.handler import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _mock_preflight():
+    """Short-circuit BacktesterPreflight.run() in handler tests.
+
+    The handler calls preflight to verify AWS_REGION + S3 bucket before
+    any work. These tests exercise handler orchestration logic, not the
+    preflight itself (which has its own coverage in test_preflight.py).
+    Patching at the source module so the handler's inline import picks
+    up the stub.
+    """
+    with patch("preflight.BacktesterPreflight") as mock_pf:
+        mock_pf.return_value.run = MagicMock()
+        yield mock_pf
+
+
 # ── _response tests ──────────────────────────────────────────────────────────
 
 def test_response_dict_body():

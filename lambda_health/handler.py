@@ -49,18 +49,28 @@ def handler(event: dict, context) -> dict:
         date     (str)  : Override date YYYY-MM-DD (default: today UTC)
         dry_run  (bool) : If True, skip S3 writes and email (for canary tests)
     """
-    # Structured logging + flow-doctor owned by log_config.py. When
-    # FLOW_DOCTOR_ENABLED=1 the root logger gets a handler that captures
-    # ERROR+ records — every log.error() call in the phases below is
-    # automatically routed to flow-doctor without explicit fd.report() plumbing.
-    from log_config import setup_logging, get_flow_doctor
-    setup_logging("lambda_health")
+    # Structured logging + flow-doctor singleton come from
+    # alpha_engine_lib. When FLOW_DOCTOR_ENABLED=1 the root logger gets
+    # a handler that captures ERROR+ records — every log.error() call
+    # in the phases below is automatically routed to flow-doctor
+    # without explicit fd.report() plumbing. The yaml ships alongside
+    # this handler in the Lambda container (see Dockerfile COPY).
+    from alpha_engine_lib.logging import setup_logging, get_flow_doctor
+    _flow_doctor_yaml = os.path.join(os.environ.get("LAMBDA_TASK_ROOT", os.path.dirname(os.path.abspath(__file__))), "flow-doctor.yaml")
+    setup_logging("lambda_health", flow_doctor_yaml=_flow_doctor_yaml)
     fd = get_flow_doctor()
 
     t0 = time.time()
     bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
     run_date = event.get("date")
     dry_run = event.get("dry_run", False)
+
+    # Preflight: AWS_REGION + S3 bucket reachable. Fail fast so the
+    # Lambda surfaces a 500 instead of a misleading 200 when the bucket
+    # is unreachable mid-run. Mirrors the handler's own belt-and-braces
+    # error handling below (phase_errors → 500).
+    from preflight import BacktesterPreflight
+    BacktesterPreflight(bucket=bucket, mode="lambda_health").run()
 
     log.info("Predictor health check starting: bucket=%s date=%s dry_run=%s", bucket, run_date, dry_run)
 
