@@ -201,16 +201,51 @@ def _load_training_ic(bucket: str) -> float | None:
         return None
 
 
+_MIN_BIN_N = 10  # skip bins with fewer samples — ECE is noise-dominated below this
+
+
+def _load_calibrator_deployed_at(bucket: str) -> str | None:
+    """Read the isotonic calibrator sidecar to get its deployment timestamp.
+
+    PR 1 (predictor) writes predictor/weights/meta/isotonic_calibrator.meta.json
+    alongside the pickle. The sidecar's ``deployed_at`` field is an ISO-8601
+    UTC timestamp used by retrain_alert.py to grace-period the
+    calibration_breakdown trigger after a fresh calibrator (ECE over a mixed
+    calibrator-semantics window is noisy by construction).
+
+    Returns None when the sidecar is absent (no calibrator yet) or unreadable.
+    """
+    try:
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key="predictor/weights/meta/isotonic_calibrator.meta.json")
+        sidecar = json.loads(obj["Body"].read())
+        value = sidecar.get("deployed_at")
+        return str(value) if value else None
+    except Exception as exc:
+        log.debug("Calibrator sidecar not available: %s", exc)
+        return None
+
+
 def compute_calibration_validation(
     db_path: str,
     bucket: str,
     run_date: str | None = None,
     lookback_days: int = 60,
+    min_bin_n: int = _MIN_BIN_N,
 ) -> dict:
     """
     Phase 2b: Per-bin confidence calibration validation.
 
-    For each confidence bin, compute actual hit rate and compare to expected.
+    For each confidence bin with at least ``min_bin_n`` samples, compute the
+    actual hit rate and compare it to the mean predicted confidence within
+    that bin. ``expected`` is the mean of predicted confidences in the bin —
+    this is the rigorous form of ECE. Using bin midpoints instead would
+    systematically overstate miscalibration when predictions cluster at one
+    end of a bin.
+
+    Bins with fewer than ``min_bin_n`` samples are dropped from the ECE
+    computation to avoid noise domination in sparse tails.
+
     Writes to predictor/metrics/calibration_validation.json.
     """
     run_date = run_date or datetime.utcnow().strftime("%Y-%m-%d")
@@ -238,6 +273,7 @@ def compute_calibration_validation(
     # ── Bin by confidence ────────────────────────────────────────────────────
     bin_edges = [0.50, 0.60, 0.70, 0.80, 0.90, 1.01]
     bins = []
+    dropped_bins = []
     total_ece = 0.0
     total_n = 0
 
@@ -250,14 +286,21 @@ def compute_calibration_validation(
             continue
 
         hit_rate = float(subset["correct"].mean())
-        expected = (lo + min(hi, 1.0)) / 2  # midpoint of bin
-        bins.append({
+        expected = float(subset["confidence"].mean())  # rigorous: mean predicted prob in bin
+
+        bin_record = {
             "range": [round(lo, 2), round(min(hi, 1.0), 2)],
             "n": n,
             "hit_rate": round(hit_rate, 3),
             "expected": round(expected, 3),
-        })
+        }
 
+        if n < min_bin_n:
+            bin_record["dropped_reason"] = f"n<{min_bin_n}"
+            dropped_bins.append(bin_record)
+            continue
+
+        bins.append(bin_record)
         total_ece += abs(hit_rate - expected) * n
         total_n += n
 
@@ -276,11 +319,21 @@ def compute_calibration_validation(
     result = {
         "date": run_date,
         "lookback_days": lookback_days,
+        "min_bin_n": min_bin_n,
         "n_total": total_n,
         "bins": bins,
+        "dropped_bins": dropped_bins,
         "overall_ece": overall_ece,
         "calibration_quality": quality,
     }
+
+    # Propagate calibrator deployment timestamp when predictor writes it
+    # alongside meta weights. retrain_alert.py uses this to apply a grace
+    # period after a fresh calibrator (ECE is mixed-semantics during the
+    # rollover window). Absent → no grace period, alerts fire normally.
+    calibrator_deployed_at = _load_calibrator_deployed_at(bucket)
+    if calibrator_deployed_at is not None:
+        result["calibrator_deployed_at"] = calibrator_deployed_at
 
     # ── Write to S3 ──────────────────────────────────────────────────────────
     try:

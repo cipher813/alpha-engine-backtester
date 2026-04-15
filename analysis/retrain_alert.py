@@ -43,6 +43,32 @@ _DRIFT_FRACTION_TRIGGER = 0.20
 _ECE_THRESHOLD = 0.10
 _MODE_COLLAPSE_THRESHOLD = 0.75
 _MIN_DAYS_BETWEEN_ALERTS = 2  # suppress duplicate alerts from reruns/retries
+_CALIBRATOR_GRACE_DAYS = 30  # skip calibration_breakdown in the N days after a new calibrator deploys
+
+
+def _calibrator_within_grace(calibration: dict, run_date: str | None = None) -> bool:
+    """True when the calibrator is too recent for ECE to be meaningful.
+
+    The predictor fits isotonic calibration on OOF predictions during training
+    and ships it to S3. For the first ``_CALIBRATOR_GRACE_DAYS`` after a new
+    calibrator lands, the ``predictor_outcomes`` table contains a mix of
+    pre-calibrator and post-calibrator confidence semantics — ECE over that
+    window is structurally noisy and does not indicate real miscalibration.
+
+    Absent ``calibrator_deployed_at`` → no grace period (legacy behavior).
+    """
+    deployed_at = calibration.get("calibrator_deployed_at")
+    if not deployed_at:
+        return False
+    try:
+        deployed_dt = datetime.fromisoformat(str(deployed_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    now = datetime.fromisoformat(run_date) if run_date else datetime.utcnow()
+    if deployed_dt.tzinfo is not None:
+        deployed_dt = deployed_dt.replace(tzinfo=None)
+    age_days = (now - deployed_dt).days
+    return 0 <= age_days < _CALIBRATOR_GRACE_DAYS
 
 
 def evaluate_retrain_triggers(
@@ -92,15 +118,22 @@ def evaluate_retrain_triggers(
     if calibration and calibration.get("overall_ece") is not None:
         ece = calibration["overall_ece"]
         if ece > _ECE_THRESHOLD:
-            reasons.append({
-                "trigger": "calibration_breakdown",
-                "detail": (
-                    f"Expected Calibration Error is {ece:.3f} "
-                    f"(threshold: {_ECE_THRESHOLD}) — model confidence "
-                    f"no longer matches actual hit rates"
-                ),
-                "severity": "medium",
-            })
+            if _calibrator_within_grace(calibration):
+                log.info(
+                    "Calibration_breakdown suppressed: calibrator deployed_at=%s within %d-day grace window",
+                    calibration.get("calibrator_deployed_at"),
+                    _CALIBRATOR_GRACE_DAYS,
+                )
+            else:
+                reasons.append({
+                    "trigger": "calibration_breakdown",
+                    "detail": (
+                        f"Expected Calibration Error is {ece:.3f} "
+                        f"(threshold: {_ECE_THRESHOLD}) — model confidence "
+                        f"no longer matches actual hit rates"
+                    ),
+                    "severity": "medium",
+                })
 
     # ── Trigger 4: Regime shift with negative IC ─────────────────────────
     if production_health:
