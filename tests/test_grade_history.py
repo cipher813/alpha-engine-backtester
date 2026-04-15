@@ -24,7 +24,7 @@ class TestExtractComponentGrades:
                 "grade": 71,
                 "letter": "B",
                 "components": {
-                    "gbm_model": {"grade": 65, "letter": "B"},
+                    "meta_model": {"grade": 65, "letter": "B"},
                     "veto_gate": {"grade": 77, "letter": "B+"},
                 },
             },
@@ -46,7 +46,7 @@ class TestExtractComponentGrades:
         assert result["research.cio"] == 70
         assert result["research.team.technology"] == 80
         assert result["research.team.healthcare"] == 60
-        assert result["predictor.gbm_model"] == 65
+        assert result["predictor.meta_model"] == 65
         assert result["predictor.veto_gate"] == 77
         assert result["executor.entry_triggers"] == 60
         assert result["executor.risk_guard"] == 72
