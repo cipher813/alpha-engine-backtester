@@ -134,6 +134,53 @@ def test_none_inputs():
     assert result["n_triggers"] == 0
 
 
+# ── calibrator grace window ──────────────────────────────────────────────────
+
+def test_calibration_breakdown_suppressed_during_grace():
+    """A calibrator deployed within the grace window should suppress the alert."""
+    from datetime import datetime, timedelta
+    recent = (datetime.utcnow() - timedelta(days=5)).isoformat()
+    calibration = {
+        "overall_ece": 0.25,  # above threshold
+        "calibrator_deployed_at": recent,
+    }
+    result = evaluate_retrain_triggers(None, None, calibration)
+    triggers = [r["trigger"] for r in result["reasons"]]
+    assert "calibration_breakdown" not in triggers
+
+
+def test_calibration_breakdown_fires_after_grace():
+    """Calibrator older than the grace window should not suppress the alert."""
+    from datetime import datetime, timedelta
+    old = (datetime.utcnow() - timedelta(days=45)).isoformat()
+    calibration = {
+        "overall_ece": 0.25,
+        "calibrator_deployed_at": old,
+    }
+    result = evaluate_retrain_triggers(None, None, calibration)
+    triggers = [r["trigger"] for r in result["reasons"]]
+    assert "calibration_breakdown" in triggers
+
+
+def test_calibration_breakdown_fires_without_timestamp():
+    """Absent calibrator_deployed_at → no grace, preserve legacy behavior."""
+    calibration = {"overall_ece": 0.25}
+    result = evaluate_retrain_triggers(None, None, calibration)
+    triggers = [r["trigger"] for r in result["reasons"]]
+    assert "calibration_breakdown" in triggers
+
+
+def test_calibration_breakdown_malformed_timestamp_fires():
+    """Unparseable timestamp should not silently swallow the alert."""
+    calibration = {
+        "overall_ece": 0.25,
+        "calibrator_deployed_at": "not-a-date",
+    }
+    result = evaluate_retrain_triggers(None, None, calibration)
+    triggers = [r["trigger"] for r in result["reasons"]]
+    assert "calibration_breakdown" in triggers
+
+
 def test_skipped_inputs():
     """Phase 2/3 returned skipped status — no crash."""
     health = {"status": "skipped", "reason": "insufficient_samples"}
