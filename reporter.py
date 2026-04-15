@@ -163,7 +163,7 @@ def _section_scorecard(grading: dict) -> list[str]:
     lines.append("")
     lines.append("| Component | Grade | Score | Detail |")
     lines.append("|-----------|-------|-------|--------|")
-    for comp_key, comp_label in [("gbm_model", "GBM Model"), ("veto_gate", "Veto Gate")]:
+    for comp_key, comp_label in [("meta_model", "Meta Model"), ("veto_gate", "Veto Gate")]:
         c = p_comps.get(comp_key, {})
         _append_component_row(lines, comp_label, c)
     lines.append("")
@@ -217,10 +217,10 @@ def _scorecard_key_metric(mod: dict) -> str:
         return f"10d accuracy: {cs_detail['accuracy_10d']}"
 
     # Predictor: show IC
-    gbm = comps.get("gbm_model", {})
-    gbm_detail = gbm.get("detail", {})
-    if "rank_ic" in gbm_detail:
-        return f"IC: {gbm_detail['rank_ic']}"
+    meta = comps.get("meta_model", {})
+    meta_detail = meta.get("detail", {})
+    if "rank_ic" in meta_detail:
+        return f"IC: {meta_detail['rank_ic']}"
 
     # Executor: show portfolio detail
     pf = comps.get("portfolio", {})

@@ -396,9 +396,16 @@ def _grade_composite_scoring(signal_quality: dict | None,
     return {"grade": grade, "letter": _letter(grade), "detail": detail}
 
 
-def _grade_gbm_model(predictor_sizing: dict | None,
-                     veto_result: dict | None) -> dict:
-    """Grade the GBM prediction model quality."""
+def _grade_meta_model(predictor_sizing: dict | None,
+                      veto_result: dict | None) -> dict:
+    """Grade the predictor meta-model quality (rank IC, stability, sizing lift).
+
+    Named for the v3 predictor architecture (4 specialized models + ridge
+    meta-learner, deployed 2026-04-01). Prior to v3 this graded a single
+    LightGBM; the signals consumed here (overall_rank_ic, sizing_lift,
+    weekly_ic) are identical across architectures, so the function kept
+    working through the cutover but the name was stale.
+    """
     ic = _safe_get(predictor_sizing, "overall_rank_ic")
     hit_rate = None
 
@@ -814,11 +821,11 @@ def compute_scorecard(
     # -----------------------------------------------------------------------
     # Predictor components
     # -----------------------------------------------------------------------
-    gbm = _grade_gbm_model(predictor_sizing, veto_result)
+    meta = _grade_meta_model(predictor_sizing, veto_result)
     veto = _grade_veto_gate(veto_result, veto_value)
 
     predictor_grade = _weighted_avg([
-        (0.55, gbm.get("grade")),
+        (0.55, meta.get("grade")),
         (0.45, veto.get("grade")),
     ])
 
@@ -826,7 +833,7 @@ def compute_scorecard(
         "grade": predictor_grade,
         "letter": _letter(predictor_grade),
         "components": {
-            "gbm_model": gbm,
+            "meta_model": meta,
             "veto_gate": veto,
         },
     }
