@@ -6,8 +6,8 @@ signals, then feeds them through the full executor pipeline (risk guard,
 position sizing, ATR stops, time decay, graduated drawdown).
 
 This tests everything downstream of Research without any LLM API calls:
-    1. Load OHLCV data (10y from S3 full cache, or 2y local slim cache)
-    2. Compute 29 technical features per ticker (one full series per ticker)
+    1. Load OHLCV + pre-computed features from ArcticDB (sole source)
+    2. Recompute features inline only when ArcticDB coverage is insufficient
     3. Run GBM inference in daily batches (up to ~2520 days × ~900 tickers)
     4. Convert alpha predictions to executor-compatible signals
     5. Build price matrix + OHLCV histories for simulation loop
@@ -15,9 +15,11 @@ This tests everything downstream of Research without any LLM API calls:
 The caller (backtest.py) then passes these to _run_simulation_loop() with
 the existing executor pipeline.
 
-Data sources:
-    - Full cache (10y): S3 predictor/price_cache/*.parquet — use on spot instances
-    - Slim cache (2y): local predictor/data/cache/*.parquet — use on always-on EC2
+Data source (Phase 0 of backtester-audit-260415.md):
+    ArcticDB universe library — OHLCV + 53 features per ticker.
+    Legacy S3 parquet cache (predictor/price_cache/*.parquet) and local
+    slim-cache fallbacks were removed on 2026-04-16; ArcticDB is the
+    unified source shared with predictor training + inference.
 
 Performance notes (10y on c5.large spot):
     - Feature computation: ~900 calls to compute_features() (~3-5 min)
@@ -54,119 +56,6 @@ _SECTOR_ETFS = {"XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP", "XLU", "XLRE", 
 _MIN_ROWS_FOR_FEATURES = 265
 
 
-def load_full_cache_from_s3(
-    bucket: str = "alpha-engine-research",
-    prefix: str = "predictor/price_cache",
-    region: str = "us-east-1",
-) -> dict[str, pd.DataFrame]:
-    """
-    Load 10-year OHLCV parquets from S3 full price cache.
-
-    This is the primary data source for spot instance backtest runs.
-    The full cache contains ~10 years of adjusted OHLCV data for ~900 tickers,
-    refreshed weekly by the predictor training pipeline.
-
-    Returns {ticker: DataFrame} with DatetimeIndex and OHLCV columns.
-    """
-    s3 = boto3.client("s3", region_name=region)
-
-    # List all parquet files in the cache prefix
-    paginator = s3.get_paginator("list_objects_v2")
-    keys = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet"):
-                keys.append(obj["Key"])
-
-    logger.info("Loading full cache from S3: %d parquet files at s3://%s/%s", len(keys), bucket, prefix)
-
-    price_data: dict[str, pd.DataFrame] = {}
-    tmp_dir = tempfile.mkdtemp(prefix="backtest_cache_")
-
-    for i, key in enumerate(keys):
-        ticker = Path(key).stem  # e.g. "AAPL" from ".../AAPL.parquet"
-        local_path = os.path.join(tmp_dir, f"{ticker}.parquet")
-
-        try:
-            s3.download_file(bucket, key, local_path)
-            df = pd.read_parquet(local_path)
-            if df.empty:
-                continue
-
-            # Ensure DatetimeIndex
-            if not isinstance(df.index, pd.DatetimeIndex):
-                if "Date" in df.columns:
-                    df["Date"] = pd.to_datetime(df["Date"])
-                    df = df.set_index("Date")
-                elif "date" in df.columns:
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.set_index("date")
-                else:
-                    df.index = pd.to_datetime(df.index)
-
-            df = df.sort_index()
-            price_data[ticker] = df
-
-            # Clean up temp file immediately to limit disk usage
-            os.unlink(local_path)
-        except Exception as e:
-            logger.debug("Skipping %s: %s", key, e)
-
-        if (i + 1) % 100 == 0:
-            logger.info("  Loaded %d/%d parquets from S3", i + 1, len(keys))
-
-    # Clean up temp directory
-    try:
-        os.rmdir(tmp_dir)
-    except OSError:
-        pass
-
-    logger.info("Loaded %d tickers from S3 full cache (10y)", len(price_data))
-    return price_data
-
-
-def load_slim_cache(predictor_path: str) -> dict[str, pd.DataFrame]:
-    """
-    Read all parquet files from {predictor_path}/data/cache/ into memory.
-
-    Returns {ticker: DataFrame} where DataFrame has DatetimeIndex and
-    columns including Close, Volume, Open, High, Low.
-
-    Includes SPY, VIX, sector ETFs, and macro series alongside ~500 stocks.
-    """
-    cache_dir = Path(predictor_path) / "data" / "cache"
-    if not cache_dir.exists():
-        raise FileNotFoundError(f"Predictor cache directory not found: {cache_dir}")
-
-    price_data: dict[str, pd.DataFrame] = {}
-    parquet_files = list(cache_dir.glob("*.parquet"))
-    logger.info("Loading slim cache: %d parquet files from %s", len(parquet_files), cache_dir)
-
-    for pf in parquet_files:
-        ticker = pf.stem  # e.g. "AAPL" from "AAPL.parquet"
-        try:
-            df = pd.read_parquet(pf)
-            if df.empty:
-                continue
-            # Ensure DatetimeIndex
-            if not isinstance(df.index, pd.DatetimeIndex):
-                if "Date" in df.columns:
-                    df["Date"] = pd.to_datetime(df["Date"])
-                    df = df.set_index("Date")
-                elif "date" in df.columns:
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.set_index("date")
-                else:
-                    df.index = pd.to_datetime(df.index)
-            df = df.sort_index()
-            price_data[ticker] = df
-        except Exception as e:
-            logger.debug("Skipping %s: %s", pf.name, e)
-
-    logger.info("Loaded %d tickers from slim cache", len(price_data))
-    return price_data
-
-
 def load_sector_map(predictor_path: str) -> dict[str, str]:
     """Load sector_map.json mapping tickers to sector ETF symbols."""
     map_path = Path(predictor_path) / "data" / "cache" / "sector_map.json"
@@ -175,90 +64,6 @@ def load_sector_map(predictor_path: str) -> dict[str, str]:
         return {}
     with open(map_path) as f:
         return json.load(f)
-
-
-def _load_features_from_store(
-    trading_dates: list[str],
-    bucket: str,
-) -> dict[str, pd.DataFrame] | None:
-    """
-    Try to load pre-computed features from the S3 feature store.
-
-    Reads technical + interaction group Parquet files for each trading date,
-    then pivots back to {ticker: DataFrame} format for GBM inference.
-
-    Returns None if feature store is unavailable or has insufficient coverage.
-    """
-    try:
-        s3 = boto3.client("s3")
-
-        # Quick availability check — does the features/ prefix exist?
-        resp = s3.list_objects_v2(Bucket=bucket, Prefix="features/", MaxKeys=1)
-        if resp.get("KeyCount", 0) == 0:
-            logger.info("Feature store empty at s3://%s/features/ — falling back to computation", bucket)
-            return None
-
-        # Read technical + interaction groups for each date
-        frames_by_ticker: dict[str, list[pd.DataFrame]] = {}
-        dates_found = 0
-
-        for date_str in trading_dates:
-            day_frames = []
-            for group in ("technical", "interaction"):
-                key = f"features/{date_str}/{group}.parquet"
-                try:
-                    import io
-                    obj = s3.get_object(Bucket=bucket, Key=key)
-                    buf = io.BytesIO(obj["Body"].read())
-                    df = pd.read_parquet(buf, engine="pyarrow")
-                    day_frames.append(df)
-                except Exception:
-                    continue
-
-            if not day_frames:
-                continue
-
-            dates_found += 1
-            # Merge groups on ticker + date
-            merged = day_frames[0]
-            for extra in day_frames[1:]:
-                merged = merged.merge(extra, on=["ticker", "date"], how="left")
-
-            # Pivot into per-ticker frames
-            for _, row in merged.iterrows():
-                ticker = row.get("ticker")
-                if not ticker:
-                    continue
-                frames_by_ticker.setdefault(ticker, []).append(row)
-
-        # Need at least 50% date coverage to be useful
-        coverage = dates_found / max(len(trading_dates), 1)
-        if coverage < 0.50:
-            logger.info(
-                "Feature store coverage %.0f%% (%d/%d dates) — too sparse, falling back",
-                coverage * 100, dates_found, len(trading_dates),
-            )
-            return None
-
-        # Convert to {ticker: DataFrame} with DatetimeIndex
-        features_by_ticker: dict[str, pd.DataFrame] = {}
-        for ticker, rows in frames_by_ticker.items():
-            df = pd.DataFrame(rows).drop(columns=["ticker"], errors="ignore")
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"])
-                df = df.set_index("date").sort_index()
-            if not df.empty:
-                features_by_ticker[ticker] = df
-
-        logger.info(
-            "Feature store loaded: %d tickers, %d dates (%.0f%% coverage)",
-            len(features_by_ticker), dates_found, coverage * 100,
-        )
-        return features_by_ticker
-
-    except Exception as e:
-        logger.warning("Feature store read failed — falling back to computation: %s", e)
-        return None
 
 
 def compute_all_features(
@@ -275,7 +80,7 @@ def compute_all_features(
 
     Parameters
     ----------
-    price_data : {ticker: OHLCV DataFrame} from load_slim_cache()
+    price_data : {ticker: OHLCV DataFrame} from load_universe_from_arctic()
     sector_map : {ticker: sector_etf} from sector_map.json
     predictor_path : path to predictor repo root (for importing compute_features)
 
@@ -704,70 +509,29 @@ def run(config: dict, keep_features: bool = False) -> dict:
     max_trading_days = pb_config.get("max_trading_days", 500)
     top_n = pb_config.get("top_n_signals_per_day", 20)
     min_score = pb_config.get("min_score", 70)
-    use_full_cache = pb_config.get("use_full_cache", False)
     bucket = config.get("signals_bucket", "alpha-engine-research")
 
-    # 1. Load price data + features — try ArcticDB first, fall back to legacy path
-    use_arcticdb = pb_config.get("use_arcticdb", True)
-    features_by_ticker = None
-    feature_skip_reasons = {}
-    price_data = None
-    data_source = "legacy"
-
-    if use_arcticdb:
-        try:
-            from store.arctic_reader import load_universe_from_arctic
-            logger.info("[data_source=arcticdb] Loading universe from ArcticDB...")
-            price_data, features_by_ticker = load_universe_from_arctic(bucket=bucket)
-            if features_by_ticker:
-                data_source = "arcticdb"
-                logger.info("[data_source=arcticdb] %d tickers with pre-computed features — skipped recomputation", len(features_by_ticker))
-            else:
-                logger.warning("[data_source=arcticdb] No features returned — falling back to legacy path")
-                price_data = None
-        except Exception as exc:
-            logger.warning("[data_source=arcticdb] Load failed — falling back to legacy path: %s", exc)
-
-    # Legacy fallback: load from S3 parquets + compute features inline
-    if price_data is None:
-        data_source = "legacy"
-        if use_full_cache:
-            logger.info("[data_source=legacy] Loading full 10y price cache from S3...")
-            price_data = load_full_cache_from_s3(bucket=bucket)
-        else:
-            price_data = load_slim_cache(predictor_path)
-
-        # Trim to recent rows to limit memory
-        trim_rows = max_trading_days + 300
-        trimmed = 0
-        for ticker in price_data:
-            if len(price_data[ticker]) > trim_rows:
-                price_data[ticker] = price_data[ticker].iloc[-trim_rows:]
-                trimmed += 1
-        if trimmed:
-            logger.info("Trimmed %d tickers to most recent %d rows (memory optimization)", trimmed, trim_rows)
+    # 1. Load price data + features from ArcticDB (sole source post-Phase-0).
+    #    Hard-fail on unreachable per backtester-audit-260415.md: legacy S3
+    #    parquet cache + inline slim-cache fallbacks have been removed.
+    from store.arctic_reader import load_universe_from_arctic
+    logger.info("[data_source=arcticdb] Loading universe from ArcticDB...")
+    price_data, features_by_ticker = load_universe_from_arctic(bucket=bucket)
+    data_source = "arcticdb"
+    feature_skip_reasons: dict = {}
+    logger.info("[data_source=arcticdb] %d tickers with pre-computed features", len(features_by_ticker))
 
     # 2. Load sector map
     sector_map = load_sector_map(predictor_path)
 
-    # 3. Compute features if not already loaded from ArcticDB
-    if features_by_ticker is None:
-        use_feature_store = pb_config.get("use_feature_store", True)
-
-        if use_feature_store and not use_full_cache:
-            all_dates = set()
-            skip_tickers = _MACRO_TICKERS | _SECTOR_ETFS
-            for t, df in price_data.items():
-                if t not in skip_tickers:
-                    all_dates.update(df.index.strftime("%Y-%m-%d"))
-            est_dates = sorted(all_dates)[-max_trading_days:] if all_dates else []
-            if est_dates:
-                features_by_ticker = _load_features_from_store(est_dates, bucket)
-                if features_by_ticker:
-                    logger.info("Using feature store cache (%d tickers) — skipped recomputation", len(features_by_ticker))
-
-        if features_by_ticker is None:
-            features_by_ticker, feature_skip_reasons = compute_all_features(price_data, sector_map, predictor_path)
+    # 3. Inline feature recompute is only hit when ArcticDB's feature coverage
+    #    is insufficient for the requested backtest window (e.g., 10y synthetic
+    #    backtest running before the feature schema was backfilled). In practice
+    #    load_universe_from_arctic returns a non-empty dict for every stock
+    #    ticker in the universe library; this branch is the safety net.
+    if not features_by_ticker:
+        logger.warning("ArcticDB returned no pre-computed features — recomputing inline from OHLCV")
+        features_by_ticker, feature_skip_reasons = compute_all_features(price_data, sector_map, predictor_path)
 
     if not features_by_ticker:
         return {
