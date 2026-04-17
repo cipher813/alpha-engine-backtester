@@ -1,14 +1,19 @@
 """
 monte_carlo.py — Permutation test for signal alpha significance.
 
-Shuffles signal-date assignments N times and compares actual strategy alpha
-to the null distribution. If the actual alpha is not in the top 5% of random
-permutations, the signal is likely noise.
+Uses materialized forward returns from score_performance (populated upstream
+by alpha-engine-data/collectors/signal_returns.py, which JOINs polygon-sourced
+universe_returns onto score rows). Reading the denormalized label column means
+Monte Carlo uses the exact same ground-truth return the weight_optimizer and
+veto_optimizer read — no training-serving skew between the significance gate
+and the promotion gates.
 
-Uses a simplified simulation (top-N by score, equal-weight, hold 5 days)
-to isolate signal quality from execution mechanics.
+Null hypothesis: scores are uninformative. Shuffling scores across rows breaks
+the (score → return) association; a top-N-by-permuted-score selection per date
+is equivalent to a random top-N selection per date.
 
-Data sources: score_performance table in research.db, price data from S3.
+Units: return_Xd and spy_Xd_return are stored as percentages (2.5 = 2.5%);
+output alpha fields are also in percentage units.
 """
 
 from __future__ import annotations
@@ -22,48 +27,57 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HOLD_DAYS = 5
 DEFAULT_TOP_N = 5
 DEFAULT_N_PERMUTATIONS = 1000
+_VALID_HORIZONS = ("5d", "10d", "30d")
 
 
 def run_monte_carlo(
     research_db_path: str,
-    price_data: dict[str, pd.DataFrame],
-    spy_prices: pd.DataFrame | None = None,
     n_permutations: int = DEFAULT_N_PERMUTATIONS,
-    hold_days: int = DEFAULT_HOLD_DAYS,
     top_n: int = DEFAULT_TOP_N,
     min_score: float = 70.0,
+    horizon: str = "5d",
     seed: int = 42,
 ) -> dict:
     """
-    Permutation test for signal alpha significance.
+    Permutation test for signal alpha significance using materialized labels.
 
     Args:
         research_db_path: path to research.db with score_performance table
-        price_data: {ticker: DataFrame with 'Close' column and DatetimeIndex}
-        spy_prices: DataFrame with SPY 'Close' column (for alpha computation)
         n_permutations: number of random shuffles
-        hold_days: holding period for simplified simulation
         top_n: number of top-scoring signals to select per date
         min_score: minimum score threshold for signal inclusion
+        horizon: return horizon — one of {"5d", "10d", "30d"}. Maps to
+                 score_performance columns return_{horizon} + spy_{horizon}_return.
         seed: random seed for reproducibility
 
     Returns dict with:
         status, actual_alpha, p_value, percentile, null_mean, null_std,
-        n_permutations, n_signals, conclusion
+        n_permutations, n_signals, n_signal_dates, horizon, top_n, min_score,
+        conclusion.
     """
+    if horizon not in _VALID_HORIZONS:
+        return {"status": "error", "error": f"Invalid horizon {horizon!r}; expected one of {_VALID_HORIZONS}"}
+
+    return_col = f"return_{horizon}"
+    spy_col = f"spy_{horizon}_return"  # score_performance uses horizon-middle naming
+
     if not Path(research_db_path).exists():
         return {"status": "error", "error": f"research.db not found at {research_db_path}"}
 
-    # ── Load signal history ────────────────────────────────────────────
+    # Load signals with materialized forward returns
     try:
         conn = sqlite3.connect(research_db_path)
         signals_df = pd.read_sql_query(
-            "SELECT ticker, score_date, score, beat_spy_5d, return_5d, spy_return_5d "
-            "FROM score_performance "
-            "WHERE score IS NOT NULL AND score_date IS NOT NULL",
+            f"SELECT symbol AS ticker, score_date, score, "
+            f"       {return_col} AS stock_return, "
+            f"       {spy_col} AS spy_return "
+            f"FROM score_performance "
+            f"WHERE score IS NOT NULL "
+            f"  AND score_date IS NOT NULL "
+            f"  AND {return_col} IS NOT NULL "
+            f"  AND {spy_col} IS NOT NULL",
             conn,
         )
         conn.close()
@@ -71,7 +85,10 @@ def run_monte_carlo(
         return {"status": "error", "error": f"Failed to load signals: {e}"}
 
     if signals_df.empty or len(signals_df) < 20:
-        return {"status": "insufficient_data", "error": f"Only {len(signals_df)} signals found"}
+        return {
+            "status": "insufficient_data",
+            "error": f"Only {len(signals_df)} signals with populated {horizon} returns",
+        }
 
     signals_df["score_date"] = pd.to_datetime(signals_df["score_date"])
     buy_signals = signals_df[signals_df["score"] >= min_score].copy()
@@ -81,25 +98,27 @@ def run_monte_carlo(
 
     signal_dates = sorted(buy_signals["score_date"].unique())
     if len(signal_dates) < 5:
-        return {"status": "insufficient_data", "error": f"Only {len(signal_dates)} unique signal dates"}
+        return {
+            "status": "insufficient_data",
+            "error": f"Only {len(signal_dates)} unique signal dates",
+        }
 
-    # ── Compute actual strategy alpha ──────────────────────────────────
-    actual_alpha = _simulate_strategy(buy_signals, price_data, spy_prices, hold_days, top_n)
+    # Actual (unpermuted) strategy alpha
+    actual_alpha = _compute_portfolio_alpha(buy_signals, top_n)
     if actual_alpha is None:
         return {"status": "error", "error": "Could not compute actual strategy alpha"}
 
-    # ── Run permutations ───────────────────────────────────────────────
+    # Null distribution: shuffle scores across rows (breaks score↔return linkage)
     rng = np.random.RandomState(seed)
-    null_alphas = []
+    null_alphas: list[float] = []
+    score_pool = buy_signals["score"].to_numpy(copy=True)
 
     for i in range(n_permutations):
-        # Shuffle: keep ticker-score pairs, randomize which dates they appear on
-        permuted = buy_signals.copy()
-        permuted_dates = permuted["score_date"].values.copy()
-        rng.shuffle(permuted_dates)
-        permuted["score_date"] = permuted_dates
+        permuted_scores = score_pool.copy()
+        rng.shuffle(permuted_scores)
+        permuted = buy_signals.assign(score=permuted_scores)
 
-        perm_alpha = _simulate_strategy(permuted, price_data, spy_prices, hold_days, top_n)
+        perm_alpha = _compute_portfolio_alpha(permuted, top_n)
         if perm_alpha is not None:
             null_alphas.append(perm_alpha)
 
@@ -109,10 +128,9 @@ def run_monte_carlo(
     if not null_alphas:
         return {"status": "error", "error": "No permutations produced valid results"}
 
-    null_alphas = np.array(null_alphas)
-    p_value = float(np.mean(null_alphas >= actual_alpha))
-    percentile = float(np.mean(null_alphas < actual_alpha) * 100)
-
+    null_arr = np.array(null_alphas)
+    p_value = float(np.mean(null_arr >= actual_alpha))
+    percentile = float(np.mean(null_arr < actual_alpha) * 100)
     conclusion = "significant" if p_value < 0.05 else "not_significant"
 
     result = {
@@ -120,87 +138,42 @@ def run_monte_carlo(
         "actual_alpha": round(actual_alpha, 4),
         "p_value": round(p_value, 4),
         "percentile": round(percentile, 1),
-        "null_mean": round(float(np.mean(null_alphas)), 4),
-        "null_std": round(float(np.std(null_alphas)), 4),
-        "null_min": round(float(np.min(null_alphas)), 4),
-        "null_max": round(float(np.max(null_alphas)), 4),
+        "null_mean": round(float(null_arr.mean()), 4),
+        "null_std": round(float(null_arr.std()), 4),
+        "null_min": round(float(null_arr.min()), 4),
+        "null_max": round(float(null_arr.max()), 4),
         "n_permutations": len(null_alphas),
         "n_signals": len(buy_signals),
         "n_signal_dates": len(signal_dates),
-        "hold_days": hold_days,
+        "horizon": horizon,
         "top_n": top_n,
         "min_score": min_score,
         "conclusion": conclusion,
     }
 
     logger.info(
-        "Monte Carlo complete: actual_alpha=%.4f, p=%.4f, percentile=%.1f%%, conclusion=%s",
+        "Monte Carlo complete: actual_alpha=%.4f%%, p=%.4f, percentile=%.1f%%, conclusion=%s",
         actual_alpha, p_value, percentile, conclusion,
     )
-
     return result
 
 
-def _simulate_strategy(
-    signals: pd.DataFrame,
-    price_data: dict[str, pd.DataFrame],
-    spy_prices: pd.DataFrame | None,
-    hold_days: int,
-    top_n: int,
-) -> float | None:
+def _compute_portfolio_alpha(signals: pd.DataFrame, top_n: int) -> float | None:
     """
-    Simplified portfolio simulation: for each signal date, select top-N by
-    score, equal-weight, hold for hold_days, compute cumulative return vs SPY.
+    Per signal date: pick top-N by score, mean(stock_return) - mean(spy_return)
+    is that date's realized alpha. Average across dates → overall alpha.
+
+    Returns None if no date produces a valid portfolio.
     """
-    portfolio_returns = []
-    spy_returns = []
+    date_alphas: list[float] = []
+    for _, day_signals in signals.groupby("score_date"):
+        top = day_signals.nlargest(top_n, "score")
+        if top.empty:
+            continue
+        portfolio_return = float(top["stock_return"].mean())
+        spy_return = float(top["spy_return"].mean())
+        date_alphas.append(portfolio_return - spy_return)
 
-    for dt in sorted(signals["score_date"].unique()):
-        day_signals = signals[signals["score_date"] == dt].nlargest(top_n, "score")
-
-        stock_rets = []
-        for _, row in day_signals.iterrows():
-            ticker = row["ticker"]
-            df = price_data.get(ticker)
-            if df is None or df.empty:
-                continue
-
-            # Find entry date (signal date or next available)
-            try:
-                entry_idx = df.index.searchsorted(pd.Timestamp(dt))
-                if entry_idx >= len(df):
-                    continue
-                exit_idx = min(entry_idx + hold_days, len(df) - 1)
-                if exit_idx <= entry_idx:
-                    continue
-                entry_price = float(df.iloc[entry_idx]["Close"])
-                exit_price = float(df.iloc[exit_idx]["Close"])
-                if entry_price <= 0:
-                    continue
-                stock_rets.append((exit_price / entry_price) - 1.0)
-            except (KeyError, IndexError):
-                continue
-
-        if stock_rets:
-            portfolio_returns.append(np.mean(stock_rets))
-
-            # SPY return for same period
-            if spy_prices is not None and not spy_prices.empty:
-                try:
-                    spy_entry_idx = spy_prices.index.searchsorted(pd.Timestamp(dt))
-                    spy_exit_idx = min(spy_entry_idx + hold_days, len(spy_prices) - 1)
-                    if spy_exit_idx > spy_entry_idx:
-                        spy_entry = float(spy_prices.iloc[spy_entry_idx]["Close"])
-                        spy_exit = float(spy_prices.iloc[spy_exit_idx]["Close"])
-                        if spy_entry > 0:
-                            spy_returns.append((spy_exit / spy_entry) - 1.0)
-                except (KeyError, IndexError):
-                    pass
-
-    if not portfolio_returns:
+    if not date_alphas:
         return None
-
-    avg_portfolio = np.mean(portfolio_returns)
-    avg_spy = np.mean(spy_returns) if spy_returns else 0.0
-
-    return float(avg_portfolio - avg_spy)
+    return float(np.mean(date_alphas))
