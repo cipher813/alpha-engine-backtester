@@ -446,8 +446,8 @@ def _run_monte_carlo(config: dict) -> dict:
     db_path = config.get("research_db")
     return run_monte_carlo(
         research_db_path=db_path,
-        price_data={},
         n_permutations=config.get("monte_carlo_permutations", 200),
+        horizon=config.get("monte_carlo_horizon", "5d"),
     )
 
 
