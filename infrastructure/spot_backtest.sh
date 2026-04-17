@@ -414,6 +414,54 @@ echo "Backtest complete at \$(date)"
 # independent Step Function step ("Evaluator") on the always-on EC2 after
 # the Backtester step completes. Split 2026-04-12 so eval can run at a
 # different cadence than simulation. See alpha-engine-data PR #23.
+
+# ── Phase 1.4: Replay parity test ──────────────────────────────────────────
+# Post-backtest gate: runs the backtester against the last N live-traded
+# dates and diffs orders against trades.db. Hard-fails on divergence so the
+# Saturday Step Function marks the Backtester step failed, which fires the
+# existing alpha-engine-saturday-sf-failed CloudWatch alarm. Prevents
+# silent logic drift between backtester and executor.
+# See docs/trade_mapping.md for the tolerance contract.
+echo ""
+echo "Running replay parity test..."
+
+PARITY_TRADES_DB="/tmp/trades_latest.db"
+PARITY_REPORT_DIR="/tmp/parity_report"
+mkdir -p "\$PARITY_REPORT_DIR"
+
+if ! aws s3 cp "s3://\${BUCKET}/trades/trades_latest.db" "\$PARITY_TRADES_DB" --quiet; then
+    echo "ERROR: could not download trades_latest.db from S3 — parity cannot run" >&2
+    echo "       backtester → executor drift will go undetected this cycle" >&2
+    exit 1
+fi
+
+# Run the opt-in parity marker. pytest exits non-zero on either divergence
+# (assert failure) or setup RuntimeError (replay_for_dates hard-fail) —
+# both cases halt the spot run and fire the SF-failed alarm.
+PARITY_EXIT=0
+TRADES_DB_PATH="\$PARITY_TRADES_DB" \\
+SIGNALS_BUCKET="\${BUCKET}" \\
+PARITY_REPORT_DIR="\$PARITY_REPORT_DIR" \\
+$REMOTE_PYTHON -m pytest tests/test_parity_replay.py -m parity -v 2>&1 || PARITY_EXIT=\$?
+
+# Upload the report regardless of pass/fail so the divergence categories are
+# visible in S3 even on failure.
+RUN_DATE=\$(date -u +%Y-%m-%d)
+if [ -f "\$PARITY_REPORT_DIR/parity_report.json" ]; then
+    aws s3 cp "\$PARITY_REPORT_DIR/parity_report.json" \\
+        "s3://\${BUCKET}/backtest/\${RUN_DATE}/parity_report.json" --quiet \\
+        && echo "Uploaded parity_report.json to s3://\${BUCKET}/backtest/\${RUN_DATE}/" \\
+        || echo "WARNING: failed to upload parity_report.json (non-fatal)"
+fi
+
+if [ "\$PARITY_EXIT" != "0" ]; then
+    echo "ERROR: parity test failed with exit \$PARITY_EXIT" >&2
+    echo "       Review s3://\${BUCKET}/backtest/\${RUN_DATE}/parity_report.json" >&2
+    echo "       Spot run marked FAILED — SF alarm will fire." >&2
+    exit "\$PARITY_EXIT"
+fi
+
+echo "Parity test passed."
 BACKTEST
 
 echo ""
