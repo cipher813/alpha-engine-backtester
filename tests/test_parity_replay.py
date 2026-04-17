@@ -8,10 +8,12 @@ Opt-in via the `parity` pytest marker so CI on feature branches doesn't
 try to reach S3. Spot instance runs it explicitly via spot_backtest.sh
 after the weekly backtest completes.
 
-Status: SCAFFOLD (2026-04-16).
+Status: WIRING LANDED (2026-04-16, Phase 1.1b).
   * Diff logic (pure functions) is complete and unit-tested below.
-  * `_run_backtester_for_dates()` is a placeholder — the integration test
-    skips until the wiring lands in a follow-up commit (Phase 1.1b).
+  * `_run_backtester_for_dates()` delegates to `backtest.replay_for_dates()`
+    which exercises the live executor (`simulate=True` path) for each date.
+  * Remaining: Phase 1.4 — invoke this test from infrastructure/spot_backtest.sh
+    post-backtest; upload parity_report.json to S3; email on divergence.
 
 Usage:
     # Unit tests (diff logic only) — always run
@@ -148,20 +150,30 @@ def diff_fields(live_trade: dict, replay_trade: dict) -> dict[str, dict]:
     return violations
 
 
-# ── Placeholder: backtester invocation wiring (Phase 1.1b) ──────────────────
+# ── Backtester invocation (Phase 1.1b) ──────────────────────────────────────
 
-def _run_backtester_for_dates(dates: list[str], bucket: str) -> list[dict]:
-    """Replay the backtester for each date, return the order list.
+def _run_backtester_for_dates(dates: list[str], bucket: str,
+                              config_path: str | None = None) -> list[dict]:
+    """Replay the backtester for each date, return the aggregated order list.
 
-    PLACEHOLDER — wiring lands in the next commit. Extracts the single-date
-    call from backtest.py::_run_simulation_loop into a reusable helper that
-    yields the order stream without side effects (no S3 report upload).
+    Thin wrapper over ``backtest.replay_for_dates`` — loads config, overrides
+    the signals_bucket for the caller's convenience, delegates to the helper
+    that factors the per-date orchestration out of ``_run_simulation_loop``.
+
+    Requires ``executor_paths`` in config.yaml to point to a live
+    ``alpha-engine`` checkout — the backtester imports the executor directly
+    rather than reimplementing it, so ``simulate=True`` actually exercises
+    live executor code.
     """
-    raise NotImplementedError(
-        "Phase 1.1b wiring not yet landed — _run_backtester_for_dates is a "
-        "scaffold. Extract backtest.py::_run_simulation_loop into a "
-        "single-date-replay helper in a follow-up commit."
-    )
+    from pipeline_common import load_config
+    import backtest as _bt
+
+    cfg_path = config_path or os.environ.get("BACKTESTER_CONFIG", "config.yaml")
+    config = load_config(cfg_path)
+    if bucket:
+        config["signals_bucket"] = bucket
+
+    return _bt.replay_for_dates(sorted(dates), config)
 
 
 # ── trades.db access ────────────────────────────────────────────────────────

@@ -188,6 +188,16 @@ python -m pytest tests/test_parity_replay.py -m parity -v
   expect trade-count divergence. The test reports this but does not
   distinguish "circuit-breaker fired" from "logic bug" automatically.
   Manual triage required.
+- **State reconstruction at day 1 of the window**. `replay_for_dates()`
+  seeds the sim_client from the full historical signal stream (warmup
+  mode, default) — not from live `trades.db` positions at window-start.
+  Positions + NAV evolve through simulated P&L only. Over many months
+  of replay, simulated and live NAV can drift materially (realized P&L
+  paths diverge). The `position_pct` ±0.5 bps tolerance absorbs small
+  drift; larger drift will surface as `position_pct` violations that
+  are misleading — they reflect NAV divergence, not sizing logic drift.
+  Treat `position_pct`-only failures with skepticism until a future
+  Phase 1.1c adds optional state-seeding from `trades.db` positions.
 
 ---
 
