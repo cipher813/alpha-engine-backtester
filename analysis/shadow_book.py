@@ -47,28 +47,50 @@ def compute_shadow_book_analysis(
     if not Path(trades_db_path).exists():
         return {"status": "error", "error": f"trades.db not found at {trades_db_path}"}
 
+    # Narrow scope of broad-except per backtester-audit-260415 Phase 1.2:
+    # shadow_book is a required input to the replay parity test (Phase 1.1),
+    # so silent-fail on schema corruption or permission errors would mask
+    # parity-test regressions. Only "table missing" is legitimately recoverable
+    # (fresh trades.db on first boot, pre-shadow-book-schema); everything else
+    # propagates to surface as a loud pipeline failure.
+    conn = sqlite3.connect(trades_db_path)
     try:
-        conn = sqlite3.connect(trades_db_path)
+        try:
+            shadow = pd.read_sql_query(
+                "SELECT ticker, date, block_reason, research_score, "
+                "prediction_confidence, predicted_direction, "
+                "intended_position_pct, intended_dollars, "
+                "current_price, market_regime "
+                "FROM executor_shadow_book",
+                conn,
+            )
+        except pd.errors.DatabaseError as exc:
+            msg = str(exc).lower()
+            if "no such table" in msg or "no such column" in msg:
+                return {
+                    "status": "insufficient_data",
+                    "error": f"shadow_book schema not present: {exc}",
+                }
+            raise  # schema corruption / disk error / unexpected condition
 
-        shadow = pd.read_sql_query(
-            "SELECT ticker, date, block_reason, research_score, "
-            "prediction_confidence, predicted_direction, "
-            "intended_position_pct, intended_dollars, "
-            "current_price, market_regime "
-            "FROM executor_shadow_book",
-            conn,
-        )
-
-        trades = pd.read_sql_query(
-            "SELECT ticker, date, fill_price, "
-            "realized_return_pct, realized_alpha_pct, "
-            "trigger_type, days_held "
-            "FROM trades WHERE action = 'ENTER'",
-            conn,
-        )
+        try:
+            trades = pd.read_sql_query(
+                "SELECT ticker, date, fill_price, "
+                "realized_return_pct, realized_alpha_pct, "
+                "trigger_type, days_held "
+                "FROM trades WHERE action = 'ENTER'",
+                conn,
+            )
+        except pd.errors.DatabaseError as exc:
+            msg = str(exc).lower()
+            if "no such table" in msg or "no such column" in msg:
+                return {
+                    "status": "insufficient_data",
+                    "error": f"trades schema not present: {exc}",
+                }
+            raise
+    finally:
         conn.close()
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
 
     if shadow.empty:
         return {"status": "insufficient_data", "error": "no blocked entries in shadow book"}

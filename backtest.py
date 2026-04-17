@@ -110,6 +110,84 @@ def _setup_simulation(config: dict) -> tuple:
     return executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv_by_ticker
 
 
+def _simulate_single_date(
+    executor_run,
+    sim_client,
+    signal_date: str,
+    price_matrix,
+    ohlcv_by_ticker: dict | None,
+    bucket: str,
+    config_override: dict | None,
+    signals_override: dict | None = None,
+) -> tuple[list[dict] | None, str | None]:
+    """
+    Run the executor once for a single signal date.
+
+    Returns ``(orders_or_none, skip_reason)``. On successful run, returns
+    ``(orders_list, None)`` — orders may be an empty list. On skip, returns
+    ``(None, reason_key)`` where reason_key ∈ {no_price_index, empty_prices,
+    no_signals}.
+
+    Side effect: mutates ``sim_client._prices`` and ``sim_client._simulation_date``
+    so state carries forward across calls (matching the existing simulation
+    loop's semantics).
+
+    Extracted from _run_simulation_loop in 2026-04-16 to support the replay
+    parity test (Phase 1.1b of backtester-audit-260415.md) without duplicating
+    the per-date orchestration logic.
+    """
+    import pandas as pd
+
+    ts = pd.Timestamp(signal_date)
+    if ts not in price_matrix.index:
+        # Weekend/holiday signal dates: use next available trading day's prices
+        later = price_matrix.index[price_matrix.index > ts]
+        if len(later) > 0:
+            ts = later[0]
+            logger.debug("Signal date %s not in price index — using next trading day %s",
+                         signal_date, ts.date())
+        else:
+            return None, "no_price_index"
+
+    date_prices = price_matrix.loc[ts].dropna().to_dict()
+    if not date_prices:
+        return None, "empty_prices"
+
+    if signals_override is not None:
+        signals_raw = signals_override
+    else:
+        from loaders import signal_loader
+        try:
+            signals_raw = signal_loader.load(bucket, signal_date)
+        except FileNotFoundError:
+            return None, "no_signals"
+
+    sim_client._prices = date_prices
+    sim_client._simulation_date = signal_date
+
+    # Filter OHLCV histories to <= signal_date (no lookahead)
+    price_histories = None
+    if ohlcv_by_ticker:
+        price_histories = {
+            ticker: [b for b in bars if b["date"] <= signal_date]
+            for ticker, bars in ohlcv_by_ticker.items()
+        }
+
+    orders = executor_run(
+        simulate=True,
+        ibkr_client=sim_client,
+        signals_override=signals_raw,
+        price_histories=price_histories,
+        config_override=config_override,
+    )
+    # Tag each order with the simulation date for downstream parity diffing.
+    # Executor-emitted orders may not include a date field (they carry
+    # fill_time instead); parity needs a `date` key per docs/trade_mapping.md.
+    for order in (orders or []):
+        order.setdefault("date", signal_date)
+    return list(orders or []), None
+
+
 def _run_simulation_loop(
     executor_run,
     SimulatedIBKRClient,
@@ -132,7 +210,6 @@ def _run_simulation_loop(
     signals_by_date: optional pre-built signals for each date (predictor-only mode).
         When provided, uses these instead of loading from S3 via signal_loader.
     """
-    import pandas as pd
     from vectorbt_bridge import orders_to_portfolio
     from vectorbt_bridge import portfolio_stats as compute_portfolio_stats
 
@@ -151,7 +228,7 @@ def _run_simulation_loop(
     config_override = _build_config_override(config)
 
     sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
-    all_orders = []
+    all_orders: list[dict] = []
     dates_simulated = 0
     skip_reasons = {"no_price_index": 0, "empty_prices": 0, "no_signals": 0}
 
@@ -162,52 +239,20 @@ def _run_simulation_loop(
         sim_dates = dates
 
     for signal_date in sim_dates:
-        ts = pd.Timestamp(signal_date)
-        if ts not in price_matrix.index:
-            # Weekend/holiday signal dates: use next available trading day's prices
-            later = price_matrix.index[price_matrix.index > ts]
-            if len(later) > 0:
-                ts = later[0]
-                logger.debug("Signal date %s not in price index — using next trading day %s",
-                             signal_date, ts.date())
-            else:
-                skip_reasons["no_price_index"] += 1
-                continue
-
-        date_prices = price_matrix.loc[ts].dropna().to_dict()
-        if not date_prices:
-            skip_reasons["empty_prices"] += 1
-            continue
-
-        # Load signals: from pre-built dict or from S3
-        if signals_by_date is not None:
-            signals_raw = signals_by_date[signal_date]
-        else:
-            from loaders import signal_loader
-            try:
-                signals_raw = signal_loader.load(bucket, signal_date)
-            except FileNotFoundError:
-                skip_reasons["no_signals"] += 1
-                continue
-
-        sim_client._prices = date_prices
-        sim_client._simulation_date = signal_date
-
-        # Filter OHLCV histories to <= signal_date (no lookahead)
-        price_histories = None
-        if ohlcv_by_ticker:
-            price_histories = {
-                ticker: [b for b in bars if b["date"] <= signal_date]
-                for ticker, bars in ohlcv_by_ticker.items()
-            }
-
-        orders = executor_run(
-            simulate=True,
-            ibkr_client=sim_client,
-            signals_override=signals_raw,
-            price_histories=price_histories,
+        signals_override = signals_by_date[signal_date] if signals_by_date is not None else None
+        orders, skip = _simulate_single_date(
+            executor_run=executor_run,
+            sim_client=sim_client,
+            signal_date=signal_date,
+            price_matrix=price_matrix,
+            ohlcv_by_ticker=ohlcv_by_ticker,
+            bucket=bucket,
             config_override=config_override,
+            signals_override=signals_override,
         )
+        if skip is not None:
+            skip_reasons[skip] += 1
+            continue
         if orders:
             all_orders.extend(orders)
         dates_simulated += 1
@@ -274,6 +319,101 @@ def _run_simulation_loop(
         if price_matrix.attrs.get("unfilled_gaps"):
             stats["unfilled_gaps"] = price_matrix.attrs["unfilled_gaps"]
     return stats
+
+
+# ── Replay helper for parity testing (Phase 1.1b) ──────────────────────────
+
+
+def replay_for_dates(
+    dates: list[str],
+    config: dict,
+    *,
+    warmup_from_full_history: bool = True,
+) -> list[dict]:
+    """
+    Replay the backtester for a specific list of signal dates; return
+    aggregated orders tagged with ``date``.
+
+    Primary consumer: ``tests/test_parity_replay.py`` (Phase 1.1 replay
+    parity test). See ``docs/trade_mapping.md`` for the tolerance contract
+    used to diff the returned orders against ``trades.db``.
+
+    Parameters
+    ----------
+    dates : signal dates to replay orders for, ``"YYYY-MM-DD"`` each.
+    config : loaded via ``pipeline_common.load_config``.
+    warmup_from_full_history : if True (default), replay the FULL historical
+        signal stream up through the latest requested date so the sim_client's
+        NAV / positions have time to evolve before the test window. Only
+        orders on ``dates`` are returned. If False, only the requested dates
+        are simulated starting from ``init_cash`` — fast but NAV-divergent.
+
+    Returns
+    -------
+    list of order dicts — each with at minimum ``date``, ``ticker``, ``action``.
+    Empty list on any simulation setup failure (stale prices, no price index).
+
+    State-reconstruction note
+    -------------------------
+    Neither mode perfectly reconstructs the live executor's state at each
+    date — live NAV on any given date reflects prior realized P&L that the
+    backtester's simulated P&L can drift from. ``position_pct`` tolerance
+    in ``docs/trade_mapping.md`` accounts for small drift; large drift is
+    a signal of logic divergence worth investigating.
+    """
+    executor_run, SimulatedIBKRClient, all_signal_dates, price_matrix, init_cash, ohlcv_by_ticker = \
+        _setup_simulation(config)
+
+    # Hard-fail on setup-level problems per feedback_no_silent_fails.
+    # Returning [] here would let the parity test interpret "no orders" as a
+    # legitimate backtester outcome, surfacing every live trade as a spurious
+    # "only_live" divergence — logic failure indistinguishable from data
+    # failure. Raising surfaces the actual cause in the test error message.
+    if price_matrix is None:
+        raise RuntimeError(
+            "replay_for_dates: _setup_simulation returned no price matrix — "
+            "cannot replay. Likely causes: ArcticDB unreachable, empty signal "
+            "history, or fewer than `min_simulation_dates` signal dates in S3."
+        )
+    if getattr(price_matrix, "attrs", {}).get("stale_circuit_break"):
+        raise RuntimeError(
+            f"replay_for_dates: price-matrix staleness circuit-breaker tripped "
+            f"({price_matrix.attrs.get('staleness_warning')}). Refusing to "
+            f"produce parity output against stale prices."
+        )
+
+    requested = set(dates)
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    config_override = _build_config_override(config)
+    sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
+
+    if warmup_from_full_history and dates:
+        latest_requested = max(dates)
+        sim_dates = [d for d in all_signal_dates if d <= latest_requested]
+    else:
+        sim_dates = sorted(dates)
+
+    captured: list[dict] = []
+    for signal_date in sim_dates:
+        orders, _skip = _simulate_single_date(
+            executor_run=executor_run,
+            sim_client=sim_client,
+            signal_date=signal_date,
+            price_matrix=price_matrix,
+            ohlcv_by_ticker=ohlcv_by_ticker,
+            bucket=bucket,
+            config_override=config_override,
+            signals_override=None,  # load from S3 per date
+        )
+        if orders and signal_date in requested:
+            captured.extend(orders)
+
+    logger.info(
+        "replay_for_dates: %d orders captured across %d requested dates "
+        "(warmup=%s, replayed=%d)",
+        len(captured), len(requested), warmup_from_full_history, len(sim_dates),
+    )
+    return captured
 
 
 # ── Param sweep helpers ─────────────────────────────────────────────────────
