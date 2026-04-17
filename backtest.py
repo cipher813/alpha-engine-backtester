@@ -363,12 +363,24 @@ def replay_for_dates(
     """
     executor_run, SimulatedIBKRClient, all_signal_dates, price_matrix, init_cash, ohlcv_by_ticker = \
         _setup_simulation(config)
+
+    # Hard-fail on setup-level problems per feedback_no_silent_fails.
+    # Returning [] here would let the parity test interpret "no orders" as a
+    # legitimate backtester outcome, surfacing every live trade as a spurious
+    # "only_live" divergence — logic failure indistinguishable from data
+    # failure. Raising surfaces the actual cause in the test error message.
     if price_matrix is None:
-        logger.warning("replay_for_dates: price matrix empty — returning no orders")
-        return []
+        raise RuntimeError(
+            "replay_for_dates: _setup_simulation returned no price matrix — "
+            "cannot replay. Likely causes: ArcticDB unreachable, empty signal "
+            "history, or fewer than `min_simulation_dates` signal dates in S3."
+        )
     if getattr(price_matrix, "attrs", {}).get("stale_circuit_break"):
-        logger.warning("replay_for_dates: stale prices circuit-breaker tripped")
-        return []
+        raise RuntimeError(
+            f"replay_for_dates: price-matrix staleness circuit-breaker tripped "
+            f"({price_matrix.attrs.get('staleness_warning')}). Refusing to "
+            f"produce parity output against stale prices."
+        )
 
     requested = set(dates)
     bucket = config.get("signals_bucket", "alpha-engine-research")
