@@ -100,7 +100,7 @@ def _setup_simulation(config: dict) -> tuple:
         return executor_run, SimulatedIBKRClient, dates, None, init_cash, {}
 
     ohlcv_by_ticker = {}
-    logger.info("Building price matrix for %d dates (yfinance fallback)...", len(dates))
+    logger.info("Building price matrix for %d dates (ArcticDB)...", len(dates))
     price_matrix = price_loader.build_matrix(dates, bucket, _ohlcv_out=ohlcv_by_ticker)
 
     if price_matrix.empty:
