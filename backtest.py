@@ -1081,6 +1081,7 @@ def main() -> None:
         BacktesterPreflight(
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             mode="backtest",
+            executor_paths=config.get("executor_paths") or [],
         ).run()
 
     # Handle --rollback before any other mode
