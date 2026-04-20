@@ -57,6 +57,10 @@ S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 BRANCH="${BRANCH:-main}"
 INSTANCE_TYPE="c5.large"            # 2 vCPU, 4GB RAM — sufficient for 10y backtest
 AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
+# Spot-side watchdog budget: backtester's 10y simulate + param sweep
+# historically runs 60-100 min. 120 min with headroom. Bump (don't
+# silently rely on the orphan reaper) if a run legitimately needs more.
+MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-7200}"
 KEY_NAME="alpha-engine-key"
 KEY_FILE="$HOME/.ssh/alpha-engine-key.pem"
 SECURITY_GROUP="sg-03cd3c4bd91e610b0"
@@ -165,6 +169,16 @@ done
 run_remote() {
     ssh $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" "$@"
 }
+
+# ── Spot-side watchdog ──────────────────────────────────────────────────────
+# Dispatcher-side `trap cleanup EXIT` only fires when THIS bash script exits
+# cleanly. If the dispatcher SSM command is cancelled, the dispatcher EC2
+# is stopped mid-run, or the shell gets SIGKILLed, the trap never runs and
+# the spot orphans until manually terminated — hit 3 times in April 2026.
+# Transient systemd timer on the spot fires shutdown -h now after
+# MAX_RUNTIME_SECONDS regardless of dispatcher state.
+echo "==> Installing spot-side watchdog (${MAX_RUNTIME_SECONDS}s = $((MAX_RUNTIME_SECONDS / 60)) min)..."
+run_remote "sudo systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog --description='alpha-engine spot hard-timeout' /sbin/shutdown -h now"
 
 # ── Bootstrap environment ──────────────────────────────────────────────────────
 echo "==> Bootstrapping EC2 environment..."
