@@ -214,15 +214,18 @@ for REPO in alpha-engine-backtester alpha-engine alpha-engine-predictor; do
 done
 
 # ── Upload .env BEFORE pip install ─────────────────────────────────────────────
-# pip install needs ALPHA_ENGINE_LIB_TOKEN from .env to clone the private
-# alpha-engine-lib repo via git. Uploading .env after pip install (as the
-# script did before) meant the first run on a fresh spot instance failed
-# to install the lib. Same fix the predictor spot_train.sh got on 2026-04-14.
+# .env carries non-secret runtime config (EMAIL_*, S3_BUCKET, etc.) that the
+# workload sources before running. The alpha-engine-lib PAT is NO LONGER
+# sourced from .env — the spot fetches it from SSM at pip-install time (see
+# the DEPS block below). This matches the spot_data_weekly pattern; removes
+# the class of failure where an ALPHA_ENGINE_LIB_TOKEN typo / missing-var on
+# the dispatcher .env crashes a fresh spot bootstrap (hit 2026-04-20 during
+# the partial-execution SF dry-run).
 if [ ! -f "$ENV_FILE" ]; then
     echo "ERROR: .env not found (checked alpha-engine-data/.env, ~/.alpha-engine.env, ./.env)"
     exit 1
 fi
-echo "==> Uploading .env to spot instance (required before pip install)..."
+echo "==> Uploading .env to spot instance..."
 scp $SSH_OPTS -i "$KEY_FILE" \
     "$ENV_FILE" \
     ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-backtester/.env
@@ -232,19 +235,25 @@ run_remote bash -s <<'DEPS'
 set -euo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 
-# Source .env so ALPHA_ENGINE_LIB_TOKEN is available for the git URL
-# rewrite below. Hard-fail if the token is missing — the
-# alpha-engine-lib pip install will fail anonymously with a cryptic
-# error otherwise.
+# Source .env for non-secret runtime vars (EMAIL_*, S3_BUCKET, etc.). The
+# alpha-engine-lib PAT comes from SSM below — keeps the secret off the
+# dispatcher + off the SCP wire.
 set -a
 # shellcheck disable=SC1091
 source /home/ec2-user/alpha-engine-backtester/.env
 set +a
-if [ -z "${ALPHA_ENGINE_LIB_TOKEN:-}" ]; then
-    echo "ERROR: ALPHA_ENGINE_LIB_TOKEN not set in .env — required to pip install private alpha-engine-lib"
+
+# Fetch alpha-engine-lib PAT from SSM Parameter Store. The spot's IAM
+# profile (alpha-engine-executor-profile) grants ssm:GetParameter on
+# /alpha-engine/*. Token is scoped to a local shell var, never exported,
+# unset immediately after git config. Matches spot_data_weekly.sh.
+LIB_TOKEN=$(aws ssm get-parameter --name /alpha-engine/lib-token --with-decryption --query 'Parameter.Value' --output text --region us-east-1 2>/dev/null || echo "")
+if [ -z "$LIB_TOKEN" ]; then
+    echo "ERROR: could not fetch /alpha-engine/lib-token from SSM — required for alpha-engine-lib pip install"
     exit 1
 fi
-git config --global url."https://x-access-token:${ALPHA_ENGINE_LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
+git config --global url."https://x-access-token:${LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
+unset LIB_TOKEN
 
 if command -v python3.12 &>/dev/null; then
     PIP="python3.12 -m pip"
