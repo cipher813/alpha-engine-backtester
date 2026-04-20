@@ -283,9 +283,17 @@ scp $SSH_OPTS -i "$KEY_FILE" \
     ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-backtester/config.yaml
 
 # Copy executor config (needed for simulation).
-# Try EC2 path first (when launched from always-on EC2), then local dev path.
+# Prod path is alpha-engine-config/executor/risk.yaml — the private config
+# repo pulled daily on ae-dashboard by boot-pull. Legacy alpha-engine/config/
+# path is kept for local dev fallback but has not been populated on
+# ae-dashboard since the config-repo split (2026-04-07). Hit 2026-04-20:
+# spot silently fell back to risk.yaml.example, executor read placeholder
+# signals_bucket="your-research-bucket-name", ArcticDB KeyNotFound on a
+# nonexistent bucket.
 EXECUTOR_CONFIG=""
 for candidate in \
+    "$HOME/alpha-engine-config/executor/risk.yaml" \
+    "$HOME/Development/alpha-engine-config/executor/risk.yaml" \
     "$HOME/alpha-engine/config/risk.yaml" \
     "$HOME/Development/alpha-engine/config/risk.yaml"; do
     if [ -f "$candidate" ]; then
@@ -294,15 +302,22 @@ for candidate in \
     fi
 done
 
-if [ -n "$EXECUTOR_CONFIG" ]; then
-    echo "  Uploading risk.yaml from $EXECUTOR_CONFIG"
-    run_remote "mkdir -p /home/ec2-user/alpha-engine/config"
-    scp $SSH_OPTS -i "$KEY_FILE" \
-        "$EXECUTOR_CONFIG" \
-        ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine/config/risk.yaml
-else
-    echo "  WARNING: risk.yaml not found — simulation will be skipped"
+if [ -z "$EXECUTOR_CONFIG" ]; then
+    echo "ERROR: executor risk.yaml not found in any search path:" >&2
+    echo "  ~/alpha-engine-config/executor/risk.yaml" >&2
+    echo "  ~/Development/alpha-engine-config/executor/risk.yaml" >&2
+    echo "  ~/alpha-engine/config/risk.yaml (legacy)" >&2
+    echo "  ~/Development/alpha-engine/config/risk.yaml (legacy)" >&2
+    echo "Backtester simulation cannot run without the executor config — silently" >&2
+    echo "falling back to risk.yaml.example produces all-placeholder bucket names" >&2
+    echo "and ArcticDB KeyNotFoundException deep in the executor-sim run." >&2
+    exit 1
 fi
+echo "  Uploading risk.yaml from $EXECUTOR_CONFIG"
+run_remote "mkdir -p /home/ec2-user/alpha-engine/config"
+scp $SSH_OPTS -i "$KEY_FILE" \
+    "$EXECUTOR_CONFIG" \
+    ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine/config/risk.yaml
 
 # Copy predictor config (needed for predictor backtest).
 PREDICTOR_CONFIG=""
