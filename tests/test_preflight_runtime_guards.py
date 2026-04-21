@@ -74,12 +74,16 @@ def test_check_imports_fails_with_named_module_on_import_error(monkeypatch):
     """When one of the critical imports raises ImportError, the preflight
     failure must name the specific module so the operator sees the fix
     (e.g. pip pin, requirements.txt)."""
-    from preflight import BacktesterPreflight, _CRITICAL_IMPORTS_BACKTEST
+    from preflight import BacktesterPreflight, _CRITICAL_IMPORTS_BACKTEST, _LOCAL_PREIMPORTS_BACKTEST
     import importlib
 
     broken_name = _CRITICAL_IMPORTS_BACKTEST[0]  # e.g. alpha_engine_lib.arcticdb
 
     def fake_import_module(name):
+        # Local preimports must succeed (they're backtester-owned code
+        # and always importable in-repo); fail only on the critical list.
+        if name in _LOCAL_PREIMPORTS_BACKTEST:
+            return types.ModuleType(name)
         raise ImportError(f"simulated: no module named {name!r}")
 
     monkeypatch.setattr(importlib, "import_module", fake_import_module)
@@ -91,6 +95,51 @@ def test_check_imports_fails_with_named_module_on_import_error(monkeypatch):
     assert broken_name in msg
     assert "requirements.txt" in msg
     assert "pip install" in msg
+
+
+def test_check_imports_preloads_local_modules_before_sys_path_insert(monkeypatch, tmp_path):
+    """Sibling-repo collision defense: backtester's own store.arctic_reader
+    must be imported and cached in sys.modules BEFORE sibling predictor_path
+    lands on sys.path[0]. Otherwise synthetic.predictor_backtest's
+    ``from store.arctic_reader import load_universe_from_arctic`` resolves
+    to predictor's same-named module (missing that function)."""
+    from preflight import BacktesterPreflight, _LOCAL_PREIMPORTS_BACKTEST
+    import sys
+    import importlib
+
+    ordered_calls: list[str] = []
+    real_import_module = importlib.import_module
+
+    def tracking_import_module(name):
+        ordered_calls.append(name)
+        if name == "store.arctic_reader":
+            # Simulate the local import succeeding
+            return real_import_module(name)
+        return types.ModuleType(name)  # stub the rest
+
+    monkeypatch.setattr(importlib, "import_module", tracking_import_module)
+
+    pred_root = tmp_path / "pred"
+    pred_root.mkdir()
+    preflight = BacktesterPreflight(
+        bucket="test-bucket",
+        mode="backtest",
+        predictor_paths=[str(pred_root)],
+    )
+    preflight._check_imports()
+
+    # Every _LOCAL_PREIMPORTS_BACKTEST entry must appear BEFORE the first
+    # sibling-repo module import. Look for the position of
+    # "synthetic.predictor_backtest" (predictor-sibling) — it must come
+    # after all local preimports.
+    synthetic_pos = ordered_calls.index("synthetic.predictor_backtest")
+    for local in _LOCAL_PREIMPORTS_BACKTEST:
+        assert local in ordered_calls, f"{local} not preimported"
+        assert ordered_calls.index(local) < synthetic_pos, (
+            f"{local} was imported at position {ordered_calls.index(local)}, "
+            f"after synthetic.predictor_backtest at {synthetic_pos} — sibling "
+            "collision defense broken"
+        )
 
 
 def test_check_imports_inserts_executor_and_predictor_paths(monkeypatch, tmp_path):
@@ -138,17 +187,16 @@ def test_check_imports_inserts_executor_and_predictor_paths(monkeypatch, tmp_pat
 
 def test_check_imports_passes_when_all_modules_resolve(monkeypatch):
     """Happy path: when importlib.import_module returns cleanly for every
-    listed module, _check_imports must not raise.
+    listed module (local + critical), _check_imports must not raise.
 
-    (The critical-imports list includes executor/predictor modules that
+    The critical-imports list includes executor/predictor modules that
     are only on sys.path in the spot deploy layout, not in the local
     backtester dev venv — so we monkeypatch import_module here rather
-    than relying on the local env to actually have them.)"""
+    than relying on the local env to actually have them."""
     from preflight import BacktesterPreflight
     import importlib
 
-    fake_module = types.ModuleType("fake")
-    monkeypatch.setattr(importlib, "import_module", lambda name: fake_module)
+    monkeypatch.setattr(importlib, "import_module", lambda name: types.ModuleType(name))
 
     preflight = BacktesterPreflight(bucket="test-bucket", mode="backtest")
     preflight._check_imports()  # must not raise

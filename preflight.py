@@ -78,6 +78,19 @@ _REQUIRED_PREDICTOR_WEIGHTS = (
     "predictor/weights/meta/momentum_model.txt.meta.json",
 )
 
+# Backtester-local modules that must be pre-imported before sibling repo
+# paths land on sys.path. Rationale: the predictor repo ships its own
+# ``store.arctic_reader`` with a different API; once predictor_path is
+# at sys.path[0], ``from store.arctic_reader import load_universe_from_arctic``
+# (in backtester's ``synthetic/predictor_backtest.py``) resolves to the
+# wrong module and ImportErrors. In production these modules load via
+# backtester's top-level imports BEFORE predictor_path is inserted;
+# preflight runs before those top-level imports so we eagerly load
+# them here to match the production sys.modules cache ordering.
+_LOCAL_PREIMPORTS_BACKTEST = (
+    "store.arctic_reader",
+)
+
 
 class BacktesterPreflight(BasePreflight):
     """Preflight checks for the three backtester entrypoints."""
@@ -177,12 +190,38 @@ class BacktesterPreflight(BasePreflight):
         Preflight does the same inserts first so the import check
         matches production import resolution.
 
+        **Sibling-repo collision defense:** the backtester and predictor
+        both ship a ``store/arctic_reader.py`` with different APIs (the
+        backtester's has ``load_universe_from_arctic``; the predictor's
+        does not). Once predictor_path lands at sys.path[0], Python
+        resolves ``store.arctic_reader`` to the predictor version and
+        ``synthetic.predictor_backtest``'s top-level import of
+        ``load_universe_from_arctic`` fails. In production this
+        doesn't bite because backtester's top-level modules have
+        already loaded (and cached in sys.modules) before predictor_path
+        is prepended. Preflight runs before any top-level backtester
+        imports, so we eagerly pre-load the local ``store`` modules
+        here to match that production ordering.
+
         Mode-specific list: only ``backtest`` mode imports the executor
         and predictor repos. ``evaluate`` / ``lambda_health`` have
         their own narrower call chains (validated by their own preflight
         branches as needed).
         """
         import sys
+
+        # Pre-import backtester-local modules that have same-name
+        # siblings in executor/predictor repos. Cache wins regardless
+        # of subsequent sys.path insert order.
+        for local in _LOCAL_PREIMPORTS_BACKTEST:
+            try:
+                importlib.import_module(local)
+            except ImportError as exc:
+                raise RuntimeError(
+                    f"Pre-flight: could not import local module "
+                    f"{local!r} — backtester's own code is broken. "
+                    f"Underlying error: {exc}"
+                ) from exc
 
         for candidates in (self.executor_paths, self.predictor_paths):
             for p in candidates:
