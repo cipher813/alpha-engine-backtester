@@ -157,39 +157,63 @@ def compute_all_features(
 
 def download_gbm_model(bucket: str = "alpha-engine-research", region: str = "us-east-1") -> str:
     """
-    Download GBM model weights + metadata from S3 to a temp file.
+    Download the v3 Layer-1A momentum GBM from S3 to a temp file.
 
-    Tries predictor/weights/ first, falls back to backtest/ prefix
-    (EC2 IAM role may lack access to predictor/ prefix).
+    Source: ``predictor/weights/meta/momentum_model.txt`` — the Layer-1A
+    quant GBM that the v3 meta-model uses as an input, re-trained every
+    Saturday alongside the rest of the meta stack. Saved by the current
+    ``GBMScorer.save`` which persists ``feature_names`` metadata, so the
+    backtester's feature-alignment check (``scorer.feature_names``) works
+    cleanly.
 
-    Returns the local path to the model file.
+    Why Layer-1A specifically (not the Ridge meta-model): the 10y synthetic
+    backtest needs a pure quant scorer fed per-ticker features. The Ridge
+    meta combines quant output with a Research calibrator whose input
+    (Research composite score) only exists from ~March 2026 onward —
+    replaying the full v3 stack over 10y would require fabricating research
+    signals for 9.8 years of history. Scoping predictor-backtest to Layer
+    1A measures the quant component in isolation, which per
+    feedback_component_baseline_validation is the right standalone
+    baseline for a stacked ensemble.
+
+    Previously loaded ``predictor/weights/gbm_latest.txt`` — a v2 artifact
+    last updated 2026-03-28, ripped from production 2026-04-13. Every
+    Saturday since has been measuring a dead model. Cleanup of the stale
+    v2 S3 artifacts is tracked in ROADMAP P2 "v2 legacy artifact cleanup".
+
+    Returns the local path to the downloaded model.
     """
     s3 = boto3.client("s3", region_name=region)
 
-    # Download booster file — try primary path, fall back to backtest/ mirror
+    model_key = "predictor/weights/meta/momentum_model.txt"
+    meta_key = "predictor/weights/meta/momentum_model.txt.meta.json"
+
     model_tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
     model_tmp.close()
-    for key in ("predictor/weights/gbm_latest.txt", "backtest/gbm_latest.txt"):
-        try:
-            s3.download_file(bucket, key, model_tmp.name)
-            logger.info("Downloaded GBM model from s3://%s/%s", bucket, key)
-            break
-        except Exception as e:
-            logger.debug("Could not download %s: %s", key, e)
-    else:
+    try:
+        s3.download_file(bucket, model_key, model_tmp.name)
+        logger.info("Downloaded Layer-1A momentum GBM from s3://%s/%s", bucket, model_key)
+    except Exception as exc:
         raise RuntimeError(
-            f"GBM model not found in S3 bucket {bucket} at "
-            "predictor/weights/gbm_latest.txt or backtest/gbm_latest.txt"
-        )
+            f"Layer-1A momentum GBM not found at s3://{bucket}/{model_key}. "
+            "Saturday PredictorTraining step must populate predictor/weights/"
+            "meta/momentum_model.txt on each run — investigate the training "
+            f"pipeline if this key is missing. Underlying error: {exc}"
+        ) from exc
 
-    # Download metadata (optional)
+    # Download metadata — hard-fail if missing. The backtester hard-requires
+    # feature_names from the meta.json for input alignment; a successful
+    # download of the booster with no meta.json would crash downstream in a
+    # less useful place.
     meta_path = model_tmp.name + ".meta.json"
-    for meta_key in ("predictor/weights/gbm_latest.txt.meta.json", "backtest/gbm_latest.txt.meta.json"):
-        try:
-            s3.download_file(bucket, meta_key, meta_path)
-            break
-        except Exception:
-            continue
+    try:
+        s3.download_file(bucket, meta_key, meta_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Layer-1A momentum GBM metadata not found at s3://{bucket}/"
+            f"{meta_key}. feature_names alignment will fail without it. "
+            f"Underlying error: {exc}"
+        ) from exc
 
     return model_tmp.name
 
