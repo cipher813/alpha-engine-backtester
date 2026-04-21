@@ -30,36 +30,55 @@ class TestBacktesterPreflight:
         with patch.object(pf, "check_env_vars") as env, \
              patch.object(pf, "check_s3_bucket") as s3, \
              patch.object(pf, "check_arcticdb_fresh") as adb, \
-             patch.object(pf, "_check_executor_config") as exec_cfg:
+             patch.object(pf, "_check_executor_config") as exec_cfg, \
+             patch.object(pf, "_check_lib_version") as lib_v, \
+             patch.object(pf, "_check_imports") as imports, \
+             patch.object(pf, "_check_predictor_weights") as pred_w:
             pf.run()
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
         adb.assert_called_once_with("macro", "SPY", max_stale_days=8)
         exec_cfg.assert_called_once()
+        lib_v.assert_called_once()
+        imports.assert_called_once()
+        pred_w.assert_called_once()
 
     def test_evaluate_mode_skips_arcticdb(self):
         pf = BacktesterPreflight(bucket="b", mode="evaluate")
         with patch.object(pf, "check_env_vars") as env, \
              patch.object(pf, "check_s3_bucket") as s3, \
              patch.object(pf, "check_arcticdb_fresh") as adb, \
-             patch.object(pf, "_check_executor_config") as exec_cfg:
+             patch.object(pf, "_check_executor_config") as exec_cfg, \
+             patch.object(pf, "_check_lib_version") as lib_v, \
+             patch.object(pf, "_check_imports") as imports, \
+             patch.object(pf, "_check_predictor_weights") as pred_w:
             pf.run()
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
         adb.assert_not_called()
         exec_cfg.assert_not_called()
+        # Backtest-mode-only checks must also not fire in evaluate mode.
+        lib_v.assert_not_called()
+        imports.assert_not_called()
+        pred_w.assert_not_called()
 
     def test_lambda_health_mode_skips_arcticdb(self):
         pf = BacktesterPreflight(bucket="b", mode="lambda_health")
         with patch.object(pf, "check_env_vars") as env, \
              patch.object(pf, "check_s3_bucket") as s3, \
              patch.object(pf, "check_arcticdb_fresh") as adb, \
-             patch.object(pf, "_check_executor_config") as exec_cfg:
+             patch.object(pf, "_check_executor_config") as exec_cfg, \
+             patch.object(pf, "_check_lib_version") as lib_v, \
+             patch.object(pf, "_check_imports") as imports, \
+             patch.object(pf, "_check_predictor_weights") as pred_w:
             pf.run()
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
         adb.assert_not_called()
         exec_cfg.assert_not_called()
+        lib_v.assert_not_called()
+        imports.assert_not_called()
+        pred_w.assert_not_called()
 
 
 class TestExecutorConfigCheck:

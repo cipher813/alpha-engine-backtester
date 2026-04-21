@@ -10,10 +10,18 @@ motivated the library.
 Modes:
 
 - ``"backtest"`` — ``backtest.py`` entrypoint (weekly spot instance).
-  S3 bucket reachable + ArcticDB ``macro/SPY`` fresh + the executor
+  Verifies that every module the full backtest call chain will import
+  is actually importable now (imports, lib version, predictor weights)
+  + S3 bucket reachable + ArcticDB ``macro/SPY`` fresh + the executor
   risk.yaml the simulate path will import resolves to a real config
   (not the placeholder .example template). 8-day threshold covers
   Fri→Mon weekly cadence + buffer.
+
+  2026-04-21 incident motivated the import/version/weights additions:
+  a Saturday SF dry-run burned ~80 minutes of c5.large compute before
+  failing on ``No module named 'alpha_engine_lib.arcticdb'`` deep in
+  ``_run_simulation_loop``. The three new preflight checks below all
+  run in <2 seconds and would have caught the same bug at startup.
 - ``"evaluate"`` — ``evaluate.py`` entrypoint. Reads simulation
   artifacts from S3 only, no ArcticDB. Keep the check cheap.
 - ``"lambda_health"`` — daily predictor health check Lambda. Reads
@@ -22,6 +30,7 @@ Modes:
 
 from __future__ import annotations
 
+import importlib
 import os
 
 import yaml
@@ -33,6 +42,41 @@ from alpha_engine_lib.preflight import BasePreflight
 # template. A bucket/path value starting with this is definitionally a
 # not-filled-in config and must never reach a live S3/ArcticDB read.
 _PLACEHOLDER_PREFIX = "your-"
+
+# Minimum alpha-engine-lib version the backtester depends on at runtime.
+# Keep in sync with the ``@vX.Y.Z`` pin in ``requirements.txt``. Bump when
+# a new symbol from the lib is imported by any backtest call path.
+#
+# Current floor: 0.1.4 — introduces ``alpha_engine_lib.arcticdb`` which
+# ``backtest._run_simulation_loop`` depends on to filter historical
+# signals against the current universe.
+MIN_LIB_VERSION = "0.1.4"
+
+# Modules whose imports are load-bearing for the backtest modes. Any
+# missing or non-importable entry here would surface deep in the call
+# chain; listing them explicitly here makes the failure show up in
+# seconds at preflight instead of ~80 minutes into a spot run.
+_CRITICAL_IMPORTS_BACKTEST = (
+    # alpha-engine-lib submodules we directly call
+    "alpha_engine_lib.arcticdb",
+    "alpha_engine_lib.logging",
+    "alpha_engine_lib.preflight",
+    # executor modules — simulate path
+    "executor.main",
+    "executor.ibkr",
+    # synthetic — predictor-backtest mode (10y GBM replay)
+    "synthetic.predictor_backtest",
+    # predictor model — loaded inside download_gbm_model
+    "model.gbm_scorer",
+)
+
+# S3 keys the backtester's predictor-backtest mode HEADs before spending
+# 10y × ~900 tickers on GBM inference. Missing means PredictorTraining
+# has not populated the Layer-1A weights — investigate there.
+_REQUIRED_PREDICTOR_WEIGHTS = (
+    "predictor/weights/meta/momentum_model.txt",
+    "predictor/weights/meta/momentum_model.txt.meta.json",
+)
 
 
 class BacktesterPreflight(BasePreflight):
@@ -59,6 +103,13 @@ class BacktesterPreflight(BasePreflight):
         self.check_s3_bucket()
 
         if self.mode == "backtest":
+            # Environment checks first — cheapest, and catch the class
+            # of failure where the spot's pip install didn't pull the
+            # pin we expected. ~2 seconds total. All three would have
+            # caught the 2026-04-21 80-minute burn.
+            self._check_lib_version()
+            self._check_imports()
+            self._check_predictor_weights()
             # synthetic/predictor_backtest.py reads from ArcticDB. SPY
             # lives in the ``macro`` library (market-wide series); its
             # freshness is a sufficient signal that the ArcticDB write
@@ -73,6 +124,87 @@ class BacktesterPreflight(BasePreflight):
             # the executor-sim call chain. Caught at preflight so the
             # operator sees the real cause in <1s. Hit 2026-04-20.
             self._check_executor_config()
+
+    # ── Environment primitives (added 2026-04-21 post-80min-burn) ────────
+
+    def _check_lib_version(self) -> None:
+        """Fail if the installed alpha_engine_lib is older than the
+        minimum the backtester's call chain needs.
+
+        Triggers when the spot's pip install silently fell back to a
+        cached older version (or when requirements.txt was bumped but
+        MIN_LIB_VERSION here wasn't — same bug in the other direction).
+        """
+        import alpha_engine_lib
+        from packaging.version import Version
+
+        installed = getattr(alpha_engine_lib, "__version__", None)
+        if not installed:
+            raise RuntimeError(
+                "Pre-flight: alpha_engine_lib has no __version__ "
+                "attribute — likely a broken install. Re-run the pip "
+                "install step on this host."
+            )
+        if Version(installed) < Version(MIN_LIB_VERSION):
+            raise RuntimeError(
+                f"Pre-flight: alpha_engine_lib {installed} < required "
+                f"{MIN_LIB_VERSION}. Spot's pip install may have pulled "
+                "a stale cached version, or requirements.txt drifted "
+                "from MIN_LIB_VERSION in preflight.py. The 2026-04-21 "
+                "Saturday SF dry-run burned ~80 min on this exact class "
+                "of failure before surfacing a deep-call-chain import "
+                "error — this check catches it at startup."
+            )
+
+    def _check_imports(self) -> None:
+        """Actually import every module the deep call chain relies on.
+
+        A Python ImportError from inside ``_run_simulation_loop`` (or
+        any of the other deep-call-stack sites) takes minutes-to-hours
+        of spot time to surface because nothing before that point tries
+        to import the module. Surfacing it at preflight is worth the
+        ~1 second of extra import cost at startup.
+
+        Mode-specific list: only ``backtest`` mode imports the executor
+        and predictor repos. ``evaluate`` / ``lambda_health`` have
+        their own narrower call chains (validated by their own preflight
+        branches as needed).
+        """
+        for name in _CRITICAL_IMPORTS_BACKTEST:
+            try:
+                importlib.import_module(name)
+            except ImportError as exc:
+                raise RuntimeError(
+                    f"Pre-flight: could not import {name!r} — would "
+                    "have crashed deep in the backtest call chain. "
+                    "Check requirements.txt pin + that pip install "
+                    "completed successfully on this host. Underlying "
+                    f"error: {exc}"
+                ) from exc
+
+    def _check_predictor_weights(self) -> None:
+        """S3 HEAD on the Layer-1A momentum GBM weights + metadata.
+
+        ``synthetic/predictor_backtest.py::download_gbm_model`` reads
+        these keys near the start of predictor-backtest mode. If they
+        don't exist, fail now (seconds) instead of after the
+        universe-data load (minutes) and report the named upstream
+        owner in the error.
+        """
+        import boto3
+        s3 = boto3.client("s3", region_name=self.region)
+        for key in _REQUIRED_PREDICTOR_WEIGHTS:
+            try:
+                s3.head_object(Bucket=self.bucket, Key=key)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Pre-flight: required key s3://{self.bucket}/{key} "
+                    "is missing or unreadable. The Layer-1A momentum "
+                    "GBM backtest requires this file; Saturday SF's "
+                    "PredictorTraining step must populate "
+                    "predictor/weights/meta/momentum_model.txt every "
+                    f"run — investigate there. Underlying error: {exc}"
+                ) from exc
 
     # ── Mode-specific primitives ─────────────────────────────────────────
 
