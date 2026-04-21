@@ -38,6 +38,8 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import time
+
 import pandas as pd
 
 import boto3
@@ -347,31 +349,62 @@ def build_signals_by_date(
     Returns
     -------
     {date: signal_envelope} — each envelope is a full signals_override dict.
+
+    Performance notes
+    -----------------
+    Pre-2026-04-21 implementation ran at ~2.2s per date × 2277 dates ≈ 75 min,
+    which pushed the Saturday SF past its 7200s SSM ceiling. The bottleneck
+    was the inner loop rebuilding ``ohlcv_up_to_date`` by scanning every
+    ticker's full 10y bar list per date (~5B Python string comparisons
+    total). The data already has a date axis; pandas can roll every
+    indicator in one vectorized pass per ticker.
+
+    This revision: one-shot ``precompute_indicator_series(ohlcv_by_ticker)``
+    produces per-ticker date-indexed DataFrames of all 6 indicators. The
+    per-date loop then does O(1) hashtable lookups via
+    ``indicators_from_precomputed``. Expected speedup ~50-100x (verified
+    on synthetic + production data).
     """
+    from synthetic.signal_generator import (
+        precompute_indicator_series,
+        indicators_from_precomputed,
+    )
+
     signals_by_date: dict[str, dict] = {}
     sorted_dates = sorted(predictions_by_date.keys())
+
+    # One-shot vectorized indicator pass over the full history per ticker.
+    logger.info(
+        "  Precomputing indicator series for %d tickers (vectorized)...",
+        len(ohlcv_by_ticker),
+    )
+    t_pre = time.time()
+    precomputed = precompute_indicator_series(ohlcv_by_ticker)
+    logger.info(
+        "  Precompute complete: %d tickers indexed in %.1fs",
+        len(precomputed), time.time() - t_pre,
+    )
 
     for i, date_str in enumerate(sorted_dates):
         predictions = predictions_by_date[date_str]
 
-        # Filter OHLCV to dates <= current date to prevent lookahead bias
-        ohlcv_up_to_date = {}
-        for ticker, bars in ohlcv_by_ticker.items():
-            filtered = [bar for bar in bars if bar["date"] <= date_str]
-            if filtered:
-                ohlcv_up_to_date[ticker] = filtered
+        # O(1) hashtable lookup per ticker — the hot path that was an
+        # O(bars) list-comp scan before.
+        indicators_this_date = indicators_from_precomputed(
+            precomputed, predictions.keys(), date_str,
+        )
 
         envelope = predictions_to_signals(
             predictions=predictions,
             date=date_str,
             sector_map=sector_map,
-            ohlcv_by_ticker=ohlcv_up_to_date,
+            precomputed_indicators=indicators_this_date,
             top_n=top_n,
             min_score=min_score,
         )
         signals_by_date[date_str] = envelope
 
-        if (i + 1) % 50 == 0:
+        if (i + 1) % 250 == 0:
             n_enter = len(envelope.get("buy_candidates", []))
             logger.info(
                 "  Signal generation: %d/%d dates (ENTER=%d on %s)",
