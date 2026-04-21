@@ -1332,6 +1332,7 @@ def main() -> None:
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             mode="backtest",
             executor_paths=config.get("executor_paths") or [],
+            predictor_paths=config.get("predictor_paths") or [],
         ).run()
 
         # Runtime smoke: end-to-end sanity with minimal data (~30-60s).
