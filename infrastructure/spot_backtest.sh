@@ -366,18 +366,13 @@ if [ "$RUN_MODE" = "smoke-only" ]; then
     echo "  SMOKE TEST"
     echo "═══════════════════════════════════════════════════════════════"
 
-    # Exercises BOTH entrypoint code paths end-to-end on a fresh spot:
-    #   1. A Python one-liner that imports backtest, calls setup_logging
-    #      and BacktesterPreflight(mode="backtest"). backtest.py has no
-    #      "validate-and-exit" mode; all real modes (simulate, param-
-    #      sweep, predictor-backtest) are heavyweight. This validates
-    #      the module-level import chain, alpha_engine_lib.logging, and
-    #      the ArcticDB SPY freshness check without spending compute.
-    #   2. evaluate.py --mode diagnostics --freeze --date <latest> —
-    #      validates BacktesterPreflight(mode="evaluate") + the
-    #      artifact-reader path. --date is pinned to the most recent
-    #      backtest/{YYYY-MM-DD}/ prefix so non-Saturday smoke runs
-    #      don't hit the hard-fail guard in _init_data_sources.
+    # backtest.py --mode=smoke runs BacktesterPreflight + runtime smoke
+    # (end-to-end with minimal data: universe symbols, per-ticker Arctic
+    # read, recent signals.json load, Layer-1A GBM load + predict) and
+    # exits 0. Keeps the smoke path in lockstep with what full modes do
+    # at startup — no drift between bash-driven smoke and in-process
+    # pipeline validation. Evaluate-mode smoke follows: artifact-read
+    # path + BacktesterPreflight(mode="evaluate").
     run_remote bash -s <<SMOKE
 set -euo pipefail
 cd /home/ec2-user/alpha-engine-backtester
@@ -385,18 +380,8 @@ ${ENV_SOURCE}
 
 BUCKET="\${OUTPUT_BUCKET:-alpha-engine-research}"
 
-echo "==> Smoke: backtest.py import + BacktesterPreflight(mode=\"backtest\")"
-$REMOTE_PYTHON - <<'PY'
-import os
-os.chdir("/home/ec2-user/alpha-engine-backtester")
-from alpha_engine_lib.logging import setup_logging
-setup_logging("backtest-smoke")
-import backtest  # noqa: F401 — validate top-level import chain
-from preflight import BacktesterPreflight
-bucket = os.environ.get("OUTPUT_BUCKET", "alpha-engine-research")
-BacktesterPreflight(bucket=bucket, mode="backtest").run()
-print("backtest smoke: imports + preflight OK")
-PY
+echo "==> Smoke: backtest.py --mode=smoke (preflight + runtime smoke)"
+$REMOTE_PYTHON backtest.py --mode=smoke --log-level INFO
 
 echo ""
 echo "==> Resolving most recent backtest artifact date from s3://\${BUCKET}/backtest/..."

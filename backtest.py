@@ -887,14 +887,167 @@ def _stop_ec2_instance() -> None:
         logger.error("Failed to stop instance: %s", e)
 
 
+# ── Runtime smoke test ──────────────────────────────────────────────────────
+
+
+_SMOKE_SAMPLE_TICKERS = ("AAPL", "MSFT", "NVDA", "JNJ", "PG")
+
+
+def _runtime_smoke(config: dict) -> None:
+    """End-to-end smoke test with minimal data.
+
+    Exercises the SAME module imports + S3 reads + ArcticDB reads + model
+    load paths as the full backtest, but scoped to a handful of tickers
+    and a single recent signal date so it completes in ~30-60 seconds.
+
+    Runs after BacktesterPreflight to catch environment issues that the
+    cheap preflight can't see from import checks alone:
+      - Actual ArcticDB `read()` works (not just `list_symbols`)
+      - signal_loader resolves a usable signals.json
+      - The Layer-1A GBM booster loads and predicts on a real feature
+        tensor with `scorer.feature_names` populated
+
+    Raises RuntimeError with a named ``[stage=X]`` prefix on the first
+    failure so the operator sees exactly where in the end-to-end chain
+    the real problem is — not "your 80-minute backtest died in stage N."
+
+    Motivated by the 2026-04-21 Saturday SF dry-run where
+    ``No module named 'alpha_engine_lib.arcticdb'`` surfaced ~80 minutes
+    into a spot run. With preflight + runtime smoke, the same failure
+    would surface in ~2 seconds (preflight) or ~30 seconds (smoke).
+    """
+    import numpy as np
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+
+    def _fail(stage: str, exc: Exception) -> RuntimeError:
+        return RuntimeError(
+            f"Runtime smoke FAILED [stage={stage}]: {exc}. "
+            "Full backtest is aborted to avoid 60-80 minutes of wasted "
+            "spot compute. Fix the underlying issue and re-run."
+        )
+
+    # Stage 1: universe symbols end-to-end (catches lib/arcticdb issues
+    # that preflight's import check only surfaces at import time).
+    try:
+        from alpha_engine_lib.arcticdb import get_universe_symbols
+        symbols = get_universe_symbols(bucket)
+        if not symbols:
+            raise RuntimeError("empty universe — ArcticDB has zero symbols")
+        sample = [t for t in _SMOKE_SAMPLE_TICKERS if t in symbols][:3]
+        if not sample:
+            raise RuntimeError(
+                f"none of {_SMOKE_SAMPLE_TICKERS} are in the current universe "
+                f"({len(symbols)} symbols) — universe drift or a broken library"
+            )
+    except Exception as exc:
+        raise _fail("universe_symbols", exc) from exc
+    logger.info("Smoke [universe_symbols]: %d symbols, sample=%s", len(symbols), sample)
+
+    # Stage 2: per-ticker ArcticDB read (catches per-symbol read failures
+    # that list_symbols alone wouldn't surface).
+    try:
+        from alpha_engine_lib.arcticdb import open_universe_lib
+        lib = open_universe_lib(bucket)
+        for t in sample:
+            df = lib.read(t).data
+            if df.empty:
+                raise RuntimeError(f"{t}: empty frame")
+    except Exception as exc:
+        raise _fail("arcticdb_per_ticker_read", exc) from exc
+    logger.info("Smoke [arcticdb_per_ticker_read]: %d tickers read OK", len(sample))
+
+    # Stage 3: recent signals.json loads and parses. Simulate mode
+    # depends on this working for every replayed date; if the most
+    # recent one can't be loaded the full replay would also fail.
+    try:
+        from loaders import signal_loader
+        # signal_loader has `list_dates` or similar — fall back to a
+        # direct S3 list if needed. Scope lookback generously.
+        recent = _latest_signals_date(bucket)
+        if recent is None:
+            raise RuntimeError("no signals/{date}/signals.json found in S3 (14d lookback)")
+        signals_raw = signal_loader.load(bucket, recent)
+        if not isinstance(signals_raw, dict) or not signals_raw.get("date"):
+            raise RuntimeError(f"{recent}/signals.json parsed but missing 'date' field")
+    except Exception as exc:
+        raise _fail("signals_load", exc) from exc
+    logger.info("Smoke [signals_load]: loaded %s/signals.json OK", recent)
+
+    # Stage 4: Layer-1A GBM loads and predicts. Covers the
+    # download_gbm_model + GBMScorer.load + scorer.predict path that
+    # predictor-backtest mode exercises over 10y. A single tensor of
+    # zeros is enough to verify feature_names is populated + the
+    # booster is callable.
+    try:
+        from synthetic.predictor_backtest import download_gbm_model
+        from model.gbm_scorer import GBMScorer
+        model_path = download_gbm_model(bucket=bucket)
+        try:
+            scorer = GBMScorer.load(model_path)
+            if not scorer.feature_names:
+                raise RuntimeError("loaded scorer has empty feature_names")
+            X = np.zeros((len(sample), len(scorer.feature_names)), dtype=np.float32)
+            preds = scorer.predict(X)
+            if len(preds) != len(sample):
+                raise RuntimeError(
+                    f"prediction shape mismatch: expected {len(sample)}, got {len(preds)}"
+                )
+        finally:
+            # Always clean up the temp file — _runtime_smoke runs before
+            # the full modes and the temp downloads would otherwise
+            # accumulate in /tmp across smoke + full invocations.
+            import os
+            for p in (model_path, model_path + ".meta.json"):
+                if os.path.exists(p):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+    except Exception as exc:
+        raise _fail("gbm_load_predict", exc) from exc
+    logger.info(
+        "Smoke [gbm_load_predict]: scorer loaded, feature_names populated (%d features), "
+        "predict returned %d values",
+        len(scorer.feature_names), len(preds),
+    )
+
+    logger.info("Runtime smoke PASSED — proceeding to full backtest modes")
+
+
+def _latest_signals_date(bucket: str, max_lookback: int = 14) -> str | None:
+    """Return the most recent date (YYYY-MM-DD) whose signals.json is in S3,
+    or None if none found within ``max_lookback`` calendar days.
+
+    Walked day-by-day via HEAD object rather than listing — a single HEAD
+    is cheaper than a ListObjectsV2 call and easier to reason about in
+    the smoke path.
+    """
+    import boto3
+    from datetime import date, timedelta
+    s3 = boto3.client("s3")
+    today = date.today()
+    for days_back in range(max_lookback + 1):
+        candidate = today - timedelta(days=days_back)
+        key = f"signals/{candidate.isoformat()}/signals.json"
+        try:
+            s3.head_object(Bucket=bucket, Key=key)
+            return candidate.isoformat()
+        except Exception:
+            continue
+    return None
+
+
 # ── Pipeline orchestration ──────────────────────────────────────────────────
 
 
 def _parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description="Alpha Engine Backtester (simulation)")
-    parser.add_argument("--mode", choices=["simulate", "param-sweep", "all", "predictor-backtest"],
-                        default="simulate")
+    parser.add_argument("--mode", choices=["simulate", "param-sweep", "all", "predictor-backtest", "smoke"],
+                        default="simulate",
+                        help="Pipeline mode. 'smoke' runs preflight + end-to-end runtime smoke with "
+                             "minimal data (~30-60s) then exits 0 — used by spot_backtest.sh --smoke-only "
+                             "and as the gate before any full run.")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--db", help="Override research_db path from config")
     parser.add_argument("--upload", action="store_true", help="Upload results to S3")
@@ -907,6 +1060,11 @@ def _parse_args() -> argparse.Namespace:
                         help="Rollback all S3 configs to previous versions and exit")
     parser.add_argument("--freeze", action="store_true",
                         help="Skip all S3 config promotions (guardrails compute + report but never write)")
+    parser.add_argument("--skip-smoke", action="store_true",
+                        help="Bypass the runtime smoke test that precedes the full modes. Only for "
+                             "genuine restart cases where the operator knows the environment is good; "
+                             "default behavior is to always run the ~30-60s smoke before committing "
+                             "to 60-80 minutes of full work.")
     return parser.parse_args()
 
 
@@ -1175,6 +1333,19 @@ def main() -> None:
             mode="backtest",
             executor_paths=config.get("executor_paths") or [],
         ).run()
+
+        # Runtime smoke: end-to-end sanity with minimal data (~30-60s).
+        # Runs after preflight (so any preflight failure surfaces first,
+        # in seconds) and before any full mode (so an environment bug
+        # doesn't burn 60-80 min of spot compute). --skip-smoke is the
+        # escape hatch for genuine restart scenarios; --mode=smoke runs
+        # the smoke and exits 0 without doing full work.
+        if args.mode == "smoke":
+            _runtime_smoke(config)
+            logger.info("Smoke-only mode complete — exiting 0 without full run")
+            return
+        if not args.skip_smoke:
+            _runtime_smoke(config)
 
     # Handle --rollback before any other mode
     if args.rollback:
