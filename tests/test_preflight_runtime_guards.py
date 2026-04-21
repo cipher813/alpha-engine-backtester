@@ -78,12 +78,9 @@ def test_check_imports_fails_with_named_module_on_import_error(monkeypatch):
     import importlib
 
     broken_name = _CRITICAL_IMPORTS_BACKTEST[0]  # e.g. alpha_engine_lib.arcticdb
-    real_import_module = importlib.import_module
 
     def fake_import_module(name):
-        if name == broken_name:
-            raise ImportError(f"simulated: no module named {name!r}")
-        return real_import_module(name)
+        raise ImportError(f"simulated: no module named {name!r}")
 
     monkeypatch.setattr(importlib, "import_module", fake_import_module)
 
@@ -94,6 +91,49 @@ def test_check_imports_fails_with_named_module_on_import_error(monkeypatch):
     assert broken_name in msg
     assert "requirements.txt" in msg
     assert "pip install" in msg
+
+
+def test_check_imports_inserts_executor_and_predictor_paths(monkeypatch, tmp_path):
+    """_check_imports must prepend executor_paths + predictor_paths
+    entries to sys.path before attempting the executor/predictor module
+    imports — otherwise they fail with ModuleNotFoundError even when
+    the repos are cloned locally. Mirrors what backtest._setup_simulation
+    does later in the pipeline."""
+    from preflight import BacktesterPreflight
+    import sys
+    import importlib
+
+    # Build two tmp dirs that stand in for alpha-engine + alpha-engine-predictor.
+    exec_root = tmp_path / "exec"
+    pred_root = tmp_path / "pred"
+    exec_root.mkdir()
+    pred_root.mkdir()
+
+    recorded: list[str] = []
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name):
+        recorded.append(name)
+        return types.ModuleType(name)  # succeed silently for every name
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
+
+    preflight = BacktesterPreflight(
+        bucket="test-bucket",
+        mode="backtest",
+        executor_paths=[str(exec_root)],
+        predictor_paths=[str(pred_root)],
+    )
+    preflight._check_imports()
+
+    # Both tmp roots should now be on sys.path so that executor/predictor
+    # modules would resolve if they lived there.
+    assert str(exec_root) in sys.path
+    assert str(pred_root) in sys.path
+    # Every critical module was import-attempted.
+    assert "alpha_engine_lib.arcticdb" in recorded
+    assert "executor.main" in recorded
+    assert "model.gbm_scorer" in recorded
 
 
 def test_check_imports_passes_when_all_modules_resolve(monkeypatch):

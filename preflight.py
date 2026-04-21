@@ -87,16 +87,21 @@ class BacktesterPreflight(BasePreflight):
         bucket: str,
         mode: str,
         executor_paths: list[str] | None = None,
+        predictor_paths: list[str] | None = None,
     ):
         super().__init__(bucket)
         if mode not in ("backtest", "evaluate", "lambda_health"):
             raise ValueError(f"BacktesterPreflight: unknown mode {mode!r}")
         self.mode = mode
-        # backtest.py passes config["executor_paths"] here so preflight
-        # can locate the executor repo root and validate its risk.yaml
-        # will load with real values. Optional: omitted by evaluate.py
-        # and lambda_health (they don't import the executor).
+        # backtest.py passes config["executor_paths"] + config["predictor_paths"]
+        # here so preflight can (a) validate executor's risk.yaml will load with
+        # real values, and (b) add both repo roots to sys.path before
+        # _check_imports so ``from executor.main`` / ``from model.gbm_scorer``
+        # resolve the same way they do in ``_setup_simulation`` later. Without
+        # the sys.path inserts, _check_imports fires ModuleNotFoundError on
+        # ``executor``/``model`` even when everything is set up correctly.
         self.executor_paths = executor_paths or []
+        self.predictor_paths = predictor_paths or []
 
     def run(self) -> None:
         self.check_env_vars("AWS_REGION")
@@ -165,11 +170,26 @@ class BacktesterPreflight(BasePreflight):
         to import the module. Surfacing it at preflight is worth the
         ~1 second of extra import cost at startup.
 
+        ``executor.main`` / ``executor.ibkr`` / ``model.gbm_scorer`` /
+        ``synthetic.predictor_backtest`` are only importable once the
+        alpha-engine + alpha-engine-predictor repo roots are on
+        ``sys.path`` — normally done inside ``backtest._setup_simulation``.
+        Preflight does the same inserts first so the import check
+        matches production import resolution.
+
         Mode-specific list: only ``backtest`` mode imports the executor
         and predictor repos. ``evaluate`` / ``lambda_health`` have
         their own narrower call chains (validated by their own preflight
         branches as needed).
         """
+        import sys
+
+        for candidates in (self.executor_paths, self.predictor_paths):
+            for p in candidates:
+                if os.path.isdir(p) and p not in sys.path:
+                    sys.path.insert(0, p)
+                    break  # first hit wins, matches backtest.py behavior
+
         for name in _CRITICAL_IMPORTS_BACKTEST:
             try:
                 importlib.import_module(name)
@@ -178,7 +198,10 @@ class BacktesterPreflight(BasePreflight):
                     f"Pre-flight: could not import {name!r} — would "
                     "have crashed deep in the backtest call chain. "
                     "Check requirements.txt pin + that pip install "
-                    "completed successfully on this host. Underlying "
+                    "completed successfully on this host. If "
+                    "executor/predictor imports fail, check config.yaml "
+                    "``executor_paths`` / ``predictor_paths`` resolve "
+                    f"to real directories on this host. Underlying "
                     f"error: {exc}"
                 ) from exc
 
