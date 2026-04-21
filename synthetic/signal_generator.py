@@ -200,17 +200,167 @@ def _compute_indicators_from_ohlcv(
     }
 
 
+def precompute_indicator_series(
+    ohlcv_by_ticker: dict[str, list[dict]],
+) -> dict[str, pd.DataFrame]:
+    """
+    Vectorized pre-computation of the same 6 indicators as
+    ``_compute_indicators_from_ohlcv`` but as full date-indexed Series per
+    ticker. Used by ``build_signals_by_date`` to replace a O(dates × tickers
+    × bars) per-date Python rescan with a single O(tickers × bars) pandas
+    vectorized pass + O(dates × tickers) hashtable lookups.
+
+    Motivation: 2026-04-21 dry-run profiling showed ``build_signals_by_date``
+    took ~75 minutes on 2277 dates × ~900 tickers — the per-date loop was
+    filtering each ticker's full 10y bar list by ``<=date`` and rebuilding a
+    pandas Series from scratch, 2277 times per ticker. That's ~5B string
+    comparisons in pure Python interpreter. Every cost is pure algorithmic
+    laziness — the underlying data already has a date axis, pandas can roll
+    everything in one pass.
+
+    Expected speedup: 50-100x for this phase.
+
+    Semantics match ``_compute_indicators_from_ohlcv`` byte-for-byte at each
+    row of the returned DataFrame: the row at date T is what
+    ``_compute_indicators_from_ohlcv(ohlcv_by_ticker[T].bars_up_to_T)`` would
+    have returned at that date. Early bars have NaN indicators (rolling-window
+    warmup) — consumer is expected to skip rows whose key fields are NaN.
+
+    Returns
+    -------
+    {ticker: DataFrame} where each DataFrame has the ticker's bar dates as
+    its index (string dates, YYYY-MM-DD) and these columns:
+        rsi_14, macd_cross, macd_above_zero, price_vs_ma50,
+        price_vs_ma200, momentum_20d
+    Tickers with zero bars are omitted.
+    """
+    out: dict[str, pd.DataFrame] = {}
+    for ticker, bars in ohlcv_by_ticker.items():
+        if not bars:
+            continue
+
+        # Build close series indexed on bar dates. Dates are strings
+        # (YYYY-MM-DD) so str ordering == chronological order.
+        dates = [bar["date"] for bar in bars]
+        close = pd.Series([bar["close"] for bar in bars], index=dates, dtype=float)
+
+        # RSI(14) via Wilder's smoothing — vectorized: one EWMA pass
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(com=13, adjust=False).mean()
+        avg_loss = loss.ewm(com=13, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, float("nan"))
+        rsi = 100 - (100 / (1 + rs))
+
+        # MACD(12, 26, 9) — vectorized
+        ema_fast = close.ewm(span=12, adjust=False).mean()
+        ema_slow = close.ewm(span=26, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        macd_above_zero = (macd_line > 0)
+
+        # macd_cross semantics (per scalar impl above): at date T, output is
+        # the most recent cross direction within the 3-bar window {T-2, T-1, T},
+        # or 0 if no cross. Vectorized: mark cross bars, forward-fill up to
+        # 2 NaN gaps (= 3-bar window inclusive), fill remaining NaN with 0.
+        diff = macd_line - signal_line
+        prev = diff.shift(1)
+        up_cross = (diff >= 0) & (prev < 0)
+        down_cross = (diff < 0) & (prev >= 0)
+        raw_cross = pd.Series(0.0, index=close.index)
+        raw_cross[up_cross] = 1.0
+        raw_cross[down_cross] = -1.0
+        macd_cross = raw_cross.replace(0.0, float("nan")).ffill(limit=2).fillna(0.0)
+
+        # Price vs MA50 / MA200 — vectorized
+        ma50 = close.rolling(50).mean()
+        ma200 = close.rolling(200).mean()
+        price_vs_ma50 = ((close - ma50) / ma50.replace(0, float("nan"))) * 100
+        price_vs_ma200 = ((close - ma200) / ma200.replace(0, float("nan"))) * 100
+
+        # 20-day momentum — vectorized
+        momentum_20d = (close / close.shift(20) - 1) * 100
+
+        out[ticker] = pd.DataFrame({
+            "rsi_14": rsi,
+            "macd_cross": macd_cross,
+            "macd_above_zero": macd_above_zero,
+            "price_vs_ma50": price_vs_ma50,
+            "price_vs_ma200": price_vs_ma200,
+            "momentum_20d": momentum_20d,
+        })
+
+    return out
+
+
+def indicators_from_precomputed(
+    precomputed: dict[str, pd.DataFrame],
+    tickers: list[str] | set[str] | dict,
+    date_str: str,
+    min_bars: int = 210,
+) -> dict[str, dict]:
+    """Look up the indicator row for ``date_str`` from each ticker's
+    precomputed DataFrame. Returns ``{ticker: indicator_dict}`` matching the
+    shape of ``_compute_indicators_from_ohlcv``'s return value, with tickers
+    excluded when:
+      - the ticker is not in ``precomputed``,
+      - ``date_str`` isn't in that ticker's index,
+      - fewer than ``min_bars`` bars of history exist up to and including
+        ``date_str`` (matches the scalar path's ``min_bars=210`` gate —
+        short-history tickers don't produce reliable indicators even
+        though EWMA technically yields a value from bar 1).
+    """
+    result: dict[str, dict] = {}
+    for ticker in tickers:
+        df = precomputed.get(ticker)
+        if df is None:
+            continue
+        try:
+            # get_loc + slice is the fast way to both check membership and
+            # measure position (= "bars up to this date") in one lookup.
+            pos = df.index.get_loc(date_str)
+        except KeyError:
+            continue
+        if (pos + 1) < min_bars:
+            continue
+        row = df.iloc[pos]
+        # rsi_14 is the first-populated indicator; if it's NaN at this
+        # position the whole row is unreliable.
+        if pd.isna(row["rsi_14"]):
+            continue
+        result[ticker] = {
+            "rsi_14": float(row["rsi_14"]),
+            "macd_cross": float(row["macd_cross"]),
+            "macd_above_zero": bool(row["macd_above_zero"]),
+            "price_vs_ma50": (
+                None if pd.isna(row["price_vs_ma50"])
+                else float(row["price_vs_ma50"])
+            ),
+            "price_vs_ma200": (
+                None if pd.isna(row["price_vs_ma200"])
+                else float(row["price_vs_ma200"])
+            ),
+            "momentum_20d": (
+                None if pd.isna(row["momentum_20d"])
+                else float(row["momentum_20d"])
+            ),
+        }
+    return result
+
+
 # ── Signal generation ─────────────────────────────────────────────────────────
 
 def predictions_to_signals(
     predictions: dict[str, float],
     date: str,
     sector_map: dict[str, str],
-    ohlcv_by_ticker: dict[str, list[dict]],
+    ohlcv_by_ticker: dict[str, list[dict]] | None = None,
     market_regime: str = "neutral",
     top_n: int = 20,
     min_score: float = 60,
     gbm_enrichment_max: float = 10.0,
+    precomputed_indicators: dict[str, dict] | None = None,
 ) -> dict:
     """
     Convert GBM alpha predictions + OHLCV price histories to executor signals.
@@ -228,19 +378,38 @@ def predictions_to_signals(
     sector_map : {ticker: sector_etf_symbol}.
     ohlcv_by_ticker : {ticker: [{date, open, high, low, close}, ...]} —
                       bars up to (and including) this date only (no lookahead).
+                      Optional when ``precomputed_indicators`` is provided.
+    precomputed_indicators : {ticker: indicator_dict} — the result of
+                             ``indicators_from_precomputed`` for this date.
+                             When provided, skips the per-ticker inline
+                             indicator compute (the hot loop that was 2.2s
+                             per date in the 2026-04-21 profile). The
+                             ``ohlcv_by_ticker`` arg is then ignored.
     market_regime : 'bull' | 'neutral' | 'caution' | 'bear'.
     top_n : max ENTER signals per date.
     min_score : minimum trading_score for ENTER.
     gbm_enrichment_max : max ±pts GBM can adjust technical score.
     """
     # Step 1: Compute technical indicators for all tickers with OHLCV data
-    indicators_by_ticker: dict[str, dict] = {}
-    for ticker in predictions:
-        history = ohlcv_by_ticker.get(ticker)
-        if history:
-            ind = _compute_indicators_from_ohlcv(history)
-            if ind is not None:
-                indicators_by_ticker[ticker] = ind
+    if precomputed_indicators is not None:
+        # Fast path: caller already has a date-resolved indicator dict
+        # (typically from `indicators_from_precomputed`). Skip the per-
+        # ticker inline compute entirely. This is the hot-loop optimization
+        # used by build_signals_by_date across the 10y backtest window.
+        indicators_by_ticker = precomputed_indicators
+    else:
+        indicators_by_ticker: dict[str, dict] = {}
+        if ohlcv_by_ticker is None:
+            raise ValueError(
+                "predictions_to_signals: either ohlcv_by_ticker or "
+                "precomputed_indicators must be provided."
+            )
+        for ticker in predictions:
+            history = ohlcv_by_ticker.get(ticker)
+            if history:
+                ind = _compute_indicators_from_ohlcv(history)
+                if ind is not None:
+                    indicators_by_ticker[ticker] = ind
 
     # Step 2: Compute momentum percentiles across all scored tickers
     momentum_data = {
