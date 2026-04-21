@@ -297,7 +297,7 @@ def _run_simulation_loop(
     universe_symbols: set[str] | None = None
     rejected_ticker_counter: dict[str, int] = {}
     try:
-        from store.arctic_reader import get_universe_symbols
+        from alpha_engine_lib.arcticdb import get_universe_symbols
         universe_symbols = get_universe_symbols(bucket)
     except Exception as exc:
         # Fail loud: simulate would otherwise crash later at load_daily_vwap
