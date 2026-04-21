@@ -101,6 +101,31 @@ def _verify_arctic_fresh(bucket: str, min_date: str | None = None) -> None:
             )
 
 
+def get_universe_symbols(bucket: str = DEFAULT_BUCKET) -> set[str]:
+    """Return the set of symbols currently present in the ArcticDB universe library.
+
+    Used by the backtester simulate path to filter historical signals against
+    today's universe — tickers that were valid when a past signals.json was
+    written but have since been dropped (e.g. TSM, ASML post-2026-04-20
+    Research↔Executor universe-coverage fix) must be excluded before replay.
+    Otherwise executor-side hard-fail guards (load_daily_vwap, load_atr_14_pct)
+    raise NoSuchVersionException and abort the whole simulation.
+
+    Raises RuntimeError on ArcticDB library-open failure — upstream ArcticDB
+    health is a pipeline-level precondition, not something to paper over.
+    """
+    arctic = _get_arctic(bucket)
+    try:
+        universe = arctic.get_library("universe")
+    except Exception as exc:
+        raise RuntimeError(
+            f"ArcticDB universe library open failed on bucket {bucket}: {exc}"
+        ) from exc
+    symbols = set(universe.list_symbols())
+    log.info("ArcticDB universe symbols available for simulate-filter: %d", len(symbols))
+    return symbols
+
+
 def load_universe_from_arctic(
     bucket: str = DEFAULT_BUCKET,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
