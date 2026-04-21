@@ -110,6 +110,49 @@ def _setup_simulation(config: dict) -> tuple:
     return executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv_by_ticker
 
 
+_SIGNAL_LIST_FIELDS = ("universe", "buy_candidates", "enter", "exit", "reduce", "hold")
+
+
+def _filter_signals_to_universe(
+    signals: dict,
+    universe_symbols: set[str],
+    rejected_counter: dict[str, int] | None,
+) -> dict:
+    """Return a shallow-copied signals dict where every ticker-carrying list
+    is filtered to entries whose ``ticker`` is in ``universe_symbols``.
+
+    Rationale: simulate mode replays historical signals.json files from S3.
+    Past constituent turnover (e.g. TSM/ASML dropped 2026-04-20) leaves
+    historical signals referencing tickers no longer in ArcticDB. Executor
+    hard-fail guards (load_daily_vwap, load_atr_14_pct) then abort the
+    simulation. This filter drops those tickers at the simulate boundary —
+    NOT at the executor layer, because live executor must preserve EXIT/
+    REDUCE/HOLD for real held positions even if the ticker somehow went
+    missing from ArcticDB (different concern: alarm, don't silently skip).
+    In simulate mode there are no real held positions so the drop is safe.
+
+    ``rejected_counter`` (if provided) accumulates per-ticker reject counts
+    across the simulation loop for a single aggregate WARN log at end of run.
+    Consistent with feedback_no_silent_fails: rejects are counted and
+    reported, not silently dropped.
+    """
+    filtered = dict(signals)
+    for field in _SIGNAL_LIST_FIELDS:
+        entries = signals.get(field)
+        if not isinstance(entries, list):
+            continue
+        kept = []
+        for e in entries:
+            ticker = (e.get("ticker") if isinstance(e, dict) else None) or ""
+            ticker = ticker.upper()
+            if ticker and ticker in universe_symbols:
+                kept.append(e)
+            elif ticker and rejected_counter is not None:
+                rejected_counter[ticker] = rejected_counter.get(ticker, 0) + 1
+        filtered[field] = kept
+    return filtered
+
+
 def _simulate_single_date(
     executor_run,
     sim_client,
@@ -119,6 +162,8 @@ def _simulate_single_date(
     bucket: str,
     config_override: dict | None,
     signals_override: dict | None = None,
+    universe_symbols: set[str] | None = None,
+    rejected_ticker_counter: dict[str, int] | None = None,
 ) -> tuple[list[dict] | None, str | None]:
     """
     Run the executor once for a single signal date.
@@ -161,6 +206,19 @@ def _simulate_single_date(
             signals_raw = signal_loader.load(bucket, signal_date)
         except FileNotFoundError:
             return None, "no_signals"
+
+    # Filter historical signals against TODAY's ArcticDB universe. Signals
+    # from weeks past may contain tickers that have since been dropped from
+    # the universe (2026-04-20 TSM/ASML Research↔Executor coverage-gap fix,
+    # future constituent turnover, etc.). The executor's hard-fail guards
+    # (load_daily_vwap, load_atr_14_pct) raise NoSuchVersionException on any
+    # such ticker and abort the whole simulate run. Dropping them per-date
+    # before executor_run is the simulate-specific defense-in-depth that
+    # pairs with the live-executor buy_candidate filter (alpha-engine PR #77).
+    if universe_symbols is not None:
+        signals_raw = _filter_signals_to_universe(
+            signals_raw, universe_symbols, rejected_ticker_counter,
+        )
 
     sim_client._prices = date_prices
     sim_client._simulation_date = signal_date
@@ -232,6 +290,25 @@ def _run_simulation_loop(
     dates_simulated = 0
     skip_reasons = {"no_price_index": 0, "empty_prices": 0, "no_signals": 0}
 
+    # Load today's ArcticDB universe once — used to filter historical signals
+    # that reference since-dropped tickers (e.g. TSM/ASML post-2026-04-20).
+    # Hard-fail on ArcticDB library-open error: that's a pipeline precondition,
+    # not a simulate-mode edge case to paper over.
+    universe_symbols: set[str] | None = None
+    rejected_ticker_counter: dict[str, int] = {}
+    try:
+        from alpha_engine_lib.arcticdb import get_universe_symbols
+        universe_symbols = get_universe_symbols(bucket)
+    except Exception as exc:
+        # Fail loud: simulate would otherwise crash later at load_daily_vwap
+        # when a historical signal references a dropped ticker, and the
+        # failure surface would be a misleading "daemon cannot plan triggers"
+        # instead of a clear "ArcticDB library unreachable."
+        raise RuntimeError(
+            f"Simulate universe-filter bootstrap failed: could not read "
+            f"ArcticDB universe symbols from bucket {bucket!r}: {exc}"
+        ) from exc
+
     # Use signals_by_date keys as iteration dates when available
     if signals_by_date is not None:
         sim_dates = sorted(signals_by_date.keys())
@@ -249,6 +326,8 @@ def _run_simulation_loop(
             bucket=bucket,
             config_override=config_override,
             signals_override=signals_override,
+            universe_symbols=universe_symbols,
+            rejected_ticker_counter=rejected_ticker_counter,
         )
         if skip is not None:
             skip_reasons[skip] += 1
@@ -267,6 +346,19 @@ def _run_simulation_loop(
         dates_simulated, dates_expected, coverage * 100, len(all_orders),
         f" — skipped: {skipped}" if skipped else "",
     )
+
+    if rejected_ticker_counter:
+        # Aggregate reject log — loud so data drift (tickers dropped from
+        # the universe between signal-write time and replay time) is visible.
+        top = sorted(rejected_ticker_counter.items(), key=lambda kv: -kv[1])
+        total_rejects = sum(rejected_ticker_counter.values())
+        logger.warning(
+            "Simulate universe-filter dropped %d signal entries across %d "
+            "tickers (tickers present in historical signals but absent from "
+            "current ArcticDB universe). Top offenders: %s",
+            total_rejects, len(rejected_ticker_counter),
+            [f"{t}={n}" for t, n in top[:10]],
+        )
 
     if dates_expected > 0 and coverage < _MIN_SIMULATION_COVERAGE:
         return {
