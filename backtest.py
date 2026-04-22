@@ -1248,6 +1248,42 @@ def _run_simulation_pipeline(
     sweep_df = None
     executor_rec = None
 
+    # Precomputed feature maps — built ONCE per _run_simulation_pipeline
+    # invocation, shared across simulate, param-sweep, holdout, and twin
+    # sub-stages. Without this hoist, every sim_fn closure below lazily
+    # derives the maps inside _run_simulation_loop, and the param-sweep
+    # path pays 60× the ~900-ticker ArcticDB bulk read (2026-04-22 13:00
+    # PT re-run timed out for exactly this reason — py-spy confirmed every
+    # combo was re-entering load_precomputed_feature_maps). The guard
+    # matches the shape of the simulate/sweep blocks: skip the read
+    # entirely when _sim_setup is None or price_matrix is empty.
+    ohlcv_dates_index = None
+    atr_by_ticker = None
+    vwap_series_by_ticker = None
+    if (
+        _sim_setup is not None
+        and _sim_setup[3] is not None  # price_matrix
+        and args.mode in ("simulate", "param-sweep", "all")
+    ):
+        _ohlcv = _sim_setup[5]
+        if _ohlcv:
+            ohlcv_dates_index = _build_ohlcv_date_index(_ohlcv)
+        try:
+            from store.feature_maps import load_precomputed_feature_maps
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            atr_by_ticker, vwap_series_by_ticker = load_precomputed_feature_maps(bucket)
+        except Exception as exc:
+            # Fall through to lazy per-call derivation rather than abort.
+            # Preserves existing behavior on a bulk-read failure — each
+            # _run_simulation_loop call will hit the slower ArcticDB path
+            # individually. Logged loud so the perf regression is visible.
+            logger.warning(
+                "feature_maps: bulk precompute failed (%s) — falling back "
+                "to per-call ArcticDB reads inside _run_simulation_loop. "
+                "Param sweep will run at the pre-PR-#50 rate.",
+                exc,
+            )
+
     # ── Simulate mode ─────────────────────────────────────────────────────
     if args.mode in ("simulate", "all"):
         try:
@@ -1266,6 +1302,9 @@ def _run_simulation_pipeline(
                     portfolio_stats = _run_simulation_loop(
                         executor_run, SimulatedIBKRClient, dates, price_matrix, config,
                         ohlcv_by_ticker=ohlcv,
+                        ohlcv_dates_index=ohlcv_dates_index,
+                        atr_by_ticker=atr_by_ticker,
+                        vwap_series_by_ticker=vwap_series_by_ticker,
                     )
         except Exception as e:
             logger.error("Mode 2 simulation failed: %s", e)
@@ -1289,6 +1328,9 @@ def _run_simulation_pipeline(
                         return _run_simulation_loop(
                             executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
                             ohlcv_by_ticker=ohlcv,
+                            ohlcv_dates_index=ohlcv_dates_index,
+                            atr_by_ticker=atr_by_ticker,
+                            vwap_series_by_ticker=vwap_series_by_ticker,
                         )
                     grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
                     grid = _seed_grid_with_current(grid, current_executor_params)
@@ -1315,6 +1357,9 @@ def _run_simulation_pipeline(
                             return _run_simulation_loop(
                                 executor_run_fn, SimClientCls, sim_dates, pm, combo_config,
                                 ohlcv_by_ticker=ohlcv_data,
+                                ohlcv_dates_index=ohlcv_dates_index,
+                                atr_by_ticker=atr_by_ticker,
+                                vwap_series_by_ticker=vwap_series_by_ticker,
                             )
                         executor_rec = executor_optimizer.validate_holdout(
                             executor_rec, holdout_sim_fn, sim_dates, config,
@@ -1337,6 +1382,9 @@ def _run_simulation_pipeline(
                             return _run_simulation_loop(
                                 executor_run_fn, SimClientCls, sim_dates, pm, cfg,
                                 ohlcv_by_ticker=ohlcv_data,
+                                ohlcv_dates_index=ohlcv_dates_index,
+                                atr_by_ticker=atr_by_ticker,
+                                vwap_series_by_ticker=vwap_series_by_ticker,
                             )
                         executor_rec["twin_sim"] = run_twin_simulation(
                             twin_sim_fn, current_cfg, proposed_cfg, changed_keys,
