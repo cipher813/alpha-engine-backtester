@@ -190,6 +190,8 @@ def _simulate_single_date(
     universe_symbols: set[str] | None = None,
     rejected_ticker_counter: dict[str, int] | None = None,
     ohlcv_dates_index: dict[str, list[str]] | None = None,
+    atr_by_ticker: dict[str, float] | None = None,
+    vwap_series_by_ticker: dict[str, pd.Series] | None = None,
 ) -> tuple[list[dict] | None, str | None]:
     """
     Run the executor once for a single signal date.
@@ -278,12 +280,41 @@ def _simulate_single_date(
                 for ticker, bars in ohlcv_by_ticker.items()
             }
 
+    # Precomputed feature-map injection (alpha-engine PR #91). When both
+    # maps are available, resolve VWAP for this simulate date against the
+    # in-memory series, then pass atr_map + vwap_map via the executor
+    # kwargs to skip the per-call ArcticDB reads (``load_atr_14_pct``
+    # and ``load_daily_vwap``). The roadmap's Saturday SF dry-run timed
+    # out at 2h in precisely these two ArcticDB hot paths.
+    #
+    # Semantics: ``atr_by_ticker`` is a flat {ticker: value} dict — the
+    # executor does ``.get(ticker)`` lookups and tolerates missing
+    # tickers via fall-through. VWAP is resolved per simulate date via
+    # ``resolve_vwap_map_for_date`` which mirrors
+    # ``load_daily_vwap``'s walk-back semantics (up to 5 trading days).
+    atr_map: dict | None = None
+    vwap_map: dict | None = None
+    if atr_by_ticker is not None:
+        atr_map = atr_by_ticker  # executor filters via .get() per ticker
+    if vwap_series_by_ticker is not None:
+        from store.feature_maps import resolve_vwap_map_for_date
+        enter_tickers = [
+            s["ticker"]
+            for s in (signals_raw.get("enter") or [])
+            if s.get("ticker")
+        ]
+        vwap_map = resolve_vwap_map_for_date(
+            vwap_series_by_ticker, enter_tickers, signal_date,
+        )
+
     orders = executor_run(
         simulate=True,
         ibkr_client=sim_client,
         signals_override=signals_raw,
         price_histories=price_histories,
         config_override=config_override,
+        atr_map=atr_map,
+        vwap_map=vwap_map,
     )
     # Tag each order with the simulation date for downstream parity diffing.
     # Executor-emitted orders may not include a date field (they carry
@@ -303,6 +334,8 @@ def _run_simulation_loop(
     signals_by_date: dict | None = None,
     spy_prices: pd.Series | None = None,
     ohlcv_dates_index: dict[str, list[str]] | None = None,
+    atr_by_ticker: dict[str, float] | None = None,
+    vwap_series_by_ticker: dict[str, pd.Series] | None = None,
 ) -> dict:
     """
     Run one full simulation pass with the given config and pre-built price matrix.
@@ -342,6 +375,21 @@ def _run_simulation_loop(
     # pass, negligible compared to the inner loop savings.
     if ohlcv_by_ticker and ohlcv_dates_index is None:
         ohlcv_dates_index = _build_ohlcv_date_index(ohlcv_by_ticker)
+
+    # Precompute ATR + VWAP maps once per simulate pass — same motivation
+    # as ohlcv_dates_index. The executor's ``load_atr_14_pct`` and
+    # ``load_daily_vwap`` both hit ArcticDB per ticker per call (20+
+    # round-trips per simulate call). The alpha-engine PR #91 kwargs
+    # ``atr_map`` + ``vwap_map`` let the backtester inject pre-resolved
+    # maps and skip those reads entirely. Callers can also pass in the
+    # pre-built maps to avoid rebuilding per combo in param sweep.
+    if (atr_by_ticker is None or vwap_series_by_ticker is None):
+        from store.feature_maps import load_precomputed_feature_maps
+        _atr, _vwap = load_precomputed_feature_maps(bucket)
+        if atr_by_ticker is None:
+            atr_by_ticker = _atr
+        if vwap_series_by_ticker is None:
+            vwap_series_by_ticker = _vwap
 
     sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
     all_orders: list[dict] = []
@@ -387,6 +435,8 @@ def _run_simulation_loop(
             universe_symbols=universe_symbols,
             rejected_ticker_counter=rejected_ticker_counter,
             ohlcv_dates_index=ohlcv_dates_index,
+            atr_by_ticker=atr_by_ticker,
+            vwap_series_by_ticker=vwap_series_by_ticker,
         )
         if skip is not None:
             skip_reasons[skip] += 1
@@ -689,11 +739,20 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
     # would otherwise rebuild it redundantly in _run_simulation_loop.
     ohlcv_dates_index = _build_ohlcv_date_index(ohlcv) if ohlcv else None
 
+    # Precompute ATR + VWAP maps ONCE across the full combo sweep.
+    # Without this, _run_simulation_loop derives them lazily per combo
+    # and we repay the ~900-ticker ArcticDB bulk read 60 times.
+    from store.feature_maps import load_precomputed_feature_maps
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    atr_by_ticker, vwap_series_by_ticker = load_precomputed_feature_maps(bucket)
+
     def sim_fn(combo_config: dict) -> dict:
         return _run_simulation_loop(
             executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
             ohlcv_by_ticker=ohlcv,
             ohlcv_dates_index=ohlcv_dates_index,
+            atr_by_ticker=atr_by_ticker,
+            vwap_series_by_ticker=vwap_series_by_ticker,
         )
 
     grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
@@ -795,6 +854,16 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     # for the inner-loop cost math.
     ohlcv_dates_index = _build_ohlcv_date_index(ohlcv_by_ticker) if ohlcv_by_ticker else None
 
+    # Same one-time-share logic for ATR + VWAP precomputed maps. The
+    # predictor-param-sweep is the bottleneck the Saturday SF dry-run
+    # timed out on: 60 combos × 2000+ dates × per-ticker ArcticDB reads.
+    # Loading once up front collapses that to a single bulk scan (~1-2
+    # min for ~900 tickers with 20-way concurrency) — every subsequent
+    # _simulate_single_date call reuses the in-memory maps.
+    from store.feature_maps import load_precomputed_feature_maps
+    _bucket_for_maps = config.get("signals_bucket", "alpha-engine-research")
+    atr_by_ticker, vwap_series_by_ticker = load_precomputed_feature_maps(_bucket_for_maps)
+
     # Import executor modules
     executor_paths = config.get("executor_paths", [])
     if isinstance(executor_paths, str):
@@ -819,6 +888,8 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
         signals_by_date=signals_by_date,
         spy_prices=spy_prices,
         ohlcv_dates_index=ohlcv_dates_index,
+        atr_by_ticker=atr_by_ticker,
+        vwap_series_by_ticker=vwap_series_by_ticker,
     )
     single_stats["predictor_metadata"] = metadata
 
@@ -929,6 +1000,8 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 signals_by_date=signals_by_date,
                 spy_prices=spy_prices,
                 ohlcv_dates_index=ohlcv_dates_index,
+                atr_by_ticker=atr_by_ticker,
+                vwap_series_by_ticker=vwap_series_by_ticker,
             )
 
         sweep_settings = config.get("param_sweep_settings", {})
