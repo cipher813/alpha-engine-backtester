@@ -192,6 +192,7 @@ def _simulate_single_date(
     ohlcv_dates_index: dict[str, list[str]] | None = None,
     atr_by_ticker: dict[str, float] | None = None,
     vwap_series_by_ticker: dict[str, pd.Series] | None = None,
+    coverage_by_ticker: dict[str, float] | None = None,
 ) -> tuple[list[dict] | None, str | None]:
     """
     Run the executor once for a single signal date.
@@ -294,8 +295,11 @@ def _simulate_single_date(
     # ``load_daily_vwap``'s walk-back semantics (up to 5 trading days).
     atr_map: dict | None = None
     vwap_map: dict | None = None
+    coverage_map: dict | None = None
     if atr_by_ticker is not None:
         atr_map = atr_by_ticker  # executor filters via .get() per ticker
+    if coverage_by_ticker is not None:
+        coverage_map = coverage_by_ticker  # executor filters via .get() per ticker
     if vwap_series_by_ticker is not None:
         from store.feature_maps import resolve_vwap_map_for_date
         enter_tickers = [
@@ -315,6 +319,7 @@ def _simulate_single_date(
         config_override=config_override,
         atr_map=atr_map,
         vwap_map=vwap_map,
+        coverage_map=coverage_map,
     )
     # Tag each order with the simulation date for downstream parity diffing.
     # Executor-emitted orders may not include a date field (they carry
@@ -336,6 +341,7 @@ def _run_simulation_loop(
     ohlcv_dates_index: dict[str, list[str]] | None = None,
     atr_by_ticker: dict[str, float] | None = None,
     vwap_series_by_ticker: dict[str, pd.Series] | None = None,
+    coverage_by_ticker: dict[str, float] | None = None,
 ) -> dict:
     """
     Run one full simulation pass with the given config and pre-built price matrix.
@@ -383,13 +389,15 @@ def _run_simulation_loop(
     # ``atr_map`` + ``vwap_map`` let the backtester inject pre-resolved
     # maps and skip those reads entirely. Callers can also pass in the
     # pre-built maps to avoid rebuilding per combo in param sweep.
-    if (atr_by_ticker is None or vwap_series_by_ticker is None):
+    if (atr_by_ticker is None or vwap_series_by_ticker is None or coverage_by_ticker is None):
         from store.feature_maps import load_precomputed_feature_maps
-        _atr, _vwap = load_precomputed_feature_maps(bucket)
+        _atr, _vwap, _cov = load_precomputed_feature_maps(bucket)
         if atr_by_ticker is None:
             atr_by_ticker = _atr
         if vwap_series_by_ticker is None:
             vwap_series_by_ticker = _vwap
+        if coverage_by_ticker is None:
+            coverage_by_ticker = _cov
 
     sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
     all_orders: list[dict] = []
@@ -437,6 +445,7 @@ def _run_simulation_loop(
             ohlcv_dates_index=ohlcv_dates_index,
             atr_by_ticker=atr_by_ticker,
             vwap_series_by_ticker=vwap_series_by_ticker,
+            coverage_by_ticker=coverage_by_ticker,
         )
         if skip is not None:
             skip_reasons[skip] += 1
@@ -739,12 +748,12 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
     # would otherwise rebuild it redundantly in _run_simulation_loop.
     ohlcv_dates_index = _build_ohlcv_date_index(ohlcv) if ohlcv else None
 
-    # Precompute ATR + VWAP maps ONCE across the full combo sweep.
-    # Without this, _run_simulation_loop derives them lazily per combo
-    # and we repay the ~900-ticker ArcticDB bulk read 60 times.
+    # Precompute ATR + VWAP + coverage maps ONCE across the full combo
+    # sweep. Without this, _run_simulation_loop derives them lazily per
+    # combo and we repay the ~900-ticker ArcticDB bulk read 60 times.
     from store.feature_maps import load_precomputed_feature_maps
     bucket = config.get("signals_bucket", "alpha-engine-research")
-    atr_by_ticker, vwap_series_by_ticker = load_precomputed_feature_maps(bucket)
+    atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = load_precomputed_feature_maps(bucket)
 
     def sim_fn(combo_config: dict) -> dict:
         return _run_simulation_loop(
@@ -753,6 +762,7 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
             ohlcv_dates_index=ohlcv_dates_index,
             atr_by_ticker=atr_by_ticker,
             vwap_series_by_ticker=vwap_series_by_ticker,
+            coverage_by_ticker=coverage_by_ticker,
         )
 
     grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
@@ -862,7 +872,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     # _simulate_single_date call reuses the in-memory maps.
     from store.feature_maps import load_precomputed_feature_maps
     _bucket_for_maps = config.get("signals_bucket", "alpha-engine-research")
-    atr_by_ticker, vwap_series_by_ticker = load_precomputed_feature_maps(_bucket_for_maps)
+    atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = load_precomputed_feature_maps(_bucket_for_maps)
 
     # Import executor modules
     executor_paths = config.get("executor_paths", [])
@@ -890,6 +900,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
         ohlcv_dates_index=ohlcv_dates_index,
         atr_by_ticker=atr_by_ticker,
         vwap_series_by_ticker=vwap_series_by_ticker,
+        coverage_by_ticker=coverage_by_ticker,
     )
     single_stats["predictor_metadata"] = metadata
 
@@ -1002,6 +1013,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 ohlcv_dates_index=ohlcv_dates_index,
                 atr_by_ticker=atr_by_ticker,
                 vwap_series_by_ticker=vwap_series_by_ticker,
+                coverage_by_ticker=coverage_by_ticker,
             )
 
         sweep_settings = config.get("param_sweep_settings", {})
@@ -1260,6 +1272,7 @@ def _run_simulation_pipeline(
     ohlcv_dates_index = None
     atr_by_ticker = None
     vwap_series_by_ticker = None
+    coverage_by_ticker = None
     if (
         _sim_setup is not None
         and _sim_setup[3] is not None  # price_matrix
@@ -1271,7 +1284,7 @@ def _run_simulation_pipeline(
         try:
             from store.feature_maps import load_precomputed_feature_maps
             bucket = config.get("signals_bucket", "alpha-engine-research")
-            atr_by_ticker, vwap_series_by_ticker = load_precomputed_feature_maps(bucket)
+            atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = load_precomputed_feature_maps(bucket)
         except Exception as exc:
             # Fall through to lazy per-call derivation rather than abort.
             # Preserves existing behavior on a bulk-read failure — each
@@ -1305,6 +1318,7 @@ def _run_simulation_pipeline(
                         ohlcv_dates_index=ohlcv_dates_index,
                         atr_by_ticker=atr_by_ticker,
                         vwap_series_by_ticker=vwap_series_by_ticker,
+                        coverage_by_ticker=coverage_by_ticker,
                     )
         except Exception as e:
             logger.error("Mode 2 simulation failed: %s", e)
@@ -1331,6 +1345,7 @@ def _run_simulation_pipeline(
                             ohlcv_dates_index=ohlcv_dates_index,
                             atr_by_ticker=atr_by_ticker,
                             vwap_series_by_ticker=vwap_series_by_ticker,
+                            coverage_by_ticker=coverage_by_ticker,
                         )
                     grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
                     grid = _seed_grid_with_current(grid, current_executor_params)
@@ -1360,6 +1375,7 @@ def _run_simulation_pipeline(
                                 ohlcv_dates_index=ohlcv_dates_index,
                                 atr_by_ticker=atr_by_ticker,
                                 vwap_series_by_ticker=vwap_series_by_ticker,
+                                coverage_by_ticker=coverage_by_ticker,
                             )
                         executor_rec = executor_optimizer.validate_holdout(
                             executor_rec, holdout_sim_fn, sim_dates, config,
@@ -1385,6 +1401,7 @@ def _run_simulation_pipeline(
                                 ohlcv_dates_index=ohlcv_dates_index,
                                 atr_by_ticker=atr_by_ticker,
                                 vwap_series_by_ticker=vwap_series_by_ticker,
+                                coverage_by_ticker=coverage_by_ticker,
                             )
                         executor_rec["twin_sim"] = run_twin_simulation(
                             twin_sim_fn, current_cfg, proposed_cfg, changed_keys,
