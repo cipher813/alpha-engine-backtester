@@ -416,6 +416,12 @@ set -euo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
 
+# BUCKET used by the replay-parity section below. OUTPUT_BUCKET is set
+# by .env (sourced above) but fall back to the default so ``set -u``
+# doesn't blow up on an environment without the .env line. Matches the
+# smoke-only heredoc's identical line.
+BUCKET="\${OUTPUT_BUCKET:-alpha-engine-research}"
+
 echo "Starting backtest at \$(date)"
 # If backtest.py fails, do NOT continue to evaluator — the evaluator
 # would consume stale or missing simulation artifacts and auto-promote
