@@ -58,6 +58,17 @@ def _patched_arctic(lib: MagicMock):
            patch.dict("sys.modules", {"arcticdb": MagicMock(Arctic=arctic_cls)})
 
 
+def _mock_bulk_read(rows: dict[str, pd.DataFrame]):
+    """Helper: sets up arcticdb mock so load_precomputed_feature_maps
+    returns the given per-ticker DataFrames."""
+    lib = _mock_arctic_library(rows)
+    arctic_instance = MagicMock()
+    arctic_instance.get_library.return_value = lib
+    fake_adb = MagicMock()
+    fake_adb.Arctic.return_value = arctic_instance
+    return patch.dict("sys.modules", {"arcticdb": fake_adb})
+
+
 class TestLoadPrecomputedFeatureMaps:
     def test_extracts_atr_last_row_per_ticker(self):
         dates = pd.DatetimeIndex(["2024-01-02", "2024-01-03", "2024-01-04"])
@@ -71,15 +82,8 @@ class TestLoadPrecomputedFeatureMaps:
                 index=dates,
             ),
         }
-        lib = _mock_arctic_library(rows)
-
-        arctic_instance = MagicMock()
-        arctic_instance.get_library.return_value = lib
-        fake_adb = MagicMock()
-        fake_adb.Arctic.return_value = arctic_instance
-
-        with patch.dict("sys.modules", {"arcticdb": fake_adb}):
-            atr, vwap = feature_maps.load_precomputed_feature_maps("test-bucket")
+        with _mock_bulk_read(rows):
+            atr, vwap, cov = feature_maps.load_precomputed_feature_maps("test-bucket")
 
         assert atr == {"AAPL": 0.0238, "MSFT": 0.007}, (
             "ATR must be the last-row value per ticker — mirrors executor's "
@@ -87,6 +91,9 @@ class TestLoadPrecomputedFeatureMaps:
         )
         assert set(vwap.keys()) == {"AAPL", "MSFT"}
         assert list(vwap["AAPL"].values) == [150.0, 151.0, 152.0]
+        # Coverage: 1 feature column (atr_14_pct, last-row non-NaN) / 1 = 1.0.
+        # VWAP is excluded from the coverage denominator per _COVERAGE_OHLCV_COLS.
+        assert cov == {"AAPL": 1.0, "MSFT": 1.0}
 
     def test_skips_tickers_missing_atr_column(self):
         rows = {
@@ -98,14 +105,8 @@ class TestLoadPrecomputedFeatureMaps:
                 {"VWAP": [50.0]}, index=pd.DatetimeIndex(["2024-01-02"]),
             ),
         }
-        lib = _mock_arctic_library(rows)
-        arctic_instance = MagicMock()
-        arctic_instance.get_library.return_value = lib
-        fake_adb = MagicMock()
-        fake_adb.Arctic.return_value = arctic_instance
-
-        with patch.dict("sys.modules", {"arcticdb": fake_adb}):
-            atr, vwap = feature_maps.load_precomputed_feature_maps("test-bucket")
+        with _mock_bulk_read(rows):
+            atr, vwap, _ = feature_maps.load_precomputed_feature_maps("test-bucket")
 
         # Ticker without atr_14_pct omitted from atr map (matches
         # load_atr_14_pct's dict semantics — .get returns None for missing).
@@ -124,14 +125,8 @@ class TestLoadPrecomputedFeatureMaps:
             "NEG": pd.DataFrame({"atr_14_pct": [-0.01], "VWAP": [100.0]}, index=dates),
             "GOOD": pd.DataFrame({"atr_14_pct": [0.02], "VWAP": [100.0]}, index=dates),
         }
-        lib = _mock_arctic_library(rows)
-        arctic_instance = MagicMock()
-        arctic_instance.get_library.return_value = lib
-        fake_adb = MagicMock()
-        fake_adb.Arctic.return_value = arctic_instance
-
-        with patch.dict("sys.modules", {"arcticdb": fake_adb}):
-            atr, _ = feature_maps.load_precomputed_feature_maps("test-bucket")
+        with _mock_bulk_read(rows):
+            atr, _, _ = feature_maps.load_precomputed_feature_maps("test-bucket")
 
         assert set(atr.keys()) == {"GOOD"}, (
             f"Expected only GOOD; got {atr}"
@@ -146,17 +141,104 @@ class TestLoadPrecomputedFeatureMaps:
                 feature_maps.load_precomputed_feature_maps("test-bucket")
 
     def test_empty_universe_returns_empty_maps(self):
-        lib = _mock_arctic_library({})
-        arctic_instance = MagicMock()
-        arctic_instance.get_library.return_value = lib
-        fake_adb = MagicMock()
-        fake_adb.Arctic.return_value = arctic_instance
-
-        with patch.dict("sys.modules", {"arcticdb": fake_adb}):
-            atr, vwap = feature_maps.load_precomputed_feature_maps("test-bucket")
+        with _mock_bulk_read({}):
+            atr, vwap, cov = feature_maps.load_precomputed_feature_maps("test-bucket")
 
         assert atr == {}
         assert vwap == {}
+        assert cov == {}
+
+
+class TestFeatureCoverageBulkExtract:
+    """Coverage = non_nan_feature_cols / total_feature_cols on the last
+    row. Feature cols = every column outside _COVERAGE_OHLCV_COLS.
+    Must match executor.price_cache.load_feature_coverage byte-for-byte."""
+
+    def test_partial_coverage_multiple_features(self):
+        """Short-history ticker: some long-window features NaN, others
+        populated. Coverage = populated / total."""
+        dates = pd.DatetimeIndex(["2024-01-02"])
+        rows = {
+            "SHORT": pd.DataFrame(
+                {
+                    "Open": [100.0], "High": [101.0], "Low": [99.0],
+                    "Close": [100.5], "Volume": [1_000_000], "VWAP": [100.2],
+                    "atr_14_pct": [0.02],  # populated
+                    "return_252d": [float("nan")],  # unpopulated (short history)
+                    "dist_from_52w_high": [float("nan")],
+                    "rsi_14": [55.0],  # populated
+                },
+                index=dates,
+            ),
+        }
+        with _mock_bulk_read(rows):
+            _, _, cov = feature_maps.load_precomputed_feature_maps("test-bucket")
+
+        # 4 feature cols (atr_14_pct, return_252d, dist_from_52w_high, rsi_14),
+        # 2 non-NaN → coverage = 0.5
+        assert cov == {"SHORT": 0.5}
+
+    def test_zero_coverage_on_no_feature_cols(self):
+        """A frame with ONLY OHLCV columns (no features) returns 0.0
+        coverage — matches load_feature_coverage's no_features branch."""
+        dates = pd.DatetimeIndex(["2024-01-02"])
+        rows = {
+            "RAW_ONLY": pd.DataFrame(
+                {"Open": [100.0], "High": [101.0], "Low": [99.0],
+                 "Close": [100.5], "Volume": [1_000_000], "VWAP": [100.2]},
+                index=dates,
+            ),
+        }
+        with _mock_bulk_read(rows):
+            _, _, cov = feature_maps.load_precomputed_feature_maps("test-bucket")
+
+        assert cov == {"RAW_ONLY": 0.0}
+
+    def test_full_coverage_all_features_populated(self):
+        dates = pd.DatetimeIndex(["2024-01-02"])
+        rows = {
+            "FULL": pd.DataFrame(
+                {"Close": [100.0], "atr_14_pct": [0.02],
+                 "rsi_14": [50.0], "return_252d": [0.15]},
+                index=dates,
+            ),
+        }
+        with _mock_bulk_read(rows):
+            _, _, cov = feature_maps.load_precomputed_feature_maps("test-bucket")
+
+        # 3 feature cols, all populated → 1.0
+        assert cov == {"FULL": 1.0}
+
+    def test_coverage_ohlcv_cols_match_executor_side(self):
+        """The _COVERAGE_OHLCV_COLS frozenset in store/feature_maps.py
+        must byte-equal executor/price_cache.py's definition. Drift
+        would silently change backtest coverage values vs live
+        executor values."""
+        expected = frozenset({
+            "Open", "High", "Low", "Close", "Adj_Close", "Volume", "VWAP",
+        })
+        assert feature_maps._COVERAGE_OHLCV_COLS == expected, (
+            "_COVERAGE_OHLCV_COLS drifted from executor's definition — "
+            "backtest and live will compute different coverage values."
+        )
+
+    def test_adj_close_excluded_from_feature_count(self):
+        """Adj_Close is a raw-market-data column, should NOT count as
+        a feature — same as Open/High/Low/Close/Volume/VWAP."""
+        dates = pd.DatetimeIndex(["2024-01-02"])
+        rows = {
+            "WITH_ADJ": pd.DataFrame(
+                {"Close": [100.0], "Adj_Close": [99.5],
+                 "atr_14_pct": [0.02]},
+                index=dates,
+            ),
+        }
+        with _mock_bulk_read(rows):
+            _, _, cov = feature_maps.load_precomputed_feature_maps("test-bucket")
+
+        # Only atr_14_pct counts as a feature → 1/1 = 1.0
+        # If Adj_Close leaked into the denominator it'd be 1/2 = 0.5
+        assert cov == {"WITH_ADJ": 1.0}
 
 
 # ── resolve_vwap_map_for_date ────────────────────────────────────────────────

@@ -41,12 +41,23 @@ log = logging.getLogger(__name__)
 # lazily and we want this module importable in isolation for tests.
 _VWAP_DEFAULT_LOOKBACK = 5
 
+# Mirror of executor/price_cache.py::_COVERAGE_OHLCV_COLS. Kept in sync
+# manually — these columns are excluded from the feature-coverage ratio
+# calculation (they're raw market data, not computed features). A drift
+# between these two sets would silently change the coverage values the
+# backtester injects vs what the live executor computes. The parity
+# tests in tests/test_feature_maps.py lock the set.
+_COVERAGE_OHLCV_COLS = frozenset({
+    "Open", "High", "Low", "Close", "Adj_Close", "Volume", "VWAP",
+})
+
 
 def load_precomputed_feature_maps(
     bucket: str,
     max_workers: int = 20,
-) -> tuple[dict[str, float], dict[str, pd.Series]]:
-    """Bulk-read atr_14_pct + VWAP for every universe ticker at once.
+) -> tuple[dict[str, float], dict[str, pd.Series], dict[str, float]]:
+    """Bulk-read atr_14_pct + VWAP + feature-coverage for every universe
+    ticker at once.
 
     Returns
     -------
@@ -61,10 +72,20 @@ def load_precomputed_feature_maps(
         Per-simulate-date resolution is done by
         ``resolve_vwap_map_for_date`` below.
 
+    coverage_by_ticker : dict[ticker, float]
+        Fraction of non-NaN feature columns in the ticker's most-recent
+        ArcticDB row. Matches ``load_feature_coverage``'s semantics:
+        ``non_nan_feature_cols / total_feature_cols`` where "feature
+        cols" = every column outside ``_COVERAGE_OHLCV_COLS``. Empty
+        frames / frames with no feature columns report 0.0 (same shape
+        the executor's admission gate / sizer derate expects).
+
     The concurrent reads mirror
     ``loaders/price_loader.load_slim_cache``'s ThreadPoolExecutor shape
     and the existing ``store/arctic_reader`` read loop. ArcticDB is
-    thread-safe for reads.
+    thread-safe for reads. All three maps share a SINGLE bulk read —
+    no additional I/O cost for coverage beyond what ATR + VWAP
+    already pay.
 
     Failure semantics: on library open failure, raises RuntimeError
     (mirrors the executor's hard-fail contract). Per-ticker read
@@ -103,9 +124,11 @@ def load_precomputed_feature_maps(
 
     atr_by_ticker: dict[str, float] = {}
     vwap_series_by_ticker: dict[str, pd.Series] = {}
+    coverage_by_ticker: dict[str, float] = {}
     n_err = 0
     n_missing_atr = 0
     n_missing_vwap = 0
+    n_zero_coverage = 0
 
     def _read_one(ticker: str) -> tuple[str, pd.DataFrame | None, str | None]:
         try:
@@ -148,13 +171,26 @@ def load_precomputed_feature_maps(
             else:
                 n_missing_vwap += 1
 
+            # Feature-coverage: fraction of non-NaN feature columns in
+            # the LAST row. Matches executor.price_cache.load_feature_coverage
+            # exactly: feature_cols = [c for c in df.columns if c not in
+            # _COVERAGE_OHLCV_COLS]; non_nan / len(feature_cols).
+            feature_cols = [c for c in df.columns if c not in _COVERAGE_OHLCV_COLS]
+            if not feature_cols:
+                coverage_by_ticker[ticker] = 0.0
+                n_zero_coverage += 1
+            else:
+                last_row = df[feature_cols].iloc[-1]
+                non_nan = int(last_row.notna().sum())
+                coverage_by_ticker[ticker] = non_nan / len(feature_cols)
+
     log.info(
-        "feature_maps: loaded atr=%d, vwap=%d, missing_atr=%d, missing_vwap=%d, "
-        "read_errors=%d (of %d tickers)",
-        len(atr_by_ticker), len(vwap_series_by_ticker),
-        n_missing_atr, n_missing_vwap, n_err, len(symbols),
+        "feature_maps: loaded atr=%d, vwap=%d, coverage=%d, missing_atr=%d, "
+        "missing_vwap=%d, zero_coverage=%d, read_errors=%d (of %d tickers)",
+        len(atr_by_ticker), len(vwap_series_by_ticker), len(coverage_by_ticker),
+        n_missing_atr, n_missing_vwap, n_zero_coverage, n_err, len(symbols),
     )
-    return atr_by_ticker, vwap_series_by_ticker
+    return atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker
 
 
 def resolve_vwap_map_for_date(
