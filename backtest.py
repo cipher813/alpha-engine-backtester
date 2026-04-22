@@ -153,6 +153,31 @@ def _filter_signals_to_universe(
     return filtered
 
 
+def _build_ohlcv_date_index(ohlcv_by_ticker: dict) -> dict[str, list[str]]:
+    """Precompute the date axis for every ticker's OHLCV history.
+
+    Returns ``{ticker: [date0, date1, ...]}`` — parallel to
+    ``ohlcv_by_ticker[ticker]`` (same order, same length). The dates are
+    already-sorted ISO8601 strings (``loaders/price_loader.py:142`` sorts
+    bars by ``date`` string), so lexicographic comparison is chronological
+    and ``bisect.bisect_right(dates, signal_date)`` gives the "<= signal_date"
+    cut index in ``O(log N)``.
+
+    Built once per simulation pipeline; every per-date
+    ``_simulate_single_date`` call then slices with ``bars[:cut]`` instead
+    of the prior ``[b for b in bars if b["date"] <= signal_date]`` Python-
+    list comprehension. For a 900-ticker × 2500-bar × 2000-date predictor
+    param sweep (60 combos) this cuts the filter inner loop from
+    ~270B dict-lookup/compare ops to ~108B list-ref copies — roughly
+    10x faster per the same micro-benchmark shape that motivated PR #46
+    (2026-04-21 ``build_signals_by_date`` vectorization, 75min → ~1min).
+    """
+    return {
+        ticker: [b["date"] for b in bars]
+        for ticker, bars in (ohlcv_by_ticker or {}).items()
+    }
+
+
 def _simulate_single_date(
     executor_run,
     sim_client,
@@ -164,6 +189,7 @@ def _simulate_single_date(
     signals_override: dict | None = None,
     universe_symbols: set[str] | None = None,
     rejected_ticker_counter: dict[str, int] | None = None,
+    ohlcv_dates_index: dict[str, list[str]] | None = None,
 ) -> tuple[list[dict] | None, str | None]:
     """
     Run the executor once for a single signal date.
@@ -223,13 +249,34 @@ def _simulate_single_date(
     sim_client._prices = date_prices
     sim_client._simulation_date = signal_date
 
-    # Filter OHLCV histories to <= signal_date (no lookahead)
+    # Filter OHLCV histories to <= signal_date (no lookahead).
+    #
+    # 2026-04-22: vectorized from a per-date Python list comprehension to
+    # bisect+slice after the Saturday SF dry-run timed out at the 2h SSM
+    # ceiling. The old path iterated every bar of every ticker doing a
+    # dict-lookup + string compare per bar — for a 60-combo × 2000-date
+    # × 900-ticker × 2500-bar predictor param sweep that worked out to
+    # ~270B inner ops. bisect.bisect_right is O(log N) against the
+    # precomputed date axis; the list slice copies only references, not
+    # bar data. Same shape as PR #46's ``build_signals_by_date`` fix.
+    #
+    # ``ohlcv_dates_index`` is threaded from the caller when available.
+    # Fallback derivation keeps the old per-call callers working while
+    # we migrate — it's the scalar path, kept under test via
+    # ``test_price_histories_parity.py`` so future refactors can't drift.
     price_histories = None
     if ohlcv_by_ticker:
-        price_histories = {
-            ticker: [b for b in bars if b["date"] <= signal_date]
-            for ticker, bars in ohlcv_by_ticker.items()
-        }
+        if ohlcv_dates_index is not None:
+            from bisect import bisect_right
+            price_histories = {
+                ticker: bars[:bisect_right(ohlcv_dates_index[ticker], signal_date)]
+                for ticker, bars in ohlcv_by_ticker.items()
+            }
+        else:
+            price_histories = {
+                ticker: [b for b in bars if b["date"] <= signal_date]
+                for ticker, bars in ohlcv_by_ticker.items()
+            }
 
     orders = executor_run(
         simulate=True,
@@ -255,6 +302,7 @@ def _run_simulation_loop(
     ohlcv_by_ticker: dict | None = None,
     signals_by_date: dict | None = None,
     spy_prices: pd.Series | None = None,
+    ohlcv_dates_index: dict[str, list[str]] | None = None,
 ) -> dict:
     """
     Run one full simulation pass with the given config and pre-built price matrix.
@@ -284,6 +332,16 @@ def _run_simulation_loop(
 
     # Build config_override from swept params that need to reach the executor
     config_override = _build_config_override(config)
+
+    # Precompute OHLCV date axis once per simulate pass. Callers sharing
+    # ``ohlcv_by_ticker`` across many simulate runs (param sweep, Phase 4
+    # evaluations) can build this once at the top-level and pass it
+    # in — otherwise we derive it here so every per-date
+    # ``_simulate_single_date`` call gets the fast bisect+slice path
+    # regardless of caller. Cost is a single ``O(N_tickers × N_bars)``
+    # pass, negligible compared to the inner loop savings.
+    if ohlcv_by_ticker and ohlcv_dates_index is None:
+        ohlcv_dates_index = _build_ohlcv_date_index(ohlcv_by_ticker)
 
     sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
     all_orders: list[dict] = []
@@ -328,6 +386,7 @@ def _run_simulation_loop(
             signals_override=signals_override,
             universe_symbols=universe_symbols,
             rejected_ticker_counter=rejected_ticker_counter,
+            ohlcv_dates_index=ohlcv_dates_index,
         )
         if skip is not None:
             skip_reasons[skip] += 1
@@ -485,6 +544,10 @@ def replay_for_dates(
     else:
         sim_dates = sorted(dates)
 
+    # One-time OHLCV date-axis build for the same reason as in
+    # ``_run_simulation_loop`` — avoids rebuilding per ``signal_date``.
+    ohlcv_dates_index = _build_ohlcv_date_index(ohlcv_by_ticker) if ohlcv_by_ticker else None
+
     captured: list[dict] = []
     for signal_date in sim_dates:
         orders, _skip = _simulate_single_date(
@@ -496,6 +559,7 @@ def replay_for_dates(
             bucket=bucket,
             config_override=config_override,
             signals_override=None,  # load from S3 per date
+            ohlcv_dates_index=ohlcv_dates_index,
         )
         if orders and signal_date in requested:
             captured.extend(orders)
@@ -621,10 +685,15 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
         )
         return pd.DataFrame()
 
+    # Build the OHLCV date-axis index ONCE — every combo's simulate pass
+    # would otherwise rebuild it redundantly in _run_simulation_loop.
+    ohlcv_dates_index = _build_ohlcv_date_index(ohlcv) if ohlcv else None
+
     def sim_fn(combo_config: dict) -> dict:
         return _run_simulation_loop(
             executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
             ohlcv_by_ticker=ohlcv,
+            ohlcv_dates_index=ohlcv_dates_index,
         )
 
     grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
@@ -717,6 +786,15 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     sector_map = result.get("sector_map", {})
     trading_dates = result.get("trading_dates", [])
 
+    # One-time OHLCV date axis build. Shared across the single-run sim,
+    # every Phase 4 evaluation that also runs a full simulation
+    # (ensemble_modes, signal_thresholds, feature_pruning), and every
+    # param-sweep combo. Without this, each of those would rebuild the
+    # index redundantly — 60+ rebuilds for a full predictor-param-sweep
+    # over 2000+ dates, each ~2s. See _build_ohlcv_date_index docstring
+    # for the inner-loop cost math.
+    ohlcv_dates_index = _build_ohlcv_date_index(ohlcv_by_ticker) if ohlcv_by_ticker else None
+
     # Import executor modules
     executor_paths = config.get("executor_paths", [])
     if isinstance(executor_paths, str):
@@ -740,6 +818,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
         ohlcv_by_ticker=ohlcv_by_ticker,
         signals_by_date=signals_by_date,
         spy_prices=spy_prices,
+        ohlcv_dates_index=ohlcv_dates_index,
     )
     single_stats["predictor_metadata"] = metadata
 
@@ -849,6 +928,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 ohlcv_by_ticker=ohlcv_by_ticker,
                 signals_by_date=signals_by_date,
                 spy_prices=spy_prices,
+                ohlcv_dates_index=ohlcv_dates_index,
             )
 
         sweep_settings = config.get("param_sweep_settings", {})
