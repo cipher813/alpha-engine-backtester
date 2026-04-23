@@ -18,23 +18,51 @@
 # Budget EXCEEDED → SystemExit 2 with a loud message and context.
 #
 # ROADMAP Backtester P0 #3 "Per-phase smoke test harness" (2026-04-22).
+#
+# ── Calibration history ─────────────────────────────────────────────────────
+#
+# 2026-04-23 (initial PR #57): budgets set optimistically
+#   (180 / 300 / 300 / 480) without empirical cold-spot data.
+#
+# 2026-04-23 (this PR, stopgap): first real smoke-only dry-run on a
+# fresh c5.large spot revealed cold-start costs the initial budgets
+# didn't account for. Observed smoke-simulate breakdown on full
+# 911-ticker universe + 5-date cap:
+#   - preflight: 141.6s (cold ArcticDB connect; 2nd invocation 103.6s)
+#   - runtime_smoke: 2.3s
+#   - simulation_setup: 196.5s  (full-universe ArcticDB bulk read)
+#   - simulation_pipeline prelude (feature_maps precompute): ~182s
+#   - simulate (actual sim loop, 5 dates × 911 tickers): 28.6s
+#   - export_artifacts: 0.07s
+#   Total: ~514s. Budget was 180s → SystemExit 2.
+#
+# Root cause: the smoke fixture caps `max_signal_dates=5` but does NOT
+# filter the ticker axis, so ArcticDB bulk reads still pay full-universe
+# cost. Fixing that (universe-filter knob wired into signal_loader /
+# price_loader / load_precomputed_feature_maps) is the real fix — see
+# the follow-up PR "universe-filter fixture for smoke modes".
+#
+# These budgets are STOPGAPS that unblock the harness on cold spots
+# while the real fix ships. Once the universe-filter lands, budgets
+# should drop to ~150-300s per mode and will be tightened in that PR.
 
 smoke_budgets_seconds:
-  # simulation_setup + simulate over 5 recent signal dates, full universe.
-  # Dominated by: price_matrix build (ArcticDB bulk read) + sim loop.
-  smoke-simulate: 180.0
+  # Universe-filter active: ArcticDB reads restricted to _SMOKE_FIXTURE_TICKERS
+  # (5 tickers). Expected: preflight ~100-140s (cold) + runtime_smoke ~2s
+  # + setup ~5-10s + simulate 2-5s + pipeline prelude ~5-10s ≈ 120-170s.
+  # Headroom to 400s covers cold-spot variance + GBM / S3 latency spikes.
+  smoke-simulate: 400.0
 
-  # Above + 3-combo param sweep. Each combo is a full sim pass over the 5
-  # dates, so roughly 3x smoke-simulate + fixed overhead.
-  smoke-param-sweep: 300.0
+  # + 3-combo param sweep inner sim (~2-5s each, amortized feature maps)
+  # + executor_optimizer rec compute. Estimated 130-200s typical.
+  smoke-param-sweep: 500.0
 
-  # preflight + runtime_smoke + predictor_data_prep (GBM model download +
-  # inference over 30-60 trading days × full universe) + single_run +
-  # feature_maps_bulk_load. The GBM download (~10-20 MB) + model load are
-  # the tail-latency risks on cold S3 caches.
-  smoke-predictor-backtest: 300.0
+  # preflight + predictor_data_prep (GBM inference 30-60 days × 5 tickers
+  # is fast — the GBM download from S3 and scorer load dominate cold-
+  # start tail) + feature_maps + single_run. Estimated 120-200s typical.
+  smoke-predictor-backtest: 500.0
 
-  # Above + 3 Phase 4 evaluators, each running an inner full sim. The
-  # eval simulations are shrunk by the same fixture overrides, so each
-  # adds ~smoke-single-run time.
-  smoke-phase4: 480.0
+  # Above + 3 Phase 4 evaluators, each an inner full sim on 5 tickers.
+  # Variant-model download + inference adds ~30-60s per evaluator.
+  # Estimated 250-400s typical.
+  smoke-phase4: 700.0

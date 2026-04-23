@@ -103,16 +103,30 @@ def _verify_arctic_fresh(bucket: str, min_date: str | None = None) -> None:
 
 def load_universe_from_arctic(
     bucket: str = DEFAULT_BUCKET,
+    tickers_allowlist: set[str] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """
-    Load all universe symbols from ArcticDB.
+    Load universe symbols from ArcticDB.
 
     Returns two dicts, both keyed by ticker:
         price_data:         {ticker: DataFrame[OHLCV]}  — for price_matrix and ohlcv_by_ticker
         features_by_ticker: {ticker: DataFrame[OHLCV + features]}  — for GBM inference
 
     Macro/ETF tickers (SPY, VIX, sector ETFs) are included in price_data but
-    excluded from features_by_ticker.
+    excluded from features_by_ticker. The macro tickers are ALWAYS loaded
+    regardless of `tickers_allowlist` — SPY in particular is required for
+    benchmark comparisons and cannot be filtered out.
+
+    Parameters
+    ----------
+    tickers_allowlist :
+        If provided, only stocks in this set are read from the universe
+        library. Intersection with the actual ArcticDB symbol list is
+        applied. Macro/ETF symbols are ALWAYS loaded regardless. Intended
+        for smoke-harness fixtures where reading the full ~900-ticker
+        universe dominates wall-clock (e.g. 2026-04-23 dry-run surfaced
+        ~196s of bulk read for a 5-date smoke). Defaults to None (full
+        universe) so production code is unchanged.
 
     Raises
     ------
@@ -129,7 +143,19 @@ def load_universe_from_arctic(
         ) from exc
 
     symbols = universe.list_symbols()
-    log.info("ArcticDB universe: %d symbols", len(symbols))
+    if tickers_allowlist is not None:
+        # Intersect with the actual ArcticDB catalog so a bad allowlist
+        # (typo, missing ticker) doesn't crash — we just read fewer
+        # tickers. Loud log so operators see when the filter activates.
+        requested = set(tickers_allowlist)
+        symbols = [s for s in symbols if s in requested]
+        log.info(
+            "ArcticDB universe: filtered to %d symbols via tickers_allowlist "
+            "(requested %d of available catalog)",
+            len(symbols), len(requested),
+        )
+    else:
+        log.info("ArcticDB universe: %d symbols", len(symbols))
 
     price_data: dict[str, pd.DataFrame] = {}
     features_by_ticker: dict[str, pd.DataFrame] = {}

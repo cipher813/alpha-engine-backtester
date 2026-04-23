@@ -36,6 +36,7 @@ def build_matrix(
     field: str = "close",
     signals_prefix: str = "signals",
     _ohlcv_out: dict | None = None,
+    tickers_allowlist: set[str] | None = None,
 ) -> pd.DataFrame:
     """
     Build a price matrix for vectorbt: rows = dates, columns = tickers.
@@ -53,6 +54,11 @@ def build_matrix(
     _ohlcv_out : Optional output dict — when provided, is populated with
                  {ticker: [{date, open, high, low, close}, ...]} for strategy layer
                  consumers (ATR trailing stops etc.) to match the prior interface.
+    tickers_allowlist : Optional set of tickers to restrict the ArcticDB bulk
+                 read. When provided, signal-resolved universe is intersected
+                 with this allowlist BEFORE the ArcticDB read so we don't pay
+                 full-universe cost for smoke fixtures. Production default
+                 None (full universe). See smoke harness fixture wiring.
 
     Returns
     -------
@@ -83,6 +89,19 @@ def build_matrix(
         logger.warning("No signals found for %d dates — price rows will be empty: %s",
                        len(no_signal_dates), no_signal_dates[:10])
 
+    # Smoke-fixture universe filter — intersect signal-resolved tickers
+    # with the operator-provided allowlist so downstream ArcticDB bulk
+    # reads only pay for tickers we actually need. Production default
+    # None → no filter, full signal universe loads.
+    if tickers_allowlist is not None:
+        before = len(all_tickers)
+        all_tickers = all_tickers & set(tickers_allowlist)
+        logger.info(
+            "price_loader: filtered to %d tickers via tickers_allowlist "
+            "(from %d signal-resolved, allowlist=%d)",
+            len(all_tickers), before, len(tickers_allowlist),
+        )
+
     if not all_tickers:
         logger.warning("Zero tickers resolved from signals across %d dates — returning empty matrix", len(dates))
         df = pd.DataFrame()
@@ -95,7 +114,14 @@ def build_matrix(
 
     # ── Bulk read ArcticDB ─────────────────────────────────────────────────
     logger.info("Reading ArcticDB universe for %d tickers across %d dates", len(all_tickers), len(dates))
-    price_data, _ = load_universe_from_arctic(bucket=bucket)
+    # When the fixture specified an allowlist, also pass it to the
+    # ArcticDB reader so it reads only those symbols. Without this the
+    # reader still enumerates all 900+ symbols even though we'd drop
+    # most of them in the filter above. Macro/ETF symbols are always
+    # loaded downstream regardless — SPY required for benchmarking.
+    price_data, _ = load_universe_from_arctic(
+        bucket=bucket, tickers_allowlist=tickers_allowlist,
+    )
 
     # ── Pivot price_data into matrix[date, ticker] ────────────────────────
     field_title = field.capitalize()  # "close" → "Close"

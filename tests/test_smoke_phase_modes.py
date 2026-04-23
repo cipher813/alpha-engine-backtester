@@ -80,6 +80,36 @@ def test_smoke_simulate_routes_to_simulate():
     assert args.freeze is True  # never promote synthetic recs to S3
 
 
+@pytest.mark.parametrize("mode", [
+    "smoke-simulate", "smoke-param-sweep",
+    "smoke-predictor-backtest", "smoke-phase4",
+])
+def test_every_smoke_mode_sets_smoke_tickers(mode: str):
+    """Every smoke fixture must set `smoke_tickers` — it's the dominant
+    speedup lever. Without it, the ArcticDB bulk read still pays full-
+    universe cost and the smoke blows any reasonable budget (proven on
+    the 2026-04-23 cold-spot dry-run: 5-date smoke-simulate took ~514s
+    because max_signal_dates=5 alone didn't restrict the ticker axis)."""
+    args = _blank_args(mode)
+    config: dict = {}
+    backtest._apply_smoke_fixture(mode, args, config)
+
+    assert "smoke_tickers" in config, (
+        f"Smoke fixture for {mode} must set smoke_tickers — otherwise "
+        f"ArcticDB bulk reads pay full-universe cost"
+    )
+    tickers = config["smoke_tickers"]
+    assert isinstance(tickers, (list, tuple, set))
+    assert len(tickers) <= 20, (
+        f"smoke_tickers for {mode} has {len(tickers)} entries — smoke "
+        f"should be tiny (≤20) to keep runtime bounded"
+    )
+    assert all(isinstance(t, str) and t.isupper() and t.strip() for t in tickers), (
+        f"smoke_tickers for {mode} must be a list of non-empty uppercase "
+        f"ticker strings"
+    )
+
+
 def test_smoke_param_sweep_sets_tiny_grid():
     args = _blank_args("smoke-param-sweep")
     config: dict = {}

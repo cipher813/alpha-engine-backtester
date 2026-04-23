@@ -114,7 +114,16 @@ def _setup_simulation(config: dict) -> tuple:
 
     ohlcv_by_ticker = {}
     logger.info("Building price matrix for %d dates (ArcticDB)...", len(dates))
-    price_matrix = price_loader.build_matrix(dates, bucket, _ohlcv_out=ohlcv_by_ticker)
+    # Smoke fixture universe filter: when config["smoke_tickers"] is set,
+    # the ArcticDB bulk read is restricted to that allowlist so we don't
+    # pay full-universe cost for a smoke run. Production runs leave the
+    # key unset → allowlist stays None → reader behavior unchanged.
+    smoke_tickers = config.get("smoke_tickers")
+    _allowlist = set(smoke_tickers) if smoke_tickers else None
+    price_matrix = price_loader.build_matrix(
+        dates, bucket, _ohlcv_out=ohlcv_by_ticker,
+        tickers_allowlist=_allowlist,
+    )
 
     if price_matrix.empty:
         return executor_run, SimulatedIBKRClient, dates, None, init_cash, {}
@@ -663,7 +672,9 @@ def _run_simulation_loop(
     # pre-built maps to avoid rebuilding per combo in param sweep.
     if (atr_by_ticker is None or vwap_series_by_ticker is None or coverage_by_ticker is None):
         from store.feature_maps import load_precomputed_feature_maps
-        _atr, _vwap, _cov = load_precomputed_feature_maps(bucket)
+        _smoke_tickers = config.get("smoke_tickers")
+        _allowlist = set(_smoke_tickers) if _smoke_tickers else None
+        _atr, _vwap, _cov = load_precomputed_feature_maps(bucket, tickers_allowlist=_allowlist)
         if atr_by_ticker is None:
             atr_by_ticker = _atr
         if vwap_series_by_ticker is None:
@@ -1042,7 +1053,11 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
     # combo and we repay the ~900-ticker ArcticDB bulk read 60 times.
     from store.feature_maps import load_precomputed_feature_maps
     bucket = config.get("signals_bucket", "alpha-engine-research")
-    atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = load_precomputed_feature_maps(bucket)
+    _smoke_tickers = config.get("smoke_tickers")
+    _allowlist = set(_smoke_tickers) if _smoke_tickers else None
+    atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = load_precomputed_feature_maps(
+        bucket, tickers_allowlist=_allowlist,
+    )
 
     def sim_fn(combo_config: dict) -> dict:
         return _run_simulation_loop(
@@ -1181,8 +1196,10 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             )
         else:
             from store.feature_maps import load_precomputed_feature_maps
+            _smoke_tickers = config.get("smoke_tickers")
+            _allowlist = set(_smoke_tickers) if _smoke_tickers else None
             atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = (
-                load_precomputed_feature_maps(bucket)
+                load_precomputed_feature_maps(bucket, tickers_allowlist=_allowlist)
             )
             _save_predictor_feature_maps(
                 ctx, bucket, registry.date,
@@ -1485,14 +1502,33 @@ _SMOKE_SAMPLE_TICKERS = ("AAPL", "MSFT", "NVDA", "JNJ", "PG")
 # ArcticDB universe; speed comes from capping dates + combos. A future PR could
 # add a ticker filter if per-smoke runtime proves too long on the spot instance.
 
+# Default smoke-fixture ticker allowlist — restricts ArcticDB bulk reads
+# to a handful of high-liquidity large-caps. Callers can override per-mode
+# by passing a different list into the fixture `smoke_tickers` config key.
+# These are the same tickers the existing _runtime_smoke uses as sample
+# probes — kept in sync so smoke paths consistently exercise the same
+# ticker slice end-to-end.
+_SMOKE_FIXTURE_TICKERS = list(_SMOKE_SAMPLE_TICKERS)
+
+
 # Mapping: smoke mode → (full mode it routes to, config overrides, optional
 # --only-phases restriction, optional --skip-phases restriction).
+#
+# Every fixture sets `smoke_tickers` — a ticker allowlist that propagates
+# into loaders/signal_loader + loaders/price_loader.build_matrix +
+# store.feature_maps.load_precomputed_feature_maps +
+# store.arctic_reader.load_universe_from_arctic, restricting the ArcticDB
+# bulk read to ~5 tickers instead of the full ~900-ticker universe. This
+# is the dominant speedup lever for smoke: the 2026-04-23 smoke-only
+# dry-run revealed that max_signal_dates=5 alone saved very little
+# because setup still paid ~380s of full-universe bulk-read cost.
 _SMOKE_PHASE_MODES: dict[str, dict] = {
     "smoke-simulate": {
         "route_mode": "simulate",
         "overrides": {
             "max_signal_dates": 5,
             "min_simulation_dates": 2,
+            "smoke_tickers": _SMOKE_FIXTURE_TICKERS,
         },
         "only_phases": None,
         "skip_phases": None,
@@ -1502,6 +1538,7 @@ _SMOKE_PHASE_MODES: dict[str, dict] = {
         "overrides": {
             "max_signal_dates": 5,
             "min_simulation_dates": 2,
+            "smoke_tickers": _SMOKE_FIXTURE_TICKERS,
             # Tiny grid — 1 param × 3 values = 3 combos total
             "param_sweep": {"max_positions": [5, 10, 15]},
             "param_sweep_settings": {"mode": "grid"},
@@ -1512,6 +1549,7 @@ _SMOKE_PHASE_MODES: dict[str, dict] = {
     "smoke-predictor-backtest": {
         "route_mode": "predictor-backtest",
         "overrides": {
+            "smoke_tickers": _SMOKE_FIXTURE_TICKERS,
             # Small GBM lookback — enough bars for features (>252 rolling
             # windows aren't needed for a smoke; ArcticDB's feature columns
             # are precomputed so min_trading_days is the slice cap on
@@ -1536,6 +1574,7 @@ _SMOKE_PHASE_MODES: dict[str, dict] = {
     "smoke-phase4": {
         "route_mode": "predictor-backtest",
         "overrides": {
+            "smoke_tickers": _SMOKE_FIXTURE_TICKERS,
             "predictor_backtest": {
                 "min_trading_days": 30,
                 "max_trading_days": 60,
@@ -1933,7 +1972,11 @@ def _run_simulation_pipeline(
         try:
             from store.feature_maps import load_precomputed_feature_maps
             bucket = config.get("signals_bucket", "alpha-engine-research")
-            atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = load_precomputed_feature_maps(bucket)
+            _smoke_tickers = config.get("smoke_tickers")
+            _allowlist = set(_smoke_tickers) if _smoke_tickers else None
+            atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = load_precomputed_feature_maps(
+                bucket, tickers_allowlist=_allowlist,
+            )
         except Exception as exc:
             # Fall through to lazy per-call derivation rather than abort.
             # Preserves existing behavior on a bulk-read failure — each

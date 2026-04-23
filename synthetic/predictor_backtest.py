@@ -573,7 +573,14 @@ def run(config: dict, keep_features: bool = False) -> dict:
     #    parquet cache + inline slim-cache fallbacks have been removed.
     from store.arctic_reader import load_universe_from_arctic
     logger.info("[data_source=arcticdb] Loading universe from ArcticDB...")
-    price_data, features_by_ticker = load_universe_from_arctic(bucket=bucket)
+    # Smoke fixture universe filter — production default is None (full
+    # universe load). When smoke_tickers is set, reader restricts the
+    # stock-symbol read; macro/ETF symbols (SPY etc.) always load.
+    _smoke_tickers = config.get("smoke_tickers")
+    _allowlist = set(_smoke_tickers) if _smoke_tickers else None
+    price_data, features_by_ticker = load_universe_from_arctic(
+        bucket=bucket, tickers_allowlist=_allowlist,
+    )
     data_source = "arcticdb"
     feature_skip_reasons: dict = {}
     logger.info("[data_source=arcticdb] %d tickers with pre-computed features", len(features_by_ticker))
