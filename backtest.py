@@ -50,7 +50,7 @@ from analysis import param_sweep
 from optimizer import executor_optimizer
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
-from pipeline_common import load_config, pull_research_db
+from pipeline_common import load_config, phase, pull_research_db
 
 logger = logging.getLogger(__name__)
 
@@ -429,7 +429,17 @@ def _run_simulation_loop(
     else:
         sim_dates = dates
 
-    for signal_date in sim_dates:
+    # Per-date heartbeat — emit an INFO line every N dates so a long sim
+    # can't go fully silent for more than a minute or two at a time. Before
+    # this, ~2000 signal dates iterated with zero log output; combined with
+    # a DEBUG-only per-combo log in param_sweep, a predictor-param-sweep
+    # could run for >100 min without a single INFO line. See ROADMAP
+    # P0 "Diagnose the silent-phase bottleneck" (2026-04-22 4th dry-run).
+    _HEARTBEAT_EVERY = 250
+    n_dates = len(sim_dates)
+    t0 = _time.monotonic()
+
+    for idx, signal_date in enumerate(sim_dates):
         signals_override = signals_by_date[signal_date] if signals_by_date is not None else None
         orders, skip = _simulate_single_date(
             executor_run=executor_run,
@@ -449,10 +459,17 @@ def _run_simulation_loop(
         )
         if skip is not None:
             skip_reasons[skip] += 1
-            continue
-        if orders:
-            all_orders.extend(orders)
-        dates_simulated += 1
+        else:
+            if orders:
+                all_orders.extend(orders)
+            dates_simulated += 1
+
+        if (idx + 1) % _HEARTBEAT_EVERY == 0 or (idx + 1) == n_dates:
+            elapsed = _time.monotonic() - t0
+            logger.info(
+                "Simulation loop: %d/%d dates processed (%.1fs elapsed, last=%s)",
+                idx + 1, n_dates, elapsed, signal_date,
+            )
 
     _MIN_SIMULATION_COVERAGE = 0.80
 
@@ -841,7 +858,8 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     from synthetic.predictor_backtest import run as run_predictor_pipeline
 
     # Prepare data once — keep features for Phase 4 evaluations
-    result = run_predictor_pipeline(config, keep_features=True)
+    with phase("predictor_data_prep"):
+        result = run_predictor_pipeline(config, keep_features=True)
 
     if result.get("status") != "ok":
         return result, pd.DataFrame()
@@ -870,9 +888,10 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     # Loading once up front collapses that to a single bulk scan (~1-2
     # min for ~900 tickers with 20-way concurrency) — every subsequent
     # _simulate_single_date call reuses the in-memory maps.
-    from store.feature_maps import load_precomputed_feature_maps
-    _bucket_for_maps = config.get("signals_bucket", "alpha-engine-research")
-    atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = load_precomputed_feature_maps(_bucket_for_maps)
+    with phase("predictor_feature_maps_bulk_load"):
+        from store.feature_maps import load_precomputed_feature_maps
+        _bucket_for_maps = config.get("signals_bucket", "alpha-engine-research")
+        atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = load_precomputed_feature_maps(_bucket_for_maps)
 
     # Import executor modules
     executor_paths = config.get("executor_paths", [])
@@ -889,19 +908,20 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
 
     # Single run with default config
     logger.info("Running predictor-only simulation (default params): %d dates", len(signals_by_date))
-    single_stats = _run_simulation_loop(
-        executor_run, SimulatedIBKRClient,
-        dates=[],
-        price_matrix=price_matrix,
-        config=config,
-        ohlcv_by_ticker=ohlcv_by_ticker,
-        signals_by_date=signals_by_date,
-        spy_prices=spy_prices,
-        ohlcv_dates_index=ohlcv_dates_index,
-        atr_by_ticker=atr_by_ticker,
-        vwap_series_by_ticker=vwap_series_by_ticker,
-        coverage_by_ticker=coverage_by_ticker,
-    )
+    with phase("predictor_single_run", n_dates=len(signals_by_date)):
+        single_stats = _run_simulation_loop(
+            executor_run, SimulatedIBKRClient,
+            dates=[],
+            price_matrix=price_matrix,
+            config=config,
+            ohlcv_by_ticker=ohlcv_by_ticker,
+            signals_by_date=signals_by_date,
+            spy_prices=spy_prices,
+            ohlcv_dates_index=ohlcv_dates_index,
+            atr_by_ticker=atr_by_ticker,
+            vwap_series_by_ticker=vwap_series_by_ticker,
+            coverage_by_ticker=coverage_by_ticker,
+        )
     single_stats["predictor_metadata"] = metadata
 
     # ── Phase 4: Predictor hyperparameter feedback ───────────────────────
@@ -919,11 +939,12 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             # Phase 4a: Ensemble mode evaluation
             ensemble_result = None
             try:
-                ensemble_result = evaluate_ensemble_modes(
-                    features_by_ticker, price_matrix, ohlcv_by_ticker,
-                    spy_prices, sector_map, trading_dates,
-                    config, single_stats,
-                )
+                with phase("phase4a_ensemble_modes"):
+                    ensemble_result = evaluate_ensemble_modes(
+                        features_by_ticker, price_matrix, ohlcv_by_ticker,
+                        spy_prices, sector_map, trading_dates,
+                        config, single_stats,
+                    )
                 single_stats["ensemble_eval"] = ensemble_result
             except Exception as exc:
                 # Bumped from warning to error so flow-doctor captures it.
@@ -941,11 +962,12 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             threshold_result = None
             if predictions_by_date:
                 try:
-                    threshold_result = evaluate_signal_thresholds(
-                        predictions_by_date, sector_map, ohlcv_by_ticker,
-                        price_matrix, spy_prices, trading_dates,
-                        config, single_stats,
-                    )
+                    with phase("phase4b_signal_thresholds"):
+                        threshold_result = evaluate_signal_thresholds(
+                            predictions_by_date, sector_map, ohlcv_by_ticker,
+                            price_matrix, spy_prices, trading_dates,
+                            config, single_stats,
+                        )
                     single_stats["threshold_eval"] = threshold_result
                 except Exception as exc:
                     logger.error(
@@ -956,11 +978,12 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             # Phase 4c: Feature pruning evaluation
             pruning_result = None
             try:
-                pruning_result = evaluate_feature_pruning(
-                    features_by_ticker, price_matrix, ohlcv_by_ticker,
-                    spy_prices, sector_map, trading_dates,
-                    config, single_stats,
-                )
+                with phase("phase4c_feature_pruning"):
+                    pruning_result = evaluate_feature_pruning(
+                        features_by_ticker, price_matrix, ohlcv_by_ticker,
+                        spy_prices, sector_map, trading_dates,
+                        config, single_stats,
+                    )
                 single_stats["pruning_eval"] = pruning_result
             except Exception as exc:
                 logger.error(
@@ -1019,7 +1042,8 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
         sweep_settings = config.get("param_sweep_settings", {})
 
         logger.info("Running predictor param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
-        sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
+        with phase("predictor_param_sweep", combos=sum(len(v) for v in grid.values())):
+            sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
 
     return single_stats, sweep_df
 
@@ -1300,26 +1324,27 @@ def _run_simulation_pipeline(
     # ── Simulate mode ─────────────────────────────────────────────────────
     if args.mode in ("simulate", "all"):
         try:
-            if _sim_setup is None:
-                portfolio_stats = {"status": "error", "error": "Simulation setup failed"}
-            else:
-                executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv = _sim_setup
-                if price_matrix is None:
-                    min_dates = config.get("min_simulation_dates", 5)
-                    portfolio_stats = {
-                        "status": "insufficient_data",
-                        "dates_available": len(dates),
-                        "min_required": min_dates,
-                    }
+            with phase("simulate", mode=args.mode):
+                if _sim_setup is None:
+                    portfolio_stats = {"status": "error", "error": "Simulation setup failed"}
                 else:
-                    portfolio_stats = _run_simulation_loop(
-                        executor_run, SimulatedIBKRClient, dates, price_matrix, config,
-                        ohlcv_by_ticker=ohlcv,
-                        ohlcv_dates_index=ohlcv_dates_index,
-                        atr_by_ticker=atr_by_ticker,
-                        vwap_series_by_ticker=vwap_series_by_ticker,
-                        coverage_by_ticker=coverage_by_ticker,
-                    )
+                    executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv = _sim_setup
+                    if price_matrix is None:
+                        min_dates = config.get("min_simulation_dates", 5)
+                        portfolio_stats = {
+                            "status": "insufficient_data",
+                            "dates_available": len(dates),
+                            "min_required": min_dates,
+                        }
+                    else:
+                        portfolio_stats = _run_simulation_loop(
+                            executor_run, SimulatedIBKRClient, dates, price_matrix, config,
+                            ohlcv_by_ticker=ohlcv,
+                            ohlcv_dates_index=ohlcv_dates_index,
+                            atr_by_ticker=atr_by_ticker,
+                            vwap_series_by_ticker=vwap_series_by_ticker,
+                            coverage_by_ticker=coverage_by_ticker,
+                        )
         except Exception as e:
             logger.error("Mode 2 simulation failed: %s", e)
             if fd:
@@ -1330,28 +1355,29 @@ def _run_simulation_pipeline(
     # ── Param sweep ───────────────────────────────────────────────────────
     if args.mode in ("param-sweep", "all"):
         try:
-            if _sim_setup is None:
-                sweep_df = None
-            else:
-                executor_run, SimulatedIBKRClient, dates, price_matrix, _, ohlcv = _sim_setup
-                if price_matrix is None:
-                    logger.warning("Param sweep skipped: only %d signal dates available", len(dates))
-                    sweep_df = pd.DataFrame()
+            with phase("param_sweep", mode=args.mode):
+                if _sim_setup is None:
+                    sweep_df = None
                 else:
-                    def sim_fn(combo_config: dict) -> dict:
-                        return _run_simulation_loop(
-                            executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
-                            ohlcv_by_ticker=ohlcv,
-                            ohlcv_dates_index=ohlcv_dates_index,
-                            atr_by_ticker=atr_by_ticker,
-                            vwap_series_by_ticker=vwap_series_by_ticker,
-                            coverage_by_ticker=coverage_by_ticker,
-                        )
-                    grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
-                    grid = _seed_grid_with_current(grid, current_executor_params)
-                    sweep_settings = config.get("param_sweep_settings", {})
-                    logger.info("Running param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
-                    sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
+                    executor_run, SimulatedIBKRClient, dates, price_matrix, _, ohlcv = _sim_setup
+                    if price_matrix is None:
+                        logger.warning("Param sweep skipped: only %d signal dates available", len(dates))
+                        sweep_df = pd.DataFrame()
+                    else:
+                        def sim_fn(combo_config: dict) -> dict:
+                            return _run_simulation_loop(
+                                executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
+                                ohlcv_by_ticker=ohlcv,
+                                ohlcv_dates_index=ohlcv_dates_index,
+                                atr_by_ticker=atr_by_ticker,
+                                vwap_series_by_ticker=vwap_series_by_ticker,
+                                coverage_by_ticker=coverage_by_ticker,
+                            )
+                        grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
+                        grid = _seed_grid_with_current(grid, current_executor_params)
+                        sweep_settings = config.get("param_sweep_settings", {})
+                        logger.info("Running param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
+                        sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
         except Exception as e:
             logger.error("Param sweep failed: %s", e)
             if fd:
@@ -1362,57 +1388,60 @@ def _run_simulation_pipeline(
         # Executor parameter optimization from sweep results
         if sweep_df is not None and not sweep_df.empty:
             try:
-                executor_rec = executor_optimizer.recommend(
-                    sweep_df, config, current_params=current_executor_params,
-                )
-                if executor_rec.get("status") == "ok" and _sim_setup is not None:
-                    executor_run_fn, SimClientCls, sim_dates, pm, _, ohlcv_data = _sim_setup
-                    if pm is not None:
-                        def holdout_sim_fn(combo_config):
-                            return _run_simulation_loop(
-                                executor_run_fn, SimClientCls, sim_dates, pm, combo_config,
-                                ohlcv_by_ticker=ohlcv_data,
-                                ohlcv_dates_index=ohlcv_dates_index,
-                                atr_by_ticker=atr_by_ticker,
-                                vwap_series_by_ticker=vwap_series_by_ticker,
-                                coverage_by_ticker=coverage_by_ticker,
-                            )
-                        executor_rec = executor_optimizer.validate_holdout(
-                            executor_rec, holdout_sim_fn, sim_dates, config,
-                        )
+                with phase("executor_optimizer", mode=args.mode):
+                    executor_rec = executor_optimizer.recommend(
+                        sweep_df, config, current_params=current_executor_params,
+                    )
+                    if executor_rec.get("status") == "ok" and _sim_setup is not None:
+                        executor_run_fn, SimClientCls, sim_dates, pm, _, ohlcv_data = _sim_setup
+                        if pm is not None:
+                            def holdout_sim_fn(combo_config):
+                                return _run_simulation_loop(
+                                    executor_run_fn, SimClientCls, sim_dates, pm, combo_config,
+                                    ohlcv_by_ticker=ohlcv_data,
+                                    ohlcv_dates_index=ohlcv_dates_index,
+                                    atr_by_ticker=atr_by_ticker,
+                                    vwap_series_by_ticker=vwap_series_by_ticker,
+                                    coverage_by_ticker=coverage_by_ticker,
+                                )
+                            with phase("executor_holdout", mode=args.mode):
+                                executor_rec = executor_optimizer.validate_holdout(
+                                    executor_rec, holdout_sim_fn, sim_dates, config,
+                                )
 
-                # Twin simulation: current vs proposed on same dates
-                if executor_rec.get("status") == "ok" and _sim_setup is not None:
-                    executor_run_fn, SimClientCls, sim_dates, pm, _, ohlcv_data = _sim_setup
-                    if pm is not None and current_executor_params:
-                        from optimizer.twin_sim import run_twin_simulation
-                        from copy import deepcopy
-                        recommended = executor_rec.get("recommended_params", {})
-                        current_cfg = deepcopy(config)
-                        current_cfg.update(current_executor_params)
-                        proposed_cfg = deepcopy(config)
-                        proposed_cfg.update(recommended)
-                        changed_keys = [k for k in recommended if recommended.get(k) != current_executor_params.get(k)]
+                    # Twin simulation: current vs proposed on same dates
+                    if executor_rec.get("status") == "ok" and _sim_setup is not None:
+                        executor_run_fn, SimClientCls, sim_dates, pm, _, ohlcv_data = _sim_setup
+                        if pm is not None and current_executor_params:
+                            from optimizer.twin_sim import run_twin_simulation
+                            from copy import deepcopy
+                            recommended = executor_rec.get("recommended_params", {})
+                            current_cfg = deepcopy(config)
+                            current_cfg.update(current_executor_params)
+                            proposed_cfg = deepcopy(config)
+                            proposed_cfg.update(recommended)
+                            changed_keys = [k for k in recommended if recommended.get(k) != current_executor_params.get(k)]
 
-                        def twin_sim_fn(cfg):
-                            return _run_simulation_loop(
-                                executor_run_fn, SimClientCls, sim_dates, pm, cfg,
-                                ohlcv_by_ticker=ohlcv_data,
-                                ohlcv_dates_index=ohlcv_dates_index,
-                                atr_by_ticker=atr_by_ticker,
-                                vwap_series_by_ticker=vwap_series_by_ticker,
-                                coverage_by_ticker=coverage_by_ticker,
-                            )
-                        executor_rec["twin_sim"] = run_twin_simulation(
-                            twin_sim_fn, current_cfg, proposed_cfg, changed_keys,
-                        )
+                            def twin_sim_fn(cfg):
+                                return _run_simulation_loop(
+                                    executor_run_fn, SimClientCls, sim_dates, pm, cfg,
+                                    ohlcv_by_ticker=ohlcv_data,
+                                    ohlcv_dates_index=ohlcv_dates_index,
+                                    atr_by_ticker=atr_by_ticker,
+                                    vwap_series_by_ticker=vwap_series_by_ticker,
+                                    coverage_by_ticker=coverage_by_ticker,
+                                )
+                            with phase("executor_twin_sim", mode=args.mode):
+                                executor_rec["twin_sim"] = run_twin_simulation(
+                                    twin_sim_fn, current_cfg, proposed_cfg, changed_keys,
+                                )
 
-                if executor_rec.get("status") == "ok":
-                    bucket = config.get("signals_bucket", "alpha-engine-research")
-                    if args.freeze:
-                        executor_rec["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
-                    else:
-                        executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
+                    if executor_rec.get("status") == "ok":
+                        bucket = config.get("signals_bucket", "alpha-engine-research")
+                        if args.freeze:
+                            executor_rec["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+                        else:
+                            executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
             except Exception as e:
                 logger.error("Executor optimizer failed: %s", e)
                 if fd:
@@ -1545,13 +1574,14 @@ def main() -> None:
     # Kept out of --rollback path because rollback touches S3 configs
     # only, not ArcticDB.
     if not args.rollback:
-        from preflight import BacktesterPreflight
-        BacktesterPreflight(
-            bucket=config.get("signals_bucket", "alpha-engine-research"),
-            mode="backtest",
-            executor_paths=config.get("executor_paths") or [],
-            predictor_paths=config.get("predictor_paths") or [],
-        ).run()
+        with phase("preflight", mode=args.mode):
+            from preflight import BacktesterPreflight
+            BacktesterPreflight(
+                bucket=config.get("signals_bucket", "alpha-engine-research"),
+                mode="backtest",
+                executor_paths=config.get("executor_paths") or [],
+                predictor_paths=config.get("predictor_paths") or [],
+            ).run()
 
         # Runtime smoke: end-to-end sanity with minimal data (~30-60s).
         # Runs after preflight (so any preflight failure surfaces first,
@@ -1560,11 +1590,13 @@ def main() -> None:
         # escape hatch for genuine restart scenarios; --mode=smoke runs
         # the smoke and exits 0 without doing full work.
         if args.mode == "smoke":
-            _runtime_smoke(config)
+            with phase("runtime_smoke", mode=args.mode):
+                _runtime_smoke(config)
             logger.info("Smoke-only mode complete — exiting 0 without full run")
             return
         if not args.skip_smoke:
-            _runtime_smoke(config)
+            with phase("runtime_smoke", mode=args.mode):
+                _runtime_smoke(config)
 
     # Handle --rollback before any other mode
     if args.rollback:
@@ -1591,7 +1623,8 @@ def main() -> None:
     _sim_setup = None
     if args.mode in ("simulate", "param-sweep", "all"):
         try:
-            _sim_setup = _setup_simulation(config)
+            with phase("simulation_setup", mode=args.mode):
+                _sim_setup = _setup_simulation(config)
         except Exception as e:
             logger.error("Simulation setup failed: %s", e)
             if fd:
@@ -1605,20 +1638,23 @@ def main() -> None:
 
     # ── Simulate + param sweep + executor optimizer ───────────────────────
     if args.mode in ("simulate", "param-sweep", "all"):
-        portfolio_stats, sweep_df, executor_rec = _run_simulation_pipeline(
-            args, config, _sim_setup, current_executor_params, fd,
-        )
+        with phase("simulation_pipeline", mode=args.mode):
+            portfolio_stats, sweep_df, executor_rec = _run_simulation_pipeline(
+                args, config, _sim_setup, current_executor_params, fd,
+            )
 
     # ── Predictor backtest ────────────────────────────────────────────────
     if args.mode in ("predictor-backtest", "all"):
-        predictor_stats, predictor_sweep_df, executor_rec = _run_predictor_pipeline(
-            args, config, executor_rec, current_executor_params, fd,
-        )
+        with phase("predictor_pipeline", mode=args.mode):
+            predictor_stats, predictor_sweep_df, executor_rec = _run_predictor_pipeline(
+                args, config, executor_rec, current_executor_params, fd,
+            )
 
     # ── Export simulation artifacts for evaluator ────────────────────────
     if args.mode in ("simulate", "param-sweep", "all", "predictor-backtest"):
         try:
-            _export_simulation_artifacts(config, args.date, sweep_df=sweep_df, predictor_sweep_df=predictor_sweep_df, portfolio_stats=portfolio_stats, predictor_stats=predictor_stats)
+            with phase("export_artifacts", mode=args.mode):
+                _export_simulation_artifacts(config, args.date, sweep_df=sweep_df, predictor_sweep_df=predictor_sweep_df, portfolio_stats=portfolio_stats, predictor_stats=predictor_stats)
         except Exception as e:
             logger.warning("Simulation artifact export failed (non-fatal): %s", e)
 

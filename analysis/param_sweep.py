@@ -173,18 +173,31 @@ def _run_combos(
     base_config: dict,
 ) -> pd.DataFrame:
     """Run simulation for each parameter combination and return results DataFrame."""
+    import time as _time
     rows = []
+    n = len(combinations)
+    t_sweep_start = _time.monotonic()
     for i, params in enumerate(combinations, 1):
         config = deepcopy(base_config)
         config.update(params)
 
-        logger.debug("Running simulation %d/%d with params: %s", i, len(combinations), params)
+        # Per-combo progress at INFO so the sweep never goes silent. Each
+        # combo is a full simulation (~30-90s); without this, 60 combos
+        # run in complete silence at default INFO level and look like a
+        # 60-min hang to any log reader. See ROADMAP Backtester P0
+        # "Diagnose the silent-phase bottleneck" (2026-04-22).
+        t_combo = _time.monotonic()
+        logger.info("Sweep combo %d/%d: %s", i, n, params)
         try:
             stats = run_simulation_fn(config)
             rows.append({**params, **stats})
         except Exception as e:
             logger.warning("Simulation failed for params %s: %s", params, e)
             rows.append({**params, "error": str(e)})
+        logger.info(
+            "Sweep combo %d/%d done in %.1fs (sweep elapsed %.1fs)",
+            i, n, _time.monotonic() - t_combo, _time.monotonic() - t_sweep_start,
+        )
 
     df = pd.DataFrame(rows)
     # Sort by total_alpha (primary) then sharpe_ratio (tiebreaker)
