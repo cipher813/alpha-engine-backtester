@@ -13,11 +13,17 @@ import pytest
 from phase_artifacts import (
     artifact_key,
     load_dataframe,
+    load_dict_of_dataframes,
+    load_dict_of_series,
     load_json,
     load_ohlcv_by_ticker,
+    load_series,
     save_dataframe,
+    save_dict_of_dataframes,
+    save_dict_of_series,
     save_json,
     save_ohlcv_by_ticker,
+    save_series,
 )
 from tests.test_phase_registry import _FakeS3
 
@@ -138,3 +144,118 @@ def test_ohlcv_preserves_date_order_per_ticker(s3):
     # Preserve original enumeration order — callers that want sorted
     # dates should sort themselves (matches current in-process behavior).
     assert [b["date"] for b in loaded["AAPL"]] == ["2026-01-03", "2026-01-01", "2026-01-02"]
+
+
+# ── Series round-trip (spy_prices) ───────────────────────────────────────────
+
+
+def test_series_roundtrip(s3):
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"])
+    s = pd.Series([100.0, 101.0, 102.0], index=dates, name="SPY")
+    key = save_series("b", "2026-04-23", "predictor_data_prep", "spy_prices",
+                      s, s3_client=s3)
+    loaded = load_series("b", key, s3_client=s3)
+    pd.testing.assert_series_equal(loaded, s, check_freq=False)
+
+
+def test_series_preserves_unnamed_as_value_column(s3):
+    """Unnamed Series survive round-trip with a 'value' column."""
+    s = pd.Series([1.0, 2.0, 3.0])
+    key = save_series("b", "2026-04-23", "p", "n", s, s3_client=s3)
+    loaded = load_series("b", key, s3_client=s3)
+    assert list(loaded) == [1.0, 2.0, 3.0]
+
+
+def test_load_series_rejects_multicolumn(s3):
+    """Loading a multi-col parquet as a Series must fail loud."""
+    df = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+    key = save_dataframe("b", "2026-04-23", "p", "n", df,
+                         s3_client=s3, preserve_index=False)
+    with pytest.raises(ValueError, match="expected 1"):
+        load_series("b", key, s3_client=s3)
+
+
+# ── Dict-of-Series round-trip (vwap_series_by_ticker) ────────────────────────
+
+
+def test_dict_of_series_roundtrip(s3):
+    data = {
+        "AAPL": pd.Series([100.0, 101.0], index=["2026-01-01", "2026-01-02"]),
+        "MSFT": pd.Series([200.0, 201.0, 202.0],
+                          index=["2026-01-01", "2026-01-02", "2026-01-03"]),
+    }
+    key = save_dict_of_series("b", "2026-04-23", "predictor_feature_maps",
+                              "vwap_series", data, s3_client=s3)
+    loaded = load_dict_of_series("b", key, s3_client=s3)
+    assert set(loaded.keys()) == set(data.keys())
+    for ticker in data:
+        pd.testing.assert_series_equal(
+            loaded[ticker].astype(float).reset_index(drop=True),
+            data[ticker].astype(float).reset_index(drop=True),
+            check_names=False,
+        )
+        assert list(loaded[ticker].index) == list(data[ticker].index)
+
+
+def test_dict_of_series_empty_dict(s3):
+    key = save_dict_of_series("b", "2026-04-23", "p", "n", {}, s3_client=s3)
+    loaded = load_dict_of_series("b", key, s3_client=s3)
+    assert loaded == {}
+
+
+def test_dict_of_series_skips_none_values(s3):
+    """A None Series for a ticker must not crash the stacker."""
+    data = {"AAPL": pd.Series([100.0], index=["2026-01-01"]), "MSFT": None}
+    key = save_dict_of_series("b", "2026-04-23", "p", "n", data, s3_client=s3)
+    loaded = load_dict_of_series("b", key, s3_client=s3)
+    assert "AAPL" in loaded
+    assert "MSFT" not in loaded
+
+
+# ── Dict-of-DataFrames round-trip (features_by_ticker) ──────────────────────
+
+
+def test_dict_of_dataframes_roundtrip(s3):
+    data = {
+        "AAPL": pd.DataFrame(
+            {"feat1": [1.0, 2.0, 3.0], "feat2": [4.0, 5.0, 6.0]},
+            index=pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"]),
+        ),
+        "MSFT": pd.DataFrame(
+            {"feat1": [10.0, 20.0], "feat2": [40.0, 50.0]},
+            index=pd.to_datetime(["2026-01-01", "2026-01-02"]),
+        ),
+    }
+    key = save_dict_of_dataframes("b", "2026-04-23", "predictor_data_prep",
+                                  "features", data, s3_client=s3)
+    loaded = load_dict_of_dataframes("b", key, s3_client=s3)
+
+    assert set(loaded.keys()) == set(data.keys())
+    for ticker in data:
+        orig = data[ticker]
+        got = loaded[ticker]
+        # Columns preserved (plus no extras)
+        assert set(got.columns) == set(orig.columns)
+        # Row count preserved
+        assert len(got) == len(orig)
+        # Values preserved (column-wise; index may be materialized as dt64)
+        for col in orig.columns:
+            assert list(got[col].astype(float)) == list(orig[col].astype(float))
+
+
+def test_dict_of_dataframes_empty_dict(s3):
+    key = save_dict_of_dataframes("b", "2026-04-23", "p", "n", {}, s3_client=s3)
+    loaded = load_dict_of_dataframes("b", key, s3_client=s3)
+    assert loaded == {}
+
+
+def test_dict_of_dataframes_drops_empty_frames(s3):
+    """A ticker with an empty DataFrame is dropped (avoids writing NaN rows)."""
+    data = {
+        "AAPL": pd.DataFrame({"f1": [1.0]}, index=[0]),
+        "MSFT": pd.DataFrame(),
+    }
+    key = save_dict_of_dataframes("b", "2026-04-23", "p", "n", data, s3_client=s3)
+    loaded = load_dict_of_dataframes("b", key, s3_client=s3)
+    assert "AAPL" in loaded
+    assert "MSFT" not in loaded
