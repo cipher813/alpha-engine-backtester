@@ -23,6 +23,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import backtest
+from pipeline_common import PhaseRegistry
+
+
+def _fake_registry():
+    """Registry that doesn't touch real S3 — marker reads always miss,
+    marker writes are captured into the mock S3 store."""
+    from tests.test_phase_registry import _FakeS3  # type: ignore[import-not-found]
+    return PhaseRegistry(
+        date="2026-04-23",
+        bucket="test-bucket",
+        s3_client=_FakeS3(),
+    )
 
 
 def test_flag_parses():
@@ -73,6 +85,7 @@ def test_skip_bypasses_phase4_in_predictor_sweep(caplog):
         "executor_paths": [],
         "signals_bucket": "test-bucket",
         "skip_phase4_evaluations": True,
+        "_phase_registry": _fake_registry(),
     }
 
     with patch("synthetic.predictor_backtest.run", fake_run), \

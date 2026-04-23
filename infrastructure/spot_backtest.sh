@@ -70,7 +70,14 @@ BACKTEST_MODE="all"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 RUN_MODE="full"  # full | smoke-only
-SKIP_PHASE4="${SKIP_PHASE4_EVALUATIONS:-false}"  # env-var routable from SF input
+# All five PhaseRegistry-adjacent flags are also routable from the
+# Saturday SF input via env vars. When set they pass through as
+# CLI args to backtest.py.
+SKIP_PHASE4="${SKIP_PHASE4_EVALUATIONS:-false}"
+SKIP_PHASES="${SKIP_PHASES:-}"            # comma-separated phase names
+ONLY_PHASES="${ONLY_PHASES:-}"            # comma-separated phase names
+FORCE_ALL="${FORCE_ALL:-false}"           # true → --force
+FORCE_PHASES="${FORCE_PHASES:-}"          # comma-separated phase names
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
@@ -78,16 +85,34 @@ while [[ $# -gt 0 ]]; do
         --mode) BACKTEST_MODE="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         --skip-phase4-evaluations) SKIP_PHASE4="true"; shift ;;
+        --skip-phases) SKIP_PHASES="$2"; shift 2 ;;
+        --only-phases) ONLY_PHASES="$2"; shift 2 ;;
+        --force) FORCE_ALL="true"; shift ;;
+        --force-phases) FORCE_PHASES="$2"; shift 2 ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
 
-# Convert SKIP_PHASE4 to a backtest.py CLI flag suffix (empty string when
+# Convert each flag to a backtest.py CLI arg suffix (empty string when
 # disabled, so we don't pass an invalid empty arg through the heredoc).
 if [ "$SKIP_PHASE4" = "true" ]; then
     BACKTEST_SKIP_PHASE4_FLAG="--skip-phase4-evaluations"
 else
     BACKTEST_SKIP_PHASE4_FLAG=""
+fi
+
+BACKTEST_PHASE_FLAGS=""
+if [ -n "$SKIP_PHASES" ]; then
+    BACKTEST_PHASE_FLAGS="$BACKTEST_PHASE_FLAGS --skip-phases=$SKIP_PHASES"
+fi
+if [ -n "$ONLY_PHASES" ]; then
+    BACKTEST_PHASE_FLAGS="$BACKTEST_PHASE_FLAGS --only-phases=$ONLY_PHASES"
+fi
+if [ "$FORCE_ALL" = "true" ]; then
+    BACKTEST_PHASE_FLAGS="$BACKTEST_PHASE_FLAGS --force"
+fi
+if [ -n "$FORCE_PHASES" ]; then
+    BACKTEST_PHASE_FLAGS="$BACKTEST_PHASE_FLAGS --force-phases=$FORCE_PHASES"
 fi
 
 echo "═══════════════════════════════════════════════════════════════"
@@ -100,6 +125,10 @@ echo "  Branch        : $BRANCH"
 echo "  Backtest mode : $BACKTEST_MODE"
 echo "  Run mode      : $RUN_MODE"
 echo "  Skip phase 4  : $SKIP_PHASE4"
+echo "  Skip phases   : ${SKIP_PHASES:-(none)}"
+echo "  Only phases   : ${ONLY_PHASES:-(none)}"
+echo "  Force all     : $FORCE_ALL"
+echo "  Force phases  : ${FORCE_PHASES:-(none)}"
 echo "  S3 bucket     : $S3_BUCKET"
 echo ""
 
@@ -449,7 +478,7 @@ echo "Starting backtest at \$(date)"
 # the Step Function catches it. Replaces the previous || { echo WARNING }
 # swallow which silently let the evaluator run against invalid sweep
 # results and was the root cause of multiple undetected param oscillations.
-if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG 2>&1; then
+if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1; then
     echo "ERROR: backtest.py failed. Skipping evaluator to prevent" >&2
     echo "       auto-promotion of unvalidated configs. Spot run is" >&2
     echo "       marked FAILED — check flow-doctor alerts." >&2
