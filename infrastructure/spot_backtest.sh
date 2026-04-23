@@ -70,15 +70,25 @@ BACKTEST_MODE="all"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 RUN_MODE="full"  # full | smoke-only
+SKIP_PHASE4="${SKIP_PHASE4_EVALUATIONS:-false}"  # env-var routable from SF input
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
         --mode) BACKTEST_MODE="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
+        --skip-phase4-evaluations) SKIP_PHASE4="true"; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
+
+# Convert SKIP_PHASE4 to a backtest.py CLI flag suffix (empty string when
+# disabled, so we don't pass an invalid empty arg through the heredoc).
+if [ "$SKIP_PHASE4" = "true" ]; then
+    BACKTEST_SKIP_PHASE4_FLAG="--skip-phase4-evaluations"
+else
+    BACKTEST_SKIP_PHASE4_FLAG=""
+fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Backtester Spot Run — $(date +%Y-%m-%d)"
@@ -89,6 +99,7 @@ echo "  Region        : $AWS_REGION"
 echo "  Branch        : $BRANCH"
 echo "  Backtest mode : $BACKTEST_MODE"
 echo "  Run mode      : $RUN_MODE"
+echo "  Skip phase 4  : $SKIP_PHASE4"
 echo "  S3 bucket     : $S3_BUCKET"
 echo ""
 
@@ -354,7 +365,15 @@ echo "Predictor cache dir: $(ls "$CACHE_DIR"/*.parquet 2>/dev/null | wc -l) parq
 CACHE
 
 # ── Build env export command ─────────────────────────────────────────────────
-ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-backtester/.env ] && source /home/ec2-user/alpha-engine-backtester/.env; set +a; export XDG_CACHE_HOME=/tmp;'
+# PYTHONUNBUFFERED=1: line-buffering stdout/stderr so SSM ships log lines as
+# they're emitted. Without this, stdout is block-buffered when the agent
+# captures it to CloudWatch — the 2026-04-22 4th Saturday SF dry-run lost
+# ~16 minutes of in-flight output when the SSM agent died mid-run and
+# buffered lines never reached the log. Combined with the phase markers
+# in pipeline_common.phase (which explicit-flush after each START/END),
+# this closes the "silent 110-minute phase" blind spot. Paired with
+# `python -u` on each backtest.py invocation below as belt-and-suspenders.
+ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-backtester/.env ] && source /home/ec2-user/alpha-engine-backtester/.env; set +a; export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1;'
 
 # Determine python binary on remote
 REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
@@ -381,7 +400,7 @@ ${ENV_SOURCE}
 BUCKET="\${OUTPUT_BUCKET:-alpha-engine-research}"
 
 echo "==> Smoke: backtest.py --mode=smoke (preflight + runtime smoke)"
-$REMOTE_PYTHON backtest.py --mode=smoke --log-level INFO
+$REMOTE_PYTHON -u backtest.py --mode=smoke --log-level INFO
 
 echo ""
 echo "==> Resolving most recent backtest artifact date from s3://\${BUCKET}/backtest/..."
@@ -394,7 +413,7 @@ echo "Using backtest date: \$LATEST_DATE"
 
 echo ""
 echo "==> Smoke: evaluate.py --mode diagnostics --freeze --date \$LATEST_DATE"
-$REMOTE_PYTHON evaluate.py --mode diagnostics --freeze --date "\$LATEST_DATE" --log-level INFO 2>&1 | tail -30
+$REMOTE_PYTHON -u evaluate.py --mode diagnostics --freeze --date "\$LATEST_DATE" --log-level INFO 2>&1 | tail -30
 
 echo ""
 echo "Smoke test complete."
@@ -430,7 +449,7 @@ echo "Starting backtest at \$(date)"
 # the Step Function catches it. Replaces the previous || { echo WARNING }
 # swallow which silently let the evaluator run against invalid sweep
 # results and was the root cause of multiple undetected param oscillations.
-if ! $REMOTE_PYTHON backtest.py --mode $BACKTEST_MODE --upload --log-level INFO 2>&1; then
+if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG 2>&1; then
     echo "ERROR: backtest.py failed. Skipping evaluator to prevent" >&2
     echo "       auto-promotion of unvalidated configs. Spot run is" >&2
     echo "       marked FAILED — check flow-doctor alerts." >&2

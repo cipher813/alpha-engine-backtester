@@ -10,7 +10,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import boto3
@@ -22,6 +25,51 @@ logger = logging.getLogger(__name__)
 
 _MIN_IC_SAMPLES = 10
 _IC_STD_EPSILON = 1e-8
+
+
+# ── Phase markers ────────────────────────────────────────────────────────────
+#
+# Structured begin/end log lines around each pipeline phase so any timeout
+# investigation can attribute wall time to a specific phase without having
+# to correlate log gaps against source code. Motivated by the 2026-04-22
+# 4th Saturday SF dry-run: 110 minutes of SSM-agent silence between the
+# last visible log and the 2h timeout, with no way to tell which phase
+# consumed the time. See ROADMAP P0 "Diagnose the silent-phase bottleneck".
+#
+# Format is parseable so future tooling (CloudWatch Insights filter, a
+# phase-runtime extractor, whatever) can grep on the `PHASE_START ` /
+# `PHASE_END ` prefix and pull name + duration from a single line.
+
+
+def _phase_logger() -> logging.Logger:
+    """Dedicated logger for phase markers so callers don't need to pass one."""
+    return logging.getLogger("backtest.phase")
+
+
+@contextmanager
+def phase(name: str, **context):
+    """Emit `PHASE_START name=X ...` and `PHASE_END name=X duration_s=Y status=ok|error ...`.
+
+    Duration is measured with monotonic time so NTP adjustments don't lie.
+    stdout is flushed after each marker — SSM agent death (see the 4th
+    2026-04-22 dry-run) ate ~16 minutes of buffered output; explicit flush
+    + PYTHONUNBUFFERED in spot_backtest.sh closes both failure modes.
+    """
+    plog = _phase_logger()
+    kv = " ".join(f"{k}={v}" for k, v in context.items())
+    plog.info("PHASE_START name=%s %s", name, kv)
+    sys.stdout.flush()
+    t0 = time.monotonic()
+    status = "ok"
+    try:
+        yield
+    except BaseException:
+        status = "error"
+        raise
+    finally:
+        dur = time.monotonic() - t0
+        plog.info("PHASE_END name=%s duration_s=%.2f status=%s %s", name, dur, status, kv)
+        sys.stdout.flush()
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
