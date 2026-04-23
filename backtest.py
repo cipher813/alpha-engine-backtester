@@ -1539,9 +1539,23 @@ _SMOKE_PHASE_MODES: dict[str, dict] = {
             "max_signal_dates": 5,
             "min_simulation_dates": 2,
             "smoke_tickers": _SMOKE_FIXTURE_TICKERS,
-            # Tiny grid — 1 param × 3 values = 3 combos total
+            # Grid override attempts to narrow the sweep to 3 combos.
+            # Note: _apply_smoke_fixture uses _deep_update which MERGES
+            # nested dicts — so if config.yaml has its own `param_sweep`
+            # block with all 7 risk params × multiple values, our
+            # 1-key override just replaces max_positions and the other
+            # 6 params stay in the grid, ballooning to 864 combos
+            # (observed on 2026-04-23 post-bugfix smoke run).
+            #
+            # Fix: force mode=random with max_trials=3. Regardless of
+            # whether the effective grid ends up with 3 or 864 shapes,
+            # _generate_random_combos samples exactly 3 combinations,
+            # capping smoke-param-sweep runtime to a predictable budget.
+            # Validates the sweep plumbing end-to-end (param_sweep.sweep
+            # → _run_combos → run_simulation_fn → simulate) without
+            # paying full grid cost.
             "param_sweep": {"max_positions": [5, 10, 15]},
-            "param_sweep_settings": {"mode": "grid"},
+            "param_sweep_settings": {"mode": "random", "max_trials": 3, "seed": 0},
         },
         "only_phases": None,
         "skip_phases": None,

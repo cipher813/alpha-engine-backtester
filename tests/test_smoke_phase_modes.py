@@ -110,15 +110,28 @@ def test_every_smoke_mode_sets_smoke_tickers(mode: str):
     )
 
 
-def test_smoke_param_sweep_sets_tiny_grid():
+def test_smoke_param_sweep_caps_combos_via_random_max_trials():
+    """The fixture forces mode=random with max_trials=3 so _generate_random_combos
+    samples exactly 3 combinations REGARDLESS of the effective grid size
+    after config.yaml deep-merge. Observed 2026-04-23 post-bugfix smoke
+    run: mode=grid produced 864 combos because config.yaml's param_sweep
+    block merged into our 1-key override."""
     args = _blank_args("smoke-param-sweep")
     config: dict = {}
     backtest._apply_smoke_fixture("smoke-param-sweep", args, config)
 
     assert args.mode == "param-sweep"
-    # 3-combo grid
+    # Grid override hint for random sampling
     assert config["param_sweep"] == {"max_positions": [5, 10, 15]}
-    assert config["param_sweep_settings"]["mode"] == "grid"
+    # Critical: mode=random + max_trials=3 caps combos regardless of
+    # grid size (fix for 2026-04-23 bug #5)
+    settings = config["param_sweep_settings"]
+    assert settings["mode"] == "random"
+    assert settings["max_trials"] == 3
+    # Seed pinned for deterministic smoke runs — same 3 combos each
+    # invocation, so a regression shows as a repro'able timing change
+    # rather than stochastic noise.
+    assert settings["seed"] == 0
 
 
 def test_smoke_predictor_backtest_shrinks_gbm_lookback():
