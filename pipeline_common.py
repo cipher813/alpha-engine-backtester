@@ -155,6 +155,13 @@ class PhaseRegistry:
         self._force_phases = set(force_phases or [])
         self._markers: dict[str, dict | None] = {}
         self._s3 = s3_client  # lazy-init if None
+        # Names of phases that wrote a marker with status=error during
+        # THIS invocation. Used by the smoke-harness budget check to
+        # catch false-PASS where the outer phase swallowed an inner
+        # error and the wall-clock still looked healthy. See 2026-04-23
+        # post-filter run where smoke-param-sweep "passed" at 96s < 500s
+        # but param_sweep itself errored with recursion depth exceeded.
+        self.phase_errors: list[str] = []
 
     # ── S3 helpers ───────────────────────────────────────────────────────
 
@@ -217,6 +224,11 @@ class PhaseRegistry:
         )
         # Keep cache consistent
         self._markers[marker["phase"]] = marker
+        # Track in-invocation error markers so smoke budget check can
+        # fail on swallowed inner errors. Only called from inside our
+        # contextmanager, so we see status before callers' try/except.
+        if marker.get("status") == "error":
+            self.phase_errors.append(marker["phase"])
 
     # ── Decision logic ───────────────────────────────────────────────────
 

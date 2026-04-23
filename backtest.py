@@ -1563,7 +1563,15 @@ _SMOKE_PHASE_MODES: dict[str, dict] = {
             # data_prep → single_run path completes.
             "param_sweep": None,
         },
+        # preflight + runtime_smoke are included so they actually run (the
+        # whole point of smoke is env validation). predictor_pipeline is
+        # the parent that wraps the inner phases; without it the parent
+        # would be SKIP-but-body-still-runs and inner phases would be
+        # flagged as "only_phases_filter" at the top level — see
+        # 2026-04-23 post-filter dry-run log traces for this pattern.
         "only_phases": [
+            "preflight",
+            "runtime_smoke",
             "predictor_pipeline",
             "predictor_data_prep",
             "predictor_feature_maps_bulk_load",
@@ -1583,6 +1591,8 @@ _SMOKE_PHASE_MODES: dict[str, dict] = {
             "param_sweep": None,
         },
         "only_phases": [
+            "preflight",
+            "runtime_smoke",
             "predictor_pipeline",
             "predictor_data_prep",
             "predictor_feature_maps_bulk_load",
@@ -1676,14 +1686,36 @@ def _load_timing_budgets() -> dict[str, float]:
         return {}
 
 
-def _assert_smoke_within_budget(mode: str, elapsed_s: float) -> None:
+def _assert_smoke_within_budget(
+    mode: str, elapsed_s: float, registry=None,
+) -> None:
     """Hard-fail (SystemExit 2) if a smoke mode's wall-clock exceeds its
-    declared budget. Catches runtime regressions at smoke time instead
-    of letting them propagate into a 2h Saturday SF run.
+    declared budget OR any inner phase completed with status=error.
 
-    Budget MISSING for a mode → log+skip (best-effort). Present-but-
-    exceeded → fail loud. Under-budget → INFO line for trend monitoring.
+    Budget MISSING for a mode → log+skip (best-effort).
+    Budget EXCEEDED → fail loud.
+    Any inner phase errored → fail loud regardless of wall-clock.
+    Clean pass → INFO line for trend monitoring.
+
+    The inner-error check closes the false-PASS gap surfaced by the
+    2026-04-23 post-filter dry-run: smoke-param-sweep's outer
+    simulation_pipeline phase completed status=ok (try/except swallowed
+    the error) while the INNER param_sweep phase errored with
+    "maximum recursion depth exceeded". The previous wall-clock-only
+    check saw 96s < 500s and reported PASSED — hiding a real failure.
     """
+    # Inner-error check first — wall-clock can look fine even when a
+    # nested phase errored and the outer swallowed it.
+    if registry is not None and registry.phase_errors:
+        raise SystemExit(
+            f"Smoke [{mode}] FAILED: inner phase(s) completed with "
+            f"status=error: {registry.phase_errors}. Wall-clock was "
+            f"{elapsed_s:.1f}s (budget check would have passed alone). "
+            f"Check the PHASE_END logs for the first error — outer phases "
+            f"may have swallowed the exception (e.g. _run_simulation_pipeline "
+            f"try/except sets sweep_df=None and continues)."
+        )
+
     budgets = _load_timing_budgets()
     budget = budgets.get(mode)
     if budget is None:
@@ -2130,11 +2162,14 @@ def _run_simulation_pipeline(
                         executor_run_fn, SimClientCls, sim_dates, pm, _, ohlcv_data = _sim_setup
                         if pm is not None and current_executor_params:
                             from optimizer.twin_sim import run_twin_simulation
-                            from copy import deepcopy
+                            from analysis.param_sweep import _deepcopy_safe_config
                             recommended = executor_rec.get("recommended_params", {})
-                            current_cfg = deepcopy(config)
+                            # Use _deepcopy_safe_config — base `config` holds
+                            # the PhaseRegistry (boto3 client) which is not
+                            # deepcopy-safe. Matches the fix in _run_combos.
+                            current_cfg = _deepcopy_safe_config(config)
                             current_cfg.update(current_executor_params)
-                            proposed_cfg = deepcopy(config)
+                            proposed_cfg = _deepcopy_safe_config(config)
                             proposed_cfg.update(recommended)
                             changed_keys = [k for k in recommended if recommended.get(k) != current_executor_params.get(k)]
 
@@ -2493,9 +2528,22 @@ def main() -> None:
             )
             print(f"\nUploaded to s3://{config.get('output_bucket')}/{config.get('output_prefix')}/{args.date}/")
 
+        # Suppress email for smoke-phase runs and any run with --freeze
+        # set (freeze signals "don't promote / don't notify"; smoke-phase
+        # modes are test invocations with synthetic fixtures and their
+        # reports would pollute the operator inbox + risk being confused
+        # with real Saturday SF emails). Detection uses _is_smoke_phase
+        # (captured at main() entry, before args.mode was rewritten to
+        # the routed full mode) and args.freeze.
+        suppress_email = _is_smoke_phase or args.freeze
         sender = config.get("email_sender")
         recipients = config.get("email_recipients", [])
-        if sender and recipients:
+        if suppress_email:
+            logger.info(
+                "Email suppressed (mode=%s, freeze=%s) — skipping report email",
+                _original_mode, args.freeze,
+            )
+        elif sender and recipients:
             send_report_email(
                 run_date=args.date,
                 report_md=report_md,
@@ -2544,10 +2592,13 @@ def main() -> None:
         # instance stop, so the stop side effect still fires even if the
         # smoke blew past its budget. Budget failure is a hard exit 2 —
         # catches regressions at smoke time (seconds) instead of during
-        # a 2h Saturday SF run. Per ROADMAP Backtester P0 #3.
+        # a 2h Saturday SF run. The registry is passed so the check can
+        # also fail on inner-phase errors swallowed by outer try/except
+        # (false-PASS guard — see 2026-04-23 post-filter dry-run). Per
+        # ROADMAP Backtester P0 #3.
         if _is_smoke_phase:
             elapsed = _time.time() - _health_start
-            _assert_smoke_within_budget(_original_mode, elapsed)
+            _assert_smoke_within_budget(_original_mode, elapsed, registry=registry)
 
 
 if __name__ == "__main__":
