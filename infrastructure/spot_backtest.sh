@@ -55,7 +55,11 @@ fi
 AWS_REGION="${AWS_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 BRANCH="${BRANCH:-main}"
-INSTANCE_TYPE="c5.large"            # 2 vCPU, 4GB RAM — sufficient for 10y backtest
+INSTANCE_TYPE="c5.large"            # 2 vCPU, 4GB RAM — keep tight; larger instance
+                                    # would enable sloppy memory usage. The 2026-04-23
+                                    # predictor_data_prep OOM is being fixed structurally
+                                    # via the ohlcv_by_ticker → DataFrame refactor
+                                    # (P2 in SYSTEM_STATE backtester section).
 AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
 # Spot-side watchdog budget: backtester's 10y simulate + param sweep
 # historically runs 60-100 min. 120 min with headroom. Bump (don't

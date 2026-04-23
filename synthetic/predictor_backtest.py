@@ -58,6 +58,48 @@ _SECTOR_ETFS = {"XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP", "XLU", "XLRE", 
 _MIN_ROWS_FOR_FEATURES = 265
 
 
+def _log_rss(label: str) -> None:
+    """Log process RSS (resident set size) at a named checkpoint.
+
+    Noisy but invaluable for catching OOM-class issues like the 2026-04-23
+    SF dry-run where predictor_data_prep blew past c5.large's 4 GB budget
+    inside load_universe_from_arctic + build_ohlcv_by_ticker. Without
+    these checkpoints we had to diagnose via CloudWatch CPU patterns +
+    SSM-agent death instead of seeing the memory curve directly.
+
+    Uses /proc/self/status on Linux (primary target — spot instances).
+    Falls back to resource.getrusage.ru_maxrss elsewhere (Darwin for
+    local tests) which reports in KB on Linux but bytes on Darwin —
+    the distinction doesn't matter for a diagnostic log.
+
+    Safe to call on any platform: any failure is swallowed since this
+    is pure observability and must never fail the caller."""
+    try:
+        rss_bytes = None
+        # Linux path — /proc/self/status line "VmRSS:  N kB"
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[-1].lower() == "kb":
+                            rss_bytes = int(parts[1]) * 1024
+                        break
+        except FileNotFoundError:
+            pass
+        if rss_bytes is None:
+            # Darwin / non-Linux fallback
+            import resource
+            rusage = resource.getrusage(resource.RUSAGE_SELF)
+            # ru_maxrss is KB on Linux but BYTES on Darwin — we
+            # don't know which, but this path is only hit in tests.
+            rss_bytes = rusage.ru_maxrss * 1024
+        rss_mb = rss_bytes / (1024 * 1024)
+        logger.info("MEM %s: RSS=%.0f MB", label, rss_mb)
+    except Exception as exc:
+        logger.debug("MEM %s: failed to sample RSS: %s", label, exc)
+
+
 def load_sector_map(predictor_path: str) -> dict[str, str]:
     """Load sector_map.json mapping tickers to sector ETF symbols."""
     map_path = Path(predictor_path) / "data" / "cache" / "sector_map.json"
@@ -457,6 +499,10 @@ def build_ohlcv_by_ticker(
     """
     Convert DataFrames to the {ticker: [{date, open, high, low, close}, ...]}
     format needed by _run_simulation_loop's price_histories parameter.
+
+    Non-destructive — callers that own `price_data` and can afford to
+    retain it use this. Memory-sensitive callers should use
+    `_drain_price_data_into_ohlcv` instead.
     """
     skip_tickers = _MACRO_TICKERS | _SECTOR_ETFS
     ohlcv: dict[str, list[dict]] = {}
@@ -464,20 +510,58 @@ def build_ohlcv_by_ticker(
     for ticker, df in price_data.items():
         if ticker in skip_tickers:
             continue
-        bars = []
-        for dt, row in df.iterrows():
-            date_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
-            close = row.get("Close", row.get("close", 0))
-            bars.append({
-                "date": date_str,
-                "open": row.get("Open", row.get("open", close)),
-                "high": row.get("High", row.get("high", close)),
-                "low": row.get("Low", row.get("low", close)),
-                "close": close,
-            })
+        bars = _df_to_bars(df)
         if bars:
             ohlcv[ticker] = bars
 
+    return ohlcv
+
+
+def _df_to_bars(df: pd.DataFrame) -> list[dict]:
+    """Convert a single ticker's OHLCV DataFrame to the list-of-dicts form."""
+    bars = []
+    for dt, row in df.iterrows():
+        date_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
+        close = row.get("Close", row.get("close", 0))
+        bars.append({
+            "date": date_str,
+            "open": row.get("Open", row.get("open", close)),
+            "high": row.get("High", row.get("high", close)),
+            "low": row.get("Low", row.get("low", close)),
+            "close": close,
+        })
+    return bars
+
+
+def _drain_price_data_into_ohlcv(
+    price_data: dict[str, pd.DataFrame],
+) -> dict[str, list[dict]]:
+    """Destructively pop each price_data[ticker] into ohlcv_by_ticker, so
+    both dicts never hold full-universe data simultaneously.
+
+    After this returns, `price_data` is empty (all entries popped).
+
+    Motivated by the 2026-04-23 OOM incident where coexisting full-
+    universe price_data (~91 MB of DataFrames) + ohlcv_by_ticker
+    (~1.1 GB of list-of-dicts due to Python overhead) pushed past
+    c5.large's 4 GB budget during predictor_data_prep. Saves ~91 MB at
+    the peak. The larger win lives in a follow-up PR that changes
+    ohlcv_by_ticker's shape itself (list-of-dicts → pd.DataFrame) —
+    that's a cross-repo contract change and tracked as P2 in
+    SYSTEM_STATE's backtester section.
+    """
+    skip_tickers = _MACRO_TICKERS | _SECTOR_ETFS
+    ohlcv: dict[str, list[dict]] = {}
+    tickers = list(price_data.keys())  # snapshot so we can mutate dict
+    for ticker in tickers:
+        df = price_data.pop(ticker)
+        if ticker in skip_tickers:
+            # skip_tickers' rows aren't needed downstream — drop silently
+            continue
+        bars = _df_to_bars(df)
+        if bars:
+            ohlcv[ticker] = bars
+    # price_data is now empty; caller can safely `del price_data`
     return ohlcv
 
 
@@ -572,6 +656,7 @@ def run(config: dict, keep_features: bool = False) -> dict:
     #    Hard-fail on unreachable per backtester-audit-260415.md: legacy S3
     #    parquet cache + inline slim-cache fallbacks have been removed.
     from store.arctic_reader import load_universe_from_arctic
+    _log_rss("pre_arcticdb_load")
     logger.info("[data_source=arcticdb] Loading universe from ArcticDB...")
     # Smoke fixture universe filter — production default is None (full
     # universe load). When smoke_tickers is set, reader restricts the
@@ -584,6 +669,7 @@ def run(config: dict, keep_features: bool = False) -> dict:
     data_source = "arcticdb"
     feature_skip_reasons: dict = {}
     logger.info("[data_source=arcticdb] %d tickers with pre-computed features", len(features_by_ticker))
+    _log_rss("post_arcticdb_load")
 
     # 2. Load sector map
     sector_map = load_sector_map(predictor_path)
@@ -610,28 +696,45 @@ def run(config: dict, keep_features: bool = False) -> dict:
     if isinstance(trading_dates, dict):
         return trading_dates  # early exit with error dict
 
-    # 4. Build price matrix and OHLCV early, then free raw price data
+    # 4. Build price matrix, extract SPY, drain price_data into ohlcv_by_ticker.
+    #    2026-04-23 SF dry-run OOM'd on c5.large because price_data (~91 MB) and
+    #    ohlcv_by_ticker (~1.1 GB, dominated by Python dict overhead in the
+    #    list-of-dicts form) coexisted at peak. Destructive iteration below
+    #    pops each price_data entry as we consume it, so the two dicts never
+    #    hold full-universe data simultaneously. Peak for this section drops
+    #    by ~91 MB — modest, but the RSS log surrounding it makes the memory
+    #    curve visible for the follow-up ohlcv→DataFrame refactor (tracked
+    #    as P2 in SYSTEM_STATE).
     price_matrix = build_price_matrix(price_data, trading_dates)
-    ohlcv_by_ticker = build_ohlcv_by_ticker(price_data)
-    spy_prices = _extract_close(price_data, "SPY")
+    _log_rss("post_price_matrix")
+    spy_prices = _extract_close(price_data, "SPY")  # extracts a Series copy
+    _log_rss("post_spy_extract")
+
+    ohlcv_by_ticker = _drain_price_data_into_ohlcv(price_data)
+    # price_data is empty now (all entries popped by the drain). Release
+    # the dict shell too so the GC can fully reclaim.
     del price_data
     gc.collect()
+    _log_rss("post_ohlcv_build_and_drain")
     logger.info("Freed raw price data (memory optimization)")
 
     # 5. Download GBM model
     model_path = download_gbm_model(bucket=bucket)
+    _log_rss("post_gbm_download")
 
     # 6. Run inference
     n_feature_tickers = len(features_by_ticker)
     predictions_by_date = run_inference(
         features_by_ticker, model_path, predictor_path, trading_dates,
     )
+    _log_rss("post_inference")
 
     # Free features and model (no longer needed unless caller needs them)
     if not keep_features:
         del features_by_ticker
         gc.collect()
         logger.info("Freed feature data (memory optimization)")
+        _log_rss("post_feature_free")
 
     # Clean up temp model file
     try:
@@ -647,6 +750,7 @@ def run(config: dict, keep_features: bool = False) -> dict:
         predictions_by_date, sector_map, ohlcv_by_ticker,
         top_n=top_n, min_score=min_score,
     )
+    _log_rss("post_build_signals")
 
     # Metadata for reporting
     n_enter_total = sum(
