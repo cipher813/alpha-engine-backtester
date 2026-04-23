@@ -55,14 +55,11 @@ fi
 AWS_REGION="${AWS_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 BRANCH="${BRANCH:-main}"
-INSTANCE_TYPE="c5.xlarge"           # 4 vCPU, 8GB RAM. Was c5.large (4GB) until 2026-04-23
-                                    # OOM in predictor_data_prep: full-universe ArcticDB
-                                    # bulk read + features_by_ticker + ohlcv_by_ticker
-                                    # (list-of-dicts, ~1GB alone due to Python overhead)
-                                    # pushed past 4GB → OS killed SSM agent + sshd while
-                                    # python kept thrashing. Upgrading gives headroom
-                                    # until the ohlcv_by_ticker → DataFrame refactor
-                                    # lands (P2 in SYSTEM_STATE). Cost +~$0.02/hr.
+INSTANCE_TYPE="c5.large"            # 2 vCPU, 4GB RAM — keep tight; larger instance
+                                    # would enable sloppy memory usage. The 2026-04-23
+                                    # predictor_data_prep OOM is being fixed structurally
+                                    # via the ohlcv_by_ticker → DataFrame refactor
+                                    # (P2 in SYSTEM_STATE backtester section).
 AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
 # Spot-side watchdog budget: backtester's 10y simulate + param sweep
 # historically runs 60-100 min. 120 min with headroom. Bump (don't
