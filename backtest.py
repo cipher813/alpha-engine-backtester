@@ -50,7 +50,7 @@ from analysis import param_sweep
 from optimizer import executor_optimizer
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
-from pipeline_common import load_config, phase, pull_research_db
+from pipeline_common import PhaseRegistry, load_config, phase, pull_research_db
 
 logger = logging.getLogger(__name__)
 
@@ -857,8 +857,10 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     import sys
     from synthetic.predictor_backtest import run as run_predictor_pipeline
 
+    registry = config["_phase_registry"]
+
     # Prepare data once — keep features for Phase 4 evaluations
-    with phase("predictor_data_prep"):
+    with registry.phase("predictor_data_prep"):
         result = run_predictor_pipeline(config, keep_features=True)
 
     if result.get("status") != "ok":
@@ -888,7 +890,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     # Loading once up front collapses that to a single bulk scan (~1-2
     # min for ~900 tickers with 20-way concurrency) — every subsequent
     # _simulate_single_date call reuses the in-memory maps.
-    with phase("predictor_feature_maps_bulk_load"):
+    with registry.phase("predictor_feature_maps_bulk_load"):
         from store.feature_maps import load_precomputed_feature_maps
         _bucket_for_maps = config.get("signals_bucket", "alpha-engine-research")
         atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = load_precomputed_feature_maps(_bucket_for_maps)
@@ -908,7 +910,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
 
     # Single run with default config
     logger.info("Running predictor-only simulation (default params): %d dates", len(signals_by_date))
-    with phase("predictor_single_run", n_dates=len(signals_by_date)):
+    with registry.phase("predictor_single_run", n_dates=len(signals_by_date)):
         single_stats = _run_simulation_loop(
             executor_run, SimulatedIBKRClient,
             dates=[],
@@ -952,7 +954,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             # Phase 4a: Ensemble mode evaluation
             ensemble_result = None
             try:
-                with phase("phase4a_ensemble_modes"):
+                with registry.phase("phase4a_ensemble_modes"):
                     ensemble_result = evaluate_ensemble_modes(
                         features_by_ticker, price_matrix, ohlcv_by_ticker,
                         spy_prices, sector_map, trading_dates,
@@ -975,7 +977,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             threshold_result = None
             if predictions_by_date:
                 try:
-                    with phase("phase4b_signal_thresholds"):
+                    with registry.phase("phase4b_signal_thresholds"):
                         threshold_result = evaluate_signal_thresholds(
                             predictions_by_date, sector_map, ohlcv_by_ticker,
                             price_matrix, spy_prices, trading_dates,
@@ -991,7 +993,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             # Phase 4c: Feature pruning evaluation
             pruning_result = None
             try:
-                with phase("phase4c_feature_pruning"):
+                with registry.phase("phase4c_feature_pruning"):
                     pruning_result = evaluate_feature_pruning(
                         features_by_ticker, price_matrix, ohlcv_by_ticker,
                         spy_prices, sector_map, trading_dates,
@@ -1055,7 +1057,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
         sweep_settings = config.get("param_sweep_settings", {})
 
         logger.info("Running predictor param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
-        with phase("predictor_param_sweep", combos=sum(len(v) for v in grid.values())):
+        with registry.phase("predictor_param_sweep", combos=sum(len(v) for v in grid.values())):
             sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
 
     return single_stats, sweep_df
@@ -1274,6 +1276,24 @@ def _parse_args() -> argparse.Namespace:
                              "runtime dramatically during dry-runs where we only want 'does the "
                              "pipeline complete end-to-end'. Defaults to running. Routable from the "
                              "Saturday Step Function input as `skip_phase4_evaluations: true`.")
+    parser.add_argument("--skip-phases", default="",
+                        help="Comma-separated list of phase names to force-skip (e.g. "
+                             "'simulate,param_sweep'). Overrides any persisted marker. For testing or "
+                             "when a phase is known-broken and you want to run downstream. Caller is "
+                             "responsible for ensuring downstream phases can tolerate the skipped "
+                             "upstream (via --only-phases or cascade handling in the code).")
+    parser.add_argument("--only-phases", default="",
+                        help="Comma-separated list of phase names that ARE allowed to run; all others "
+                             "are skipped. Useful for targeted testing. Cannot be combined with "
+                             "--skip-phases (would be contradictory).")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-run every phase even if a completion marker exists on S3 for today's "
+                             "date. The default is auto-skip-per-date: a phase that completed today "
+                             "(same args.date, status=ok) is skipped on retry. Use this to force a "
+                             "full recompute from scratch.")
+    parser.add_argument("--force-phases", default="",
+                        help="Comma-separated list of phase names to force-rerun (overrides markers "
+                             "for those phases only). More surgical than --force.")
     return parser.parse_args()
 
 
@@ -1303,6 +1323,8 @@ def _run_simulation_pipeline(
     portfolio_stats = None
     sweep_df = None
     executor_rec = None
+
+    registry = config["_phase_registry"]
 
     # Precomputed feature maps — built ONCE per _run_simulation_pipeline
     # invocation, shared across simulate, param-sweep, holdout, and twin
@@ -1344,7 +1366,7 @@ def _run_simulation_pipeline(
     # ── Simulate mode ─────────────────────────────────────────────────────
     if args.mode in ("simulate", "all"):
         try:
-            with phase("simulate", mode=args.mode):
+            with registry.phase("simulate", mode=args.mode):
                 if _sim_setup is None:
                     portfolio_stats = {"status": "error", "error": "Simulation setup failed"}
                 else:
@@ -1375,7 +1397,7 @@ def _run_simulation_pipeline(
     # ── Param sweep ───────────────────────────────────────────────────────
     if args.mode in ("param-sweep", "all"):
         try:
-            with phase("param_sweep", mode=args.mode):
+            with registry.phase("param_sweep", mode=args.mode):
                 if _sim_setup is None:
                     sweep_df = None
                 else:
@@ -1408,7 +1430,7 @@ def _run_simulation_pipeline(
         # Executor parameter optimization from sweep results
         if sweep_df is not None and not sweep_df.empty:
             try:
-                with phase("executor_optimizer", mode=args.mode):
+                with registry.phase("executor_optimizer", mode=args.mode):
                     executor_rec = executor_optimizer.recommend(
                         sweep_df, config, current_params=current_executor_params,
                     )
@@ -1424,7 +1446,7 @@ def _run_simulation_pipeline(
                                     vwap_series_by_ticker=vwap_series_by_ticker,
                                     coverage_by_ticker=coverage_by_ticker,
                                 )
-                            with phase("executor_holdout", mode=args.mode):
+                            with registry.phase("executor_holdout", mode=args.mode):
                                 executor_rec = executor_optimizer.validate_holdout(
                                     executor_rec, holdout_sim_fn, sim_dates, config,
                                 )
@@ -1451,7 +1473,7 @@ def _run_simulation_pipeline(
                                     vwap_series_by_ticker=vwap_series_by_ticker,
                                     coverage_by_ticker=coverage_by_ticker,
                                 )
-                            with phase("executor_twin_sim", mode=args.mode):
+                            with registry.phase("executor_twin_sim", mode=args.mode):
                                 executor_rec["twin_sim"] = run_twin_simulation(
                                     twin_sim_fn, current_cfg, proposed_cfg, changed_keys,
                                 )
@@ -1593,13 +1615,40 @@ def main() -> None:
     if args.skip_phase4_evaluations:
         config["skip_phase4_evaluations"] = True
 
+    # Parse + validate phase-selection flags.
+    def _split(s: str) -> list[str]:
+        return [p.strip() for p in s.split(",") if p.strip()]
+
+    skip_phases = _split(args.skip_phases)
+    only_phases = _split(args.only_phases)
+    force_phases = _split(args.force_phases)
+    if skip_phases and only_phases:
+        raise SystemExit(
+            "--skip-phases and --only-phases are mutually exclusive — pick one"
+        )
+
+    # PhaseRegistry drives auto-skip-per-date + honors the CLI flags above.
+    # Stored on config so deep-pipeline code can read it without threading
+    # the registry through every function signature. Phases pass
+    # supports_auto_skip=True only when they know how to persist + reload
+    # their outputs (artifact persistence lands in PR 2/3).
+    registry = PhaseRegistry(
+        date=args.date,
+        bucket=config.get("signals_bucket", "alpha-engine-research"),
+        skip_phases=skip_phases,
+        only_phases=only_phases or None,
+        force=args.force,
+        force_phases=force_phases,
+    )
+    config["_phase_registry"] = registry
+
     # Preflight: external-world handshakes must pass before any 90-min
     # spot run starts. Raises RuntimeError (propagates to non-zero exit)
     # on missing env vars, unreachable S3, or stale ArcticDB macro/SPY.
     # Kept out of --rollback path because rollback touches S3 configs
     # only, not ArcticDB.
     if not args.rollback:
-        with phase("preflight", mode=args.mode):
+        with registry.phase("preflight", mode=args.mode):
             from preflight import BacktesterPreflight
             BacktesterPreflight(
                 bucket=config.get("signals_bucket", "alpha-engine-research"),
@@ -1615,12 +1664,12 @@ def main() -> None:
         # escape hatch for genuine restart scenarios; --mode=smoke runs
         # the smoke and exits 0 without doing full work.
         if args.mode == "smoke":
-            with phase("runtime_smoke", mode=args.mode):
+            with registry.phase("runtime_smoke", mode=args.mode):
                 _runtime_smoke(config)
             logger.info("Smoke-only mode complete — exiting 0 without full run")
             return
         if not args.skip_smoke:
-            with phase("runtime_smoke", mode=args.mode):
+            with registry.phase("runtime_smoke", mode=args.mode):
                 _runtime_smoke(config)
 
     # Handle --rollback before any other mode
@@ -1648,7 +1697,7 @@ def main() -> None:
     _sim_setup = None
     if args.mode in ("simulate", "param-sweep", "all"):
         try:
-            with phase("simulation_setup", mode=args.mode):
+            with registry.phase("simulation_setup", mode=args.mode):
                 _sim_setup = _setup_simulation(config)
         except Exception as e:
             logger.error("Simulation setup failed: %s", e)
@@ -1663,14 +1712,14 @@ def main() -> None:
 
     # ── Simulate + param sweep + executor optimizer ───────────────────────
     if args.mode in ("simulate", "param-sweep", "all"):
-        with phase("simulation_pipeline", mode=args.mode):
+        with registry.phase("simulation_pipeline", mode=args.mode):
             portfolio_stats, sweep_df, executor_rec = _run_simulation_pipeline(
                 args, config, _sim_setup, current_executor_params, fd,
             )
 
     # ── Predictor backtest ────────────────────────────────────────────────
     if args.mode in ("predictor-backtest", "all"):
-        with phase("predictor_pipeline", mode=args.mode):
+        with registry.phase("predictor_pipeline", mode=args.mode):
             predictor_stats, predictor_sweep_df, executor_rec = _run_predictor_pipeline(
                 args, config, executor_rec, current_executor_params, fd,
             )
@@ -1678,7 +1727,7 @@ def main() -> None:
     # ── Export simulation artifacts for evaluator ────────────────────────
     if args.mode in ("simulate", "param-sweep", "all", "predictor-backtest"):
         try:
-            with phase("export_artifacts", mode=args.mode):
+            with registry.phase("export_artifacts", mode=args.mode):
                 _export_simulation_artifacts(config, args.date, sweep_df=sweep_df, predictor_sweep_df=predictor_sweep_df, portfolio_stats=portfolio_stats, predictor_stats=predictor_stats)
         except Exception as e:
             logger.warning("Simulation artifact export failed (non-fatal): %s", e)

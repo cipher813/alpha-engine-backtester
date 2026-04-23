@@ -14,7 +14,9 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
 
 import boto3
 from botocore.exceptions import ClientError
@@ -70,6 +72,276 @@ def phase(name: str, **context):
         dur = time.monotonic() - t0
         plog.info("PHASE_END name=%s duration_s=%.2f status=%s %s", name, dur, status, kv)
         sys.stdout.flush()
+
+
+# ── Phase registry + S3 completion markers ──────────────────────────────────
+#
+# Each phase writes a JSON marker to
+#   s3://{bucket}/backtest/{date}/.phases/{phase}.json
+# at completion. On subsequent runs with the same `date`, the registry
+# reads the marker and auto-skips the phase (unless --force overrides).
+# Paired with artifact persistence (PR 2/3) this gives us durable resume:
+# a pipeline that crashes mid-param-sweep can be restarted and picks up
+# from the failed phase without redoing simulate / data_prep / feature_maps.
+#
+# Marker schema (v1):
+#   {
+#     "phase": "simulate",
+#     "date": "2026-04-23",
+#     "status": "ok" | "error",
+#     "started_at": "2026-04-23T16:04:12Z",
+#     "completed_at": "2026-04-23T16:13:47Z",
+#     "duration_s": 575.4,
+#     "artifact_keys": ["backtest/2026-04-23/.phases/simulate.json"],
+#     "error": null
+#   }
+#
+# Additive fields only — future versions add fields, never rename or
+# remove. Per `S3 Contract Safety` in CLAUDE.md.
+
+
+_MARKER_SCHEMA_VERSION = 1
+
+
+def _marker_key(date: str, phase_name: str) -> str:
+    return f"backtest/{date}/.phases/{phase_name}.json"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class PhaseRegistry:
+    """Drives per-phase skip/force decisions and writes completion markers.
+
+    Lifecycle:
+      1. Operator constructs a registry in `main()` from CLI flags.
+      2. For each phase, caller uses `with registry.phase(name, ...)` —
+         either (a) it's already complete for this date → ctx.skipped=True,
+         caller loads the artifact from S3 instead of recomputing; or
+         (b) caller runs the compute + registers any artifact keys via
+         `ctx.record_artifact(key)` before the block exits.
+      3. On `__exit__` the registry writes an END marker to S3 with
+         duration_s + status + artifact_keys.
+
+    A phase is "auto-skippable" only when the caller passes
+    `supports_auto_skip=True`. Phases that don't yet know how to persist
+    + reload their outputs must pass False (the default) so a stale
+    marker from a prior run doesn't trick the pipeline into skipping a
+    phase whose output isn't actually on S3. Artifact-persistence PRs
+    will flip each phase's flag to True as they land.
+
+    The registry is designed to be cheap: marker reads are cached per
+    phase name, so a phase whose marker is queried during `should_run`
+    doesn't re-read S3 when the context manager enters.
+    """
+
+    def __init__(
+        self,
+        *,
+        date: str,
+        bucket: str,
+        skip_phases: Iterable[str] | None = None,
+        only_phases: Iterable[str] | None = None,
+        force: bool = False,
+        force_phases: Iterable[str] | None = None,
+        s3_client=None,
+    ):
+        self.date = date
+        self.bucket = bucket
+        self._explicit_skip = set(skip_phases or [])
+        self._only = set(only_phases) if only_phases else None
+        self._force_all = bool(force)
+        self._force_phases = set(force_phases or [])
+        self._markers: dict[str, dict | None] = {}
+        self._s3 = s3_client  # lazy-init if None
+
+    # ── S3 helpers ───────────────────────────────────────────────────────
+
+    def _client(self):
+        if self._s3 is None:
+            self._s3 = boto3.client("s3")
+        return self._s3
+
+    def _read_marker(self, phase_name: str) -> dict | None:
+        """Return the marker dict for (date, phase), or None if absent/corrupt.
+
+        Result is cached — repeated calls during the same run don't re-hit S3.
+        A corrupt marker (unparseable JSON, missing required fields) is
+        treated as absent and logged loud so operators can investigate.
+        """
+        if phase_name in self._markers:
+            return self._markers[phase_name]
+
+        key = _marker_key(self.date, phase_name)
+        try:
+            obj = self._client().get_object(Bucket=self.bucket, Key=key)
+            body = obj["Body"].read()
+            try:
+                marker = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                marker = None
+            if not isinstance(marker, dict) or marker.get("status") not in ("ok", "error"):
+                logger.warning(
+                    "phase_registry: marker at s3://%s/%s malformed — ignoring "
+                    "and recomputing phase %s. Body: %s",
+                    self.bucket, key, phase_name, body[:200],
+                )
+                marker = None
+            self._markers[phase_name] = marker
+            return marker
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                self._markers[phase_name] = None
+                return None
+            # Network / permission errors: fail loud rather than silently
+            # "marker absent → recompute." A transient S3 blip shouldn't
+            # cause a 2h pipeline to silently redo work it already did.
+            raise
+
+    def _write_marker(self, marker: dict) -> None:
+        key = _marker_key(self.date, marker["phase"])
+        self._client().put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=json.dumps(marker, indent=2).encode(),
+            ContentType="application/json",
+        )
+        # Keep cache consistent
+        self._markers[marker["phase"]] = marker
+
+    # ── Decision logic ───────────────────────────────────────────────────
+
+    def should_run(self, phase_name: str, supports_auto_skip: bool = False) -> tuple[bool, str]:
+        """Return (run: bool, reason: str).
+
+        Order of precedence:
+          1. --only-phases restricts to the set (all others skipped).
+          2. --skip-phases / --force-phases take precedence (explicit wins).
+          3. --force overrides any auto-skip.
+          4. Auto-skip if phase is auto-skippable AND a prior-run marker
+             is present with status=ok.
+          5. Default: run.
+
+        Reason strings are structured so downstream INFO logs are grep-able:
+          "only_phases_filter" | "explicit_skip" | "auto_skip_marker_ok"
+          | "force_rerun" | "force_phase_rerun" | "default_run" | "not_auto_skippable"
+        """
+        if self._only is not None and phase_name not in self._only:
+            return False, "only_phases_filter"
+        if phase_name in self._explicit_skip:
+            return False, "explicit_skip"
+        if self._force_all:
+            return True, "force_rerun"
+        if phase_name in self._force_phases:
+            return True, "force_phase_rerun"
+        if not supports_auto_skip:
+            return True, "not_auto_skippable"
+        marker = self._read_marker(phase_name)
+        if marker is not None and marker.get("status") == "ok":
+            return False, "auto_skip_marker_ok"
+        return True, "default_run"
+
+    def load_marker(self, phase_name: str) -> dict | None:
+        """Public accessor for a phase's marker — used by loaders in later PRs."""
+        return self._read_marker(phase_name)
+
+    # ── Phase context manager ────────────────────────────────────────────
+
+    @contextmanager
+    def phase(self, name: str, *, supports_auto_skip: bool = False, **log_ctx):
+        """Phase context manager — writes a START/END marker to S3 around the block.
+
+        Yields a `_PhaseContext` the caller can inspect:
+          - `ctx.skipped`: True if the phase should not run (caller loads
+            its artifact instead of recomputing).
+          - `ctx.record_artifact(s3_key)`: call before exiting to attach
+            an artifact key to the END marker.
+
+        If `ctx.skipped`, the body still executes — the caller is
+        expected to check `ctx.skipped` at the top of the block and load
+        from S3 via `load_marker(name)["artifact_keys"]` rather than
+        recomputing. This lets the skip decision live with the compute
+        code, so a reader of the call site can see both paths.
+        """
+        run, reason = self.should_run(name, supports_auto_skip=supports_auto_skip)
+        plog = _phase_logger()
+        kv = " ".join(f"{k}={v}" for k, v in log_ctx.items())
+
+        ctx = _PhaseContext(name=name, skipped=not run, skip_reason=reason)
+
+        if not run:
+            plog.info("PHASE_SKIP name=%s reason=%s %s", name, reason, kv)
+            sys.stdout.flush()
+            yield ctx
+            return
+
+        started_at = _now_iso()
+        plog.info("PHASE_START name=%s %s", name, kv)
+        sys.stdout.flush()
+        t0 = time.monotonic()
+        status = "ok"
+        err_msg: str | None = None
+        try:
+            yield ctx
+        except BaseException as exc:
+            status = "error"
+            err_msg = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            dur = time.monotonic() - t0
+            completed_at = _now_iso()
+            plog.info(
+                "PHASE_END name=%s duration_s=%.2f status=%s %s",
+                name, dur, status, kv,
+            )
+            sys.stdout.flush()
+            # Best-effort marker write. A marker write failure should NOT
+            # fail the whole pipeline — the phase already did its work.
+            # But we log loud so silent marker-write drift doesn't build
+            # up across runs.
+            try:
+                self._write_marker({
+                    "schema_version": _MARKER_SCHEMA_VERSION,
+                    "phase": name,
+                    "date": self.date,
+                    "status": status,
+                    "started_at": started_at,
+                    "completed_at": completed_at,
+                    "duration_s": round(dur, 2),
+                    "artifact_keys": sorted(ctx._artifact_keys),
+                    "error": err_msg,
+                })
+            except Exception as marker_exc:
+                logger.warning(
+                    "phase_registry: failed to write marker for phase %s: %s. "
+                    "Phase compute succeeded; future runs will not see this "
+                    "completion and will re-run the phase.",
+                    name, marker_exc,
+                )
+
+
+class _PhaseContext:
+    """Yielded by PhaseRegistry.phase() so callers can query skip state
+    and register artifact keys before the phase ends."""
+
+    def __init__(self, *, name: str, skipped: bool, skip_reason: str):
+        self.name = name
+        self.skipped = skipped
+        self.skip_reason = skip_reason
+        self._artifact_keys: set[str] = set()
+
+    def record_artifact(self, s3_key: str) -> None:
+        """Attach an S3 key to the phase's END marker (recorded on exit).
+
+        Called by phases that persist artifacts so the marker stores a
+        durable pointer to what was produced. Downstream phases / loaders
+        read `load_marker(name)["artifact_keys"]` to find the outputs.
+        """
+        if not isinstance(s3_key, str) or not s3_key:
+            raise ValueError(f"record_artifact: expected non-empty str, got {s3_key!r}")
+        self._artifact_keys.add(s3_key)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
