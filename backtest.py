@@ -1673,10 +1673,33 @@ def _apply_smoke_fixture(mode: str, args, config: dict) -> None:
     # enough that any recommendations would be garbage.
     args.freeze = True
 
+    # Namespace smoke markers + artifacts under a separate S3 prefix so
+    # they don't collide with production-run markers on the same calendar
+    # date. Observed 2026-04-23 SF dry-run: smoke had left ok markers at
+    # backtest/2026-04-23/.phases/ which the full SF run then auto-
+    # skipped, replaying tiny 5-ticker smoke artifacts and breaking the
+    # downstream parity test. Prefixing with ".smoke/" hierarchically
+    # isolates smoke state (backtest/.smoke/2026-04-23/.phases/...) and
+    # — critically — lex-sorts BEFORE "2026-..." so spot_backtest.sh's
+    # "latest date" probe via `aws s3 ls backtest/ | sort | tail -1`
+    # still resolves to real dates. Report filename + local results dir
+    # inherit the prefix too but smoke emails are suppressed and smoke
+    # uploads are disabled below so no user-visible artifacts appear.
+    args.date = f".smoke/{args.date}"
+
+    # Suppress top-level S3 upload. Without this, the export_artifacts
+    # phase writes smoke's 5-ticker portfolio_stats.json etc. to
+    # backtest/{date}/ top-level, overwriting production run outputs.
+    # Namespaced date above handles most of this, but args.upload also
+    # drives a `backtest/{date}/` upload in reporter.upload_to_s3 —
+    # simpler to just short-circuit the upload for smoke.
+    args.upload = False
+
     logger.info(
         "Smoke fixture applied for mode=%s → routing to --mode=%s "
-        "with only_phases=%r skip_phases=%r force=True freeze=True",
-        mode, args.mode, args.only_phases, args.skip_phases,
+        "with only_phases=%r skip_phases=%r force=True freeze=True "
+        "date=%s upload=False (namespaced to isolate from production runs)",
+        mode, args.mode, args.only_phases, args.skip_phases, args.date,
     )
 
 
