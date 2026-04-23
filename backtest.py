@@ -92,6 +92,19 @@ def _setup_simulation(config: dict) -> tuple:
     dates = signal_loader.list_dates(bucket)
     logger.info("Simulation setup: %d signal dates available in S3", len(dates))
 
+    # Smoke harness support: cap signal_dates to the N most recent so a
+    # smoke-<phase> run completes in seconds instead of minutes. Config
+    # knob only — no effect on normal runs (defaults unchanged). ROADMAP
+    # Backtester P0 #3 "Per-phase smoke test harness" (2026-04-22).
+    max_signal_dates = config.get("max_signal_dates")
+    if max_signal_dates is not None and len(dates) > max_signal_dates:
+        logger.info(
+            "Simulation setup: capping signal dates to %d most recent (from %d) "
+            "per config.max_signal_dates — smoke fixture active",
+            max_signal_dates, len(dates),
+        )
+        dates = list(dates)[-int(max_signal_dates):]
+
     if len(dates) < min_dates:
         logger.warning(
             "Only %d signal dates available (need %d) — simulation skipped",
@@ -1453,6 +1466,207 @@ def _stop_ec2_instance() -> None:
 _SMOKE_SAMPLE_TICKERS = ("AAPL", "MSFT", "NVDA", "JNJ", "PG")
 
 
+# ── Per-phase smoke harness ──────────────────────────────────────────────────
+#
+# ROADMAP Backtester P0 #3. Each `smoke-<phase>` mode:
+#   1. applies a tiny-fixture config override (few dates, tiny param grid, short
+#      predictor-backtest lookback),
+#   2. routes to the equivalent full mode (simulate / param-sweep /
+#      predictor-backtest / all),
+#   3. optionally restricts to a phase subset via --only-phases (smoke-phase4),
+#   4. is wrapped in a wall-clock budget check loaded from timing_budget.yaml.
+#
+# The fixture overrides leverage EXISTING config knobs wherever possible so the
+# harness doesn't change production data-flow code. The only new knob added in
+# this PR is `max_signal_dates` (slice cap on the list returned by
+# signal_loader.list_dates) — used by _setup_simulation.
+#
+# Not implemented here: universe-size limit. Smoke still runs against the full
+# ArcticDB universe; speed comes from capping dates + combos. A future PR could
+# add a ticker filter if per-smoke runtime proves too long on the spot instance.
+
+# Mapping: smoke mode → (full mode it routes to, config overrides, optional
+# --only-phases restriction, optional --skip-phases restriction).
+_SMOKE_PHASE_MODES: dict[str, dict] = {
+    "smoke-simulate": {
+        "route_mode": "simulate",
+        "overrides": {
+            "max_signal_dates": 5,
+            "min_simulation_dates": 2,
+        },
+        "only_phases": None,
+        "skip_phases": None,
+    },
+    "smoke-param-sweep": {
+        "route_mode": "param-sweep",
+        "overrides": {
+            "max_signal_dates": 5,
+            "min_simulation_dates": 2,
+            # Tiny grid — 1 param × 3 values = 3 combos total
+            "param_sweep": {"max_positions": [5, 10, 15]},
+            "param_sweep_settings": {"mode": "grid"},
+        },
+        "only_phases": None,
+        "skip_phases": None,
+    },
+    "smoke-predictor-backtest": {
+        "route_mode": "predictor-backtest",
+        "overrides": {
+            # Small GBM lookback — enough bars for features (>252 rolling
+            # windows aren't needed for a smoke; ArcticDB's feature columns
+            # are precomputed so min_trading_days is the slice cap on
+            # trading_dates used by run_inference).
+            "predictor_backtest": {
+                "min_trading_days": 30,
+                "max_trading_days": 60,
+                "top_n_signals_per_day": 5,
+            },
+            # Skip the full predictor sweep — smoke just validates the
+            # data_prep → single_run path completes.
+            "param_sweep": None,
+        },
+        "only_phases": [
+            "predictor_pipeline",
+            "predictor_data_prep",
+            "predictor_feature_maps_bulk_load",
+            "predictor_single_run",
+        ],
+        "skip_phases": None,
+    },
+    "smoke-phase4": {
+        "route_mode": "predictor-backtest",
+        "overrides": {
+            "predictor_backtest": {
+                "min_trading_days": 30,
+                "max_trading_days": 60,
+                "top_n_signals_per_day": 5,
+            },
+            "param_sweep": None,
+        },
+        "only_phases": [
+            "predictor_pipeline",
+            "predictor_data_prep",
+            "predictor_feature_maps_bulk_load",
+            "predictor_single_run",
+            "phase4a_ensemble_modes",
+            "phase4b_signal_thresholds",
+            "phase4c_feature_pruning",
+        ],
+        "skip_phases": None,
+    },
+}
+
+
+def _is_smoke_phase_mode(mode: str) -> bool:
+    return mode in _SMOKE_PHASE_MODES
+
+
+def _apply_smoke_fixture(mode: str, args, config: dict) -> None:
+    """Apply the config overrides for a smoke-<phase> mode.
+
+    Mutates `config` in place. Also rewrites `args.mode` to the routed
+    full mode and sets `args.only_phases` / `args.skip_phases` if the
+    smoke mode restricts phase selection.
+    """
+    spec = _SMOKE_PHASE_MODES[mode]
+
+    def _deep_update(target: dict, overrides: dict) -> None:
+        """Recursive merge so nested dicts (e.g. predictor_backtest)
+        don't clobber sibling keys the smoke override didn't set."""
+        for k, v in overrides.items():
+            if (
+                isinstance(v, dict)
+                and isinstance(target.get(k), dict)
+            ):
+                _deep_update(target[k], v)
+            else:
+                target[k] = v
+
+    _deep_update(config, spec["overrides"])
+
+    # Route to the underlying full mode for downstream branching
+    # (_run_simulation_pipeline, _run_predictor_pipeline).
+    args.mode = spec["route_mode"]
+
+    if spec["only_phases"]:
+        # Append to whatever the operator already passed — a CLI-passed
+        # --only-phases narrows further, never widens beyond what the
+        # smoke mode allows.
+        existing = [p.strip() for p in (args.only_phases or "").split(",") if p.strip()]
+        combined = existing or spec["only_phases"]
+        args.only_phases = ",".join(combined)
+
+    if spec["skip_phases"]:
+        existing = [p.strip() for p in (args.skip_phases or "").split(",") if p.strip()]
+        combined = existing + spec["skip_phases"]
+        args.skip_phases = ",".join(combined)
+
+    # Smoke should always run fresh — auto-skip from a prior run on the
+    # same args.date would defeat the purpose of the harness (we want to
+    # know the PHASE COMPUTE works, not that the S3 artifact is readable).
+    args.force = True
+
+    # Smoke runs never promote to S3 configs — the fixture is synthetic
+    # enough that any recommendations would be garbage.
+    args.freeze = True
+
+    logger.info(
+        "Smoke fixture applied for mode=%s → routing to --mode=%s "
+        "with only_phases=%r skip_phases=%r force=True freeze=True",
+        mode, args.mode, args.only_phases, args.skip_phases,
+    )
+
+
+def _load_timing_budgets() -> dict[str, float]:
+    """Read timing_budget.yaml from the repo root. Returns empty dict if
+    missing — budget enforcement is best-effort, not a hard dependency."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "timing_budget.yaml")
+    if not os.path.exists(path):
+        logger.warning(
+            "timing_budget.yaml not found at %s — smoke budget enforcement disabled",
+            path,
+        )
+        return {}
+    try:
+        import yaml
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        return {str(k): float(v) for k, v in data.get("smoke_budgets_seconds", {}).items()}
+    except Exception as exc:
+        logger.warning("timing_budget.yaml parse failed: %s — budgets disabled", exc)
+        return {}
+
+
+def _assert_smoke_within_budget(mode: str, elapsed_s: float) -> None:
+    """Hard-fail (SystemExit 2) if a smoke mode's wall-clock exceeds its
+    declared budget. Catches runtime regressions at smoke time instead
+    of letting them propagate into a 2h Saturday SF run.
+
+    Budget MISSING for a mode → log+skip (best-effort). Present-but-
+    exceeded → fail loud. Under-budget → INFO line for trend monitoring.
+    """
+    budgets = _load_timing_budgets()
+    budget = budgets.get(mode)
+    if budget is None:
+        logger.warning(
+            "Smoke [%s] completed in %.1fs — no budget declared in "
+            "timing_budget.yaml, consider adding one to catch regressions",
+            mode, elapsed_s,
+        )
+        return
+    if elapsed_s > budget:
+        raise SystemExit(
+            f"Smoke [{mode}] BUDGET EXCEEDED: {elapsed_s:.1f}s > {budget:.1f}s. "
+            f"A phase inside this smoke regressed. Profile the PHASE_END "
+            f"markers to find the slow phase and either fix it or bump the "
+            f"budget in timing_budget.yaml with justification."
+        )
+    logger.info(
+        "Smoke [%s] PASSED budget check: %.1fs <= %.1fs (%.0f%% of budget)",
+        mode, elapsed_s, budget, 100 * elapsed_s / budget,
+    )
+
+
 def _runtime_smoke(config: dict) -> None:
     """End-to-end smoke test with minimal data.
 
@@ -1603,11 +1817,24 @@ def _latest_signals_date(bucket: str, max_lookback: int = 14) -> str | None:
 def _parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description="Alpha Engine Backtester (simulation)")
-    parser.add_argument("--mode", choices=["simulate", "param-sweep", "all", "predictor-backtest", "smoke"],
-                        default="simulate",
-                        help="Pipeline mode. 'smoke' runs preflight + end-to-end runtime smoke with "
-                             "minimal data (~30-60s) then exits 0 — used by spot_backtest.sh --smoke-only "
-                             "and as the gate before any full run.")
+    parser.add_argument(
+        "--mode",
+        choices=[
+            "simulate", "param-sweep", "all", "predictor-backtest", "smoke",
+            "smoke-simulate", "smoke-param-sweep",
+            "smoke-predictor-backtest", "smoke-phase4",
+        ],
+        default="simulate",
+        help=(
+            "Pipeline mode. 'smoke' runs preflight + end-to-end runtime "
+            "smoke with minimal data (~30-60s) then exits 0. The "
+            "'smoke-<phase>' modes exercise a single phase-family with "
+            "a tiny fixture (few dates, tiny grid, short predictor "
+            "lookback) and assert completion within the budget declared "
+            "in timing_budget.yaml — used to catch phase regressions at "
+            "smoke time instead of during a 2h Saturday SF run."
+        ),
+    )
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--db", help="Override research_db path from config")
     parser.add_argument("--upload", action="store_true", help="Upload results to S3")
@@ -2026,6 +2253,16 @@ def main() -> None:
     if args.skip_phase4_evaluations:
         config["skip_phase4_evaluations"] = True
 
+    # Smoke-phase mode: apply the fixture BEFORE phase-selection parsing
+    # so the fixture's only_phases/skip_phases/force flow through the
+    # registry. The fixture also rewrites args.mode to the routed full
+    # mode (e.g. smoke-simulate → simulate) so downstream branching in
+    # _run_simulation_pipeline / _run_predictor_pipeline is unchanged.
+    _original_mode = args.mode
+    _is_smoke_phase = _is_smoke_phase_mode(args.mode)
+    if _is_smoke_phase:
+        _apply_smoke_fixture(args.mode, args, config)
+
     # Parse + validate phase-selection flags.
     def _split(s: str) -> list[str]:
         return [p.strip() for p in s.split(",") if p.strip()]
@@ -2259,6 +2496,15 @@ def main() -> None:
 
         if args.stop_instance:
             _stop_ec2_instance()
+
+        # Smoke budget enforcement runs LAST, after health write +
+        # instance stop, so the stop side effect still fires even if the
+        # smoke blew past its budget. Budget failure is a hard exit 2 —
+        # catches regressions at smoke time (seconds) instead of during
+        # a 2h Saturday SF run. Per ROADMAP Backtester P0 #3.
+        if _is_smoke_phase:
+            elapsed = _time.time() - _health_start
+            _assert_smoke_within_budget(_original_mode, elapsed)
 
 
 if __name__ == "__main__":

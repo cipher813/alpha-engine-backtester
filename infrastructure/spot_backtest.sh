@@ -431,6 +431,21 @@ BUCKET="\${OUTPUT_BUCKET:-alpha-engine-research}"
 echo "==> Smoke: backtest.py --mode=smoke (preflight + runtime smoke)"
 $REMOTE_PYTHON -u backtest.py --mode=smoke --log-level INFO
 
+# Per-phase smoke harness — exercise each pipeline phase-family with a
+# tiny fixture (few dates, tiny param grid, short GBM lookback) and
+# enforce per-mode wall-clock budgets from timing_budget.yaml. Catches
+# phase regressions at smoke time instead of during a 2h full Saturday
+# run. Ordered fastest → slowest so a failure in an earlier mode
+# short-circuits the harder ones. ROADMAP Backtester P0 #3.
+for SMOKE_PHASE_MODE in smoke-simulate smoke-param-sweep smoke-predictor-backtest smoke-phase4; do
+    echo ""
+    echo "==> Smoke: backtest.py --mode=\$SMOKE_PHASE_MODE"
+    if ! $REMOTE_PYTHON -u backtest.py --mode=\$SMOKE_PHASE_MODE --log-level INFO; then
+        echo "ERROR: smoke phase \$SMOKE_PHASE_MODE FAILED — aborting smoke-only run"
+        exit 1
+    fi
+done
+
 echo ""
 echo "==> Resolving most recent backtest artifact date from s3://\${BUCKET}/backtest/..."
 LATEST_DATE=\$(aws s3 ls "s3://\${BUCKET}/backtest/" | awk '/PRE / {print \$2}' | tr -d '/' | sort | tail -1)

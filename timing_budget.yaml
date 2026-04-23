@@ -1,0 +1,40 @@
+# timing_budget.yaml — smoke-phase wall-clock budgets (seconds).
+#
+# Each smoke-<phase> mode must complete within the declared budget or
+# backtest.py exits non-zero. The harness catches runtime regressions
+# at smoke time (seconds) instead of during a 2h Saturday SF run.
+#
+# How to set budgets:
+#   - Start generous (~50-100% headroom above typical) to absorb CI
+#     variance + cold-start latency for ArcticDB + GBM downloads.
+#   - Tighten over time as baseline runtimes stabilize.
+#   - If a legitimate perf-improving feature shortens a smoke, LOWER the
+#     budget in the same PR so future regressions can't silently creep
+#     back up.
+#   - If a legitimate feature genuinely needs more runtime, RAISE the
+#     budget in the same PR with justification in the commit message.
+#
+# Budgets MISSING for a mode → soft-warn in logs; no hard fail.
+# Budget EXCEEDED → SystemExit 2 with a loud message and context.
+#
+# ROADMAP Backtester P0 #3 "Per-phase smoke test harness" (2026-04-22).
+
+smoke_budgets_seconds:
+  # simulation_setup + simulate over 5 recent signal dates, full universe.
+  # Dominated by: price_matrix build (ArcticDB bulk read) + sim loop.
+  smoke-simulate: 180.0
+
+  # Above + 3-combo param sweep. Each combo is a full sim pass over the 5
+  # dates, so roughly 3x smoke-simulate + fixed overhead.
+  smoke-param-sweep: 300.0
+
+  # preflight + runtime_smoke + predictor_data_prep (GBM model download +
+  # inference over 30-60 trading days × full universe) + single_run +
+  # feature_maps_bulk_load. The GBM download (~10-20 MB) + model load are
+  # the tail-latency risks on cold S3 caches.
+  smoke-predictor-backtest: 300.0
+
+  # Above + 3 Phase 4 evaluators, each running an inner full sim. The
+  # eval simulations are shrunk by the same fixture overrides, so each
+  # adds ~smoke-single-run time.
+  smoke-phase4: 480.0
