@@ -925,8 +925,21 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     single_stats["predictor_metadata"] = metadata
 
     # ── Phase 4: Predictor hyperparameter feedback ───────────────────────
+    # `skip_phase4_evaluations` (config flag, set by --skip-phase4-evaluations
+    # CLI or SF input): bypass the three Phase 4 evaluators wholesale. Each
+    # runs a full silent simulation internally and can add tens of minutes
+    # to the predictor pipeline. For dry-runs where we only care "does the
+    # pipeline complete end-to-end", skipping is cheap and safe — the S3
+    # config promotions will have nothing to apply, so the next real run
+    # picks up the existing configs unchanged.
     predictions_by_date = result.get("predictions_by_date", {})
-    if features_by_ticker and trading_dates:
+    if config.get("skip_phase4_evaluations"):
+        logger.info(
+            "Phase 4 predictor-hyperparameter feedback SKIPPED "
+            "(skip_phase4_evaluations=true). Ensemble mode / signal "
+            "threshold / feature pruning evaluators will not run."
+        )
+    elif features_by_ticker and trading_dates:
         try:
             from optimizer.predictor_optimizer import (
                 evaluate_ensemble_modes,
@@ -1254,6 +1267,13 @@ def _parse_args() -> argparse.Namespace:
                              "genuine restart cases where the operator knows the environment is good; "
                              "default behavior is to always run the ~30-60s smoke before committing "
                              "to 60-80 minutes of full work.")
+    parser.add_argument("--skip-phase4-evaluations", action="store_true",
+                        help="Skip Phase 4 predictor-hyperparameter feedback (ensemble mode, signal "
+                             "threshold, feature pruning). Each Phase 4 evaluator runs a full silent "
+                             "simulation internally; skipping all three shaves the predictor-pipeline "
+                             "runtime dramatically during dry-runs where we only want 'does the "
+                             "pipeline complete end-to-end'. Defaults to running. Routable from the "
+                             "Saturday Step Function input as `skip_phase4_evaluations: true`.")
     return parser.parse_args()
 
 
@@ -1567,6 +1587,11 @@ def main() -> None:
     fd = get_flow_doctor()
 
     config = load_config(args.config)
+
+    # Stamp CLI flags into config so deep-pipeline code (run_predictor_param_sweep
+    # and below) can read them without threading args all the way down.
+    if args.skip_phase4_evaluations:
+        config["skip_phase4_evaluations"] = True
 
     # Preflight: external-world handshakes must pass before any 90-min
     # spot run starts. Raises RuntimeError (propagates to non-zero exit)

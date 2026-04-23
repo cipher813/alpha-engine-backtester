@@ -70,15 +70,25 @@ BACKTEST_MODE="all"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 RUN_MODE="full"  # full | smoke-only
+SKIP_PHASE4="${SKIP_PHASE4_EVALUATIONS:-false}"  # env-var routable from SF input
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
         --mode) BACKTEST_MODE="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
+        --skip-phase4-evaluations) SKIP_PHASE4="true"; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
+
+# Convert SKIP_PHASE4 to a backtest.py CLI flag suffix (empty string when
+# disabled, so we don't pass an invalid empty arg through the heredoc).
+if [ "$SKIP_PHASE4" = "true" ]; then
+    BACKTEST_SKIP_PHASE4_FLAG="--skip-phase4-evaluations"
+else
+    BACKTEST_SKIP_PHASE4_FLAG=""
+fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Backtester Spot Run — $(date +%Y-%m-%d)"
@@ -89,6 +99,7 @@ echo "  Region        : $AWS_REGION"
 echo "  Branch        : $BRANCH"
 echo "  Backtest mode : $BACKTEST_MODE"
 echo "  Run mode      : $RUN_MODE"
+echo "  Skip phase 4  : $SKIP_PHASE4"
 echo "  S3 bucket     : $S3_BUCKET"
 echo ""
 
@@ -438,7 +449,7 @@ echo "Starting backtest at \$(date)"
 # the Step Function catches it. Replaces the previous || { echo WARNING }
 # swallow which silently let the evaluator run against invalid sweep
 # results and was the root cause of multiple undetected param oscillations.
-if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --upload --log-level INFO 2>&1; then
+if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG 2>&1; then
     echo "ERROR: backtest.py failed. Skipping evaluator to prevent" >&2
     echo "       auto-promotion of unvalidated configs. Spot run is" >&2
     echo "       marked FAILED — check flow-doctor alerts." >&2
