@@ -196,6 +196,179 @@ def _load_simulation_setup(config: dict, registry) -> tuple:
     return (executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv_by_ticker)
 
 
+def _save_predictor_data_prep(
+    ctx, bucket: str, date: str, result: dict, *, s3_client=None,
+) -> None:
+    """Persist every output of synthetic.predictor_backtest.run(keep_features=True).
+
+    8 artifacts on disk (JSON + parquet). The one big one is features_by_ticker
+    (stacked parquet, ~150-250 MB for ~900 tickers × 2500 rows × 59 cols).
+    Skips persistence when status != 'ok' — a failed prep should re-run,
+    not replay a degraded snapshot.
+    """
+    from phase_artifacts import (
+        save_dataframe, save_dict_of_dataframes, save_json,
+        save_ohlcv_by_ticker, save_series,
+    )
+    if result.get("status") != "ok":
+        return
+    phase_name = "predictor_data_prep"
+    ctx.record_artifact(save_json(
+        bucket, date, phase_name, "signals_by_date", result["signals_by_date"],
+        s3_client=s3_client,
+    ))
+    ctx.record_artifact(save_dataframe(
+        bucket, date, phase_name, "price_matrix", result["price_matrix"],
+        s3_client=s3_client,
+    ))
+    ctx.record_artifact(save_ohlcv_by_ticker(
+        bucket, date, phase_name, "ohlcv_by_ticker", result["ohlcv_by_ticker"],
+        s3_client=s3_client,
+    ))
+    spy = result.get("spy_prices")
+    if spy is not None and len(spy) > 0:
+        ctx.record_artifact(save_series(
+            bucket, date, phase_name, "spy_prices", spy, s3_client=s3_client,
+        ))
+    ctx.record_artifact(save_json(
+        bucket, date, phase_name, "metadata", result["metadata"],
+        s3_client=s3_client,
+    ))
+    ctx.record_artifact(save_json(
+        bucket, date, phase_name, "sector_map", result.get("sector_map", {}),
+        s3_client=s3_client,
+    ))
+    ctx.record_artifact(save_json(
+        bucket, date, phase_name, "trading_dates", list(result.get("trading_dates", [])),
+        s3_client=s3_client,
+    ))
+    ctx.record_artifact(save_json(
+        bucket, date, phase_name, "predictions_by_date",
+        result.get("predictions_by_date", {}),
+        s3_client=s3_client,
+    ))
+    features = result.get("features_by_ticker") or {}
+    if features:
+        ctx.record_artifact(save_dict_of_dataframes(
+            bucket, date, phase_name, "features_by_ticker", features,
+            s3_client=s3_client,
+        ))
+
+
+def _load_predictor_data_prep(bucket: str, registry) -> dict:
+    """Inverse of _save_predictor_data_prep — returns a dict with the same
+    shape `synthetic.predictor_backtest.run(keep_features=True)` produces.
+
+    Raises loud if marker missing or a required artifact absent from the
+    marker's artifact_keys list."""
+    from phase_artifacts import (
+        load_dataframe, load_dict_of_dataframes, load_json,
+        load_ohlcv_by_ticker, load_series,
+    )
+    s3 = registry.s3_client
+    marker = registry.load_marker("predictor_data_prep")
+    if marker is None:
+        raise RuntimeError(
+            "predictor_data_prep auto-skip: marker missing — should not "
+            "reach load path without a prior ok marker"
+        )
+    keys = marker.get("artifact_keys") or []
+
+    def _find(suffix: str, required: bool = True) -> str | None:
+        matches = [k for k in keys if k.endswith(suffix)]
+        if not matches:
+            if required:
+                raise RuntimeError(
+                    f"predictor_data_prep reload: artifact {suffix!r} missing "
+                    f"from marker (artifact_keys={keys})"
+                )
+            return None
+        return matches[0]
+
+    result = {
+        "status": "ok",
+        "signals_by_date": load_json(bucket, _find("/signals_by_date.json"), s3_client=s3),
+        "price_matrix": load_dataframe(bucket, _find("/price_matrix.parquet"), s3_client=s3),
+        "ohlcv_by_ticker": load_ohlcv_by_ticker(
+            bucket, _find("/ohlcv_by_ticker.parquet"), s3_client=s3,
+        ),
+        "metadata": load_json(bucket, _find("/metadata.json"), s3_client=s3),
+        "sector_map": load_json(bucket, _find("/sector_map.json"), s3_client=s3),
+        "trading_dates": load_json(bucket, _find("/trading_dates.json"), s3_client=s3),
+        "predictions_by_date": load_json(
+            bucket, _find("/predictions_by_date.json"), s3_client=s3,
+        ),
+    }
+    spy_key = _find("/spy_prices.parquet", required=False)
+    result["spy_prices"] = load_series(bucket, spy_key, s3_client=s3) if spy_key else None
+    features_key = _find("/features_by_ticker.parquet", required=False)
+    result["features_by_ticker"] = (
+        load_dict_of_dataframes(bucket, features_key, s3_client=s3)
+        if features_key else {}
+    )
+
+    logger.info(
+        "predictor_data_prep auto-skip: reloaded %d signal dates, "
+        "price_matrix %s, %d tickers OHLCV, %d tickers features",
+        len(result["signals_by_date"]), result["price_matrix"].shape,
+        len(result["ohlcv_by_ticker"]), len(result["features_by_ticker"]),
+    )
+    return result
+
+
+def _save_predictor_feature_maps(
+    ctx, bucket: str, date: str,
+    atr_by_ticker: dict, vwap_series_by_ticker: dict, coverage_by_ticker: dict,
+    *, s3_client=None,
+) -> None:
+    """Persist the three feature maps produced by the bulk ArcticDB load."""
+    from phase_artifacts import save_dict_of_series, save_json
+    phase_name = "predictor_feature_maps_bulk_load"
+    ctx.record_artifact(save_json(
+        bucket, date, phase_name, "atr_by_ticker", atr_by_ticker,
+        s3_client=s3_client,
+    ))
+    ctx.record_artifact(save_json(
+        bucket, date, phase_name, "coverage_by_ticker", coverage_by_ticker,
+        s3_client=s3_client,
+    ))
+    ctx.record_artifact(save_dict_of_series(
+        bucket, date, phase_name, "vwap_series_by_ticker", vwap_series_by_ticker,
+        s3_client=s3_client,
+    ))
+
+
+def _load_predictor_feature_maps(bucket: str, registry) -> tuple[dict, dict, dict]:
+    """Inverse — returns (atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker)."""
+    from phase_artifacts import load_dict_of_series, load_json
+    s3 = registry.s3_client
+    marker = registry.load_marker("predictor_feature_maps_bulk_load")
+    if marker is None:
+        raise RuntimeError(
+            "predictor_feature_maps_bulk_load auto-skip: marker missing"
+        )
+    keys = marker.get("artifact_keys") or []
+
+    def _find(suffix: str) -> str:
+        matches = [k for k in keys if k.endswith(suffix)]
+        if not matches:
+            raise RuntimeError(
+                f"predictor_feature_maps_bulk_load reload: artifact {suffix!r} "
+                f"missing (artifact_keys={keys})"
+            )
+        return matches[0]
+
+    atr = load_json(bucket, _find("/atr_by_ticker.json"), s3_client=s3)
+    coverage = load_json(bucket, _find("/coverage_by_ticker.json"), s3_client=s3)
+    vwap = load_dict_of_series(bucket, _find("/vwap_series_by_ticker.parquet"), s3_client=s3)
+    logger.info(
+        "predictor_feature_maps_bulk_load auto-skip: reloaded %d tickers "
+        "(atr) / %d (vwap) / %d (coverage)",
+        len(atr), len(vwap), len(coverage),
+    )
+    return atr, vwap, coverage
+
+
 _SIGNAL_LIST_FIELDS = ("universe", "buy_candidates", "enter", "exit", "reduce", "hold")
 
 
@@ -944,10 +1117,20 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     from synthetic.predictor_backtest import run as run_predictor_pipeline
 
     registry = config["_phase_registry"]
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    s3 = registry.s3_client
 
     # Prepare data once — keep features for Phase 4 evaluations
-    with registry.phase("predictor_data_prep"):
-        result = run_predictor_pipeline(config, keep_features=True)
+    with registry.phase(
+        "predictor_data_prep", supports_auto_skip=True,
+    ) as ctx:
+        if ctx.skipped:
+            result = _load_predictor_data_prep(bucket, registry)
+        else:
+            result = run_predictor_pipeline(config, keep_features=True)
+            _save_predictor_data_prep(
+                ctx, bucket, registry.date, result, s3_client=s3,
+            )
 
     if result.get("status") != "ok":
         return result, pd.DataFrame()
@@ -976,10 +1159,23 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     # Loading once up front collapses that to a single bulk scan (~1-2
     # min for ~900 tickers with 20-way concurrency) — every subsequent
     # _simulate_single_date call reuses the in-memory maps.
-    with registry.phase("predictor_feature_maps_bulk_load"):
-        from store.feature_maps import load_precomputed_feature_maps
-        _bucket_for_maps = config.get("signals_bucket", "alpha-engine-research")
-        atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = load_precomputed_feature_maps(_bucket_for_maps)
+    with registry.phase(
+        "predictor_feature_maps_bulk_load", supports_auto_skip=True,
+    ) as ctx:
+        if ctx.skipped:
+            atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = (
+                _load_predictor_feature_maps(bucket, registry)
+            )
+        else:
+            from store.feature_maps import load_precomputed_feature_maps
+            atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = (
+                load_precomputed_feature_maps(bucket)
+            )
+            _save_predictor_feature_maps(
+                ctx, bucket, registry.date,
+                atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker,
+                s3_client=s3,
+            )
 
     # Import executor modules
     executor_paths = config.get("executor_paths", [])
@@ -995,21 +1191,38 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     from executor.ibkr import SimulatedIBKRClient
 
     # Single run with default config
+    from phase_artifacts import save_json as _save_json_p, load_json as _load_json_p
     logger.info("Running predictor-only simulation (default params): %d dates", len(signals_by_date))
-    with registry.phase("predictor_single_run", n_dates=len(signals_by_date)):
-        single_stats = _run_simulation_loop(
-            executor_run, SimulatedIBKRClient,
-            dates=[],
-            price_matrix=price_matrix,
-            config=config,
-            ohlcv_by_ticker=ohlcv_by_ticker,
-            signals_by_date=signals_by_date,
-            spy_prices=spy_prices,
-            ohlcv_dates_index=ohlcv_dates_index,
-            atr_by_ticker=atr_by_ticker,
-            vwap_series_by_ticker=vwap_series_by_ticker,
-            coverage_by_ticker=coverage_by_ticker,
-        )
+    with registry.phase(
+        "predictor_single_run", n_dates=len(signals_by_date),
+        supports_auto_skip=True,
+    ) as ctx:
+        if ctx.skipped:
+            marker = registry.load_marker("predictor_single_run") or {}
+            keys = marker.get("artifact_keys") or []
+            if not keys:
+                raise RuntimeError(
+                    "predictor_single_run auto-skip: marker missing artifact_keys"
+                )
+            single_stats = _load_json_p(bucket, keys[0], s3_client=s3)
+        else:
+            single_stats = _run_simulation_loop(
+                executor_run, SimulatedIBKRClient,
+                dates=[],
+                price_matrix=price_matrix,
+                config=config,
+                ohlcv_by_ticker=ohlcv_by_ticker,
+                signals_by_date=signals_by_date,
+                spy_prices=spy_prices,
+                ohlcv_dates_index=ohlcv_dates_index,
+                atr_by_ticker=atr_by_ticker,
+                vwap_series_by_ticker=vwap_series_by_ticker,
+                coverage_by_ticker=coverage_by_ticker,
+            )
+            ctx.record_artifact(_save_json_p(
+                bucket, registry.date, "predictor_single_run",
+                "single_stats", single_stats, s3_client=s3,
+            ))
     single_stats["predictor_metadata"] = metadata
 
     # ── Phase 4: Predictor hyperparameter feedback ───────────────────────
@@ -1040,13 +1253,26 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             # Phase 4a: Ensemble mode evaluation
             ensemble_result = None
             try:
-                with registry.phase("phase4a_ensemble_modes"):
-                    ensemble_result = evaluate_ensemble_modes(
-                        features_by_ticker, price_matrix, ohlcv_by_ticker,
-                        spy_prices, sector_map, trading_dates,
-                        config, single_stats,
-                    )
-                single_stats["ensemble_eval"] = ensemble_result
+                with registry.phase(
+                    "phase4a_ensemble_modes", supports_auto_skip=True,
+                ) as p4a_ctx:
+                    if p4a_ctx.skipped:
+                        marker = registry.load_marker("phase4a_ensemble_modes") or {}
+                        keys = marker.get("artifact_keys") or []
+                        ensemble_result = _load_json_p(bucket, keys[0], s3_client=s3) if keys else None
+                    else:
+                        ensemble_result = evaluate_ensemble_modes(
+                            features_by_ticker, price_matrix, ohlcv_by_ticker,
+                            spy_prices, sector_map, trading_dates,
+                            config, single_stats,
+                        )
+                        if ensemble_result is not None:
+                            p4a_ctx.record_artifact(_save_json_p(
+                                bucket, registry.date, "phase4a_ensemble_modes",
+                                "ensemble_result", ensemble_result, s3_client=s3,
+                            ))
+                if ensemble_result is not None:
+                    single_stats["ensemble_eval"] = ensemble_result
             except Exception as exc:
                 # Bumped from warning to error so flow-doctor captures it.
                 # Previously logged at warning and the spot run stayed
@@ -1063,13 +1289,26 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             threshold_result = None
             if predictions_by_date:
                 try:
-                    with registry.phase("phase4b_signal_thresholds"):
-                        threshold_result = evaluate_signal_thresholds(
-                            predictions_by_date, sector_map, ohlcv_by_ticker,
-                            price_matrix, spy_prices, trading_dates,
-                            config, single_stats,
-                        )
-                    single_stats["threshold_eval"] = threshold_result
+                    with registry.phase(
+                        "phase4b_signal_thresholds", supports_auto_skip=True,
+                    ) as p4b_ctx:
+                        if p4b_ctx.skipped:
+                            marker = registry.load_marker("phase4b_signal_thresholds") or {}
+                            keys = marker.get("artifact_keys") or []
+                            threshold_result = _load_json_p(bucket, keys[0], s3_client=s3) if keys else None
+                        else:
+                            threshold_result = evaluate_signal_thresholds(
+                                predictions_by_date, sector_map, ohlcv_by_ticker,
+                                price_matrix, spy_prices, trading_dates,
+                                config, single_stats,
+                            )
+                            if threshold_result is not None:
+                                p4b_ctx.record_artifact(_save_json_p(
+                                    bucket, registry.date, "phase4b_signal_thresholds",
+                                    "threshold_result", threshold_result, s3_client=s3,
+                                ))
+                    if threshold_result is not None:
+                        single_stats["threshold_eval"] = threshold_result
                 except Exception as exc:
                     logger.error(
                         "Phase 4b signal threshold evaluation failed: %s",
@@ -1079,13 +1318,26 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             # Phase 4c: Feature pruning evaluation
             pruning_result = None
             try:
-                with registry.phase("phase4c_feature_pruning"):
-                    pruning_result = evaluate_feature_pruning(
-                        features_by_ticker, price_matrix, ohlcv_by_ticker,
-                        spy_prices, sector_map, trading_dates,
-                        config, single_stats,
-                    )
-                single_stats["pruning_eval"] = pruning_result
+                with registry.phase(
+                    "phase4c_feature_pruning", supports_auto_skip=True,
+                ) as p4c_ctx:
+                    if p4c_ctx.skipped:
+                        marker = registry.load_marker("phase4c_feature_pruning") or {}
+                        keys = marker.get("artifact_keys") or []
+                        pruning_result = _load_json_p(bucket, keys[0], s3_client=s3) if keys else None
+                    else:
+                        pruning_result = evaluate_feature_pruning(
+                            features_by_ticker, price_matrix, ohlcv_by_ticker,
+                            spy_prices, sector_map, trading_dates,
+                            config, single_stats,
+                        )
+                        if pruning_result is not None:
+                            p4c_ctx.record_artifact(_save_json_p(
+                                bucket, registry.date, "phase4c_feature_pruning",
+                                "pruning_result", pruning_result, s3_client=s3,
+                            ))
+                if pruning_result is not None:
+                    single_stats["pruning_eval"] = pruning_result
             except Exception as exc:
                 logger.error(
                     "Phase 4c feature pruning evaluation failed: %s",
@@ -1143,8 +1395,26 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
         sweep_settings = config.get("param_sweep_settings", {})
 
         logger.info("Running predictor param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
-        with registry.phase("predictor_param_sweep", combos=sum(len(v) for v in grid.values())):
-            sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
+        from phase_artifacts import save_dataframe as _save_df_p, load_dataframe as _load_df_p
+        with registry.phase(
+            "predictor_param_sweep",
+            combos=sum(len(v) for v in grid.values()),
+            supports_auto_skip=True,
+        ) as ps_ctx:
+            if ps_ctx.skipped:
+                marker = registry.load_marker("predictor_param_sweep") or {}
+                keys = marker.get("artifact_keys") or []
+                if keys:
+                    sweep_df = _load_df_p(bucket, keys[0], s3_client=s3)
+                else:
+                    sweep_df = pd.DataFrame()
+            else:
+                sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
+                if sweep_df is not None and not sweep_df.empty:
+                    ps_ctx.record_artifact(_save_df_p(
+                        bucket, registry.date, "predictor_param_sweep",
+                        "sweep_df", sweep_df, preserve_index=False, s3_client=s3,
+                    ))
 
     return single_stats, sweep_df
 
