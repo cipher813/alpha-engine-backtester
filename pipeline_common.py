@@ -163,6 +163,13 @@ class PhaseRegistry:
             self._s3 = boto3.client("s3")
         return self._s3
 
+    @property
+    def s3_client(self):
+        """Public accessor so artifact save/load helpers can use the same
+        client the registry writes markers with. Keeps test fakes and
+        production clients aligned without global monkey-patching."""
+        return self._client()
+
     def _read_marker(self, phase_name: str) -> dict | None:
         """Return the marker dict for (date, phase), or None if absent/corrupt.
 

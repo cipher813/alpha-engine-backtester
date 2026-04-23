@@ -110,6 +110,92 @@ def _setup_simulation(config: dict) -> tuple:
     return executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv_by_ticker
 
 
+def _save_simulation_setup(
+    ctx, bucket: str, date: str, sim_setup: tuple, *, s3_client=None,
+) -> None:
+    """Persist the reconstructable parts of `_sim_setup` to S3 and record
+    their keys on the phase context. Skips persistence when the tuple
+    represents the degraded 'insufficient data / empty price matrix' state
+    (price_matrix is None) — nothing to reload, the retry should rerun
+    setup fresh."""
+    from phase_artifacts import (
+        save_dataframe, save_json, save_ohlcv_by_ticker,
+    )
+    _, _, dates, price_matrix, _init_cash, ohlcv_by_ticker = sim_setup
+    if price_matrix is None:
+        return
+    ctx.record_artifact(save_dataframe(
+        bucket, date, "simulation_setup", "price_matrix", price_matrix,
+        s3_client=s3_client,
+    ))
+    ctx.record_artifact(save_ohlcv_by_ticker(
+        bucket, date, "simulation_setup", "ohlcv_by_ticker", ohlcv_by_ticker,
+        s3_client=s3_client,
+    ))
+    ctx.record_artifact(save_json(
+        bucket, date, "simulation_setup", "dates", list(dates),
+        s3_client=s3_client,
+    ))
+
+
+def _load_simulation_setup(config: dict, registry) -> tuple:
+    """Reconstruct the `_sim_setup` tuple from S3 artifacts.
+
+    Executor callables can't be persisted — re-imported from
+    `executor_paths` every run. init_cash re-read from config.
+    """
+    import sys
+    from phase_artifacts import (
+        load_dataframe, load_json, load_ohlcv_by_ticker,
+    )
+
+    executor_paths = config.get("executor_paths", [])
+    if isinstance(executor_paths, str):
+        executor_paths = [executor_paths]
+    executor_path = next((p for p in executor_paths if os.path.isdir(p)), None)
+    if not executor_path:
+        raise ValueError(
+            f"simulation_setup reload: no executor_paths exist ({executor_paths})"
+        )
+    if executor_path not in sys.path:
+        sys.path.insert(0, executor_path)
+    from executor.main import run as executor_run
+    from executor.ibkr import SimulatedIBKRClient
+
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    init_cash = float(config.get("init_cash", 1_000_000.0))
+    s3 = registry.s3_client
+
+    marker = registry.load_marker("simulation_setup")
+    if marker is None:
+        raise RuntimeError(
+            "simulation_setup auto-skip: marker missing — should not reach "
+            "load path without a prior ok marker"
+        )
+    keys = marker.get("artifact_keys") or []
+
+    def _find(suffix: str) -> str:
+        matches = [k for k in keys if k.endswith(suffix)]
+        if not matches:
+            raise RuntimeError(
+                f"simulation_setup reload: artifact ending {suffix!r} missing "
+                f"from marker (artifact_keys={keys})"
+            )
+        return matches[0]
+
+    price_matrix = load_dataframe(bucket, _find("/price_matrix.parquet"), s3_client=s3)
+    ohlcv_by_ticker = load_ohlcv_by_ticker(bucket, _find("/ohlcv_by_ticker.parquet"), s3_client=s3)
+    dates = load_json(bucket, _find("/dates.json"), s3_client=s3)
+
+    logger.info(
+        "simulation_setup auto-skip: reloaded price_matrix (%dx%d), "
+        "%d tickers of OHLCV, %d dates from S3 artifacts",
+        price_matrix.shape[0], price_matrix.shape[1],
+        len(ohlcv_by_ticker), len(dates),
+    )
+    return (executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv_by_ticker)
+
+
 _SIGNAL_LIST_FIELDS = ("universe", "buy_candidates", "enter", "exit", "reduce", "hold")
 
 
@@ -1364,12 +1450,26 @@ def _run_simulation_pipeline(
             )
 
     # ── Simulate mode ─────────────────────────────────────────────────────
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    s3 = registry.s3_client
     if args.mode in ("simulate", "all"):
+        from phase_artifacts import save_json, load_json
         try:
-            with registry.phase("simulate", mode=args.mode):
-                if _sim_setup is None:
-                    portfolio_stats = {"status": "error", "error": "Simulation setup failed"}
+            with registry.phase(
+                "simulate", mode=args.mode, supports_auto_skip=True,
+            ) as ctx:
+                if ctx.skipped:
+                    marker = registry.load_marker("simulate") or {}
+                    keys = marker.get("artifact_keys") or []
+                    if not keys:
+                        raise RuntimeError(
+                            "simulate auto-skip: marker has no artifact_keys — "
+                            "cannot reload portfolio_stats"
+                        )
+                    portfolio_stats = load_json(bucket, keys[0], s3_client=s3)
                 else:
+                    if _sim_setup is None:
+                        raise RuntimeError("Simulation setup failed — cannot run simulate")
                     executor_run, SimulatedIBKRClient, dates, price_matrix, init_cash, ohlcv = _sim_setup
                     if price_matrix is None:
                         min_dates = config.get("min_simulation_dates", 5)
@@ -1387,6 +1487,10 @@ def _run_simulation_pipeline(
                             vwap_series_by_ticker=vwap_series_by_ticker,
                             coverage_by_ticker=coverage_by_ticker,
                         )
+                    ctx.record_artifact(save_json(
+                        bucket, args.date, "simulate", "portfolio_stats", portfolio_stats,
+                        s3_client=s3,
+                    ))
         except Exception as e:
             logger.error("Mode 2 simulation failed: %s", e)
             if fd:
@@ -1396,10 +1500,22 @@ def _run_simulation_pipeline(
 
     # ── Param sweep ───────────────────────────────────────────────────────
     if args.mode in ("param-sweep", "all"):
+        from phase_artifacts import save_dataframe, load_dataframe
         try:
-            with registry.phase("param_sweep", mode=args.mode):
-                if _sim_setup is None:
-                    sweep_df = None
+            with registry.phase(
+                "param_sweep", mode=args.mode, supports_auto_skip=True,
+            ) as ctx:
+                if ctx.skipped:
+                    marker = registry.load_marker("param_sweep") or {}
+                    keys = marker.get("artifact_keys") or []
+                    if not keys:
+                        # No persisted sweep (e.g. empty sweep on prior run);
+                        # treat as empty DataFrame so executor_optimizer skips cleanly.
+                        sweep_df = pd.DataFrame()
+                    else:
+                        sweep_df = load_dataframe(bucket, keys[0], s3_client=s3)
+                elif _sim_setup is None:
+                    raise RuntimeError("Simulation setup failed — cannot run param sweep")
                 else:
                     executor_run, SimulatedIBKRClient, dates, price_matrix, _, ohlcv = _sim_setup
                     if price_matrix is None:
@@ -1420,6 +1536,11 @@ def _run_simulation_pipeline(
                         sweep_settings = config.get("param_sweep_settings", {})
                         logger.info("Running param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
                         sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
+                    if sweep_df is not None and not sweep_df.empty:
+                        ctx.record_artifact(save_dataframe(
+                            bucket, args.date, "param_sweep", "sweep_df", sweep_df,
+                            preserve_index=False, s3_client=s3,
+                        ))
         except Exception as e:
             logger.error("Param sweep failed: %s", e)
             if fd:
@@ -1429,8 +1550,21 @@ def _run_simulation_pipeline(
 
         # Executor parameter optimization from sweep results
         if sweep_df is not None and not sweep_df.empty:
+            from phase_artifacts import save_json, load_json
             try:
-                with registry.phase("executor_optimizer", mode=args.mode):
+                with registry.phase(
+                    "executor_optimizer", mode=args.mode, supports_auto_skip=True,
+                ) as ctx:
+                  if ctx.skipped:
+                    marker = registry.load_marker("executor_optimizer") or {}
+                    keys = marker.get("artifact_keys") or []
+                    if not keys:
+                        raise RuntimeError(
+                            "executor_optimizer auto-skip: marker has no "
+                            "artifact_keys — cannot reload executor_rec"
+                        )
+                    executor_rec = load_json(bucket, keys[0], s3_client=s3)
+                  else:
                     executor_rec = executor_optimizer.recommend(
                         sweep_df, config, current_params=current_executor_params,
                     )
@@ -1479,11 +1613,18 @@ def _run_simulation_pipeline(
                                 )
 
                     if executor_rec.get("status") == "ok":
-                        bucket = config.get("signals_bucket", "alpha-engine-research")
                         if args.freeze:
                             executor_rec["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
                         else:
                             executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
+
+                    # Persist final state (includes holdout + twin_sim +
+                    # apply_result) so an auto-skipped retry restores the
+                    # complete optimizer recommendation tree atomically.
+                    ctx.record_artifact(save_json(
+                        bucket, args.date, "executor_optimizer", "executor_rec", executor_rec,
+                        s3_client=s3,
+                    ))
             except Exception as e:
                 logger.error("Executor optimizer failed: %s", e)
                 if fd:
@@ -1696,9 +1837,19 @@ def main() -> None:
     # ── Simulation setup (shared by simulate + param-sweep) ───────────────
     _sim_setup = None
     if args.mode in ("simulate", "param-sweep", "all"):
+        bucket = config.get("signals_bucket", "alpha-engine-research")
         try:
-            with registry.phase("simulation_setup", mode=args.mode):
-                _sim_setup = _setup_simulation(config)
+            with registry.phase(
+                "simulation_setup", mode=args.mode, supports_auto_skip=True,
+            ) as ctx:
+                if ctx.skipped:
+                    _sim_setup = _load_simulation_setup(config, registry)
+                else:
+                    _sim_setup = _setup_simulation(config)
+                    _save_simulation_setup(
+                        ctx, bucket, args.date, _sim_setup,
+                        s3_client=registry.s3_client,
+                    )
         except Exception as e:
             logger.error("Simulation setup failed: %s", e)
             if fd:
