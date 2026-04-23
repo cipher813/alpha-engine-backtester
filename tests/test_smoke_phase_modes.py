@@ -65,6 +65,8 @@ def _blank_args(mode: str) -> argparse.Namespace:
         skip_phases="",
         force=False,
         freeze=False,
+        date="2026-04-23",
+        upload=True,
     )
 
 
@@ -78,6 +80,42 @@ def test_smoke_simulate_routes_to_simulate():
     assert config["min_simulation_dates"] == 2
     assert args.force is True  # always fresh — never auto-skip a smoke run
     assert args.freeze is True  # never promote synthetic recs to S3
+
+
+@pytest.mark.parametrize("mode", [
+    "smoke-simulate", "smoke-param-sweep",
+    "smoke-predictor-backtest", "smoke-phase4",
+])
+def test_smoke_fixture_namespaces_date_to_isolate_markers(mode: str):
+    """Fix for 2026-04-23 SF dry-run failure: smoke markers at
+    backtest/{date}/.phases/ polluted full-run auto-skip on the same
+    date. Fixture now prefixes args.date with ".smoke/" so markers +
+    artifacts go to backtest/.smoke/{date}/ instead. Lex-sort places
+    ".smoke/" before "2026-..." so production "latest date" probes
+    keep resolving to real dates."""
+    args = _blank_args(mode)
+    config: dict = {}
+    backtest._apply_smoke_fixture(mode, args, config)
+
+    assert args.date == ".smoke/2026-04-23"
+    # Critical: sort order stays safe — ".smoke/" < "2026-..."
+    assert ".smoke/" < "2026-04-23"
+
+
+@pytest.mark.parametrize("mode", [
+    "smoke-simulate", "smoke-param-sweep",
+    "smoke-predictor-backtest", "smoke-phase4",
+])
+def test_smoke_fixture_disables_upload(mode: str):
+    """Smoke must not write top-level backtest/{date}/ artifacts (report,
+    sweep_df, portfolio_stats). Namespacing args.date covers the phase
+    artifacts; disabling args.upload covers the reporter.upload_to_s3
+    path that writes the run summary to s3://.../backtest/{date}/."""
+    args = _blank_args(mode)
+    config: dict = {}
+    backtest._apply_smoke_fixture(mode, args, config)
+
+    assert args.upload is False
 
 
 @pytest.mark.parametrize("mode", [
