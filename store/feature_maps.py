@@ -55,6 +55,7 @@ _COVERAGE_OHLCV_COLS = frozenset({
 def load_precomputed_feature_maps(
     bucket: str,
     max_workers: int = 20,
+    tickers_allowlist: set[str] | None = None,
 ) -> tuple[dict[str, float], dict[str, pd.Series], dict[str, float]]:
     """Bulk-read atr_14_pct + VWAP + feature-coverage for every universe
     ticker at once.
@@ -117,10 +118,21 @@ def load_precomputed_feature_maps(
         ) from exc
 
     symbols = universe.list_symbols()
-    log.info(
-        "feature_maps: bulk-reading atr_14_pct + VWAP for %d ticker(s)",
-        len(symbols),
-    )
+    if tickers_allowlist is not None:
+        # Intersect with catalog so a bad allowlist doesn't crash — we
+        # just read fewer tickers. Smoke-harness fixture path.
+        requested = set(tickers_allowlist)
+        symbols = [s for s in symbols if s in requested]
+        log.info(
+            "feature_maps: filtered to %d ticker(s) via tickers_allowlist "
+            "(requested %d)",
+            len(symbols), len(requested),
+        )
+    else:
+        log.info(
+            "feature_maps: bulk-reading atr_14_pct + VWAP for %d ticker(s)",
+            len(symbols),
+        )
 
     atr_by_ticker: dict[str, float] = {}
     vwap_series_by_ticker: dict[str, pd.Series] = {}

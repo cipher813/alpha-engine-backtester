@@ -47,24 +47,22 @@
 # should drop to ~150-300s per mode and will be tightened in that PR.
 
 smoke_budgets_seconds:
-  # Observed 514s + ~75% headroom for variance.
-  # Post universe-filter target: ~150-200s.
-  smoke-simulate: 900.0
+  # Universe-filter active: ArcticDB reads restricted to _SMOKE_FIXTURE_TICKERS
+  # (5 tickers). Expected: preflight ~100-140s (cold) + runtime_smoke ~2s
+  # + setup ~5-10s + simulate 2-5s + pipeline prelude ~5-10s ≈ 120-170s.
+  # Headroom to 400s covers cold-spot variance + GBM / S3 latency spikes.
+  smoke-simulate: 400.0
 
-  # smoke-simulate + 3 × simulate (~30s each) + executor_optimizer
-  # overhead. setup/preflight/feature_maps are amortized across combos.
-  # Post universe-filter target: ~250-400s.
-  smoke-param-sweep: 1200.0
+  # + 3-combo param sweep inner sim (~2-5s each, amortized feature maps)
+  # + executor_optimizer rec compute. Estimated 130-200s typical.
+  smoke-param-sweep: 500.0
 
-  # preflight + predictor_data_prep (GBM inference 30-60 days ×
-  # 911 tickers — CPU-intensive) + feature_maps + single_run.
-  # The GBM download (~10-20 MB) + inference loop is the tail-latency
-  # risk on cold S3 caches.
-  # Post universe-filter target: ~200-400s.
-  smoke-predictor-backtest: 1500.0
+  # preflight + predictor_data_prep (GBM inference 30-60 days × 5 tickers
+  # is fast — the GBM download from S3 and scorer load dominate cold-
+  # start tail) + feature_maps + single_run. Estimated 120-200s typical.
+  smoke-predictor-backtest: 500.0
 
-  # Above + 3 Phase 4 evaluators, each running an inner full sim across
-  # the predictor_data_prep inputs. Each variant model adds ~30-60s
-  # inference time on top of its inner simulation.
-  # Post universe-filter target: ~400-700s.
-  smoke-phase4: 2400.0
+  # Above + 3 Phase 4 evaluators, each an inner full sim on 5 tickers.
+  # Variant-model download + inference adds ~30-60s per evaluator.
+  # Estimated 250-400s typical.
+  smoke-phase4: 700.0
