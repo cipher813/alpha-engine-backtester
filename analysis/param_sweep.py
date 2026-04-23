@@ -21,11 +21,30 @@ import logging
 import math
 import random
 from copy import deepcopy
-from typing import Callable
+from typing import Any, Callable
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+def _deepcopy_safe_config(base: dict) -> dict:
+    """Deepcopy a config dict while excluding keys whose values are not
+    deepcopy-safe (boto3 clients, PhaseRegistry, other runtime objects
+    with cyclic refs). Underscore-prefixed keys are treated as runtime
+    refs by convention and re-attached shallow to the copy.
+
+    Without this, the 2026-04-23 post-filter smoke-param-sweep hit
+    `maximum recursion depth exceeded` because `config["_phase_registry"]`
+    holds a boto3 S3 client whose internal cyclic refs broke deepcopy.
+    """
+    serializable: dict[str, Any] = {
+        k: v for k, v in base.items() if not k.startswith("_")
+    }
+    copied = deepcopy(serializable)
+    runtime = {k: v for k, v in base.items() if k.startswith("_")}
+    copied.update(runtime)
+    return copied
 
 # Core 6 parameters — high-frequency, regime-invariant risk/exit rules that
 # affect every trade.  60 random trials gives 95% confidence of finding a
@@ -178,7 +197,7 @@ def _run_combos(
     n = len(combinations)
     t_sweep_start = _time.monotonic()
     for i, params in enumerate(combinations, 1):
-        config = deepcopy(base_config)
+        config = _deepcopy_safe_config(base_config)
         config.update(params)
 
         # Per-combo progress at INFO so the sweep never goes silent. Each
