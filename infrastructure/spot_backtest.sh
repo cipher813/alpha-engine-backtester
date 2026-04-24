@@ -705,9 +705,18 @@ else
         exit 1
     fi
 
-    # pytest exits non-zero on either divergence (assert failure) or setup
-    # RuntimeError (replay_for_dates hard-fail) — both halt the spot run
-    # and fire the SF-failed alarm.
+    # Parity is a DIAGNOSTIC GATE, not a pipeline-correctness gate — its
+    # failure indicates "investigate this divergence" but doesn't mean the
+    # pipeline is broken. Soft-fail: log a warning, emit a dedicated
+    # CloudWatch metric, but DO NOT exit the script — let the evaluator
+    # stage proceed against the freshly-produced backtest artifacts.
+    #
+    # Per-stage failure policy (codified 2026-04-24):
+    #   backtest:  HARD-fail (artifacts feed parity + evaluator)
+    #   parity:    SOFT-fail (diagnostic; emits AlphaEngine.ParityTestFailure
+    #              metric on failure for separate alerting)
+    #   evaluator: HARD-fail (writes optimizer configs to S3; silent failure
+    #              means stale/wrong configs promoted)
     PARITY_EXIT=0
     # USE_REAL_ARCTICDB=1 tells tests/conftest.py to skip the default
     # MagicMock stub so the integration test hits real ArcticDB. Without
@@ -729,10 +738,33 @@ else
     fi
 
     if [ "\$PARITY_EXIT" != "0" ]; then
-        echo "ERROR: parity test failed with exit \$PARITY_EXIT" >&2
-        echo "       Review s3://\${BUCKET}/backtest/\${RUN_DATE}/parity_report.json" >&2
-        echo "       Spot run marked FAILED — SF alarm will fire." >&2
-        exit "\$PARITY_EXIT"
+        echo "WARNING: parity test failed with exit \$PARITY_EXIT (non-blocking)" >&2
+        echo "         Review s3://\${BUCKET}/backtest/\${RUN_DATE}/parity_report.json" >&2
+        echo "         Pipeline continues to evaluator. Parity is diagnostic — its" >&2
+        echo "         failure does not gate downstream stages. Tracked separately" >&2
+        echo "         via the AlphaEngine.ParityTestFailure CloudWatch metric." >&2
+        # Emit a dedicated metric so parity divergence is alertable independently
+        # of pipeline-correctness failures. Failure-to-emit is non-fatal — the
+        # parity_report.json upload above is the durable artifact.
+        aws cloudwatch put-metric-data \\
+            --namespace "AlphaEngine" \\
+            --metric-name "ParityTestFailure" \\
+            --dimensions "Process=backtester" \\
+            --value 1 --unit "Count" \\
+            --region "\${AWS_REGION:-us-east-1}" 2>/dev/null \\
+            && echo "Emitted AlphaEngine.ParityTestFailure metric." \\
+            || echo "WARNING: failed to emit parity-failure metric (non-fatal)"
+        # Do NOT exit — fall through to the next stage.
+    else
+        # Optional: emit a success metric so a CloudWatch alarm can detect
+        # missing-runs (no metric emitted) vs failed-runs (failure metric).
+        aws cloudwatch put-metric-data \\
+            --namespace "AlphaEngine" \\
+            --metric-name "ParityTestFailure" \\
+            --dimensions "Process=backtester" \\
+            --value 0 --unit "Count" \\
+            --region "\${AWS_REGION:-us-east-1}" 2>/dev/null \\
+            || true
     fi
     echo "▶ stage=parity END at \$(date -u +%H:%M:%S)"
 fi
