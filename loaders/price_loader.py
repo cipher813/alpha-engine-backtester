@@ -52,8 +52,14 @@ def build_matrix(
     field : OHLCV field to use ("open", "close", "high", "low"). Default "close".
     signals_prefix : S3 prefix for signal-set ticker resolution (default "signals").
     _ohlcv_out : Optional output dict — when provided, is populated with
-                 {ticker: [{date, open, high, low, close}, ...]} for strategy layer
-                 consumers (ATR trailing stops etc.) to match the prior interface.
+                 {ticker: pd.DataFrame} (DatetimeIndex, lowercase
+                 [open, high, low, close] columns, dtype float64) for
+                 strategy-layer consumers (ATR trailing stops etc.).
+                 Downstream consumers dispatch on shape — see
+                 ``_simulate_single_date`` + ``precompute_indicator_series``
+                 — so this is drop-in compatible with the legacy
+                 list-of-dicts producers until step 9 cleanup lands
+                 (pandas refactor, plan 2026-04-23).
     tickers_allowlist : Optional set of tickers to restrict the ArcticDB bulk
                  read. When provided, signal-resolved universe is intersected
                  with this allowlist BEFORE the ArcticDB read so we don't pay
@@ -145,27 +151,45 @@ def build_matrix(
     df = df.reindex(df.index.union(date_index)).loc[:date_index.max()]
 
     # ── Capture per-ticker OHLCV for strategy layer consumers ──────────────
+    #
+    # 2026-04-23 (pandas refactor): emit per-ticker pd.DataFrame rather
+    # than list-of-dicts. Shape matches ``build_ohlcv_df_by_ticker`` —
+    # DatetimeIndex + lowercase [open, high, low, close], fallback-to-
+    # close for missing OHL, sorted + dedup'd. Downstream consumers
+    # dispatch on shape (see backtest._simulate_single_date and
+    # synthetic.signal_generator.precompute_indicator_series) so this
+    # drop-in replaces the prior list-of-dicts production without
+    # coordinating producers and consumers across the migration.
     if _ohlcv_out is not None:
         for ticker in all_tickers:
             df_ticker = price_data.get(ticker)
             if df_ticker is None or df_ticker.empty:
                 continue
-            # Filter to backtest date range (inclusive)
-            sliced = df_ticker.loc[df_ticker.index <= date_index.max()].copy()
+            sliced = df_ticker.loc[df_ticker.index <= date_index.max()]
             if sliced.empty:
                 continue
-            _ohlcv_out[ticker] = [
-                {
-                    "date":  idx.strftime("%Y-%m-%d"),
-                    "open":  float(row.get("Open",  row.get("Close", 0.0))),
-                    "high":  float(row.get("High",  row.get("Close", 0.0))),
-                    "low":   float(row.get("Low",   row.get("Close", 0.0))),
-                    "close": float(row.get("Close", 0.0)),
-                }
-                for idx, row in sliced.iterrows()
-            ]
-        for ticker in _ohlcv_out:
-            _ohlcv_out[ticker].sort(key=lambda b: b["date"])
+            cols: dict[str, pd.Series] = {}
+            for title in ("Close", "Open", "High", "Low"):
+                lower = title.lower()
+                if title in sliced.columns:
+                    cols[lower] = sliced[title]
+                elif lower in sliced.columns:
+                    cols[lower] = sliced[lower]
+            if "close" not in cols:
+                continue
+            close = cols["close"]
+            for key in ("open", "high", "low"):
+                if key not in cols:
+                    cols[key] = close
+            frame = pd.DataFrame({
+                "open":  cols["open"],
+                "high":  cols["high"],
+                "low":   cols["low"],
+                "close": cols["close"],
+            }).astype(float)
+            frame.index = pd.to_datetime(frame.index)
+            frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+            _ohlcv_out[ticker] = frame
 
     # ── Gap detection, ffill, circuit-breaker (unchanged semantics) ────────
     was_nan = df.isna()
