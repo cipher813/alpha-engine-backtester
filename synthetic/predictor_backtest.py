@@ -714,20 +714,40 @@ def _df_slice_to_bars(df: pd.DataFrame, until_date: str) -> list[dict]:
     2026-04-22. Used at the executor boundary once the producer flips
     to DataFrame form — the executor itself still expects list-of-dicts
     during Option A's coexistence window.
+
+    Vectorized implementation: pandas ``DataFrame.iterrows()`` allocates
+    a fresh Series per row (with a pandas.options lookup inside
+    ``Series.__init__`` for mode.data_manager — observed directly in the
+    2026-04-24 watchdog stack dump). At param-sweep scale
+    (~60 combos × ~2500 dates × ~800 tickers, each slice materialized
+    here), that per-row overhead dominated simulate wall-clock — the
+    2026-04-24 `--dry-run` tripped simulation_pipeline's 2700s watchdog
+    cap inside param_sweep, with iterrows at the top of the stuck
+    traceback. Column-wise ``.tolist()`` extraction is C-level and
+    avoids the per-row Series allocation entirely.
     """
     ts = pd.Timestamp(until_date)
     sliced = df.loc[:ts]
-    bars: list[dict] = []
-    for dt, row in sliced.iterrows():
-        date_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
-        bars.append({
-            "date":  date_str,
-            "open":  float(row["open"]),
-            "high":  float(row["high"]),
-            "low":   float(row["low"]),
-            "close": float(row["close"]),
-        })
-    return bars
+    if sliced.empty:
+        return []
+    # strftime on a DatetimeIndex returns an Index of str; .tolist()
+    # yields native Python str values. If the index is already str-like
+    # (non-Datetime), fall back to a list-comp str coercion.
+    idx = sliced.index
+    if hasattr(idx, "strftime"):
+        dates = idx.strftime("%Y-%m-%d").tolist()
+    else:
+        dates = [str(d)[:10] for d in idx]
+    # astype(float, copy=False) ensures .tolist() produces Python floats
+    # (DataFrame column dtype may arrive as float32 from the tensor path).
+    opens = sliced["open"].astype(float, copy=False).tolist()
+    highs = sliced["high"].astype(float, copy=False).tolist()
+    lows = sliced["low"].astype(float, copy=False).tolist()
+    closes = sliced["close"].astype(float, copy=False).tolist()
+    return [
+        {"date": d, "open": o, "high": h, "low": l, "close": c}
+        for d, o, h, l, c in zip(dates, opens, highs, lows, closes)
+    ]
 
 
 def _drain_price_data_into_ohlcv(
