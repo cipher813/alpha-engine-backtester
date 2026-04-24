@@ -271,6 +271,49 @@ class TestSimulateDispatchParity:
             assert canon_df == canon_sc, f"df vs scalar divergence: {ticker} at {signal_date}"
 
 
+class TestIndicatorParity:
+    """``precompute_indicator_series`` must produce byte-identical
+    indicator DataFrames for both input shapes. This is the signal-
+    generation equivalence guarantee — downstream ``predictions_to_signals``
+    consumes only the indicator frames, so identical indicators mean
+    identical signals."""
+
+    def test_indicator_frames_match_across_shapes(self, small_price_data):
+        from synthetic.signal_generator import precompute_indicator_series
+
+        old = build_ohlcv_by_ticker(small_price_data)
+        new_df = build_ohlcv_df_by_ticker(small_price_data)
+
+        from_list = precompute_indicator_series(old)
+        from_df = precompute_indicator_series(new_df)
+
+        assert set(from_list.keys()) == set(from_df.keys())
+        for ticker in from_list:
+            pd.testing.assert_frame_equal(
+                from_df[ticker],
+                from_list[ticker],
+                check_names=False,
+                check_freq=False,
+                check_column_type=False,
+            )
+
+    def test_indicator_output_index_is_string_dates(self, small_price_data):
+        """Contract: output index is YYYY-MM-DD strings regardless of
+        input shape — downstream ``indicators_from_precomputed`` does
+        ``df.index.get_loc(date_str)``."""
+        from synthetic.signal_generator import precompute_indicator_series
+
+        new_df = build_ohlcv_df_by_ticker(small_price_data)
+        frames = precompute_indicator_series(new_df)
+        for ticker, frame in frames.items():
+            assert all(isinstance(idx, str) for idx in frame.index[:3]), (
+                f"{ticker} index first values are not str: {frame.index[:3].tolist()}"
+            )
+            # All dates match the YYYY-MM-DD pattern
+            assert all(len(idx) == 10 and idx[4] == "-" and idx[7] == "-"
+                       for idx in frame.index)
+
+
 class TestBuildDateIndex:
     """``_build_ohlcv_date_index`` detects shape — the bisect date axis
     is only useful for list-of-dicts. On DataFrame input it returns an

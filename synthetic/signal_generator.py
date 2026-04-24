@@ -201,7 +201,7 @@ def _compute_indicators_from_ohlcv(
 
 
 def precompute_indicator_series(
-    ohlcv_by_ticker: dict[str, list[dict]],
+    ohlcv_by_ticker: "dict[str, list[dict]] | dict[str, pd.DataFrame]",
 ) -> dict[str, pd.DataFrame]:
     """
     Vectorized pre-computation of the same 6 indicators as
@@ -226,6 +226,12 @@ def precompute_indicator_series(
     have returned at that date. Early bars have NaN indicators (rolling-window
     warmup) — consumer is expected to skip rows whose key fields are NaN.
 
+    Accepts either input shape (pandas refactor, plan 2026-04-23):
+      - ``dict[str, list[dict]]`` (legacy) — each value is
+        ``[{date, open, high, low, close}, ...]``
+      - ``dict[str, pd.DataFrame]`` (new) — each value has a DatetimeIndex
+        and a lowercase ``close`` column per ``build_ohlcv_df_by_ticker``
+
     Returns
     -------
     {ticker: DataFrame} where each DataFrame has the ticker's bar dates as
@@ -235,14 +241,24 @@ def precompute_indicator_series(
     Tickers with zero bars are omitted.
     """
     out: dict[str, pd.DataFrame] = {}
-    for ticker, bars in ohlcv_by_ticker.items():
-        if not bars:
-            continue
-
-        # Build close series indexed on bar dates. Dates are strings
-        # (YYYY-MM-DD) so str ordering == chronological order.
-        dates = [bar["date"] for bar in bars]
-        close = pd.Series([bar["close"] for bar in bars], index=dates, dtype=float)
+    for ticker, bars_or_df in ohlcv_by_ticker.items():
+        if isinstance(bars_or_df, pd.DataFrame):
+            # New shape: DatetimeIndex + lowercase "close" column. Copy the
+            # close series so the .index reassignment below doesn't mutate
+            # the caller's DataFrame. Convert index to YYYY-MM-DD strings so
+            # the output contract (string-date-indexed frames consumed by
+            # indicators_from_precomputed via df.index.get_loc) is preserved.
+            if bars_or_df.empty:
+                continue
+            close = bars_or_df["close"].astype(float).copy()
+            close.index = close.index.strftime("%Y-%m-%d")
+        else:
+            # Legacy list-of-dicts shape. Dates are strings (YYYY-MM-DD) so
+            # str ordering == chronological order.
+            if not bars_or_df:
+                continue
+            dates = [bar["date"] for bar in bars_or_df]
+            close = pd.Series([bar["close"] for bar in bars_or_df], index=dates, dtype=float)
 
         # RSI(14) via Wilder's smoothing — vectorized: one EWMA pass
         delta = close.diff()
