@@ -14,10 +14,13 @@ during the migration:
 3. Artifact round-trip — ``save_dict_of_dataframes`` /
    ``load_dict_of_dataframes`` survive byte-identical on the new shape.
 4. Macro + sector filter — both producers drop the same ticker set.
-
-Full-simulate parity (executor-boundary order equivalence) lives in a
-follow-up test added alongside ``_simulate_single_date``'s shape
-detection.
+5. Executor-boundary parity — ``_simulate_single_date``'s OHLCV slice
+   dispatch must produce identical ``price_histories`` for both shapes
+   at every call site we care about (``ohlcv_dates_index`` present vs
+   absent, scalar fallback vs bisect path vs DataFrame path).
+6. ``_build_ohlcv_date_index`` returns ``{}`` on DataFrame input — the
+   bisect path is unused there and building a parallel date axis would
+   waste the ~1 GB memory win the refactor targets.
 """
 
 from __future__ import annotations
@@ -189,6 +192,103 @@ class TestSliceParity:
         bars = _df_slice_to_bars(new["AAPL"], "2024-01-05")
         assert bars[-1]["date"] == "2024-01-05"
         assert len(bars) >= 1
+
+
+class TestSimulateDispatchParity:
+    """``_simulate_single_date``'s slice dispatch must produce identical
+    ``price_histories`` across all three input shapes the migration
+    needs to support simultaneously: DataFrame form (new), list-of-dicts
+    + ohlcv_dates_index (bisect path, post-2026-04-22), and list-of-dicts
+    without the index (scalar fallback path). This is the executor-boundary
+    equivalence guarantee — downstream orders depend only on these bars
+    so identical inputs ensure identical orders without needing a full
+    executor harness here."""
+
+    @staticmethod
+    def _run_and_capture(ohlcv_by_ticker, ohlcv_dates_index, signal_date):
+        """Fire ``_simulate_single_date`` with a captured executor_run and
+        return the ``price_histories`` it received."""
+        import backtest as backtest_mod
+
+        captured: dict = {}
+
+        def mock_executor_run(**kwargs):
+            captured["price_histories"] = kwargs.get("price_histories")
+            return []
+
+        class _MockSimClient:
+            def __init__(self):
+                self._prices = {}
+                self._simulation_date = None
+
+        price_matrix = pd.DataFrame(
+            {"AAPL": [150.0]},
+            index=pd.DatetimeIndex([signal_date]),
+        )
+
+        backtest_mod._simulate_single_date(
+            executor_run=mock_executor_run,
+            sim_client=_MockSimClient(),
+            signal_date=signal_date,
+            price_matrix=price_matrix,
+            ohlcv_by_ticker=ohlcv_by_ticker,
+            bucket="test-bucket",
+            config_override=None,
+            signals_override={},
+            universe_symbols=None,
+            ohlcv_dates_index=ohlcv_dates_index,
+            atr_by_ticker=None,
+            vwap_series_by_ticker=None,
+            coverage_by_ticker=None,
+        )
+        return captured["price_histories"]
+
+    @pytest.mark.parametrize("signal_date", [
+        "2024-01-05",   # inside range, 3-4 bars
+        "2024-01-20",   # Saturday — non-trading
+        "2024-02-15",   # mid-range
+        "2024-03-12",   # last bar in fixture
+    ])
+    def test_dispatch_parity_all_three_paths(self, small_price_data, signal_date):
+        """DataFrame path, bisect path, and scalar fallback path must all
+        produce byte-identical price_histories."""
+        from backtest import _build_ohlcv_date_index
+
+        old = build_ohlcv_by_ticker(small_price_data)
+        new_df = build_ohlcv_df_by_ticker(small_price_data)
+        old_index = _build_ohlcv_date_index(old)
+
+        from_df = self._run_and_capture(new_df, None, signal_date)
+        from_bisect = self._run_and_capture(old, old_index, signal_date)
+        from_scalar = self._run_and_capture(old, None, signal_date)
+
+        assert set(from_df.keys()) == set(from_bisect.keys()) == set(from_scalar.keys())
+        for ticker in from_df:
+            canon_df = _canon(from_df[ticker])
+            canon_bi = _canon(from_bisect[ticker])
+            canon_sc = _canon(from_scalar[ticker])
+            assert canon_df == canon_bi, f"df vs bisect divergence: {ticker} at {signal_date}"
+            assert canon_df == canon_sc, f"df vs scalar divergence: {ticker} at {signal_date}"
+
+
+class TestBuildDateIndex:
+    """``_build_ohlcv_date_index`` detects shape — the bisect date axis
+    is only useful for list-of-dicts. On DataFrame input it returns an
+    empty dict so callers don't waste memory building a parallel axis
+    that ``_simulate_single_date`` won't use."""
+
+    def test_returns_empty_on_dataframe_input(self, small_price_data):
+        from backtest import _build_ohlcv_date_index
+        new = build_ohlcv_df_by_ticker(small_price_data)
+        assert _build_ohlcv_date_index(new) == {}
+
+    def test_returns_date_lists_on_list_of_dicts_input(self, small_price_data):
+        from backtest import _build_ohlcv_date_index
+        old = build_ohlcv_by_ticker(small_price_data)
+        idx = _build_ohlcv_date_index(old)
+        assert set(idx.keys()) == set(old.keys())
+        for ticker in idx:
+            assert idx[ticker] == [b["date"] for b in old[ticker]]
 
 
 class TestArtifactRoundTrip:
