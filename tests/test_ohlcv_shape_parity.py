@@ -31,7 +31,9 @@ import pytest
 
 from phase_artifacts import (
     load_dict_of_dataframes,
+    load_ohlcv_by_ticker,
     save_dict_of_dataframes,
+    save_ohlcv_by_ticker,
 )
 from synthetic.predictor_backtest import (
     _df_slice_to_bars,
@@ -356,6 +358,46 @@ class TestArtifactRoundTrip:
         for ticker, df in new.items():
             loaded_df = loaded[ticker]
             # Normalize column order (groupby round-trip can re-order)
+            loaded_df = loaded_df[list(df.columns)]
+            pd.testing.assert_frame_equal(
+                loaded_df, df,
+                check_names=False,
+                check_freq=False,
+                check_column_type=False,
+            )
+
+    def test_save_ohlcv_by_ticker_dispatches_on_shape(self, small_price_data):
+        """``save_ohlcv_by_ticker`` accepts either shape. ``load_ohlcv_by_ticker``
+        detects schema on disk via the ``__idx__`` column and returns the
+        matching shape — list-of-dicts in, list-of-dicts out; DataFrame
+        in, DataFrame out. Backward-compatible with legacy artifacts."""
+        old = build_ohlcv_by_ticker(small_price_data)
+        new = build_ohlcv_df_by_ticker(small_price_data)
+        s3 = _FakeS3()
+
+        # Legacy shape: save + load returns list-of-dicts
+        key_old = save_ohlcv_by_ticker(
+            "b", "2024-03-12", "simulation_setup", "ohlcv_by_ticker", old,
+            s3_client=s3,
+        )
+        loaded_old = load_ohlcv_by_ticker("b", key_old, s3_client=s3)
+        assert set(loaded_old.keys()) == set(old.keys())
+        for ticker in old:
+            sample = loaded_old[ticker][0]
+            assert isinstance(sample, dict)
+            assert "date" in sample and "close" in sample
+            assert _canon(loaded_old[ticker]) == _canon(old[ticker])
+
+        # New shape: save + load returns dict[str, DataFrame]
+        key_new = save_ohlcv_by_ticker(
+            "b", "2024-03-12", "predictor_data_prep", "ohlcv_by_ticker", new,
+            s3_client=s3,
+        )
+        loaded_new = load_ohlcv_by_ticker("b", key_new, s3_client=s3)
+        assert set(loaded_new.keys()) == set(new.keys())
+        for ticker, df in new.items():
+            loaded_df = loaded_new[ticker]
+            assert isinstance(loaded_df, pd.DataFrame)
             loaded_df = loaded_df[list(df.columns)]
             pd.testing.assert_frame_equal(
                 loaded_df, df,
