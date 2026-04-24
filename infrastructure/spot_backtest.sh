@@ -102,19 +102,31 @@ SKIP_STAGES="${SKIP_STAGES:-}"
 # CheckEvaluatorFreeze Choice state (evaluator consolidated into spot
 # 2026-04-24); the freeze_evaluator SF input param is no longer honored.
 FREEZE_EVALUATOR="${FREEZE_EVALUATOR:-false}"
+# Accept both --flag value and --flag=value forms for every value-taking
+# flag. The equals form is GNU-getopt-style muscle memory and it's cheap to
+# support — each value flag gets a companion `--foo=*` case that splits on
+# `=`. Boolean flags (--smoke-only, --force, --dry-run, etc.) accept no
+# value and don't need the companion case.
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
+        --instance-type=*) INSTANCE_TYPE="${1#*=}"; shift ;;
         --mode) BACKTEST_MODE="$2"; shift 2 ;;
+        --mode=*) BACKTEST_MODE="${1#*=}"; shift ;;
         --branch) BRANCH="$2"; shift 2 ;;
+        --branch=*) BRANCH="${1#*=}"; shift ;;
         --skip-phase4-evaluations) SKIP_PHASE4="true"; shift ;;
         --skip-phases) SKIP_PHASES="$2"; shift 2 ;;
+        --skip-phases=*) SKIP_PHASES="${1#*=}"; shift ;;
         --only-phases) ONLY_PHASES="$2"; shift 2 ;;
+        --only-phases=*) ONLY_PHASES="${1#*=}"; shift ;;
         --force) FORCE_ALL="true"; shift ;;
         --force-phases) FORCE_PHASES="$2"; shift 2 ;;
+        --force-phases=*) FORCE_PHASES="${1#*=}"; shift ;;
         --dry-run) DRY_RUN="true"; shift ;;
         --skip-stages) SKIP_STAGES="$2"; shift 2 ;;
+        --skip-stages=*) SKIP_STAGES="${1#*=}"; shift ;;
         --freeze-evaluator) FREEZE_EVALUATOR="true"; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
