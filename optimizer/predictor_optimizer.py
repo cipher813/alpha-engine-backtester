@@ -49,23 +49,35 @@ log = logging.getLogger(__name__)
 _VARIANT_INFERENCE_HEARTBEAT = 500
 
 # ── S3 model variant keys ────────────────────────────────────────────────────
-_MODEL_VARIANTS = {
-    "mse": {
-        "weights_key": "predictor/weights/gbm_mse_latest.txt",
-        "meta_key": "predictor/weights/gbm_mse_latest.txt.meta.json",
-        "scorer_cls": "GBMScorer",
-    },
-    "rank": {
-        "weights_key": "predictor/weights/gbm_rank_latest.txt",
-        "meta_key": "predictor/weights/gbm_rank_latest.txt.meta.json",
-        "scorer_cls": "GBMScorer",
-    },
-    "catboost": {
-        "weights_key": "predictor/weights/catboost_latest.cbm",
-        "meta_key": "predictor/weights/catboost_latest.cbm.meta.json",
-        "scorer_cls": "CatBoostScorer",
-    },
-}
+#
+# Registry of Phase 4a ensemble-mode variants. Empty as of 2026-04-24:
+# the prior `mse` / `rank` / `catboost` entries were v2-architecture
+# comparison targets (single-GBM variants trained with different loss
+# functions), orphaned by the v3 meta-model launch on 2026-04-01. After
+# v3, the predictor's Layer-1 stack (momentum GBM, volatility GBM,
+# regime predictor, research calibrator) is composed internally by the
+# ridge meta-model, so the backtester-side "swap the model, re-run
+# inference, compare Sharpe" pattern has no live target.
+#
+# Evidence for deprecation:
+#   - `gbm_mse_latest.txt` on S3 last modified 2026-03-28 (4 days
+#     before v3 launch); meta.json never uploaded.
+#   - `gbm_rank_latest.txt` same pattern.
+#   - `catboost_latest.cbm` never uploaded at all.
+#   - Predictor `training/` module has zero write paths for any of
+#     these keys.
+#   - `inference/stages/load_model.py` only references them in
+#     non-default `inference_mode == "rank"` / `"ensemble"` branches.
+#
+# With the registry empty, `_discover_model_variants` returns {},
+# `evaluate_ensemble_modes` short-circuits at its "no alternative
+# models" guard (line ~133), and Phase 4a completes cleanly in <1s
+# with status=ok and reason=no_alternative_models. The surrounding
+# plumbing (_run_variant_backtest, _discover_model_variants'
+# meta-check, _download_variant_model, _run_variant_inference) stays
+# in place — when v3-era variants are defined, they just register
+# here and the existing pre-filter + inference path handles them.
+_MODEL_VARIANTS: dict[str, dict] = {}
 
 # Guardrails
 _MIN_SHARPE_IMPROVEMENT = 0.10  # 10% relative improvement required
@@ -186,15 +198,64 @@ def evaluate_ensemble_modes(
 
 
 def _discover_model_variants(bucket: str) -> dict:
-    """Check which alternative model files exist on S3."""
+    """Check which alternative model files exist on S3 AND are usable.
+
+    A variant is "usable" when both:
+      1. The weights file exists on S3.
+      2. The meta JSON exists and has non-empty ``feature_names``.
+
+    Without a populated ``feature_names`` metadata, the variant's
+    trained feature count drifts from `config.GBM_FEATURES` and
+    inference crashes with a LightGBM-internal "feature count mismatch"
+    assertion (observed 2026-04-24 smoke: mse + rank both trained with
+    36 features but config.GBM_FEATURES had 38; scorer.feature_names
+    was empty so there was no way to align the input). Filtering at
+    discovery time keeps Phase 4a output clean — variants with bad
+    metadata are skipped with a WARNING instead of burning 0.26s per
+    variant on a guaranteed crash.
+    """
     s3 = boto3.client("s3")
     available = {}
     for mode, info in _MODEL_VARIANTS.items():
+        # Weights must exist
         try:
             s3.head_object(Bucket=bucket, Key=info["weights_key"])
-            available[mode] = info
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Variant [%s] weights not found at s3://%s/%s (%s)",
+                      mode, bucket, info["weights_key"], exc)
+            continue
+
+        # Meta JSON must exist AND have feature_names populated
+        meta_key = info.get("meta_key")
+        if not meta_key:
+            log.warning(
+                "Variant [%s] has no meta_key in _MODEL_VARIANTS registry — "
+                "skipping. Fix the registry entry before re-enabling.", mode,
+            )
+            continue
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=meta_key)
+            meta = json.loads(obj["Body"].read())
+        except Exception as exc:
+            log.warning(
+                "Variant [%s] meta JSON unreadable at s3://%s/%s (%s) — "
+                "skipping. Re-train to regenerate the meta JSON.",
+                mode, bucket, meta_key, exc,
+            )
+            continue
+        feature_names = meta.get("feature_names") or []
+        if not feature_names:
+            log.warning(
+                "Variant [%s] meta JSON has empty feature_names — "
+                "skipping. Re-train this variant so it persists "
+                "feature_names in the meta JSON. (Without feature_names, "
+                "inference can't align the input matrix to the trained "
+                "feature order and LightGBM crashes with a feature-count "
+                "assertion.)", mode,
+            )
+            continue
+
+        available[mode] = info
     return available
 
 
@@ -256,7 +317,16 @@ def _run_variant_backtest(
 
 
 def _download_variant_model(bucket: str, variant_info: dict) -> str:
-    """Download a model variant from S3 to a temp file."""
+    """Download a model variant + its meta JSON from S3 to temp files.
+
+    Both weights and meta JSON must download successfully — the scorer
+    loads feature_names from the adjacent .meta.json, and a missing
+    meta leaves scorer.feature_names empty, which cascades into a
+    LightGBM feature-count assertion at inference time. _discover_model_variants
+    already pre-filters for meta presence, but defending here too
+    matches the no-silent-fails standard: a transient S3 blip during
+    download should surface loudly, not leave a half-downloaded
+    variant in a partially-usable state."""
     s3 = boto3.client("s3")
     suffix = ".cbm" if variant_info["scorer_cls"] == "CatBoostScorer" else ".txt"
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
@@ -264,10 +334,7 @@ def _download_variant_model(bucket: str, variant_info: dict) -> str:
     s3.download_file(bucket, variant_info["weights_key"], tmp.name)
 
     meta_path = tmp.name + ".meta.json"
-    try:
-        s3.download_file(bucket, variant_info["meta_key"], meta_path)
-    except Exception:
-        pass
+    s3.download_file(bucket, variant_info["meta_key"], meta_path)
 
     return tmp.name
 
@@ -286,10 +353,16 @@ def _run_variant_inference(
     pre-refactor path allocated a 911-entry dict-of-dicts with ~2.28M
     inner-loop ticks per inference pass; the tensor path does a single
     O(n_tickers) build + O(n_dates) vectorized per-date slice.
+
+    Uses ``scorer.feature_names`` (the variant's OWN trained feature
+    list) to align the input, not ``config.GBM_FEATURES`` — the two
+    can legitimately differ after a predictor retrain, and the
+    variant always knows what it was trained on. _discover_model_variants
+    pre-filters variants with empty feature_names metadata, so
+    reaching this path with an unusable variant is a hard error.
     """
     if predictor_path not in sys.path:
         sys.path.insert(0, predictor_path)
-    from config import GBM_FEATURES
 
     if variant_info["scorer_cls"] == "CatBoostScorer":
         from model.catboost_scorer import CatBoostScorer
@@ -298,18 +371,33 @@ def _run_variant_inference(
         from model.gbm_scorer import GBMScorer
         scorer = GBMScorer.load(model_path)
 
+    # Use the variant's own trained feature list (loaded from the meta
+    # JSON during scorer.load). _discover_model_variants pre-filters
+    # variants with empty feature_names, so this should always be
+    # populated at this point — if it isn't, the registry contract has
+    # been violated and we fail loud.
+    variant_features = getattr(scorer, "feature_names", None) or []
+    if not variant_features:
+        raise RuntimeError(
+            f"Variant [{mode}] scorer.feature_names is empty after load. "
+            f"Either _discover_model_variants' pre-filter failed or the "
+            f"meta JSON regressed between discovery and load. Re-train "
+            f"the variant to persist feature_names."
+        )
+
     from synthetic.predictor_backtest import (
         build_inference_tensor,
         _predict_from_tensor,
     )
 
     log.info(
-        "Variant [%s] inference: starting across %d dates × %d tickers",
-        mode, len(trading_dates), len(features_by_ticker),
+        "Variant [%s] inference: starting across %d dates × %d tickers "
+        "(model has %d features)",
+        mode, len(trading_dates), len(features_by_ticker), len(variant_features),
     )
     t0 = time.monotonic()
     tensor, tickers, date_to_idx = build_inference_tensor(
-        features_by_ticker, GBM_FEATURES,
+        features_by_ticker, variant_features,
     )
     log.info(
         "Variant [%s] inference tensor: shape=%s usable_tickers=%d (%.1fs)",

@@ -75,16 +75,94 @@ def test_pick_best_mode_skips_error_variants():
 
 # ── _discover_model_variants tests ──────────────────────────────────────────
 
+# The production _MODEL_VARIANTS registry is empty as of 2026-04-24 —
+# the v2-era mse/rank/catboost entries were orphaned by the v3 meta-model
+# launch (2026-04-01) and removed. The discovery-path logic (weights-check +
+# meta-check + feature_names-check) is still exercised by tests that
+# temporarily inject a test registry. When v3-era variants are added to
+# _MODEL_VARIANTS, the pre-filter catches the bad-metadata failure mode
+# reproduced here before it reaches inference.
+
+_TEST_VARIANTS = {
+    "mse": {
+        "weights_key": "predictor/weights/gbm_mse_latest.txt",
+        "meta_key": "predictor/weights/gbm_mse_latest.txt.meta.json",
+        "scorer_cls": "GBMScorer",
+    },
+    "rank": {
+        "weights_key": "predictor/weights/gbm_rank_latest.txt",
+        "meta_key": "predictor/weights/gbm_rank_latest.txt.meta.json",
+        "scorer_cls": "GBMScorer",
+    },
+    "catboost": {
+        "weights_key": "predictor/weights/catboost_latest.cbm",
+        "meta_key": "predictor/weights/catboost_latest.cbm.meta.json",
+        "scorer_cls": "CatBoostScorer",
+    },
+}
+
+
+def _install_s3_mocks(
+    s3_mock,
+    *,
+    weights_present: set[str],
+    meta_feature_names: dict[str, list[str]] | None = None,
+):
+    """Install head_object + get_object side effects that mirror the
+    discover-variant S3 contract.
+
+    weights_present: set of modes whose weights file "exists" on S3.
+    meta_feature_names: per-mode list of feature_names to return in the
+        meta JSON. Empty list → simulates the drift bug (model weights
+        present but meta feature_names empty). Missing key → meta JSON
+        absent (get_object raises).
+    """
+    meta_feature_names = meta_feature_names or {}
+
+    def head_object(Bucket, Key):
+        for mode in weights_present:
+            if mode in Key:
+                return {}
+        raise Exception(f"NoSuchKey: {Key}")
+    s3_mock.head_object.side_effect = head_object
+
+    def get_object(Bucket, Key):
+        for mode, feats in meta_feature_names.items():
+            if mode in Key and Key.endswith(".meta.json"):
+                body = json.dumps({"feature_names": feats}).encode()
+
+                class _Body:
+                    def read(self_inner): return body
+                return {"Body": _Body()}
+        raise Exception(f"NoSuchKey: {Key}")
+    s3_mock.get_object.side_effect = get_object
+
+
+def test_discover_model_variants_production_registry_is_empty():
+    """v2-era variants removed post-v3 meta-model launch. Registry stays
+    empty until v3-compatible variants are defined."""
+    from optimizer.predictor_optimizer import _MODEL_VARIANTS
+    assert _MODEL_VARIANTS == {}, (
+        "Production _MODEL_VARIANTS is intentionally empty post-2026-04-24. "
+        "Add v3-compatible variants here when ready; the pre-filter logic "
+        "in _discover_model_variants will validate their metadata."
+    )
+
+
+@patch("optimizer.predictor_optimizer._MODEL_VARIANTS", _TEST_VARIANTS)
 @patch("optimizer.predictor_optimizer.boto3")
-def test_discover_model_variants_finds_mse_and_rank(mock_boto):
+def test_discover_model_variants_finds_usable_variants(mock_boto):
+    """Variants with weights present AND non-empty feature_names are usable."""
     s3 = MagicMock()
     mock_boto.client.return_value = s3
-
-    # mse exists, rank exists, catboost doesn't
-    def head_object(Bucket, Key):
-        if "catboost" in Key:
-            raise Exception("Not found")
-    s3.head_object.side_effect = head_object
+    _install_s3_mocks(
+        s3,
+        weights_present={"mse", "rank"},
+        meta_feature_names={
+            "mse": ["f1", "f2", "f3"],
+            "rank": ["f1", "f2", "f3"],
+        },
+    )
 
     available = _discover_model_variants("bucket")
     assert "mse" in available
@@ -92,14 +170,91 @@ def test_discover_model_variants_finds_mse_and_rank(mock_boto):
     assert "catboost" not in available
 
 
+@patch("optimizer.predictor_optimizer._MODEL_VARIANTS", _TEST_VARIANTS)
 @patch("optimizer.predictor_optimizer.boto3")
 def test_discover_model_variants_none_found(mock_boto):
+    """Nothing on S3 → empty dict."""
     s3 = MagicMock()
     mock_boto.client.return_value = s3
-    s3.head_object.side_effect = Exception("Not found")
+    _install_s3_mocks(s3, weights_present=set())
 
     available = _discover_model_variants("bucket")
     assert available == {}
+
+
+@patch("optimizer.predictor_optimizer._MODEL_VARIANTS", _TEST_VARIANTS)
+@patch("optimizer.predictor_optimizer.boto3")
+def test_discover_model_variants_skips_empty_feature_names(mock_boto):
+    """Variant with empty meta feature_names must be skipped.
+
+    Reproduces the 2026-04-24 smoke-run bug: mse + rank weights on S3
+    trained with 36 features but meta.json wrote feature_names=[],
+    causing LightGBM feature-count assertion at inference time."""
+    s3 = MagicMock()
+    mock_boto.client.return_value = s3
+    _install_s3_mocks(
+        s3,
+        weights_present={"mse", "rank"},
+        meta_feature_names={
+            "mse": [],  # empty — must skip
+            "rank": ["f1", "f2"],
+        },
+    )
+
+    available = _discover_model_variants("bucket")
+    assert "mse" not in available, (
+        "Variant with empty feature_names must be skipped to prevent "
+        "LightGBM feature-count assertion at inference"
+    )
+    assert "rank" in available
+
+
+@patch("optimizer.predictor_optimizer._MODEL_VARIANTS", _TEST_VARIANTS)
+@patch("optimizer.predictor_optimizer.boto3")
+def test_discover_model_variants_skips_missing_meta(mock_boto):
+    """Variant with weights present but meta JSON missing must be skipped."""
+    s3 = MagicMock()
+    mock_boto.client.return_value = s3
+    _install_s3_mocks(
+        s3,
+        weights_present={"mse"},
+        meta_feature_names={},  # no meta for any variant
+    )
+
+    available = _discover_model_variants("bucket")
+    assert "mse" not in available
+    assert available == {}
+
+
+@patch("optimizer.predictor_optimizer._MODEL_VARIANTS", _TEST_VARIANTS)
+@patch("optimizer.predictor_optimizer.boto3")
+def test_discover_model_variants_skips_when_weights_missing_even_with_meta(mock_boto):
+    """Weights absence short-circuits before meta check."""
+    s3 = MagicMock()
+    mock_boto.client.return_value = s3
+    _install_s3_mocks(
+        s3,
+        weights_present=set(),  # no weights
+        meta_feature_names={"mse": ["f1", "f2"]},  # meta exists but weights don't
+    )
+
+    available = _discover_model_variants("bucket")
+    assert available == {}
+
+
+@patch("optimizer.predictor_optimizer.boto3")
+def test_discover_model_variants_empty_registry_returns_empty(mock_boto):
+    """With the production registry empty, discovery returns {} without
+    making any S3 calls — Phase 4a's early-exit guard then fires and
+    the phase completes with reason=no_alternative_models."""
+    s3 = MagicMock()
+    mock_boto.client.return_value = s3
+
+    available = _discover_model_variants("bucket")
+    assert available == {}
+    # No S3 calls should have been made — the for loop never iterated
+    assert s3.head_object.call_count == 0
+    assert s3.get_object.call_count == 0
 
 
 # ── _load_noise_candidates tests ─────────────────────────────────────────────
