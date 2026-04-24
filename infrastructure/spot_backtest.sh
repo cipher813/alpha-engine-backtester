@@ -465,9 +465,24 @@ done
 
 echo ""
 echo "==> Resolving most recent backtest artifact date from s3://\${BUCKET}/backtest/..."
-LATEST_DATE=\$(aws s3 ls "s3://\${BUCKET}/backtest/" | awk '/PRE / {print \$2}' | tr -d '/' | sort | tail -1)
+# Pick the most-recent date that ALSO has portfolio_stats.json on S3.
+# The plain "sort | tail -1" approach picked stale empty prefixes
+# created by prior half-complete runs (observed 2026-04-24 smoke: a
+# 2026-04-24/ prefix existed but had no artifacts, causing evaluate.py
+# to hard-fail with "All critical simulation artifacts missing").
+# Excluding hidden prefixes (.smoke/, .dry-run/) keeps the probe
+# pointing at production dates.
+LATEST_DATE=""
+while IFS= read -r candidate; do
+    [ -z "\$candidate" ] && continue
+    case "\$candidate" in .*) continue ;; esac
+    if aws s3api head-object --bucket "\${BUCKET}" --key "backtest/\$candidate/portfolio_stats.json" >/dev/null 2>&1; then
+        LATEST_DATE="\$candidate"
+        break
+    fi
+done < <(aws s3 ls "s3://\${BUCKET}/backtest/" | awk '/PRE / {print \$2}' | tr -d '/' | sort -r)
 if [ -z "\$LATEST_DATE" ]; then
-    echo "ERROR: no backtest/{date}/ prefix found in s3://\${BUCKET}/backtest/"
+    echo "ERROR: no backtest/{date}/ prefix with portfolio_stats.json found in s3://\${BUCKET}/backtest/"
     exit 1
 fi
 echo "Using backtest date: \$LATEST_DATE"
