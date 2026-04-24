@@ -42,8 +42,10 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-# arcticdb is heavy C-ext; stub for local test runs (real calls mocked per test).
-sys.modules.setdefault("arcticdb", MagicMock())
+# arcticdb stubbing lives in tests/conftest.py — unit tests get a MagicMock
+# by default, integration tests (this file's @pytest.mark.parity case) opt
+# in to the real module by setting USE_REAL_ARCTICDB=1 before pytest starts
+# (spot_backtest.sh's parity stage does this).
 
 
 # ── Tolerance contract (see docs/trade_mapping.md for rationale) ────────────
