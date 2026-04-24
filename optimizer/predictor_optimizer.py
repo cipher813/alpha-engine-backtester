@@ -30,13 +30,23 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from datetime import date
 
 import boto3
 import numpy as np
 import pandas as pd
 
+from pipeline_common import phase
+
 log = logging.getLogger(__name__)
+
+# Emit an INFO heartbeat every N dates inside the per-variant inference
+# loop. Motivation: _run_variant_inference iterates ~2500 trading dates
+# silently; with 3 variants this was 3 silent stretches inside the
+# phase4a block. See ROADMAP "Diagnose the silent-phase bottleneck"
+# (2026-04-22 4th dry-run).
+_VARIANT_INFERENCE_HEARTBEAT = 500
 
 # ── S3 model variant keys ────────────────────────────────────────────────────
 _MODEL_VARIANTS = {
@@ -124,20 +134,26 @@ def evaluate_ensemble_modes(
 
     log.info("Ensemble eval: found %d variant(s): %s", len(available_variants), list(available_variants.keys()))
 
-    # Run backtest for each variant
+    # Run backtest for each variant. Each variant is wrapped in a
+    # PHASE_START/END marker so a stall inside one variant's inference
+    # or simulation loop is attributable to a specific mode.
     variant_results = {}
     for mode, variant_info in available_variants.items():
         try:
-            stats = _run_variant_backtest(
-                mode, variant_info, features_by_ticker, price_matrix,
-                ohlcv_by_ticker, spy_prices, sector_map, trading_dates,
-                config, predictor_path, top_n, min_score,
-            )
+            log.info("Ensemble eval [%s]: starting variant backtest", mode)
+            t0 = time.monotonic()
+            with phase("phase4a_variant", variant=mode):
+                stats = _run_variant_backtest(
+                    mode, variant_info, features_by_ticker, price_matrix,
+                    ohlcv_by_ticker, spy_prices, sector_map, trading_dates,
+                    config, predictor_path, top_n, min_score,
+                )
             variant_results[mode] = stats
             log.info(
-                "Ensemble eval [%s]: Sharpe=%.3f  alpha=%.3f  max_dd=%.3f",
+                "Ensemble eval [%s]: Sharpe=%.3f  alpha=%.3f  max_dd=%.3f  (%.1fs)",
                 mode, stats.get("sharpe_ratio", 0),
                 stats.get("total_alpha", 0), stats.get("max_drawdown", 0),
+                time.monotonic() - t0,
             )
         except Exception as exc:
             log.warning("Ensemble eval [%s]: failed — %s", mode, exc)
@@ -286,8 +302,13 @@ def _run_variant_inference(
         except (KeyError, ValueError):
             continue
 
+    log.info(
+        "Variant [%s] inference: starting across %d dates × %d tickers",
+        mode, len(trading_dates), len(feature_arrays),
+    )
+    t0 = time.monotonic()
     predictions_by_date: dict[str, dict[str, float]] = {}
-    for date_str in trading_dates:
+    for i, date_str in enumerate(trading_dates):
         tickers_batch = []
         vectors_batch = []
         for ticker, date_to_vec in feature_arrays.items():
@@ -302,8 +323,16 @@ def _run_variant_inference(
         predictions_by_date[date_str] = {
             ticker: float(alpha) for ticker, alpha in zip(tickers_batch, alphas)
         }
+        if (i + 1) % _VARIANT_INFERENCE_HEARTBEAT == 0:
+            log.info(
+                "Variant [%s] inference: %d/%d dates (%.1fs elapsed, last=%s)",
+                mode, i + 1, len(trading_dates), time.monotonic() - t0, date_str,
+            )
 
-    log.info("Variant [%s] inference: %d dates with predictions", mode, len(predictions_by_date))
+    log.info(
+        "Variant [%s] inference: %d dates with predictions (%.1fs total)",
+        mode, len(predictions_by_date), time.monotonic() - t0,
+    )
     return predictions_by_date
 
 
@@ -426,39 +455,48 @@ def evaluate_signal_thresholds(
 
     threshold_results = []
 
+    # Each threshold gets its own PHASE_START/END marker so a stall in
+    # a specific threshold's simulate call is attributable to the value.
     for threshold in thresholds:
         try:
-            # Filter predictions: only keep tickers with alpha >= threshold
-            filtered_predictions = _filter_predictions_by_alpha(
-                predictions_by_date, threshold,
-            )
+            log.info("Signal threshold %.3f: starting sweep iteration", threshold)
+            t0 = time.monotonic()
+            with phase("phase4b_threshold", threshold=f"{threshold:.3f}"):
+                # Filter predictions: only keep tickers with alpha >= threshold
+                filtered_predictions = _filter_predictions_by_alpha(
+                    predictions_by_date, threshold,
+                )
 
-            # Count how many ENTER-eligible predictions survive
-            total_above = sum(len(d) for d in filtered_predictions.values())
-            if total_above == 0:
-                log.info("Signal threshold %.3f: 0 predictions survive — skipping", threshold)
-                threshold_results.append({
-                    "threshold": threshold,
-                    "status": "no_predictions",
-                })
-                continue
+                # Count how many ENTER-eligible predictions survive
+                total_above = sum(len(d) for d in filtered_predictions.values())
+                if total_above == 0:
+                    log.info("Signal threshold %.3f: 0 predictions survive — skipping", threshold)
+                    threshold_results.append({
+                        "threshold": threshold,
+                        "status": "no_predictions",
+                    })
+                    continue
 
-            # Generate signals from filtered predictions
-            signals_by_date = build_signals_by_date(
-                filtered_predictions, sector_map, ohlcv_by_ticker,
-                top_n=top_n, min_score=min_score,
-            )
+                # Generate signals from filtered predictions
+                signals_by_date = build_signals_by_date(
+                    filtered_predictions, sector_map, ohlcv_by_ticker,
+                    top_n=top_n, min_score=min_score,
+                )
 
-            # Simulate
-            stats = _run_simulation_loop(
-                executor_run, SimulatedIBKRClient,
-                dates=[],
-                price_matrix=price_matrix,
-                config=config,
-                ohlcv_by_ticker=ohlcv_by_ticker,
-                signals_by_date=signals_by_date,
-                spy_prices=spy_prices,
-            )
+                # Simulate
+                log.info(
+                    "Signal threshold %.3f: starting simulation (%d signal dates)",
+                    threshold, len(signals_by_date),
+                )
+                stats = _run_simulation_loop(
+                    executor_run, SimulatedIBKRClient,
+                    dates=[],
+                    price_matrix=price_matrix,
+                    config=config,
+                    ohlcv_by_ticker=ohlcv_by_ticker,
+                    signals_by_date=signals_by_date,
+                    spy_prices=spy_prices,
+                )
 
             sharpe = stats.get("sharpe_ratio", 0) or 0
             alpha = stats.get("total_alpha", 0) or 0
@@ -474,8 +512,8 @@ def evaluate_signal_thresholds(
             })
 
             log.info(
-                "Signal threshold %.3f: Sharpe=%.3f  alpha=%.3f  trades=%d",
-                threshold, sharpe, alpha, trades,
+                "Signal threshold %.3f: Sharpe=%.3f  alpha=%.3f  trades=%d  (%.1fs)",
+                threshold, sharpe, alpha, trades, time.monotonic() - t0,
             )
 
         except Exception as exc:
@@ -592,7 +630,10 @@ def evaluate_feature_pruning(
     log.info("Feature pruning: testing removal of %d noise features: %s", len(noise_candidates), noise_candidates)
 
     # Create pruned feature set (zero out noise features)
+    log.info("Feature pruning: zeroing noise features across %d tickers", len(features_by_ticker))
+    t0 = time.monotonic()
     pruned_features = _zero_out_features(features_by_ticker, noise_candidates)
+    log.info("Feature pruning: feature zeroing done (%.1fs)", time.monotonic() - t0)
 
     pb_config = config.get("predictor_backtest", {})
     top_n = pb_config.get("top_n_signals_per_day", 20)
@@ -605,13 +646,25 @@ def evaluate_feature_pruning(
     try:
         # Run inference with pruned features
         from synthetic.predictor_backtest import run_inference, build_signals_by_date
+        log.info(
+            "Feature pruning: starting inference (%d tickers × %d dates)",
+            len(pruned_features), len(trading_dates),
+        )
+        t0 = time.monotonic()
         predictions_by_date = run_inference(
             pruned_features, model_path, predictor_path, trading_dates,
         )
+        log.info("Feature pruning: inference complete (%.1fs)", time.monotonic() - t0)
 
+        log.info("Feature pruning: building signals from predictions")
+        t0 = time.monotonic()
         signals_by_date = build_signals_by_date(
             predictions_by_date, sector_map, ohlcv_by_ticker,
             top_n=top_n, min_score=min_score,
+        )
+        log.info(
+            "Feature pruning: signal build complete (%d dates, %.1fs)",
+            len(signals_by_date), time.monotonic() - t0,
         )
 
         # Run simulation
@@ -624,15 +677,19 @@ def evaluate_feature_pruning(
         from executor.main import run as executor_run
         from executor.ibkr import SimulatedIBKRClient
 
-        pruned_stats = _run_simulation_loop(
-            executor_run, SimulatedIBKRClient,
-            dates=[],
-            price_matrix=price_matrix,
-            config=config,
-            ohlcv_by_ticker=ohlcv_by_ticker,
-            signals_by_date=signals_by_date,
-            spy_prices=spy_prices,
-        )
+        log.info("Feature pruning: starting simulation")
+        t0 = time.monotonic()
+        with phase("phase4c_pruned_simulation"):
+            pruned_stats = _run_simulation_loop(
+                executor_run, SimulatedIBKRClient,
+                dates=[],
+                price_matrix=price_matrix,
+                config=config,
+                ohlcv_by_ticker=ohlcv_by_ticker,
+                signals_by_date=signals_by_date,
+                spy_prices=spy_prices,
+            )
+        log.info("Feature pruning: simulation complete (%.1fs)", time.monotonic() - t0)
     finally:
         _cleanup_model_files(model_path)
 
