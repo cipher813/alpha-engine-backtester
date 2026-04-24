@@ -66,3 +66,53 @@ smoke_budgets_seconds:
   # Variant-model download + inference adds ~30-60s per evaluator.
   # Estimated 250-400s typical.
   smoke-phase4: 700.0
+
+# ── Full-run hard caps (tripwire) ────────────────────────────────────────────
+#
+# Per-phase hard-cap watchdog for non-smoke runs. Exceeding the cap:
+#   1. Dumps all-thread stack traces to stderr (via faulthandler)
+#   2. Logs PHASE_TIMEOUT name=X cap_s=Y at WARNING level
+#   3. Raises PhaseTimeoutError in the main thread so the pipeline
+#      aborts fast instead of thrashing until the 2h SSM ceiling.
+#
+# Motivation: 2026-04-22 4th Saturday SF dry-run silently consumed 110
+# minutes inside one of the Phase 4 evaluators with zero log output. The
+# pipeline burned its full 2h budget before any diagnostic information
+# was captured. A watchdog would have aborted at cap + dumped the stuck
+# call stack, turning that incident from "2h of wasted compute, no clue"
+# into "N minutes wasted + exact source location."
+#
+# Calibration philosophy:
+#   - Set caps at ~2–3× observed typical runtime. Generous enough to
+#     absorb cold-start + ArcticDB variance; tight enough to abort
+#     before the SSM ceiling.
+#   - Phase not in this block → no watchdog (opt-in per phase).
+#   - A hit on these caps in a real run means either (a) a regression
+#     to investigate or (b) the cap needs bumping with justification
+#     in the PR commit message.
+#   - The SSM execution timeout on spot runs is 7200s (2h). Every cap
+#     here MUST be < 7200s, or the ceiling fires first.
+
+full_run_hard_caps_seconds:
+  # Phase 4a: 3 variant backtests (mse / rank / catboost).
+  # Typical: 10–20 min. Cap at 45 min covers cold-start + ArcticDB tail.
+  phase4a_ensemble_modes: 2700.0
+
+  # Phase 4b: 7 threshold sims. Typical: 15–25 min. Cap at 60 min.
+  phase4b_signal_thresholds: 3600.0
+
+  # Phase 4c: single pruned sim. Typical: 5–10 min. Cap at 20 min.
+  phase4c_feature_pruning: 1200.0
+
+  # Predictor data prep (feature build + matrix) — post ohlcv pandas
+  # refactor expected ~5–10 min. Cap at 30 min covers 911-ticker cold
+  # ArcticDB read + GBM inference + indicator precompute.
+  predictor_data_prep: 1800.0
+
+  # Predictor-side pipeline (encompasses data_prep → inference → signal
+  # generation → primary sim). Typical 10–20 min. Cap at 60 min.
+  predictor_pipeline: 3600.0
+
+  # Main simulation pipeline (signals → orders → vectorbt). Typical
+  # 5–15 min for a single-run. Cap at 45 min.
+  simulation_pipeline: 2700.0

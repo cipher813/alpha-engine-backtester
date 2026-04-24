@@ -7,16 +7,19 @@ Data seeding/backfilling lives in alpha-engine-data/collectors/signal_returns.py
 
 from __future__ import annotations
 
+import _thread
+import faulthandler
 import json
 import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import boto3
 from botocore.exceptions import ClientError
@@ -111,6 +114,96 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ── Phase watchdog (trip preflight) ─────────────────────────────────────────
+#
+# A per-phase hard-cap timer that dumps all-thread stack traces and raises
+# TimeoutError in the main thread if a phase exceeds its cap. Motivated by
+# the 2026-04-22 4th Saturday SF dry-run where Phase 4 went silent at 55%
+# CPU for 110 minutes before the 2h SSM ceiling fired — no stack trace, no
+# idea where execution was stuck, and no abort until the whole pipeline
+# burned its budget.
+#
+# Design:
+#   - A threading.Timer fires after cap_s seconds if the phase hasn't
+#     cancelled it. This is cheaper than signal.SIGALRM and portable to
+#     any thread (signals only work from main thread on POSIX).
+#   - On trip: faulthandler.dump_traceback(all_threads=True) to stderr
+#     gives us the hung call stack; _thread.interrupt_main() raises
+#     KeyboardInterrupt in the main thread, which the phase context
+#     manager catches as BaseException → records PHASE_END with
+#     status=error → converts to PhaseTimeoutError at the boundary.
+#   - Caller only sees PhaseTimeoutError at the outer exception handler.
+#
+# Caps are opt-in per-phase via PhaseRegistry(hard_caps={...}). No cap
+# means no watchdog — behavior identical to pre-watchdog code. Per-phase
+# caps live in timing_budget.yaml under `full_run_hard_caps_seconds`.
+
+
+class PhaseTimeoutError(RuntimeError):
+    """Raised when a phase exceeds its hard cap. Stack traces of all
+    threads have been written to stderr by faulthandler before the
+    exception is raised in the main thread."""
+
+
+def _default_watchdog_trip(name: str, cap_s: float) -> None:
+    """Default trip handler: log PHASE_TIMEOUT, dump all-thread stacks,
+    interrupt main. Exposed so tests can swap in a no-op handler."""
+    plog = _phase_logger()
+    plog.warning(
+        "PHASE_TIMEOUT name=%s cap_s=%.1f — dumping all-thread stacks to stderr "
+        "and raising PhaseTimeoutError in main thread", name, cap_s,
+    )
+    # Write a header so the faulthandler block is grep-able in SSM/CloudWatch
+    sys.stderr.write(
+        f"\n── PHASE_TIMEOUT name={name} cap_s={cap_s:.1f} ────────────────\n"
+    )
+    sys.stderr.flush()
+    try:
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    except Exception as dump_exc:
+        sys.stderr.write(f"(faulthandler.dump_traceback failed: {dump_exc})\n")
+    sys.stderr.flush()
+    # interrupt_main raises KeyboardInterrupt in the main thread on its
+    # next bytecode dispatch. The phase context manager's except BaseException
+    # catches it, records status=error, re-raises; the outer handler in
+    # backtest.py maps to PhaseTimeoutError via the `_watchdog_tripped` flag.
+    _thread.interrupt_main()
+
+
+def _start_watchdog(
+    name: str,
+    cap_s: float,
+    on_trip: Callable[[str, float], None] | None = None,
+) -> tuple[threading.Timer, dict]:
+    """Start a watchdog Timer; return (timer, state-dict).
+
+    State dict has `tripped: bool` so the phase context manager can
+    distinguish "KeyboardInterrupt from watchdog" vs "KeyboardInterrupt
+    from operator Ctrl+C" and raise PhaseTimeoutError only in the former.
+    """
+    state = {"tripped": False, "name": name, "cap_s": cap_s}
+    handler = on_trip or _default_watchdog_trip
+
+    def _fire():
+        state["tripped"] = True
+        try:
+            handler(name, cap_s)
+        except Exception as handler_exc:
+            # A broken handler shouldn't leave the watchdog in a weird
+            # state. Log loud and fall back to interrupting main so the
+            # phase still aborts.
+            logger.error(
+                "phase watchdog handler raised: %s — falling back to interrupt_main",
+                handler_exc,
+            )
+            _thread.interrupt_main()
+
+    timer = threading.Timer(cap_s, _fire)
+    timer.daemon = True
+    timer.start()
+    return timer, state
+
+
 class PhaseRegistry:
     """Drives per-phase skip/force decisions and writes completion markers.
 
@@ -145,6 +238,7 @@ class PhaseRegistry:
         only_phases: Iterable[str] | None = None,
         force: bool = False,
         force_phases: Iterable[str] | None = None,
+        hard_caps: dict[str, float] | None = None,
         s3_client=None,
     ):
         self.date = date
@@ -153,6 +247,11 @@ class PhaseRegistry:
         self._only = set(only_phases) if only_phases else None
         self._force_all = bool(force)
         self._force_phases = set(force_phases or [])
+        # Per-phase hard caps (seconds). A phase exceeding its cap trips
+        # the watchdog: stack traces dumped, PhaseTimeoutError raised.
+        # No cap → no watchdog for that phase (behavior identical to
+        # pre-watchdog code).
+        self._hard_caps = dict(hard_caps or {})
         self._markers: dict[str, dict | None] = {}
         self._s3 = s3_client  # lazy-init if None
         # Names of phases that wrote a marker with status=error during
@@ -297,18 +396,41 @@ class PhaseRegistry:
             return
 
         started_at = _now_iso()
-        plog.info("PHASE_START name=%s %s", name, kv)
+        cap_s = self._hard_caps.get(name)
+        if cap_s is not None:
+            plog.info("PHASE_START name=%s hard_cap_s=%.1f %s", name, cap_s, kv)
+        else:
+            plog.info("PHASE_START name=%s %s", name, kv)
         sys.stdout.flush()
         t0 = time.monotonic()
         status = "ok"
         err_msg: str | None = None
+        watchdog_timer: threading.Timer | None = None
+        watchdog_state: dict | None = None
+        if cap_s is not None and cap_s > 0:
+            watchdog_timer, watchdog_state = _start_watchdog(name, cap_s)
         try:
             yield ctx
         except BaseException as exc:
             status = "error"
+            # If the watchdog tripped, surface a PhaseTimeoutError from
+            # the KeyboardInterrupt _thread.interrupt_main raises — the
+            # caller's except handler reads the more descriptive type.
+            if (
+                watchdog_state is not None
+                and watchdog_state.get("tripped")
+                and isinstance(exc, KeyboardInterrupt)
+            ):
+                err_msg = (
+                    f"PhaseTimeoutError: phase {name!r} exceeded hard cap "
+                    f"{cap_s:.1f}s (see PHASE_TIMEOUT + faulthandler dump on stderr)"
+                )
+                raise PhaseTimeoutError(err_msg) from exc
             err_msg = f"{type(exc).__name__}: {exc}"
             raise
         finally:
+            if watchdog_timer is not None:
+                watchdog_timer.cancel()
             dur = time.monotonic() - t0
             completed_at = _now_iso()
             plog.info(
@@ -361,6 +483,53 @@ class _PhaseContext:
         if not isinstance(s3_key, str) or not s3_key:
             raise ValueError(f"record_artifact: expected non-empty str, got {s3_key!r}")
         self._artifact_keys.add(s3_key)
+
+
+def load_phase_hard_caps(
+    path: str | Path = "timing_budget.yaml",
+) -> dict[str, float]:
+    """Load per-phase hard caps from the `full_run_hard_caps_seconds`
+    block of timing_budget.yaml. Returns empty dict if file or block
+    absent (watchdog stays off — no behavior change).
+
+    Keyed by phase name (e.g. ``phase4a_ensemble_modes``). Values are
+    floats interpreted as seconds. Missing caps leave that phase
+    unwatchdogged, which is the right default for phases whose typical
+    runtime we haven't measured yet."""
+    p = Path(path)
+    if not p.is_absolute():
+        # Resolve relative to repo root (where timing_budget.yaml lives)
+        p = Path(__file__).parent / p
+    if not p.exists():
+        logger.info("timing_budget.yaml not found at %s — no phase watchdogs", p)
+        return {}
+    try:
+        with open(p) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as exc:
+        logger.warning(
+            "timing_budget.yaml at %s failed to parse: %s — no phase watchdogs",
+            p, exc,
+        )
+        return {}
+    caps = data.get("full_run_hard_caps_seconds") or {}
+    if not isinstance(caps, dict):
+        logger.warning(
+            "timing_budget.yaml: full_run_hard_caps_seconds is not a dict (got %s) — "
+            "no phase watchdogs", type(caps).__name__,
+        )
+        return {}
+    # Coerce to float; drop non-numeric entries with a loud log.
+    out: dict[str, float] = {}
+    for name, cap in caps.items():
+        try:
+            out[str(name)] = float(cap)
+        except (TypeError, ValueError):
+            logger.warning(
+                "timing_budget.yaml: phase %r has non-numeric cap %r — skipping",
+                name, cap,
+            )
+    return out
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
