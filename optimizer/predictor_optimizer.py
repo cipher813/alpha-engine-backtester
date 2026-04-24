@@ -49,23 +49,35 @@ log = logging.getLogger(__name__)
 _VARIANT_INFERENCE_HEARTBEAT = 500
 
 # ── S3 model variant keys ────────────────────────────────────────────────────
-_MODEL_VARIANTS = {
-    "mse": {
-        "weights_key": "predictor/weights/gbm_mse_latest.txt",
-        "meta_key": "predictor/weights/gbm_mse_latest.txt.meta.json",
-        "scorer_cls": "GBMScorer",
-    },
-    "rank": {
-        "weights_key": "predictor/weights/gbm_rank_latest.txt",
-        "meta_key": "predictor/weights/gbm_rank_latest.txt.meta.json",
-        "scorer_cls": "GBMScorer",
-    },
-    "catboost": {
-        "weights_key": "predictor/weights/catboost_latest.cbm",
-        "meta_key": "predictor/weights/catboost_latest.cbm.meta.json",
-        "scorer_cls": "CatBoostScorer",
-    },
-}
+#
+# Registry of Phase 4a ensemble-mode variants. Empty as of 2026-04-24:
+# the prior `mse` / `rank` / `catboost` entries were v2-architecture
+# comparison targets (single-GBM variants trained with different loss
+# functions), orphaned by the v3 meta-model launch on 2026-04-01. After
+# v3, the predictor's Layer-1 stack (momentum GBM, volatility GBM,
+# regime predictor, research calibrator) is composed internally by the
+# ridge meta-model, so the backtester-side "swap the model, re-run
+# inference, compare Sharpe" pattern has no live target.
+#
+# Evidence for deprecation:
+#   - `gbm_mse_latest.txt` on S3 last modified 2026-03-28 (4 days
+#     before v3 launch); meta.json never uploaded.
+#   - `gbm_rank_latest.txt` same pattern.
+#   - `catboost_latest.cbm` never uploaded at all.
+#   - Predictor `training/` module has zero write paths for any of
+#     these keys.
+#   - `inference/stages/load_model.py` only references them in
+#     non-default `inference_mode == "rank"` / `"ensemble"` branches.
+#
+# With the registry empty, `_discover_model_variants` returns {},
+# `evaluate_ensemble_modes` short-circuits at its "no alternative
+# models" guard (line ~133), and Phase 4a completes cleanly in <1s
+# with status=ok and reason=no_alternative_models. The surrounding
+# plumbing (_run_variant_backtest, _discover_model_variants'
+# meta-check, _download_variant_model, _run_variant_inference) stays
+# in place — when v3-era variants are defined, they just register
+# here and the existing pre-filter + inference path handles them.
+_MODEL_VARIANTS: dict[str, dict] = {}
 
 # Guardrails
 _MIN_SHARPE_IMPROVEMENT = 0.10  # 10% relative improvement required

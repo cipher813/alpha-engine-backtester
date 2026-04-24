@@ -75,6 +75,33 @@ def test_pick_best_mode_skips_error_variants():
 
 # ── _discover_model_variants tests ──────────────────────────────────────────
 
+# The production _MODEL_VARIANTS registry is empty as of 2026-04-24 —
+# the v2-era mse/rank/catboost entries were orphaned by the v3 meta-model
+# launch (2026-04-01) and removed. The discovery-path logic (weights-check +
+# meta-check + feature_names-check) is still exercised by tests that
+# temporarily inject a test registry. When v3-era variants are added to
+# _MODEL_VARIANTS, the pre-filter catches the bad-metadata failure mode
+# reproduced here before it reaches inference.
+
+_TEST_VARIANTS = {
+    "mse": {
+        "weights_key": "predictor/weights/gbm_mse_latest.txt",
+        "meta_key": "predictor/weights/gbm_mse_latest.txt.meta.json",
+        "scorer_cls": "GBMScorer",
+    },
+    "rank": {
+        "weights_key": "predictor/weights/gbm_rank_latest.txt",
+        "meta_key": "predictor/weights/gbm_rank_latest.txt.meta.json",
+        "scorer_cls": "GBMScorer",
+    },
+    "catboost": {
+        "weights_key": "predictor/weights/catboost_latest.cbm",
+        "meta_key": "predictor/weights/catboost_latest.cbm.meta.json",
+        "scorer_cls": "CatBoostScorer",
+    },
+}
+
+
 def _install_s3_mocks(
     s3_mock,
     *,
@@ -111,6 +138,18 @@ def _install_s3_mocks(
     s3_mock.get_object.side_effect = get_object
 
 
+def test_discover_model_variants_production_registry_is_empty():
+    """v2-era variants removed post-v3 meta-model launch. Registry stays
+    empty until v3-compatible variants are defined."""
+    from optimizer.predictor_optimizer import _MODEL_VARIANTS
+    assert _MODEL_VARIANTS == {}, (
+        "Production _MODEL_VARIANTS is intentionally empty post-2026-04-24. "
+        "Add v3-compatible variants here when ready; the pre-filter logic "
+        "in _discover_model_variants will validate their metadata."
+    )
+
+
+@patch("optimizer.predictor_optimizer._MODEL_VARIANTS", _TEST_VARIANTS)
 @patch("optimizer.predictor_optimizer.boto3")
 def test_discover_model_variants_finds_usable_variants(mock_boto):
     """Variants with weights present AND non-empty feature_names are usable."""
@@ -131,6 +170,7 @@ def test_discover_model_variants_finds_usable_variants(mock_boto):
     assert "catboost" not in available
 
 
+@patch("optimizer.predictor_optimizer._MODEL_VARIANTS", _TEST_VARIANTS)
 @patch("optimizer.predictor_optimizer.boto3")
 def test_discover_model_variants_none_found(mock_boto):
     """Nothing on S3 → empty dict."""
@@ -142,6 +182,7 @@ def test_discover_model_variants_none_found(mock_boto):
     assert available == {}
 
 
+@patch("optimizer.predictor_optimizer._MODEL_VARIANTS", _TEST_VARIANTS)
 @patch("optimizer.predictor_optimizer.boto3")
 def test_discover_model_variants_skips_empty_feature_names(mock_boto):
     """Variant with empty meta feature_names must be skipped.
@@ -168,6 +209,7 @@ def test_discover_model_variants_skips_empty_feature_names(mock_boto):
     assert "rank" in available
 
 
+@patch("optimizer.predictor_optimizer._MODEL_VARIANTS", _TEST_VARIANTS)
 @patch("optimizer.predictor_optimizer.boto3")
 def test_discover_model_variants_skips_missing_meta(mock_boto):
     """Variant with weights present but meta JSON missing must be skipped."""
@@ -184,6 +226,7 @@ def test_discover_model_variants_skips_missing_meta(mock_boto):
     assert available == {}
 
 
+@patch("optimizer.predictor_optimizer._MODEL_VARIANTS", _TEST_VARIANTS)
 @patch("optimizer.predictor_optimizer.boto3")
 def test_discover_model_variants_skips_when_weights_missing_even_with_meta(mock_boto):
     """Weights absence short-circuits before meta check."""
@@ -197,6 +240,21 @@ def test_discover_model_variants_skips_when_weights_missing_even_with_meta(mock_
 
     available = _discover_model_variants("bucket")
     assert available == {}
+
+
+@patch("optimizer.predictor_optimizer.boto3")
+def test_discover_model_variants_empty_registry_returns_empty(mock_boto):
+    """With the production registry empty, discovery returns {} without
+    making any S3 calls — Phase 4a's early-exit guard then fires and
+    the phase completes with reason=no_alternative_models."""
+    s3 = MagicMock()
+    mock_boto.client.return_value = s3
+
+    available = _discover_model_variants("bucket")
+    assert available == {}
+    # No S3 calls should have been made — the for loop never iterated
+    assert s3.head_object.call_count == 0
+    assert s3.get_object.call_count == 0
 
 
 # ── _load_noise_candidates tests ─────────────────────────────────────────────
