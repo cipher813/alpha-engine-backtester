@@ -452,10 +452,22 @@ def _build_ohlcv_date_index(ohlcv_by_ticker: dict) -> dict[str, list[str]]:
     ~270B dict-lookup/compare ops to ~108B list-ref copies — roughly
     10x faster per the same micro-benchmark shape that motivated PR #46
     (2026-04-21 ``build_signals_by_date`` vectorization, 75min → ~1min).
+
+    2026-04-23 (pandas refactor): When ``ohlcv_by_ticker`` is the new
+    ``{ticker: pd.DataFrame}`` shape, returns an empty dict — the
+    bisect+list-slice path is unused there. Pandas ``.loc[:date]`` on a
+    DatetimeIndex is already O(log N) via its own binary search, and
+    ``_simulate_single_date`` dispatches on shape to
+    ``_df_slice_to_bars``. See plan doc for migration arc.
     """
+    if not ohlcv_by_ticker:
+        return {}
+    sample = next(iter(ohlcv_by_ticker.values()))
+    if isinstance(sample, pd.DataFrame):
+        return {}
     return {
         ticker: [b["date"] for b in bars]
-        for ticker, bars in (ohlcv_by_ticker or {}).items()
+        for ticker, bars in ohlcv_by_ticker.items()
     }
 
 
@@ -548,9 +560,25 @@ def _simulate_single_date(
     # Fallback derivation keeps the old per-call callers working while
     # we migrate — it's the scalar path, kept under test via
     # ``test_price_histories_parity.py`` so future refactors can't drift.
+    #
+    # 2026-04-23 (pandas refactor): dispatch on ``ohlcv_by_ticker``'s shape.
+    # When DataFrame-form ({ticker: pd.DataFrame}), slice via
+    # ``_df_slice_to_bars``. Pandas ``.loc[:date]`` on a DatetimeIndex is
+    # O(log N) via its own binsearch — same complexity as the bisect
+    # path. The executor still consumes list-of-dicts at its boundary
+    # (Option A coexistence window), so we materialize the filtered
+    # slice back to the bar shape here. List-of-dicts path retained
+    # until all producers flip (plan step 9 cleanup).
     price_histories = None
     if ohlcv_by_ticker:
-        if ohlcv_dates_index is not None:
+        sample = next(iter(ohlcv_by_ticker.values()), None)
+        if isinstance(sample, pd.DataFrame):
+            from synthetic.predictor_backtest import _df_slice_to_bars
+            price_histories = {
+                ticker: _df_slice_to_bars(df, signal_date)
+                for ticker, df in ohlcv_by_ticker.items()
+            }
+        elif ohlcv_dates_index is not None:
             from bisect import bisect_right
             price_histories = {
                 ticker: bars[:bisect_right(ohlcv_dates_index[ticker], signal_date)]

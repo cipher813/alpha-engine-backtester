@@ -783,23 +783,25 @@ def run(config: dict, keep_features: bool = False) -> dict:
     if isinstance(trading_dates, dict):
         return trading_dates  # early exit with error dict
 
-    # 4. Build price matrix, extract SPY, drain price_data into ohlcv_by_ticker.
-    #    2026-04-23 SF dry-run OOM'd on c5.large because price_data (~91 MB) and
-    #    ohlcv_by_ticker (~1.1 GB, dominated by Python dict overhead in the
-    #    list-of-dicts form) coexisted at peak. Destructive iteration below
-    #    pops each price_data entry as we consume it, so the two dicts never
-    #    hold full-universe data simultaneously. Peak for this section drops
-    #    by ~91 MB — modest, but the RSS log surrounding it makes the memory
-    #    curve visible for the follow-up ohlcv→DataFrame refactor (tracked
-    #    as P2 in SYSTEM_STATE).
+    # 4. Build price matrix, extract SPY, build DataFrame-form ohlcv_by_ticker.
+    #    2026-04-23 SF dry-run OOM'd on c5.large because price_data (~91 MB)
+    #    and ohlcv_by_ticker (~1.1 GB, dominated by Python dict overhead in
+    #    the list-of-dicts form) coexisted at peak. The pandas refactor
+    #    (plan 2026-04-23) replaces list-of-dicts with per-ticker
+    #    DataFrames, dropping ohlcv_by_ticker's resident size to ~91 MB
+    #    (~12x reduction) and eliminating the concurrent-peak risk
+    #    outright. Downstream consumers (simulate, precompute_indicator_series,
+    #    artifact save/load) dispatch on shape until step 9 cleanup
+    #    removes the legacy branches.
     price_matrix = build_price_matrix(price_data, trading_dates)
     _log_rss("post_price_matrix")
     spy_prices = _extract_close(price_data, "SPY")  # extracts a Series copy
     _log_rss("post_spy_extract")
 
-    ohlcv_by_ticker = _drain_price_data_into_ohlcv(price_data)
-    # price_data is empty now (all entries popped by the drain). Release
-    # the dict shell too so the GC can fully reclaim.
+    ohlcv_by_ticker = build_ohlcv_df_by_ticker(price_data)
+    # Release price_data: its entries now live as normalized DataFrames
+    # inside ohlcv_by_ticker. Holding both would re-introduce the
+    # concurrent-peak the pandas refactor is designed to kill.
     del price_data
     gc.collect()
     _log_rss("post_ohlcv_build_and_drain")

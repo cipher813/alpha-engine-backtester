@@ -105,10 +105,30 @@ def load_dataframe(bucket: str, key: str, *, s3_client=None) -> pd.DataFrame:
 
 def save_ohlcv_by_ticker(
     bucket: str, date: str, phase: str, name: str,
-    ohlcv_by_ticker: dict[str, list[dict]],
+    ohlcv_by_ticker,
     *, s3_client=None,
 ) -> str:
-    """Stack per-ticker OHLCV lists into one parquet frame + upload."""
+    """Persist ohlcv_by_ticker in whichever shape the caller produced.
+
+    Accepts either:
+      - ``dict[str, list[dict]]`` (legacy) — stacks bars into one parquet
+        frame with a ``ticker`` column and one row per bar.
+      - ``dict[str, pd.DataFrame]`` (new, post-2026-04-23 pandas refactor) —
+        delegates to ``save_dict_of_dataframes`` which adds a ``ticker``
+        column and an ``__idx__`` column carrying the DatetimeIndex.
+
+    The load side (``load_ohlcv_by_ticker``) detects which schema is on
+    disk via the presence of ``__idx__`` and returns the matching shape.
+    Downstream consumers dispatch on shape (see
+    ``_simulate_single_date``'s isinstance branch and
+    ``precompute_indicator_series``) so both schemas round-trip without
+    any caller coordination.
+    """
+    sample = next(iter(ohlcv_by_ticker.values()), None) if ohlcv_by_ticker else None
+    if isinstance(sample, pd.DataFrame):
+        return save_dict_of_dataframes(
+            bucket, date, phase, name, ohlcv_by_ticker, s3_client=s3_client,
+        )
     rows = []
     for ticker, bars in ohlcv_by_ticker.items():
         for bar in bars:
@@ -122,24 +142,39 @@ def save_ohlcv_by_ticker(
 
 def load_ohlcv_by_ticker(
     bucket: str, key: str, *, s3_client=None,
-) -> dict[str, list[dict]]:
-    """Inverse of save_ohlcv_by_ticker.
+):
+    """Inverse of ``save_ohlcv_by_ticker``. Detects on-disk schema by
+    the presence of the ``__idx__`` column (added by
+    ``save_dict_of_dataframes``) and returns the matching in-memory
+    shape: ``dict[str, pd.DataFrame]`` for the new schema or
+    ``dict[str, list[dict]]`` for the legacy one.
 
-    Reshapes the stacked frame back to the per-ticker list-of-dicts
-    shape that the simulation loop expects. Date ordering is preserved
-    within each ticker's list because the stacked frame preserves the
-    original enumeration order.
+    Auto-skip robustness: a Saturday rerun can touch a marker from the
+    prior run whose artifact is on the OTHER schema. Downstream
+    consumers (simulate's slice dispatch, precompute_indicator_series)
+    shape-dispatch on whatever this function returns — no coordination
+    needed between producer and consumer.
     """
     df = load_dataframe(bucket, key, s3_client=s3_client)
+    if df.empty:
+        return {}
     if "ticker" not in df.columns:
         raise ValueError(
             f"load_ohlcv_by_ticker: parquet at {key!r} missing 'ticker' column "
             f"(found: {list(df.columns)})"
         )
-    out: dict[str, list[dict]] = {}
+    if "__idx__" in df.columns:
+        out_df: dict[str, pd.DataFrame] = {}
+        for ticker, group in df.groupby("ticker", sort=False):
+            frame = group.drop(columns=["ticker"]).copy()
+            frame = frame.set_index("__idx__")
+            frame.index.name = None
+            out_df[str(ticker)] = frame
+        return out_df
+    out_list: dict[str, list[dict]] = {}
     for ticker, group in df.groupby("ticker", sort=False):
-        out[str(ticker)] = group.drop(columns=["ticker"]).to_dict("records")
-    return out
+        out_list[str(ticker)] = group.drop(columns=["ticker"]).to_dict("records")
+    return out_list
 
 
 # ── Series artifacts (e.g. spy_prices) ───────────────────────────────────────
