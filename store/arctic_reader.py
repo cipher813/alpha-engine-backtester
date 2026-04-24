@@ -45,15 +45,41 @@ _MAX_ERROR_RATE = 0.05
 
 
 def _get_arctic(bucket: str) -> adb.Arctic:
-    """Create ArcticDB connection. Raises on unreachable."""
+    """Create ArcticDB connection. Raises on unreachable.
+
+    Logs the resolved URI + library list at DEBUG level so subprocess-vs-
+    parent Arctic-state divergence (e.g. 2026-04-24 parity incident:
+    main backtest saw 910 universe symbols, fresh pytest subprocess on
+    the same spot saw 0) can be diagnosed from the stream without a
+    separate instrumentation pass.
+    """
     region = os.environ.get("AWS_REGION", "us-east-1")
     uri = f"s3s://s3.{region}.amazonaws.com:{bucket}?path_prefix={ARCTIC_PREFIX}&aws_auth=true"
     try:
-        return adb.Arctic(uri)
+        arctic = adb.Arctic(uri)
     except Exception as exc:
         raise RuntimeError(
             f"ArcticDB unreachable at {uri}: {exc}"
         ) from exc
+    # Log connection details once per process so subprocess/parent
+    # divergence is greppable. At INFO level on first call only — repeat
+    # calls in the same process would spam.
+    global _ARCTIC_LOGGED
+    if not _ARCTIC_LOGGED:
+        try:
+            libs = sorted(arctic.list_libraries())
+        except Exception as exc:
+            libs = f"<list_libraries failed: {exc}>"
+        log.info(
+            "ArcticDB connected: uri=%s libraries=%s region=%s",
+            uri.replace("&aws_auth=true", "&aws_auth=true"),  # URI is already auth-stripped of secrets
+            libs, region,
+        )
+        _ARCTIC_LOGGED = True
+    return arctic
+
+
+_ARCTIC_LOGGED = False
 
 
 def _safe_last_date(idx: pd.Index) -> pd.Timestamp | None:
@@ -156,6 +182,42 @@ def load_universe_from_arctic(
         )
     else:
         log.info("ArcticDB universe: %d symbols", len(symbols))
+        # No-silent-fails: an empty universe in a production path (no
+        # allowlist) is never a legitimate outcome — it silently cascades
+        # to empty price_matrix → empty orders → misleading "no divergence"
+        # results in parity checks and silent zero-order outputs in real
+        # backtests. Hard-fail here with the diagnostic context needed
+        # to triage (URI, available libraries, a sample of what IS in
+        # the library if anything).
+        #
+        # Motivated by 2026-04-24 parity incident: list_symbols returned
+        # 0 in a fresh pytest subprocess on a spot where the main
+        # backtest's Python process had just successfully read 910
+        # symbols minutes earlier. Root cause still under investigation;
+        # this guard ensures the next occurrence surfaces loud with
+        # actionable context instead of silently producing zero-order
+        # outputs downstream.
+        if len(symbols) == 0:
+            region = os.environ.get("AWS_REGION", "us-east-1")
+            uri = (
+                f"s3s://s3.{region}.amazonaws.com:{bucket}"
+                f"?path_prefix={ARCTIC_PREFIX}&aws_auth=true"
+            )
+            try:
+                all_libs = sorted(arctic.list_libraries())
+            except Exception as exc:
+                all_libs = f"<list_libraries failed: {exc}>"
+            raise RuntimeError(
+                f"ArcticDB universe library returned 0 symbols — refusing to "
+                f"proceed with empty universe (no-silent-fails). "
+                f"Context: uri={uri} bucket={bucket!r} "
+                f"arctic.list_libraries()={all_libs} "
+                f"process_pid={os.getpid()}. "
+                f"If this is a fresh/new bucket, populate via "
+                f"alpha-engine-data's weekly backfill first. If this was "
+                f"working minutes ago in another process, look for env/auth "
+                f"divergence between the invocations."
+            )
 
     price_data: dict[str, pd.DataFrame] = {}
     features_by_ticker: dict[str, pd.DataFrame] = {}
