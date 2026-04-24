@@ -445,19 +445,97 @@ ${ENV_SOURCE}
 
 BUCKET="\${OUTPUT_BUCKET:-alpha-engine-research}"
 
-echo "==> Smoke: backtest.py --mode=smoke (preflight + runtime smoke)"
-$REMOTE_PYTHON -u backtest.py --mode=smoke --log-level INFO
+# Per-mode smoke summary — collected throughout the run and printed as
+# a single table at the end. Each entry: "name|status|duration|budget|usage".
+# Populated regardless of pass/fail so partial runs still show which
+# modes completed before the failure.
+declare -a _SMOKE_SUMMARY=()
+
+_smoke_record() {
+    # args: name, status ("ok" | "FAIL"), duration_s, budget_s (may be ""), usage_pct (may be "")
+    _SMOKE_SUMMARY+=("\$1|\$2|\$3|\$4|\$5")
+}
+
+_smoke_extract_budget() {
+    # Pull "N.Ns <= N.Ns (N% of budget)" from a log file's last
+    # budget-check line. Emits "budget_s<TAB>usage_pct" or empty.
+    local log_file="\$1"
+    local line
+    line="\$(grep -oE 'budget check: [0-9.]+s <= [0-9.]+s \([0-9]+% of budget\)' "\$log_file" | tail -1 || true)"
+    [ -z "\$line" ] && return
+    local budget usage
+    budget="\$(echo "\$line" | grep -oE '<= [0-9.]+s' | grep -oE '[0-9.]+s')"
+    usage="\$(echo "\$line" | grep -oE '\([0-9]+%' | tr -d '(%')%"
+    printf '%s\t%s' "\$budget" "\$usage"
+}
+
+_smoke_run_mode() {
+    # Run one backtest.py --mode=X, tee output, record to summary.
+    # Returns non-zero on Python failure so caller can decide to break.
+    local mode="\$1"
+    local log_file="/tmp/smoke_\${mode//\//_}.log"
+    local start=\$SECONDS
+    local status="ok"
+
+    echo ""
+    echo "==> Smoke: backtest.py --mode=\$mode"
+    if ! $REMOTE_PYTHON -u backtest.py --mode=\$mode --log-level INFO 2>&1 | tee "\$log_file"; then
+        status="FAIL"
+    fi
+    local dur=\$((SECONDS - start))
+
+    local budget="" usage=""
+    local extracted
+    extracted="\$(_smoke_extract_budget "\$log_file")"
+    if [ -n "\$extracted" ]; then
+        budget="\${extracted%%\$'\t'*}"
+        usage="\${extracted##*\$'\t'}"
+    fi
+
+    _smoke_record "\$mode" "\$status" "\${dur}s" "\$budget" "\$usage"
+    [ "\$status" = "ok" ]
+}
+
+_smoke_print_summary() {
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  SMOKE SUMMARY"
+    echo "═══════════════════════════════════════════════════════════════"
+    printf "  %-28s %-8s %-10s %-10s %-8s\n" "Mode" "Status" "Duration" "Budget" "Usage"
+    printf "  %s\n" "─────────────────────────────────────────────────────────────────────"
+    local any_fail=0
+    for entry in "\${_SMOKE_SUMMARY[@]}"; do
+        IFS='|' read -r name status dur budget usage <<< "\$entry"
+        printf "  %-28s %-8s %-10s %-10s %-8s\n" "\$name" "\$status" "\$dur" "\${budget:-–}" "\${usage:-–}"
+        [ "\$status" = "FAIL" ] && any_fail=1
+    done
+    echo "═══════════════════════════════════════════════════════════════"
+    if [ "\$any_fail" = "1" ]; then
+        echo "  RESULT: FAIL (one or more modes did not pass)"
+    else
+        echo "  RESULT: PASS (all \${#_SMOKE_SUMMARY[@]} modes ok)"
+    fi
+    echo "═══════════════════════════════════════════════════════════════"
+}
+
+# Always print summary, even if a mode aborts mid-run.
+trap '_smoke_print_summary' EXIT
+
+# backtest.py --mode=smoke: preflight + runtime smoke (universe symbols,
+# per-ticker Arctic read, recent signals.json load, Layer-1A GBM load +
+# predict). Keeps smoke in lockstep with what full modes do at startup.
+if ! _smoke_run_mode smoke; then
+    echo "ERROR: smoke preflight FAILED — aborting"
+    exit 1
+fi
 
 # Per-phase smoke harness — exercise each pipeline phase-family with a
 # tiny fixture (few dates, tiny param grid, short GBM lookback) and
-# enforce per-mode wall-clock budgets from timing_budget.yaml. Catches
-# phase regressions at smoke time instead of during a 2h full Saturday
-# run. Ordered fastest → slowest so a failure in an earlier mode
-# short-circuits the harder ones. ROADMAP Backtester P0 #3.
+# enforce per-mode wall-clock budgets from timing_budget.yaml. Ordered
+# fastest → slowest so a failure in an earlier mode short-circuits
+# the harder ones. ROADMAP Backtester P0 #3.
 for SMOKE_PHASE_MODE in smoke-simulate smoke-param-sweep smoke-predictor-backtest smoke-phase4; do
-    echo ""
-    echo "==> Smoke: backtest.py --mode=\$SMOKE_PHASE_MODE"
-    if ! $REMOTE_PYTHON -u backtest.py --mode=\$SMOKE_PHASE_MODE --log-level INFO; then
+    if ! _smoke_run_mode "\$SMOKE_PHASE_MODE"; then
         echo "ERROR: smoke phase \$SMOKE_PHASE_MODE FAILED — aborting smoke-only run"
         exit 1
     fi
@@ -483,16 +561,24 @@ while IFS= read -r candidate; do
 done < <(aws s3 ls "s3://\${BUCKET}/backtest/" | awk '/PRE / {print \$2}' | tr -d '/' | sort -r)
 if [ -z "\$LATEST_DATE" ]; then
     echo "ERROR: no backtest/{date}/ prefix with portfolio_stats.json found in s3://\${BUCKET}/backtest/"
+    _smoke_record "evaluate-diagnostics" "FAIL" "0s" "" ""
     exit 1
 fi
 echo "Using backtest date: \$LATEST_DATE"
 
 echo ""
 echo "==> Smoke: evaluate.py --mode diagnostics --freeze --date \$LATEST_DATE"
-$REMOTE_PYTHON -u evaluate.py --mode diagnostics --freeze --date "\$LATEST_DATE" --log-level INFO 2>&1 | tail -30
+_EVAL_START=\$SECONDS
+_EVAL_STATUS="ok"
+if ! $REMOTE_PYTHON -u evaluate.py --mode diagnostics --freeze --date "\$LATEST_DATE" --log-level INFO 2>&1 | tail -30; then
+    _EVAL_STATUS="FAIL"
+fi
+_EVAL_DUR=\$((SECONDS - _EVAL_START))
+_smoke_record "evaluate-diagnostics" "\$_EVAL_STATUS" "\${_EVAL_DUR}s" "" ""
 
 echo ""
 echo "Smoke test complete."
+# Summary prints via trap on exit
 SMOKE
 
     echo "==> Smoke-only mode — instance will be terminated."
