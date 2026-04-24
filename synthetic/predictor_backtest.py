@@ -533,6 +533,93 @@ def _df_to_bars(df: pd.DataFrame) -> list[dict]:
     return bars
 
 
+def build_ohlcv_df_by_ticker(
+    price_data: dict[str, pd.DataFrame],
+) -> dict[str, pd.DataFrame]:
+    """Produce the DataFrame-form ohlcv_by_ticker — the new shape for the
+    backtester memory refactor (plan 2026-04-23). Each value is a
+    pd.DataFrame with:
+
+      - DatetimeIndex (sorted ascending, no duplicates)
+      - Columns [open, high, low, close], dtype float64
+
+    Normalizes ArcticDB's capitalized column names to lowercase at the
+    producer boundary so downstream consumers (executor, indicator
+    compute, artifact persistence) can rely on a single canonical
+    column naming without per-site case handling.
+
+    Missing OHL columns (frequent in thin-history tickers where only
+    Close is populated) fall back to the Close series — matches the
+    existing list-of-dicts producer's ``_df_to_bars`` semantic.
+
+    Macro + sector ETFs are filtered at the producer boundary — they
+    aren't used downstream in the list form either.
+
+    This is the low-overhead shape (~91 MB for 911 tickers × 2500 bars
+    vs. ~1.1 GB for the equivalent list-of-dicts, where Python dict
+    header overhead dominates at ~240 B/row). Kills the backtester
+    OOM-on-c5.large risk diagnosed in the 2026-04-23 root-cause
+    analysis (see alpha-engine-backtester-pandas-refactor-plan-260423.md).
+    """
+    skip_tickers = _MACRO_TICKERS | _SECTOR_ETFS
+    out: dict[str, pd.DataFrame] = {}
+    for ticker, df in price_data.items():
+        if ticker in skip_tickers:
+            continue
+        if df is None or df.empty:
+            continue
+        cols: dict[str, pd.Series] = {}
+        for title in ("Close", "Open", "High", "Low"):
+            lower = title.lower()
+            if title in df.columns:
+                cols[lower] = df[title]
+            elif lower in df.columns:
+                cols[lower] = df[lower]
+        if "close" not in cols:
+            continue
+        close = cols["close"]
+        for key in ("open", "high", "low"):
+            if key not in cols:
+                cols[key] = close
+        frame = pd.DataFrame({
+            "open":  cols["open"],
+            "high":  cols["high"],
+            "low":   cols["low"],
+            "close": cols["close"],
+        }).astype(float)
+        frame.index = pd.to_datetime(frame.index)
+        frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+        out[ticker] = frame
+    return out
+
+
+def _df_slice_to_bars(df: pd.DataFrame, until_date: str) -> list[dict]:
+    """Materialize the <= until_date slice of a single ticker's OHLCV
+    DataFrame as the list-of-dicts form the executor still consumes.
+
+    ``until_date`` is an ISO8601 string. The slice is inclusive of the
+    final bar whose DatetimeIndex entry is <= ``until_date``, matching
+    the historic ``[b for b in bars if b["date"] <= signal_date]``
+    semantic that _simulate_single_date's bisect path replaced on
+    2026-04-22. Used at the executor boundary once the producer flips
+    to DataFrame form — the executor itself still expects list-of-dicts
+    during Option A's coexistence window.
+    """
+    ts = pd.Timestamp(until_date)
+    sliced = df.loc[:ts]
+    bars: list[dict] = []
+    for dt, row in sliced.iterrows():
+        date_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
+        bars.append({
+            "date":  date_str,
+            "open":  float(row["open"]),
+            "high":  float(row["high"]),
+            "low":   float(row["low"]),
+            "close": float(row["close"]),
+        })
+    return bars
+
+
 def _drain_price_data_into_ohlcv(
     price_data: dict[str, pd.DataFrame],
 ) -> dict[str, list[dict]]:
