@@ -90,6 +90,18 @@ ONLY_PHASES="${ONLY_PHASES:-}"            # comma-separated phase names
 FORCE_ALL="${FORCE_ALL:-false}"           # true → --force
 FORCE_PHASES="${FORCE_PHASES:-}"          # comma-separated phase names
 DRY_RUN="${DRY_RUN:-false}"               # true → --dry-run
+# Pipeline-level stage control: comma-separated subset of {backtest, parity,
+# evaluator}. All three stages run by default on the spot. Used for fast
+# iteration against a single stage (e.g. parity-only when debugging a cred
+# divergence).
+SKIP_STAGES="${SKIP_STAGES:-}"
+# Freeze the evaluator (passes --freeze to evaluate.py → suppresses per-
+# optimizer S3 config writes; report artifacts + email still upload). Use
+# for off-cycle test runs so mid-week sweeps don't auto-promote weights/
+# params/thresholds against Monday trading. Replaces the retired SF
+# CheckEvaluatorFreeze Choice state (evaluator consolidated into spot
+# 2026-04-24); the freeze_evaluator SF input param is no longer honored.
+FREEZE_EVALUATOR="${FREEZE_EVALUATOR:-false}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
@@ -102,9 +114,31 @@ while [[ $# -gt 0 ]]; do
         --force) FORCE_ALL="true"; shift ;;
         --force-phases) FORCE_PHASES="$2"; shift 2 ;;
         --dry-run) DRY_RUN="true"; shift ;;
+        --skip-stages) SKIP_STAGES="$2"; shift 2 ;;
+        --freeze-evaluator) FREEZE_EVALUATOR="true"; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
+
+# ── Validate --skip-stages against the known stage vocabulary ────────────────
+# Hard-fail on unknown names per no-silent-fails: a typo like
+# --skip-stages=evaulator would silently run evaluator (no match) and mislead
+# the operator into thinking the pipeline respected their request.
+_KNOWN_STAGES="backtest parity evaluator"
+if [ -n "$SKIP_STAGES" ]; then
+    IFS=',' read -ra _SKIP_ARR <<< "$SKIP_STAGES"
+    for _s in "${_SKIP_ARR[@]}"; do
+        _s_trim="$(echo "$_s" | tr -d '[:space:]')"
+        case " $_KNOWN_STAGES " in
+            *" $_s_trim "*) ;;
+            *)
+                echo "ERROR: unknown stage '$_s_trim' in --skip-stages=$SKIP_STAGES" >&2
+                echo "       Valid stages: $_KNOWN_STAGES" >&2
+                exit 1
+                ;;
+        esac
+    done
+fi
 
 # Convert each flag to a backtest.py CLI arg suffix (empty string when
 # disabled, so we don't pass an invalid empty arg through the heredoc).
@@ -146,6 +180,8 @@ echo "  Only phases   : ${ONLY_PHASES:-(none)}"
 echo "  Force all     : $FORCE_ALL"
 echo "  Force phases  : ${FORCE_PHASES:-(none)}"
 echo "  Dry-run       : $DRY_RUN"
+echo "  Skip stages   : ${SKIP_STAGES:-(none)}"
+echo "  Freeze eval   : $FREEZE_EVALUATOR"
 echo "  S3 bucket     : $S3_BUCKET"
 echo ""
 
@@ -597,81 +633,118 @@ set -euo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
 
-# BUCKET used by the replay-parity section below. OUTPUT_BUCKET is set
-# by .env (sourced above) but fall back to the default so ``set -u``
-# doesn't blow up on an environment without the .env line. Matches the
-# smoke-only heredoc's identical line.
+# BUCKET used across all three stages. OUTPUT_BUCKET is set by .env (sourced
+# above) but fall back to the default so \`\`set -u\`\` doesn't blow up on an
+# environment without the .env line. Matches the smoke-only heredoc's line.
 BUCKET="\${OUTPUT_BUCKET:-alpha-engine-research}"
+# SKIP_STAGES baked in from the dispatcher's --skip-stages flag. Stages in
+# this CSV are skipped with a loud ⊘ echo; everything else runs.
+SKIP_STAGES="${SKIP_STAGES}"
+# Shared RUN_DATE used by parity + evaluator uploads so they land under the
+# same backtest/{date}/ prefix.
+RUN_DATE=\$(date -u +%Y-%m-%d)
 
-echo "Starting backtest at \$(date)"
-# If backtest.py fails, do NOT continue to evaluator — the evaluator
-# would consume stale or missing simulation artifacts and auto-promote
-# garbage params to S3. Fail loud and exit non-zero so the spot-instance
-# run is marked as failed, the heartbeat metric is not emitted, and
-# the Step Function catches it. Replaces the previous || { echo WARNING }
-# swallow which silently let the evaluator run against invalid sweep
-# results and was the root cause of multiple undetected param oscillations.
-if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1; then
-    echo "ERROR: backtest.py failed. Skipping evaluator to prevent" >&2
-    echo "       auto-promotion of unvalidated configs. Spot run is" >&2
-    echo "       marked FAILED — check flow-doctor alerts." >&2
-    exit 1
+_stage_skipped() {
+    case ",\${SKIP_STAGES}," in
+        *",\$1,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ── Stage: backtest ─────────────────────────────────────────────────────────
+# If backtest.py fails we exit non-zero so parity + evaluator never run
+# against stale or missing artifacts — the evaluator would otherwise
+# auto-promote garbage params to S3. Fail loud so the spot run is marked
+# failed, the heartbeat metric is not emitted, and the Step Function catches
+# it. Replaces the previous || { echo WARNING } swallow that silently let
+# evaluator run against invalid sweep results and was the root cause of
+# multiple undetected param oscillations.
+if _stage_skipped backtest; then
+    echo "⊘ stage=backtest SKIPPED (--skip-stages=\${SKIP_STAGES})"
+else
+    echo "▶ stage=backtest START at \$(date -u +%H:%M:%S)"
+    if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1; then
+        echo "ERROR: backtest.py failed. Spot run marked FAILED — check" >&2
+        echo "       flow-doctor alerts. Parity + evaluator stages skipped" >&2
+        echo "       to prevent auto-promotion of unvalidated configs." >&2
+        exit 1
+    fi
+    echo "▶ stage=backtest END at \$(date -u +%H:%M:%S)"
 fi
 
-echo ""
-echo "Backtest complete at \$(date)"
-# NOTE: evaluate.py is no longer run on the spot instance. It runs as an
-# independent Step Function step ("Evaluator") on the always-on EC2 after
-# the Backtester step completes. Split 2026-04-12 so eval can run at a
-# different cadence than simulation. See alpha-engine-data PR #23.
-
-# ── Phase 1.4: Replay parity test ──────────────────────────────────────────
+# ── Stage: parity ───────────────────────────────────────────────────────────
 # Post-backtest gate: runs the backtester against the last N live-traded
 # dates and diffs orders against trades.db. Hard-fails on divergence so the
 # Saturday Step Function marks the Backtester step failed, which fires the
-# existing alpha-engine-saturday-sf-failed CloudWatch alarm. Prevents
-# silent logic drift between backtester and executor.
+# existing alpha-engine-saturday-sf-failed CloudWatch alarm. Prevents silent
+# logic drift between backtester and executor.
 # See docs/trade_mapping.md for the tolerance contract.
+if _stage_skipped parity; then
+    echo "⊘ stage=parity SKIPPED (--skip-stages=\${SKIP_STAGES})"
+else
+    echo "▶ stage=parity START at \$(date -u +%H:%M:%S)"
+    PARITY_TRADES_DB="/tmp/trades_latest.db"
+    PARITY_REPORT_DIR="/tmp/parity_report"
+    mkdir -p "\$PARITY_REPORT_DIR"
+
+    if ! aws s3 cp "s3://\${BUCKET}/trades/trades_latest.db" "\$PARITY_TRADES_DB" --quiet; then
+        echo "ERROR: could not download trades_latest.db from S3 — parity cannot run" >&2
+        echo "       backtester → executor drift will go undetected this cycle" >&2
+        exit 1
+    fi
+
+    # pytest exits non-zero on either divergence (assert failure) or setup
+    # RuntimeError (replay_for_dates hard-fail) — both halt the spot run
+    # and fire the SF-failed alarm.
+    PARITY_EXIT=0
+    TRADES_DB_PATH="\$PARITY_TRADES_DB" \\
+    SIGNALS_BUCKET="\${BUCKET}" \\
+    PARITY_REPORT_DIR="\$PARITY_REPORT_DIR" \\
+    $REMOTE_PYTHON -m pytest tests/test_parity_replay.py -m parity -v 2>&1 || PARITY_EXIT=\$?
+
+    # Upload the report regardless of pass/fail so divergence categories are
+    # visible in S3 even on failure.
+    if [ -f "\$PARITY_REPORT_DIR/parity_report.json" ]; then
+        aws s3 cp "\$PARITY_REPORT_DIR/parity_report.json" \\
+            "s3://\${BUCKET}/backtest/\${RUN_DATE}/parity_report.json" --quiet \\
+            && echo "Uploaded parity_report.json to s3://\${BUCKET}/backtest/\${RUN_DATE}/" \\
+            || echo "WARNING: failed to upload parity_report.json (non-fatal)"
+    fi
+
+    if [ "\$PARITY_EXIT" != "0" ]; then
+        echo "ERROR: parity test failed with exit \$PARITY_EXIT" >&2
+        echo "       Review s3://\${BUCKET}/backtest/\${RUN_DATE}/parity_report.json" >&2
+        echo "       Spot run marked FAILED — SF alarm will fire." >&2
+        exit "\$PARITY_EXIT"
+    fi
+    echo "▶ stage=parity END at \$(date -u +%H:%M:%S)"
+fi
+
+# ── Stage: evaluator ────────────────────────────────────────────────────────
+# Runs evaluate.py against today's backtest artifacts in S3. Consolidated
+# into the spot step 2026-04-24 — the SF's dedicated Evaluator states
+# (CheckSkipEvaluator, CheckEvaluatorFreeze, Evaluator, EvaluatorFrozen,
+# WaitForEvaluator, CheckEvaluatorStatus, EvaluatorWait, ExtractEvaluatorError)
+# were retired. --freeze-evaluator controls config-promotion (freeze =
+# diagnostic-only, no config writes). Default is live-apply for the Sat SF;
+# manual iteration runs should pass --freeze-evaluator.
+if _stage_skipped evaluator; then
+    echo "⊘ stage=evaluator SKIPPED (--skip-stages=\${SKIP_STAGES})"
+else
+    echo "▶ stage=evaluator START at \$(date -u +%H:%M:%S) freeze=${FREEZE_EVALUATOR}"
+    _EVAL_FREEZE=""
+    if [ "${FREEZE_EVALUATOR}" = "true" ]; then
+        _EVAL_FREEZE="--freeze"
+    fi
+    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload \$_EVAL_FREEZE --log-level INFO 2>&1; then
+        echo "ERROR: evaluate.py failed. Spot run marked FAILED." >&2
+        exit 1
+    fi
+    echo "▶ stage=evaluator END at \$(date -u +%H:%M:%S)"
+fi
+
 echo ""
-echo "Running replay parity test..."
-
-PARITY_TRADES_DB="/tmp/trades_latest.db"
-PARITY_REPORT_DIR="/tmp/parity_report"
-mkdir -p "\$PARITY_REPORT_DIR"
-
-if ! aws s3 cp "s3://\${BUCKET}/trades/trades_latest.db" "\$PARITY_TRADES_DB" --quiet; then
-    echo "ERROR: could not download trades_latest.db from S3 — parity cannot run" >&2
-    echo "       backtester → executor drift will go undetected this cycle" >&2
-    exit 1
-fi
-
-# Run the opt-in parity marker. pytest exits non-zero on either divergence
-# (assert failure) or setup RuntimeError (replay_for_dates hard-fail) —
-# both cases halt the spot run and fire the SF-failed alarm.
-PARITY_EXIT=0
-TRADES_DB_PATH="\$PARITY_TRADES_DB" \\
-SIGNALS_BUCKET="\${BUCKET}" \\
-PARITY_REPORT_DIR="\$PARITY_REPORT_DIR" \\
-$REMOTE_PYTHON -m pytest tests/test_parity_replay.py -m parity -v 2>&1 || PARITY_EXIT=\$?
-
-# Upload the report regardless of pass/fail so the divergence categories are
-# visible in S3 even on failure.
-RUN_DATE=\$(date -u +%Y-%m-%d)
-if [ -f "\$PARITY_REPORT_DIR/parity_report.json" ]; then
-    aws s3 cp "\$PARITY_REPORT_DIR/parity_report.json" \\
-        "s3://\${BUCKET}/backtest/\${RUN_DATE}/parity_report.json" --quiet \\
-        && echo "Uploaded parity_report.json to s3://\${BUCKET}/backtest/\${RUN_DATE}/" \\
-        || echo "WARNING: failed to upload parity_report.json (non-fatal)"
-fi
-
-if [ "\$PARITY_EXIT" != "0" ]; then
-    echo "ERROR: parity test failed with exit \$PARITY_EXIT" >&2
-    echo "       Review s3://\${BUCKET}/backtest/\${RUN_DATE}/parity_report.json" >&2
-    echo "       Spot run marked FAILED — SF alarm will fire." >&2
-    exit "\$PARITY_EXIT"
-fi
-
-echo "Parity test passed."
+echo "All requested stages complete at \$(date)"
 BACKTEST
 
 echo ""
