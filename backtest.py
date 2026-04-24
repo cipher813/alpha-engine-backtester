@@ -932,6 +932,23 @@ def replay_for_dates(
     config_override = _build_config_override(config)
     sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
 
+    # Load today's ArcticDB universe once — used to filter historical signals
+    # that reference since-dropped tickers (e.g. TSM/ASML post-2026-04-20).
+    # Mirrors the _run_simulation_loop pattern. Without this, parity replay
+    # of a date with a dropped ticker hits the executor's load_daily_vwap
+    # NoSuchVersionException hard-fail and aborts the entire replay
+    # (observed 2026-04-24 parity dry-run on date 2026-03-09 with TSM).
+    universe_symbols: set[str] | None = None
+    rejected_ticker_counter: dict[str, int] = {}
+    try:
+        from alpha_engine_lib.arcticdb import get_universe_symbols
+        universe_symbols = get_universe_symbols(bucket)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Replay universe-filter bootstrap failed: could not read "
+            f"ArcticDB universe symbols from bucket {bucket!r}: {exc}"
+        ) from exc
+
     if warmup_from_full_history and dates:
         latest_requested = max(dates)
         sim_dates = [d for d in all_signal_dates if d <= latest_requested]
@@ -953,10 +970,23 @@ def replay_for_dates(
             bucket=bucket,
             config_override=config_override,
             signals_override=None,  # load from S3 per date
+            universe_symbols=universe_symbols,
+            rejected_ticker_counter=rejected_ticker_counter,
             ohlcv_dates_index=ohlcv_dates_index,
         )
         if orders and signal_date in requested:
             captured.extend(orders)
+
+    if rejected_ticker_counter:
+        top = sorted(rejected_ticker_counter.items(), key=lambda kv: -kv[1])
+        total_rejects = sum(rejected_ticker_counter.values())
+        logger.warning(
+            "Replay universe-filter dropped %d signal entries across %d "
+            "tickers (present in historical signals but absent from current "
+            "ArcticDB universe). Top offenders: %s",
+            total_rejects, len(rejected_ticker_counter),
+            [f"{t}={n}" for t, n in top[:10]],
+        )
 
     logger.info(
         "replay_for_dates: %d orders captured across %d requested dates "
