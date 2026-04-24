@@ -50,7 +50,14 @@ from analysis import param_sweep
 from optimizer import executor_optimizer
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
-from pipeline_common import PhaseRegistry, load_config, phase, pull_research_db
+from pipeline_common import (
+    PhaseRegistry,
+    PhaseTimeoutError,
+    load_config,
+    load_phase_hard_caps,
+    phase,
+    pull_research_db,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2423,6 +2430,17 @@ def main() -> None:
     # the registry through every function signature. Phases pass
     # supports_auto_skip=True only when they know how to persist + reload
     # their outputs (artifact persistence lands in PR 2/3).
+    # Load per-phase hard caps from timing_budget.yaml. A phase exceeding
+    # its cap trips the watchdog (all-thread stack dump + PhaseTimeoutError).
+    # Missing caps leave the phase unwatchdogged — opt-in per phase.
+    hard_caps = load_phase_hard_caps()
+    if hard_caps:
+        logger.info(
+            "Phase watchdog active for %d phase(s): %s",
+            len(hard_caps),
+            ", ".join(f"{k}={v:.0f}s" for k, v in sorted(hard_caps.items())),
+        )
+
     registry = PhaseRegistry(
         date=args.date,
         bucket=config.get("signals_bucket", "alpha-engine-research"),
@@ -2430,6 +2448,7 @@ def main() -> None:
         only_phases=only_phases or None,
         force=args.force,
         force_phases=force_phases,
+        hard_caps=hard_caps,
     )
     config["_phase_registry"] = registry
 
