@@ -709,9 +709,14 @@ else
     # RuntimeError (replay_for_dates hard-fail) — both halt the spot run
     # and fire the SF-failed alarm.
     PARITY_EXIT=0
+    # USE_REAL_ARCTICDB=1 tells tests/conftest.py to skip the default
+    # MagicMock stub so the integration test hits real ArcticDB. Without
+    # this, parity silently sees an empty universe and reports false-
+    # positive divergence (hit 2026-04-24).
     TRADES_DB_PATH="\$PARITY_TRADES_DB" \\
     SIGNALS_BUCKET="\${BUCKET}" \\
     PARITY_REPORT_DIR="\$PARITY_REPORT_DIR" \\
+    USE_REAL_ARCTICDB=1 \\
     $REMOTE_PYTHON -m pytest tests/test_parity_replay.py -m parity -v 2>&1 || PARITY_EXIT=\$?
 
     # Upload the report regardless of pass/fail so divergence categories are

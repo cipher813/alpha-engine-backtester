@@ -42,25 +42,10 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-# arcticdb is a heavy C-ext; some local dev environments skip installing it.
-# Only stub when the real module isn't importable, so integration tests
-# (test_parity_replay_end_to_end) on a fully-provisioned spot use the real
-# ArcticDB and actually talk to S3.
-#
-# Prior bug (2026-04-24 parity dry-run): the unconditional
-# `sys.modules.setdefault("arcticdb", MagicMock())` ran at module import
-# time before arctic_reader.py was imported. When pytest collected this
-# file on a spot with arcticdb installed, the setdefault call happened
-# first (arcticdb not yet imported in the pytest process → setdefault
-# proceeds), and subsequent `import arcticdb as adb` in arctic_reader.py
-# returned the MagicMock. `sorted(MagicMock().list_libraries())` → []
-# (MagicMock's default __iter__ yields nothing), triggering the
-# no-silent-fails guard with "ArcticDB universe library returned 0 symbols".
-# The symptom masqueraded as a credential-resolution bug for hours.
-try:
-    import arcticdb  # noqa: F401
-except ImportError:
-    sys.modules["arcticdb"] = MagicMock()
+# arcticdb stubbing lives in tests/conftest.py — unit tests get a MagicMock
+# by default, integration tests (this file's @pytest.mark.parity case) opt
+# in to the real module by setting USE_REAL_ARCTICDB=1 before pytest starts
+# (spot_backtest.sh's parity stage does this).
 
 
 # ── Tolerance contract (see docs/trade_mapping.md for rationale) ────────────
