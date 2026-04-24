@@ -10,7 +10,6 @@ import pytest
 from optimizer.predictor_optimizer import (
     _discover_model_variants,
     _pick_best_mode,
-    _zero_out_features,
     _load_noise_candidates,
     _filter_predictions_by_alpha,
     apply_recommendations,
@@ -72,27 +71,6 @@ def test_pick_best_mode_skips_error_variants():
     }
     result = _pick_best_mode(baseline, variants, has_sufficient_data=True)
     assert result["recommended_mode"] == "rank"
-
-
-# ── _zero_out_features tests ────────────────────────────────────────────────
-
-def test_zero_out_features():
-    dates = pd.to_datetime(["2026-04-01", "2026-04-02"])
-    features = {
-        "AAPL": pd.DataFrame(
-            {"rsi_14": [45.0, 50.0], "momentum_20d": [0.1, 0.2], "macd_cross": [1.0, -1.0]},
-            index=dates,
-        )
-    }
-
-    result = _zero_out_features(features, ["rsi_14", "nonexistent_feature"])
-
-    # rsi_14 should be zeroed
-    assert (result["AAPL"]["rsi_14"] == 0.0).all()
-    # momentum_20d should be untouched
-    assert list(result["AAPL"]["momentum_20d"]) == [0.1, 0.2]
-    # original should be untouched (copy, not in-place)
-    assert list(features["AAPL"]["rsi_14"]) == [45.0, 50.0]
 
 
 # ── _discover_model_variants tests ──────────────────────────────────────────
