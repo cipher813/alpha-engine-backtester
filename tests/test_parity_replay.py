@@ -64,14 +64,37 @@ FIELD_TOLERANCES: dict[str, Tolerance] = {
     "research_score":         Tolerance(rel=0.0, abs_=0.5),
     "prediction_confidence":  Tolerance(rel=0.0, abs_=0.02),
     "position_pct":           Tolerance(rel=0.0, abs_=0.005),
-    "realized_return_pct":    Tolerance(rel=0.001),
 }
 
 # Shares have rounding at fill time; allow ±1 share
 SHARES_ABS_TOLERANCE = 1
 
 # Exact-match fields (any deviation = divergence)
-EXACT_FIELDS = {"date", "ticker", "action", "trigger_type", "predicted_direction", "days_held"}
+EXACT_FIELDS = {"ticker", "action", "trigger_type", "predicted_direction"}
+
+# Lifecycle fields populated post-trade by the live executor (forward-looking
+# from the trade's perspective) that the backtester sim cannot reproduce —
+# its replay is a single-shot decision per signal_date with no time advance.
+# These are skipped in diff_fields rather than treated as divergence. See
+# DATE_CONVENTIONS.md migration notes + ROADMAP "Backtester ↔ executor parity
+# divergence" P1.
+LIFECYCLE_SKIP_FIELDS = frozenset({
+    "days_held",
+    "realized_return_pct",
+    "realized_pnl",
+    "realized_alpha_pct",
+    "spy_return_during_hold",
+    "fill_time",
+    "created_at",
+    "ib_order_id",
+    "slippage_vs_signal",
+    "execution_latency_ms",
+    # The legacy `date` column is the calendar fill date (live) vs signal_date
+    # (backtester) — they semantically differ until the broader date-convention
+    # migration is fully rolled out. Cohort matching uses signal_trading_day,
+    # so the per-row `date` field check would always trip on the legacy column.
+    "date",
+})
 
 # Per-day divergence thresholds (see docs/trade_mapping.md)
 TRADE_COUNT_PCT_THRESHOLD = 0.05     # 5%
@@ -128,10 +151,19 @@ def diff_ticker_sets(live_by_date: dict[str, set[str]],
 
 
 def diff_fields(live_trade: dict, replay_trade: dict) -> dict[str, dict]:
-    """Per-field comparison for a single matched trade. Returns {field: {live, replay, ...}} for violations."""
+    """Per-field comparison for a single matched trade. Returns
+    ``{field: {live, replay, ...}}`` for violations.
+
+    Fields in ``LIFECYCLE_SKIP_FIELDS`` are excluded from the comparison —
+    they're populated post-trade by the live executor (e.g. ``days_held``,
+    ``realized_return_pct``) and the backtester sim cannot reproduce them.
+    Including them would generate noise on every matched ENTER trade.
+    """
     violations: dict[str, dict] = {}
 
     for field in EXACT_FIELDS:
+        if field in LIFECYCLE_SKIP_FIELDS:
+            continue
         lv, rv = live_trade.get(field), replay_trade.get(field)
         if lv != rv:
             violations[field] = {"live": lv, "backtester": rv, "match_rule": "exact"}
@@ -144,6 +176,8 @@ def diff_fields(live_trade: dict, replay_trade: dict) -> dict[str, dict]:
                                     "threshold_abs": SHARES_ABS_TOLERANCE}
 
     for field, tol in FIELD_TOLERANCES.items():
+        if field in LIFECYCLE_SKIP_FIELDS:
+            continue
         lv, rv = live_trade.get(field), replay_trade.get(field)
         if not within_tolerance(lv, rv, tol):
             violations[field] = {"live": lv, "backtester": rv,
@@ -201,8 +235,23 @@ def _load_trades_from_db(db_path: str, since_date: str | None = None) -> pd.Data
 
 
 def _last_n_trading_dates(trades_df: pd.DataFrame, n: int) -> list[str]:
+    """Return the last n unique signal_trading_day values from the trades
+    DataFrame — the parity cohort key per DATE_CONVENTIONS.md.
+
+    Falls back to the legacy ``date`` column when ``signal_trading_day`` is
+    missing or empty (pre-migration DBs). Operators running the parity test
+    against a pre-PR-2 trades.db will see zero matchable rows downstream and
+    the integration test will skip with a clear message.
+    """
     if trades_df.empty:
         return []
+    if "signal_trading_day" in trades_df.columns:
+        col_values = trades_df["signal_trading_day"].dropna()
+        if not col_values.empty:
+            return sorted(col_values.unique())[-n:]
+    # Fallback for pre-migration DBs — legacy `date` column. Test will
+    # filter to ENTERs with non-null signal_trading_day downstream and skip
+    # if nothing matches.
     return sorted(trades_df["date"].dropna().unique())[-n:]
 
 
@@ -371,6 +420,68 @@ class TestLastNTradingDates:
                                      "2026-04-04", "2026-04-05"]})
         assert _last_n_trading_dates(df, 3) == ["2026-04-03", "2026-04-04", "2026-04-05"]
 
+    def test_prefers_signal_trading_day_when_present(self):
+        """Post-PR-2 DBs have signal_trading_day; cohort matching uses it."""
+        df = pd.DataFrame({
+            "date": ["2026-04-13", "2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17"],
+            "signal_trading_day": ["2026-04-10", "2026-04-10", "2026-04-10", "2026-04-17", "2026-04-17"],
+        })
+        # Should return unique signal_trading_days, not unique fill dates.
+        result = _last_n_trading_dates(df, 5)
+        assert result == ["2026-04-10", "2026-04-17"]
+
+    def test_falls_back_to_date_when_signal_trading_day_all_null(self):
+        """Pre-backfill DB might have the column but with all NULLs.
+        Falls back to the legacy `date` column so the test can still
+        function (and the integration path skips later if no matchable
+        rows remain after the ENTER + non-null filter)."""
+        df = pd.DataFrame({
+            "date": ["2026-04-13", "2026-04-14", "2026-04-15"],
+            "signal_trading_day": [None, None, None],
+        })
+        assert _last_n_trading_dates(df, 5) == ["2026-04-13", "2026-04-14", "2026-04-15"]
+
+
+class TestLifecycleSkipFields:
+    """Lifecycle fields populated post-trade by the live executor are
+    excluded from diff comparison — they can never match backtester sim."""
+
+    def _trade(self, **kwargs):
+        base = {"date": "2026-04-13", "ticker": "AAPL", "action": "ENTER", "shares": 100}
+        base.update(kwargs)
+        return base
+
+    def test_days_held_difference_not_flagged(self):
+        live = self._trade(days_held=5)
+        replay = self._trade(days_held=None)
+        assert "days_held" not in diff_fields(live, replay)
+
+    def test_realized_return_pct_difference_not_flagged(self):
+        live = self._trade(realized_return_pct=2.5)
+        replay = self._trade(realized_return_pct=None)
+        assert "realized_return_pct" not in diff_fields(live, replay)
+
+    def test_fill_time_difference_not_flagged(self):
+        live = self._trade(fill_time="2026-04-13T14:30:00+00:00")
+        replay = self._trade(fill_time=None)
+        assert "fill_time" not in diff_fields(live, replay)
+
+    def test_legacy_date_difference_not_flagged(self):
+        # Live's `date` is the calendar fill day; backtester's is signal_date.
+        # Cohort matching uses signal_trading_day, so the per-row `date`
+        # column is irrelevant to the diff and is in LIFECYCLE_SKIP_FIELDS.
+        live = self._trade(date="2026-04-20")
+        replay = self._trade(date="2026-04-17")
+        assert "date" not in diff_fields(live, replay)
+
+    def test_non_lifecycle_field_still_compared(self):
+        # ticker is exact-match; this confirms the skip-set doesn't
+        # accidentally swallow real comparisons.
+        live = self._trade(ticker="AAPL")
+        replay = self._trade(ticker="MSFT")
+        v = diff_fields(live, replay)
+        assert "ticker" in v
+
 
 # ── Integration test (opt-in) ───────────────────────────────────────────────
 
@@ -398,48 +509,107 @@ def test_parity_replay_end_to_end():
     if trades_df.empty:
         pytest.skip("trades.db is empty — no history to parity-check against")
 
-    dates = _last_n_trading_dates(trades_df, window_days)
-    if len(dates) < 3:
-        pytest.skip(f"Need >=3 dates with trades; have {len(dates)}")
+    if "signal_trading_day" not in trades_df.columns:
+        pytest.skip(
+            "trades.db missing `signal_trading_day` column — run "
+            "alpha-engine PR 2 migration (init_db on next executor start "
+            "applies the schema; then run scripts/backfill_trading_day.py)."
+        )
 
-    # Run backtester (placeholder — raises NotImplementedError until 1.1b)
+    # Cohort matching: filter live trades to ENTERs with a populated
+    # signal_trading_day. Exits leave signal_trading_day NULL by design (PR 2);
+    # pre-backfill rows would also be NULL. Those rows are excluded from
+    # cohort-level comparison — they're not signal-driven decisions and
+    # shouldn't be expected to round-trip against backtester output.
+    matchable = trades_df[
+        (trades_df["action"] == "ENTER")
+        & trades_df["signal_trading_day"].notna()
+    ]
+    n_excluded = len(trades_df) - len(matchable)
+
+    if matchable.empty:
+        pytest.skip(
+            f"trades.db has {len(trades_df)} rows but 0 are matchable ENTER "
+            f"+ signal_trading_day populated rows. Run "
+            f"scripts/backfill_trading_day.py to populate the column on "
+            f"historical rows."
+        )
+
+    dates = _last_n_trading_dates(matchable, window_days)
+    if len(dates) < 3:
+        pytest.skip(
+            f"Need >=3 signal_trading_days with matchable trades; have "
+            f"{len(dates)} (matchable rows: {len(matchable)})"
+        )
+
+    # Run backtester replay over the same signal_trading_day cohorts.
+    # backtest.replay_for_dates iterates the input dates as signal_dates,
+    # producing orders tagged with `o["date"] = signal_date` — which equals
+    # signal_trading_day on the live side post-backfill. The cohort key
+    # matches across both sides without further translation.
     replay_orders = _run_backtester_for_dates(dates, bucket)
 
-    # Group both sides by date
-    window = trades_df[trades_df["date"].isin(dates)]
-    live_by_date: dict[str, int] = window.groupby("date").size().to_dict()
+    # Filter both sides to ENTERs for cohort matching. Exits don't have
+    # signal_trading_day on the live side (NULL by design), so cohort
+    # comparison is ENTER-only. Backtester also produces exits but those
+    # are tagged with the same signal_date and could be cohort-matched
+    # in a future expansion.
+    matchable_enters = matchable
+    replay_enters = [o for o in replay_orders if o.get("action") == "ENTER"]
+
+    window = matchable_enters[matchable_enters["signal_trading_day"].isin(dates)]
+    live_by_date: dict[str, int] = window.groupby("signal_trading_day").size().to_dict()
     replay_by_date_count: dict[str, int] = {}
     replay_tickers_by_date: dict[str, set[str]] = {}
-    for o in replay_orders:
+    for o in replay_enters:
         d = o["date"]
         replay_by_date_count[d] = replay_by_date_count.get(d, 0) + 1
         replay_tickers_by_date.setdefault(d, set()).add(o["ticker"])
 
     live_tickers_by_date = {
-        d: set(window[window["date"] == d]["ticker"].tolist()) for d in dates
+        d: set(window[window["signal_trading_day"] == d]["ticker"].tolist())
+        for d in dates
     }
 
     count_violations = diff_trade_count(live_by_date, replay_by_date_count)
     ticker_violations = diff_ticker_sets(live_tickers_by_date, replay_tickers_by_date)
 
-    # Field-level diffs on matched trades
+    # Field-level diffs on matched trades — keyed on
+    # (signal_trading_day, ticker, action). Lifecycle fields (days_held,
+    # realized_return_pct, etc.) are excluded by LIFECYCLE_SKIP_FIELDS in
+    # diff_fields — they're populated post-trade by the live executor and
+    # the backtester sim cannot reproduce them.
     field_violations: list[dict] = []
     for _, row in window.iterrows():
-        key = (row["date"], row["ticker"], row["action"])
-        match = next((o for o in replay_orders
-                      if (o["date"], o["ticker"], o["action"]) == key), None)
+        key = (row["signal_trading_day"], row["ticker"], row["action"])
+        match = next(
+            (
+                o for o in replay_enters
+                if (o.get("date"), o.get("ticker"), o.get("action")) == key
+            ),
+            None,
+        )
         if match is None:
             continue
         vs = diff_fields(row.to_dict(), match)
         if vs:
-            field_violations.append({"date": row["date"], "ticker": row["ticker"],
-                                     "action": row["action"], "fields": vs})
+            field_violations.append({
+                "signal_trading_day": row["signal_trading_day"],
+                "ticker": row["ticker"],
+                "action": row["action"],
+                "fields": vs,
+            })
 
     report = {
         "status": "fail" if (count_violations or ticker_violations or field_violations) else "pass",
-        "window": [dates[0], dates[-1]],
-        "n_live_trades": int(len(window)),
-        "n_backtester_trades": len(replay_orders),
+        "match_key": "(signal_trading_day, ticker, action)",
+        "window_signal_trading_days": [dates[0], dates[-1]],
+        "n_live_trades_total": int(len(trades_df)),
+        "n_live_enters_matchable": int(len(matchable)),
+        "n_live_excluded_no_signal_day": int(n_excluded),
+        "n_backtester_orders_total": len(replay_orders),
+        "n_backtester_enters": len(replay_enters),
+        "lifecycle_fields_skipped": sorted(LIFECYCLE_SKIP_FIELDS),
         "trade_count_divergence": count_violations,
         "ticker_set_divergence": ticker_violations,
         "field_divergence": field_violations,
