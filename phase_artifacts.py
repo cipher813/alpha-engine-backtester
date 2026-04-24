@@ -261,7 +261,7 @@ def save_dict_of_dataframes(
     data: dict[str, pd.DataFrame],
     *, s3_client=None,
 ) -> str:
-    """Stack per-ticker DataFrames into one parquet with a 'ticker' column.
+    """Stream per-ticker DataFrames into one parquet with a 'ticker' column.
 
     The original DataFrame index is materialized as a column named
     `__idx__` so it round-trips; on load the per-ticker frames set that
@@ -270,23 +270,75 @@ def save_dict_of_dataframes(
 
     Used for features_by_ticker in predictor_data_prep. ~900 tickers
     × ~2500 rows × 59 feature cols compresses to ~150-250 MB parquet.
+
+    Memory-efficient streaming write: uses pyarrow ParquetWriter to
+    append one row group per ticker instead of building a stacked
+    in-memory DataFrame via pd.concat. Motivated by the 2026-04-24
+    dry-run's predictor_data_prep save block spending 20+ min
+    thrashing swap on c5.large — the prior pd.concat approach held
+    (dict + parts list + concat result + parquet buffer) = ~2.3 GB
+    simultaneously. This path peaks at ~1 ticker (~1.4 MB) + the
+    accumulating compressed parquet buffer (~250 MB final) = ~300 MB
+    peak, ~8× reduction.
+
+    Schema unification: when tickers have mismatched columns, pyarrow's
+    default behavior rejects the second row group. We unify by building
+    all pyarrow Tables first (cheap, zero-copy from pandas), then
+    `pa.unify_schemas()` on their schemas and casting each table to the
+    unified schema before appending. This preserves the legacy
+    "compatible superset" semantic (missing column → NaN on load).
     """
-    parts = []
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    # Filter + build the reset-and-annotated DataFrames, but do NOT
+    # concat them. Each becomes a pyarrow Table below.
+    ticker_frames: list[tuple[str, pd.DataFrame]] = []
     for ticker, df in data.items():
         if df is None or df.empty:
             continue
-        # Materialize index as a column so it survives concat+parquet
         reset = df.reset_index().rename(columns={df.index.name or "index": "__idx__"})
         reset.insert(0, "ticker", str(ticker))
-        parts.append(reset)
-    if not parts:
-        stacked = pd.DataFrame(columns=["ticker", "__idx__"])
-    else:
-        stacked = pd.concat(parts, ignore_index=True)
-    return save_dataframe(
-        bucket, date, phase, name, stacked,
-        s3_client=s3_client, preserve_index=False,
+        ticker_frames.append((str(ticker), reset))
+
+    if not ticker_frames:
+        # Empty-data fallback preserves the legacy shape: a parquet with
+        # just the ticker + __idx__ column headers. Load path returns {}.
+        empty = pd.DataFrame(columns=["ticker", "__idx__"])
+        return save_dataframe(
+            bucket, date, phase, name, empty,
+            s3_client=s3_client, preserve_index=False,
+        )
+
+    # Convert each DataFrame to a pyarrow Table. preserve_index=False
+    # because we materialized the original index into __idx__ above.
+    tables = [
+        (ticker, pa.Table.from_pandas(frame, preserve_index=False))
+        for ticker, frame in ticker_frames
+    ]
+
+    # Unify schemas so row groups with missing columns widen to the
+    # union (NaN-filled on load). Matches the legacy pd.concat semantic.
+    unified_schema = pa.unify_schemas([t.schema for _, t in tables])
+    tables = [(ticker, t.cast(unified_schema)) for ticker, t in tables]
+
+    # Stream-write each table as its own row group. The ParquetWriter
+    # buffer is the only large allocation and grows only with compressed
+    # output size. No full-DataFrame concat ever materializes in memory.
+    buf = io.BytesIO()
+    writer = pq.ParquetWriter(buf, unified_schema, compression="snappy")
+    try:
+        for _, table in tables:
+            writer.write_table(table)
+    finally:
+        writer.close()
+
+    key = artifact_key(date, phase, name, "parquet")
+    _client(s3_client).put_object(
+        Bucket=bucket, Key=key, Body=buf.getvalue(),
+        ContentType="application/vnd.apache.parquet",
     )
+    return key
 
 
 def load_dict_of_dataframes(
