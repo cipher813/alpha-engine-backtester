@@ -1738,6 +1738,50 @@ def _apply_smoke_fixture(mode: str, args, config: dict) -> None:
     )
 
 
+def _apply_dry_run_isolation(args) -> None:
+    """Apply the --dry-run safety bundle.
+
+    Mirrors the smoke fixture's isolation pattern but preserves the
+    operator's choice of mode + universe size. Intended use: ad-hoc
+    validation spot runs that exercise the production pipeline without
+    polluting production S3 state (phase markers, artifacts, reports,
+    config promotions).
+
+    Bundle:
+      - args.date = ".dry-run/{date}/" — markers + artifacts + reports
+        all namespace-isolated from the scheduled SF on the same
+        calendar date. Mirrors smoke's ".smoke/{date}/" pattern.
+      - args.freeze = True — no optimizer S3 config writes
+        (scoring_weights.json / executor_params.json / predictor_params.json
+        / research_params.json stay untouched).
+      - args.upload = False — no reporter upload. The dry-run produces
+        local artifacts on the spot; the point of the run is to validate
+        behavior, not to publish outputs.
+      - args.force = True — auto-skip disabled. A dry-run validates a
+        code change; loading a prior run's S3 artifact would defeat
+        the purpose.
+
+    Motivation (2026-04-24): the --dry-run ask surfaced while preparing
+    an ad-hoc validation run for the backtester silent-phase diagnosis
+    arc (PRs #65 + #66 + #67). Operator was concerned that a manual
+    spot on the same calendar date as the scheduled Sat SF could
+    contaminate phase markers. Smoke mode already solved the isolation
+    problem with ".smoke/"; --dry-run gives full-universe runs the
+    same treatment.
+    """
+    args.date = f".dry-run/{args.date}"
+    args.freeze = True
+    args.upload = False
+    args.force = True
+    logger.warning(
+        "══ DRY RUN MODE ══ mode=%s date=%s "
+        "(force=True, freeze=True, upload=False, S3 namespace .dry-run/). "
+        "No production configs will be written; phase markers + artifacts "
+        "are isolated from scheduled-SF output.",
+        args.mode, args.date,
+    )
+
+
 def _load_timing_budgets() -> dict[str, float]:
     """Read timing_budget.yaml from the repo root. Returns empty dict if
     missing — budget enforcement is best-effort, not a hard dependency."""
@@ -1990,6 +2034,14 @@ def _parse_args() -> argparse.Namespace:
                         help="Rollback all S3 configs to previous versions and exit")
     parser.add_argument("--freeze", action="store_true",
                         help="Skip all S3 config promotions (guardrails compute + report but never write)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Exercise the full backtest pipeline without touching production S3 "
+                             "state. Bundles --freeze + --force + no upload + date namespaced to "
+                             "`.dry-run/{date}/` so phase markers, artifacts, and reports never "
+                             "collide with scheduled-SF output on the same calendar date. Use for "
+                             "ad-hoc validation runs (e.g. verifying a refactor pre-SF) where you "
+                             "want full-universe coverage but no prod pollution. Mirrors the "
+                             "existing smoke-mode isolation pattern (smoke uses `.smoke/{date}/`).")
     parser.add_argument("--skip-smoke", action="store_true",
                         help="Bypass the runtime smoke test that precedes the full modes. Only for "
                              "genuine restart cases where the operator knows the environment is good; "
@@ -2412,6 +2464,16 @@ def main() -> None:
     _is_smoke_phase = _is_smoke_phase_mode(args.mode)
     if _is_smoke_phase:
         _apply_smoke_fixture(args.mode, args, config)
+
+    # Apply dry-run isolation if requested. Bundles the same safety
+    # switches as smoke mode but preserves the full-universe mode the
+    # operator selected. Smoke already handles its own isolation via
+    # _apply_smoke_fixture; --dry-run + smoke-X is redundant but safe
+    # (the smoke fixture runs first, then dry-run adds its own guards
+    # on top — the .smoke/ prefix wins because the date rewrite in
+    # _apply_smoke_fixture has already executed).
+    if getattr(args, "dry_run", False) and not _is_smoke_phase:
+        _apply_dry_run_isolation(args)
 
     # Parse + validate phase-selection flags.
     def _split(s: str) -> list[str]:
