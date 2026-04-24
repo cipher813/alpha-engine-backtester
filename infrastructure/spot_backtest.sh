@@ -10,6 +10,13 @@
 #   ./infrastructure/spot_backtest.sh --smoke-only      # quick validation, then terminate
 #   ./infrastructure/spot_backtest.sh --mode simulate   # override backtest mode
 #   ./infrastructure/spot_backtest.sh --instance-type c5.xlarge  # override instance type
+#   ./infrastructure/spot_backtest.sh --dry-run         # full-universe exercise without
+#                                                       #   production S3 pollution:
+#                                                       #   markers + artifacts + reports
+#                                                       #   go to .dry-run/{date}/, no
+#                                                       #   optimizer config writes, no
+#                                                       #   reporter upload. Safe to run
+#                                                       #   concurrently with scheduled SF.
 #
 # Prerequisites:
 #   - AWS CLI configured (uses alpha-engine-executor-profile for S3/SES access)
@@ -74,7 +81,7 @@ BACKTEST_MODE="all"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 RUN_MODE="full"  # full | smoke-only
-# All five PhaseRegistry-adjacent flags are also routable from the
+# All PhaseRegistry-adjacent flags are also routable from the
 # Saturday SF input via env vars. When set they pass through as
 # CLI args to backtest.py.
 SKIP_PHASE4="${SKIP_PHASE4_EVALUATIONS:-false}"
@@ -82,6 +89,7 @@ SKIP_PHASES="${SKIP_PHASES:-}"            # comma-separated phase names
 ONLY_PHASES="${ONLY_PHASES:-}"            # comma-separated phase names
 FORCE_ALL="${FORCE_ALL:-false}"           # true → --force
 FORCE_PHASES="${FORCE_PHASES:-}"          # comma-separated phase names
+DRY_RUN="${DRY_RUN:-false}"               # true → --dry-run
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
@@ -93,6 +101,7 @@ while [[ $# -gt 0 ]]; do
         --only-phases) ONLY_PHASES="$2"; shift 2 ;;
         --force) FORCE_ALL="true"; shift ;;
         --force-phases) FORCE_PHASES="$2"; shift 2 ;;
+        --dry-run) DRY_RUN="true"; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
@@ -118,6 +127,9 @@ fi
 if [ -n "$FORCE_PHASES" ]; then
     BACKTEST_PHASE_FLAGS="$BACKTEST_PHASE_FLAGS --force-phases=$FORCE_PHASES"
 fi
+if [ "$DRY_RUN" = "true" ]; then
+    BACKTEST_PHASE_FLAGS="$BACKTEST_PHASE_FLAGS --dry-run"
+fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Backtester Spot Run — $(date +%Y-%m-%d)"
@@ -133,6 +145,7 @@ echo "  Skip phases   : ${SKIP_PHASES:-(none)}"
 echo "  Only phases   : ${ONLY_PHASES:-(none)}"
 echo "  Force all     : $FORCE_ALL"
 echo "  Force phases  : ${FORCE_PHASES:-(none)}"
+echo "  Dry-run       : $DRY_RUN"
 echo "  S3 bucket     : $S3_BUCKET"
 echo ""
 
