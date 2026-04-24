@@ -262,11 +262,127 @@ def download_gbm_model(bucket: str = "alpha-engine-research", region: str = "us-
     return model_tmp.name
 
 
+def build_inference_tensor(
+    features_by_ticker: dict[str, pd.DataFrame],
+    feature_names: list[str],
+) -> tuple[np.ndarray, list[str], dict[str, int]]:
+    """Materialize per-ticker feature DataFrames into a dense 3D tensor.
+
+    Replaces the O(n_dates × n_tickers) Python-loop vector-collection
+    pattern (911 × 2500 ≈ 2.28M inner ticks per inference pass) with a
+    vectorized per-date slice: ``tensor[date_idx]`` → (n_tickers, n_features).
+
+    Callers downstream compute a per-date validity mask via
+    ``~np.isnan(tensor[di]).any(axis=1)`` so feature zeroing (for
+    Phase 4c pruning) can be applied to the tensor before the mask
+    without paying a full DataFrame.copy() per ticker.
+
+    Returns
+    -------
+    tensor : np.ndarray (n_dates, n_tickers, n_features), float32
+        NaN in slots where a (date, ticker) has no feature row.
+    tickers : list[str]
+        Ticker ordering matching axis=1. Callers zip this with
+        ``np.where(valid_mask_row)[0]`` to recover ticker labels per date.
+    date_to_idx : dict[str, int]
+        Map "YYYY-MM-DD" → axis=0 index.
+    """
+    # Skip tickers missing any required feature column — matches the
+    # legacy ``try: df[feature_names] except KeyError: continue`` path
+    usable: dict[str, pd.DataFrame] = {}
+    for ticker, df in features_by_ticker.items():
+        try:
+            usable[ticker] = df[feature_names]
+        except KeyError:
+            continue
+
+    if not usable:
+        return (
+            np.empty((0, 0, len(feature_names)), dtype=np.float32),
+            [],
+            {},
+        )
+
+    # Union of all dates across usable tickers, as ISO strings (the
+    # contract downstream consumers rely on — signal_generator,
+    # build_signals_by_date keyed on "YYYY-MM-DD")
+    all_dates: set[str] = set()
+    for df in usable.values():
+        all_dates.update(df.index.strftime("%Y-%m-%d"))
+    sorted_dates = sorted(all_dates)
+    date_to_idx = {d: i for i, d in enumerate(sorted_dates)}
+
+    tickers = list(usable.keys())
+    tensor = np.full(
+        (len(sorted_dates), len(tickers), len(feature_names)),
+        np.nan, dtype=np.float32,
+    )
+
+    for ti, ticker in enumerate(tickers):
+        df = usable[ticker]
+        # Duplicate dates: keep last, matches legacy ``dict(zip(dates, arr))``
+        if df.index.has_duplicates:
+            df = df[~df.index.duplicated(keep="last")]
+        arr = df.to_numpy(dtype=np.float32)
+        date_indices = np.fromiter(
+            (date_to_idx[d] for d in df.index.strftime("%Y-%m-%d")),
+            dtype=np.int64, count=len(df),
+        )
+        tensor[date_indices, ti, :] = arr
+
+    return tensor, tickers, date_to_idx
+
+
+def _predict_from_tensor(
+    tensor: np.ndarray,
+    tickers: list[str],
+    date_to_idx: dict[str, int],
+    trading_dates: list[str],
+    scorer,
+    heartbeat_every: int,
+    log_label: str,
+) -> dict[str, dict[str, float]]:
+    """Run batched scorer.predict() over a prebuilt inference tensor.
+
+    Validity is checked per (date, ticker) via isnan — same contract as
+    the legacy ``vec is not None and not np.any(np.isnan(vec))`` gate.
+    """
+    predictions_by_date: dict[str, dict[str, float]] = {}
+    t0 = time.monotonic() if hasattr(time, "monotonic") else 0.0
+
+    for i, date_str in enumerate(trading_dates):
+        di = date_to_idx.get(date_str)
+        if di is None:
+            continue
+        # Per-date slice: (n_tickers, n_features) view, no copy
+        day_matrix = tensor[di]
+        row_mask = ~np.isnan(day_matrix).any(axis=1)
+        if not row_mask.any():
+            continue
+        X = day_matrix[row_mask]
+        alphas = scorer.predict(X)
+        ticker_idxs = np.flatnonzero(row_mask)
+        predictions_by_date[date_str] = {
+            tickers[ti]: float(a)
+            for ti, a in zip(ticker_idxs, alphas)
+        }
+
+        if (i + 1) % heartbeat_every == 0:
+            elapsed = (time.monotonic() - t0) if hasattr(time, "monotonic") else 0.0
+            logger.info(
+                "%s inference: %d/%d dates (%.1fs elapsed, last=%s)",
+                log_label, i + 1, len(trading_dates), elapsed, date_str,
+            )
+
+    return predictions_by_date
+
+
 def run_inference(
     features_by_ticker: dict[str, pd.DataFrame],
     model_path: str,
     predictor_path: str,
     trading_dates: list[str] | None = None,
+    zero_features: list[str] | None = None,
 ) -> dict[str, dict[str, float]]:
     """
     Run GBM inference for all tickers across all trading dates.
@@ -282,6 +398,14 @@ def run_inference(
     predictor_path : path to predictor repo root (for importing GBMScorer)
     trading_dates : optional list of dates to run inference on. If None,
         uses the union of all available feature dates.
+    zero_features : optional list of feature names to zero in-place on
+        the inference tensor before prediction. Used by
+        ``evaluate_feature_pruning`` to test noise-feature removal
+        without paying the ~1.1 GB DataFrame.copy() cost of building a
+        separate ``features_by_ticker`` dict. Matches the legacy
+        ``_zero_out_features`` contract: NaN entries in a zeroed column
+        become 0.0 (which may re-admit previously-invalid rows, same
+        as the legacy path).
 
     Returns
     -------
@@ -320,47 +444,33 @@ def run_inference(
         len(features_by_ticker), len(trading_dates),
     )
 
-    # Pre-extract feature vectors into {ticker: {date_str: numpy_array}}
-    # This avoids ~2M slow pandas .loc[] lookups in the inner loop.
-    logger.info("Pre-extracting feature vectors...")
-    feature_arrays: dict[str, dict[str, np.ndarray]] = {}
-    for ticker, featured_df in features_by_ticker.items():
-        try:
-            arr = featured_df[GBM_FEATURES].to_numpy(dtype=np.float32)
-            dates = featured_df.index.strftime("%Y-%m-%d")
-            # Handle duplicate dates: last value wins (same as iloc[-1])
-            feature_arrays[ticker] = dict(zip(dates, arr))
-        except (KeyError, ValueError):
-            continue
-    logger.info("Pre-extracted vectors for %d tickers", len(feature_arrays))
+    logger.info("Building inference tensor...")
+    tensor, tickers, date_to_idx = build_inference_tensor(
+        features_by_ticker, GBM_FEATURES,
+    )
+    logger.info(
+        "Inference tensor: shape=%s usable_tickers=%d",
+        tensor.shape, len(tickers),
+    )
 
-    predictions_by_date: dict[str, dict[str, float]] = {}
+    if zero_features:
+        # Zero requested feature columns across all (date, ticker)
+        # slots in-place on the tensor. Skips unknown features silently
+        # to match the legacy _zero_out_features behavior.
+        zero_idx = [
+            GBM_FEATURES.index(f) for f in zero_features if f in GBM_FEATURES
+        ]
+        if zero_idx:
+            tensor[:, :, zero_idx] = 0.0
+            logger.info(
+                "Zeroed %d feature column(s) on inference tensor: %s",
+                len(zero_idx), [GBM_FEATURES[i] for i in zero_idx],
+            )
 
-    for i, date_str in enumerate(trading_dates):
-        # Collect feature vectors for all tickers on this date
-        tickers_batch = []
-        vectors_batch = []
-
-        for ticker, date_to_vec in feature_arrays.items():
-            vec = date_to_vec.get(date_str)
-            if vec is not None and not np.any(np.isnan(vec)):
-                tickers_batch.append(ticker)
-                vectors_batch.append(vec)
-
-        if not vectors_batch:
-            continue
-
-        # Batch predict
-        X = np.stack(vectors_batch)  # shape (N, 29)
-        alphas = scorer.predict(X)   # shape (N,)
-
-        predictions_by_date[date_str] = {
-            ticker: float(alpha)
-            for ticker, alpha in zip(tickers_batch, alphas)
-        }
-
-        if (i + 1) % 50 == 0:
-            logger.info("  Inference: %d/%d dates", i + 1, len(trading_dates))
+    predictions_by_date = _predict_from_tensor(
+        tensor, tickers, date_to_idx, trading_dates,
+        scorer=scorer, heartbeat_every=50, log_label=" ",
+    )
 
     logger.info(
         "Inference complete: %d dates with predictions",

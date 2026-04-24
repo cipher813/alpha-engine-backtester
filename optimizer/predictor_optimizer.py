@@ -280,7 +280,13 @@ def _run_variant_inference(
     predictor_path: str,
     trading_dates: list[str],
 ) -> dict[str, dict[str, float]]:
-    """Run inference using a specific model variant."""
+    """Run inference using a specific model variant.
+
+    Shares the vectorized tensor builder with ``run_inference``. The
+    pre-refactor path allocated a 911-entry dict-of-dicts with ~2.28M
+    inner-loop ticks per inference pass; the tensor path does a single
+    O(n_tickers) build + O(n_dates) vectorized per-date slice.
+    """
     if predictor_path not in sys.path:
         sys.path.insert(0, predictor_path)
     from config import GBM_FEATURES
@@ -292,42 +298,30 @@ def _run_variant_inference(
         from model.gbm_scorer import GBMScorer
         scorer = GBMScorer.load(model_path)
 
-    # Pre-extract feature arrays (same pattern as run_inference)
-    feature_arrays: dict[str, dict[str, np.ndarray]] = {}
-    for ticker, featured_df in features_by_ticker.items():
-        try:
-            arr = featured_df[GBM_FEATURES].to_numpy(dtype=np.float32)
-            dates = featured_df.index.strftime("%Y-%m-%d")
-            feature_arrays[ticker] = dict(zip(dates, arr))
-        except (KeyError, ValueError):
-            continue
+    from synthetic.predictor_backtest import (
+        build_inference_tensor,
+        _predict_from_tensor,
+    )
 
     log.info(
         "Variant [%s] inference: starting across %d dates × %d tickers",
-        mode, len(trading_dates), len(feature_arrays),
+        mode, len(trading_dates), len(features_by_ticker),
     )
     t0 = time.monotonic()
-    predictions_by_date: dict[str, dict[str, float]] = {}
-    for i, date_str in enumerate(trading_dates):
-        tickers_batch = []
-        vectors_batch = []
-        for ticker, date_to_vec in feature_arrays.items():
-            vec = date_to_vec.get(date_str)
-            if vec is not None and not np.any(np.isnan(vec)):
-                tickers_batch.append(ticker)
-                vectors_batch.append(vec)
-        if not vectors_batch:
-            continue
-        X = np.stack(vectors_batch)
-        alphas = scorer.predict(X)
-        predictions_by_date[date_str] = {
-            ticker: float(alpha) for ticker, alpha in zip(tickers_batch, alphas)
-        }
-        if (i + 1) % _VARIANT_INFERENCE_HEARTBEAT == 0:
-            log.info(
-                "Variant [%s] inference: %d/%d dates (%.1fs elapsed, last=%s)",
-                mode, i + 1, len(trading_dates), time.monotonic() - t0, date_str,
-            )
+    tensor, tickers, date_to_idx = build_inference_tensor(
+        features_by_ticker, GBM_FEATURES,
+    )
+    log.info(
+        "Variant [%s] inference tensor: shape=%s usable_tickers=%d (%.1fs)",
+        mode, tensor.shape, len(tickers), time.monotonic() - t0,
+    )
+
+    predictions_by_date = _predict_from_tensor(
+        tensor, tickers, date_to_idx, trading_dates,
+        scorer=scorer,
+        heartbeat_every=_VARIANT_INFERENCE_HEARTBEAT,
+        log_label=f"Variant [{mode}]",
+    )
 
     log.info(
         "Variant [%s] inference: %d dates with predictions (%.1fs total)",
@@ -629,12 +623,6 @@ def evaluate_feature_pruning(
 
     log.info("Feature pruning: testing removal of %d noise features: %s", len(noise_candidates), noise_candidates)
 
-    # Create pruned feature set (zero out noise features)
-    log.info("Feature pruning: zeroing noise features across %d tickers", len(features_by_ticker))
-    t0 = time.monotonic()
-    pruned_features = _zero_out_features(features_by_ticker, noise_candidates)
-    log.info("Feature pruning: feature zeroing done (%.1fs)", time.monotonic() - t0)
-
     pb_config = config.get("predictor_backtest", {})
     top_n = pb_config.get("top_n_signals_per_day", 20)
     min_score = pb_config.get("min_score", 70)
@@ -644,15 +632,21 @@ def evaluate_feature_pruning(
     model_path = download_gbm_model(bucket=bucket)
 
     try:
-        # Run inference with pruned features
+        # Run inference with noise features zeroed in the shared
+        # inference tensor (no per-ticker DataFrame.copy() — previously
+        # allocated ~1.1 GB of transient DataFrame copies on the full
+        # 911-ticker universe, a legitimate OOM contributor on c5.large
+        # when Phase 4c runs while features_by_ticker is still resident).
         from synthetic.predictor_backtest import run_inference, build_signals_by_date
         log.info(
-            "Feature pruning: starting inference (%d tickers × %d dates)",
-            len(pruned_features), len(trading_dates),
+            "Feature pruning: starting inference (%d tickers × %d dates, "
+            "zeroing %d noise features)",
+            len(features_by_ticker), len(trading_dates), len(noise_candidates),
         )
         t0 = time.monotonic()
         predictions_by_date = run_inference(
-            pruned_features, model_path, predictor_path, trading_dates,
+            features_by_ticker, model_path, predictor_path, trading_dates,
+            zero_features=noise_candidates,
         )
         log.info("Feature pruning: inference complete (%.1fs)", time.monotonic() - t0)
 
@@ -738,19 +732,12 @@ def _load_noise_candidates(bucket: str) -> list[str]:
         return []
 
 
-def _zero_out_features(
-    features_by_ticker: dict[str, pd.DataFrame],
-    noise_features: list[str],
-) -> dict[str, pd.DataFrame]:
-    """Create a copy of features with noise columns zeroed out."""
-    result = {}
-    for ticker, df in features_by_ticker.items():
-        df_copy = df.copy()
-        for feat in noise_features:
-            if feat in df_copy.columns:
-                df_copy[feat] = 0.0
-        result[ticker] = df_copy
-    return result
+# Prior-art note: `_zero_out_features` was removed on 2026-04-24.
+# It deep-copied the 911-ticker feature dict (~1.1 GB transient)
+# just to zero a handful of columns. The equivalent semantics are
+# now expressed via run_inference(zero_features=...), which applies
+# the zero on the shared inference tensor in-place. See PR that
+# removed it for parity-test coverage.
 
 
 # ═════════════════════════════════════════════════════════════════════════════
