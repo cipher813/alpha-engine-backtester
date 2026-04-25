@@ -869,6 +869,80 @@ def _run_simulation_loop(
 # ── Replay helper for parity testing (Phase 1.1b) ──────────────────────────
 
 
+def _load_initial_state_from_eod_pnl(
+    trades_db_path: str | None,
+    parity_window_start: str,
+) -> dict | None:
+    """Bootstrap sim_client state from live's ``eod_pnl`` snapshot for the
+    most recent trading day strictly before ``parity_window_start``.
+
+    Returns ``None`` when no trades.db is available or when ``eod_pnl``
+    coverage doesn't reach back to ``parity_window_start - 1`` — caller
+    falls back to cold-start warmup. This is the bootstrap step in the
+    Option A long-term parity strategy: instead of replaying the entire
+    historical signal stream from day 0 (which compounds drift between
+    sim and live across every fill, dividend, corporate action, and
+    operator intervention), we pin sim's starting state to live's
+    actual realized state at the parity window edge. From there, both
+    systems run forward continuously and any divergence within the
+    window is genuine logic divergence — not warmup drift.
+
+    The ``eod_pnl.positions_snapshot`` JSON column is the source of
+    truth: live's executor writes it after each EOD reconcile pass with
+    full ticker / shares / avg_cost / sector. ``total_cash`` and
+    ``portfolio_nav`` complete the bootstrap state. Peak NAV is queried
+    as ``MAX(portfolio_nav)`` over all ``eod_pnl`` rows up to the
+    bootstrap date so drawdown gates start with the correct watermark.
+    """
+    import json
+    import os
+    import sqlite3
+
+    if not trades_db_path or not os.path.exists(trades_db_path):
+        return None
+
+    conn = sqlite3.connect(trades_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT date, portfolio_nav, total_cash, positions_snapshot "
+            "FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1",
+            (parity_window_start,),
+        ).fetchone()
+        if row is None:
+            return None
+        peak_row = conn.execute(
+            "SELECT MAX(portfolio_nav) FROM eod_pnl WHERE date <= ?",
+            (row["date"],),
+        ).fetchone()
+        peak_nav = float(peak_row[0]) if peak_row[0] is not None else float(row["portfolio_nav"])
+        positions_raw = json.loads(row["positions_snapshot"]) if row["positions_snapshot"] else {}
+        # Project to sim_client._positions shape: {ticker: {shares, avg_cost,
+        # entry_date, sector}}. The eod_pnl snapshot carries richer fields
+        # (market_value, unrealized_pnl, daily_return_pct, alpha_contribution)
+        # that the sim doesn't read; drop them to keep the bootstrap dict
+        # shape symmetric with what place_market_order writes during the run.
+        positions: dict[str, dict] = {}
+        for ticker, p in positions_raw.items():
+            shares = int(p.get("shares") or 0)
+            if shares == 0:
+                continue
+            positions[ticker] = {
+                "shares": shares,
+                "avg_cost": float(p.get("avg_cost") or 0.0),
+                "entry_date": p.get("entry_date"),
+                "sector": p.get("sector", ""),
+            }
+        return {
+            "positions": positions,
+            "cash": float(row["total_cash"] or 0.0),
+            "peak_nav": peak_nav,
+            "as_of": row["date"],
+        }
+    finally:
+        conn.close()
+
+
 def replay_for_dates(
     dates: list[str],
     config: dict,
@@ -932,6 +1006,31 @@ def replay_for_dates(
     config_override = _build_config_override(config)
     sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
 
+    # Bootstrap sim_client state from live's eod_pnl if a trades.db is
+    # available and the parity window starts after eod_pnl coverage begins.
+    # See ``_load_initial_state_from_eod_pnl`` docstring for the rationale.
+    # When bootstrap succeeds, the long-warmup replay below is REPLACED by
+    # the bootstrap state — sim runs only the requested dates with live's
+    # actual portfolio at the window edge as its starting point.
+    bootstrap_state: dict | None = None
+    if dates:
+        earliest_requested = min(dates)
+        bootstrap_state = _load_initial_state_from_eod_pnl(
+            config.get("trades_db_path"), earliest_requested,
+        )
+        if bootstrap_state:
+            sim_client._cash = bootstrap_state["cash"]
+            sim_client._positions = bootstrap_state["positions"]
+            sim_client._peak_nav = bootstrap_state["peak_nav"]
+            logger.info(
+                "Bootstrapped sim from live eod_pnl as_of=%s: "
+                "%d positions, cash=$%.0f, peak_nav=$%.0f",
+                bootstrap_state["as_of"],
+                len(bootstrap_state["positions"]),
+                bootstrap_state["cash"],
+                bootstrap_state["peak_nav"],
+            )
+
     # Load today's ArcticDB universe once — used to filter historical signals
     # that reference since-dropped tickers (e.g. TSM/ASML post-2026-04-20).
     # Mirrors the _run_simulation_loop pattern. Without this, parity replay
@@ -949,7 +1048,13 @@ def replay_for_dates(
             f"ArcticDB universe symbols from bucket {bucket!r}: {exc}"
         ) from exc
 
-    if warmup_from_full_history and dates:
+    if bootstrap_state is not None:
+        # Bootstrap already pinned sim to live state at the window edge;
+        # warmup-replay would just re-evolve from that point producing
+        # the same orders we're trying to test. Run only the requested
+        # parity dates with continuous state.
+        sim_dates = sorted(dates)
+    elif warmup_from_full_history and dates:
         latest_requested = max(dates)
         sim_dates = [d for d in all_signal_dates if d <= latest_requested]
     else:
