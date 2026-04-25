@@ -905,34 +905,52 @@ def _load_initial_state_from_eod_pnl(
         logger.warning("Bootstrap skipped: trades_db_path %s does not exist", trades_db_path)
         return None
 
+    # eod_pnl rows must carry meaningful state to be useful for bootstrap.
+    # ``total_cash`` and ``positions_snapshot`` were added by alpha-engine
+    # PR #59 (2026-04-17 EOD cash-attribution fixes); historical rows
+    # before that have NULL/empty values. Falling back to the earliest
+    # row regardless yielded cash=$0/positions={} which makes sim
+    # produce zero ENTERs in the entire window. Require non-null cash
+    # AND non-empty positions_snapshot — anything else isn't a usable
+    # baseline.
+    _MEANINGFUL_CLAUSE = (
+        "total_cash IS NOT NULL "
+        "AND positions_snapshot IS NOT NULL "
+        "AND length(positions_snapshot) > 2"
+    )
+
     conn = sqlite3.connect(trades_db_path)
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(
             "SELECT date, portfolio_nav, total_cash, positions_snapshot "
-            "FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1",
+            f"FROM eod_pnl WHERE date < ? AND {_MEANINGFUL_CLAUSE} "
+            "ORDER BY date DESC LIMIT 1",
             (parity_window_start,),
         ).fetchone()
         if row is None:
-            # No eod_pnl row strictly before window_start. Fall back to the
-            # earliest available eod_pnl row — bootstrap from the closest
-            # state we have. Caller is responsible for clipping the parity
-            # window to dates >= row.date so we don't compare uncoverable
-            # pre-bootstrap dates against the wrong baseline.
+            # No meaningful eod_pnl row strictly before window_start. Fall
+            # back to the earliest meaningful row available. Caller clips
+            # parity dates to >= row.date so we don't validate against
+            # state we can't reconstruct.
             row = conn.execute(
                 "SELECT date, portfolio_nav, total_cash, positions_snapshot "
-                "FROM eod_pnl ORDER BY date ASC LIMIT 1"
+                f"FROM eod_pnl WHERE {_MEANINGFUL_CLAUSE} "
+                "ORDER BY date ASC LIMIT 1"
             ).fetchone()
             if row is None:
                 logger.warning(
-                    "Bootstrap skipped: eod_pnl table is empty in %s",
+                    "Bootstrap skipped: no eod_pnl row in %s has both "
+                    "non-null total_cash AND non-empty positions_snapshot. "
+                    "Live executor's EOD reconcile may not yet be writing "
+                    "those columns — see alpha-engine PR #59.",
                     trades_db_path,
                 )
                 return None
             logger.warning(
-                "Bootstrap fallback: no eod_pnl row strictly before "
-                "parity_window_start=%s; using earliest available row "
-                "(date=%s). Caller must clip parity dates to >= %s.",
+                "Bootstrap fallback: no meaningful eod_pnl row strictly "
+                "before parity_window_start=%s; using earliest meaningful "
+                "row (date=%s). Caller must clip parity dates to >= %s.",
                 parity_window_start, row["date"], row["date"],
             )
         peak_row = conn.execute(
