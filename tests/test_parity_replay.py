@@ -189,7 +189,8 @@ def diff_fields(live_trade: dict, replay_trade: dict) -> dict[str, dict]:
 # ── Backtester invocation (Phase 1.1b) ──────────────────────────────────────
 
 def _run_backtester_for_dates(dates: list[str], bucket: str,
-                              config_path: str | None = None) -> list[dict]:
+                              config_path: str | None = None,
+                              trades_db_path: str | None = None) -> list[dict]:
     """Replay the backtester for each date, return the aggregated order list.
 
     Thin wrapper over ``backtest.replay_for_dates`` — loads config, overrides
@@ -200,6 +201,12 @@ def _run_backtester_for_dates(dates: list[str], bucket: str,
     ``alpha-engine`` checkout — the backtester imports the executor directly
     rather than reimplementing it, so ``simulate=True`` actually exercises
     live executor code.
+
+    ``trades_db_path``: when provided, sim bootstraps initial positions/cash
+    from ``eod_pnl``'s most recent snapshot strictly before the parity
+    window. Replaces the cold-start warmup (Option A long-term parity
+    strategy — see ``_load_initial_state_from_eod_pnl`` docstring in
+    backtest.py).
     """
     from pipeline_common import load_config
     import backtest as _bt
@@ -208,6 +215,8 @@ def _run_backtester_for_dates(dates: list[str], bucket: str,
     config = load_config(cfg_path)
     if bucket:
         config["signals_bucket"] = bucket
+    if trades_db_path:
+        config["trades_db_path"] = trades_db_path
 
     return _bt.replay_for_dates(sorted(dates), config)
 
@@ -547,7 +556,7 @@ def test_parity_replay_end_to_end():
     # producing orders tagged with `o["date"] = signal_date` — which equals
     # signal_trading_day on the live side post-backfill. The cohort key
     # matches across both sides without further translation.
-    replay_orders = _run_backtester_for_dates(dates, bucket)
+    replay_orders = _run_backtester_for_dates(dates, bucket, trades_db_path=db_path)
 
     # Filter both sides to ENTERs for cohort matching. Exits don't have
     # signal_trading_day on the live side (NULL by design), so cohort
