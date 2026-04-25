@@ -898,7 +898,11 @@ def _load_initial_state_from_eod_pnl(
     import os
     import sqlite3
 
-    if not trades_db_path or not os.path.exists(trades_db_path):
+    if not trades_db_path:
+        logger.info("Bootstrap skipped: no trades_db_path in config — cold-start warmup")
+        return None
+    if not os.path.exists(trades_db_path):
+        logger.warning("Bootstrap skipped: trades_db_path %s does not exist", trades_db_path)
         return None
 
     conn = sqlite3.connect(trades_db_path)
@@ -910,7 +914,27 @@ def _load_initial_state_from_eod_pnl(
             (parity_window_start,),
         ).fetchone()
         if row is None:
-            return None
+            # No eod_pnl row strictly before window_start. Fall back to the
+            # earliest available eod_pnl row — bootstrap from the closest
+            # state we have. Caller is responsible for clipping the parity
+            # window to dates >= row.date so we don't compare uncoverable
+            # pre-bootstrap dates against the wrong baseline.
+            row = conn.execute(
+                "SELECT date, portfolio_nav, total_cash, positions_snapshot "
+                "FROM eod_pnl ORDER BY date ASC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                logger.warning(
+                    "Bootstrap skipped: eod_pnl table is empty in %s",
+                    trades_db_path,
+                )
+                return None
+            logger.warning(
+                "Bootstrap fallback: no eod_pnl row strictly before "
+                "parity_window_start=%s; using earliest available row "
+                "(date=%s). Caller must clip parity dates to >= %s.",
+                parity_window_start, row["date"], row["date"],
+            )
         peak_row = conn.execute(
             "SELECT MAX(portfolio_nav) FROM eod_pnl WHERE date <= ?",
             (row["date"],),
@@ -1053,7 +1077,28 @@ def replay_for_dates(
         # warmup-replay would just re-evolve from that point producing
         # the same orders we're trying to test. Run only the requested
         # parity dates with continuous state.
-        sim_dates = sorted(dates)
+        #
+        # Clip dates to >= bootstrap.as_of: a parity date that predates
+        # our state snapshot can't be validated — sim's positions came
+        # from a future point relative to that date. Drop those dates
+        # rather than emitting orders the test will spuriously diff.
+        as_of = bootstrap_state["as_of"]
+        clipped = [d for d in sorted(dates) if d >= as_of]
+        n_dropped = len(dates) - len(clipped)
+        if n_dropped:
+            dropped_dates = sorted(d for d in dates if d < as_of)
+            logger.warning(
+                "Parity window clipped: %d/%d requested dates predate the "
+                "bootstrap as_of=%s — dropping %s. Increase eod_pnl coverage "
+                "or shorten the parity window to include only post-bootstrap "
+                "dates.",
+                n_dropped, len(dates), as_of, dropped_dates,
+            )
+        sim_dates = clipped
+        # Mirror the clip in `requested` so the caller's downstream
+        # ``signal_date in requested`` filter doesn't emit captured
+        # orders for clipped dates either.
+        requested = set(clipped)
     elif warmup_from_full_history and dates:
         latest_requested = max(dates)
         sim_dates = [d for d in all_signal_dates if d <= latest_requested]
