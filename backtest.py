@@ -1091,18 +1091,22 @@ def replay_for_dates(
         ) from exc
 
     if bootstrap_state is not None:
-        # Bootstrap already pinned sim to live state at the window edge;
-        # warmup-replay would just re-evolve from that point producing
-        # the same orders we're trying to test. Run only the requested
-        # parity dates with continuous state.
+        # Bootstrap pinned sim to live state at as_of. From there we run
+        # sim continuously through every signal date up to max(dates),
+        # capturing orders only on the requested dates. Running just the
+        # requested dates would skip state evolution on every date in
+        # between — sim's positions/cash at parity_date_2 would still
+        # reflect bootstrap state, ignoring everything sim "did" between
+        # bootstrap and parity_date_1. Continuous replay from bootstrap
+        # is the Option A contract: live and sim share a starting state
+        # then evolve forward through the same trading days.
         #
-        # Clip dates to >= bootstrap.as_of: a parity date that predates
-        # our state snapshot can't be validated — sim's positions came
-        # from a future point relative to that date. Drop those dates
-        # rather than emitting orders the test will spuriously diff.
+        # Clip captured orders to dates >= bootstrap.as_of: pre-bootstrap
+        # parity dates can't be validated (sim's state came from after
+        # they happened). Drop them with a named WARNING.
         as_of = bootstrap_state["as_of"]
-        clipped = [d for d in sorted(dates) if d >= as_of]
-        n_dropped = len(dates) - len(clipped)
+        post_bootstrap_requested = sorted(d for d in dates if d >= as_of)
+        n_dropped = len(dates) - len(post_bootstrap_requested)
         if n_dropped:
             dropped_dates = sorted(d for d in dates if d < as_of)
             logger.warning(
@@ -1112,11 +1116,17 @@ def replay_for_dates(
                 "dates.",
                 n_dropped, len(dates), as_of, dropped_dates,
             )
-        sim_dates = clipped
-        # Mirror the clip in `requested` so the caller's downstream
-        # ``signal_date in requested`` filter doesn't emit captured
-        # orders for clipped dates either.
-        requested = set(clipped)
+        if post_bootstrap_requested:
+            latest_requested = max(post_bootstrap_requested)
+            # All signal dates in [as_of, latest_requested] — sim evolves
+            # state on every one, parity captures only the requested set.
+            sim_dates = [
+                d for d in all_signal_dates
+                if as_of <= d <= latest_requested
+            ]
+        else:
+            sim_dates = []
+        requested = set(post_bootstrap_requested)
     elif warmup_from_full_history and dates:
         latest_requested = max(dates)
         sim_dates = [d for d in all_signal_dates if d <= latest_requested]
