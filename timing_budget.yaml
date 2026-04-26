@@ -104,10 +104,18 @@ full_run_hard_caps_seconds:
   # Phase 4c: single pruned sim. Typical: 5–10 min. Cap at 20 min.
   phase4c_feature_pruning: 1200.0
 
-  # Predictor data prep (feature build + matrix) — post ohlcv pandas
-  # refactor expected ~5–10 min. Cap at 30 min covers 911-ticker cold
-  # ArcticDB read + GBM inference + indicator precompute.
-  predictor_data_prep: 1800.0
+  # Predictor data prep (feature build + matrix + signal generation +
+  # full artifact persistence). Empirical 2026-04-26 v6 c5.large:
+  # 1913s (~32 min). Most of the time is in _save_predictor_data_prep
+  # serializing the ~1 GB signals_by_date dict as a single JSON blob —
+  # known performance hot spot, follow-up to convert to flat parquet
+  # tracked separately. Cap raised from 1800s to 3600s to absorb that
+  # cost; the optimization-arc validation hit the 30-min cap with a
+  # PhaseTimeoutError despite producing all artifacts correctly +
+  # staying within memory budget. The 60-min cap leaves comfortable
+  # margin for cold ArcticDB tail + GBM cold-start while still
+  # firing well before the 7200s SSM ceiling.
+  predictor_data_prep: 3600.0
 
   # Predictor-side pipeline (encompasses data_prep → inference → signal
   # generation → primary sim). Typical 10–20 min. Cap at 60 min.
