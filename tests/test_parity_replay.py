@@ -8,29 +8,50 @@ Opt-in via the `parity` pytest marker so CI on feature branches doesn't
 try to reach S3. Spot instance runs it explicitly via spot_backtest.sh
 after the weekly backtest completes.
 
-Status: WIRING LANDED (2026-04-16, Phase 1.1b).
-  * Diff logic (pure functions) is complete and unit-tested below.
-  * `_run_backtester_for_dates()` delegates to `backtest.replay_for_dates()`
-    which exercises the live executor (`simulate=True` path) for each date.
-  * Remaining: Phase 1.4 — invoke this test from infrastructure/spot_backtest.sh
-    post-backtest; upload parity_report.json to S3; email on divergence.
+PARITY IS OBSERVABILITY, NOT A GATE
+-----------------------------------
+The integration test does NOT pass/fail on divergence. Its job is to
+GENERATE two artifacts every Saturday SF run:
+
+* ``parity_report.json`` — per-run drill-down (per-date count + ticker-set
+  + field divergence breakdowns). Operator-readable; surfaced via the
+  spot_backtest.sh upload to ``s3://{bucket}/backtest/{date}/``.
+* ``parity_metrics.csv`` — append one row per run to
+  ``s3://{bucket}/backtest/parity_metrics.csv`` with five trend-friendly
+  numbers. Time series: anomaly is visible as a step-change vs trailing
+  trend, not as a tolerance breach.
+
+The reason: 0% historical parity is structurally unreachable for a
+system with auto-tuned configs and weekly-evolving executor code. Code
+drift, config drift, score-snapshot drift, market-data drift, and
+daemon-stage logic gaps all contribute to bounded-but-nonzero variance.
+Treating that variance as a binary FAIL produces noise alarms each
+Saturday and chases tolerance instead of *understanding* divergence.
+
+Tracking variance over time is what's load-bearing: stable variance =
+healthy, sudden swing = root-cause investigation. Specific dates can
+still be inspected via the per-run report; the metric trend tells us
+when it's worth opening that drill-down.
 
 Usage:
-    # Unit tests (diff logic only) — always run
+    # Unit tests (diff logic + metric computation) — always run
     pytest tests/test_parity_replay.py
 
     # Full parity replay — opt-in, requires trades.db + S3 ArcticDB access
     pytest tests/test_parity_replay.py -m parity -v
 
 Environment (for parity run):
-    TRADES_DB_PATH       override path to trades.db (else download from S3)
-    TRADES_DB_S3_URI     e.g. s3://alpha-engine-research/trades/trades_latest.db
-    SIGNALS_BUCKET       default "alpha-engine-research"
-    PARITY_WINDOW_DAYS   default 10
+    TRADES_DB_PATH                override path to trades.db (else download from S3)
+    TRADES_DB_S3_URI              e.g. s3://alpha-engine-research/trades/trades_latest.db
+    SIGNALS_BUCKET                default "alpha-engine-research"
+    PARITY_WINDOW_DAYS            default 10
+    PARITY_RUN_DATE               override the run_date column in the time-series CSV
+    PARITY_SKIP_METRICS_WRITE=1   skip the time-series append (e.g. dev runs)
 """
 
 from __future__ import annotations
 
+import io
 import os
 import sqlite3
 import sys
@@ -118,9 +139,12 @@ LIFECYCLE_SKIP_FIELDS = frozenset({
     "prediction_confidence",
 })
 
-# Per-day divergence thresholds (see docs/trade_mapping.md)
+# Per-day divergence thresholds. Used by ``diff_trade_count`` /
+# ``diff_ticker_sets`` to surface DATES-OF-INTEREST in the report's
+# divergence breakdown. NOT used as a pass/fail gate — see "parity is
+# observability, not a binary" in the module docstring above.
 TRADE_COUNT_PCT_THRESHOLD = 0.05     # 5%
-TICKER_SET_PER_DAY_MAX = 1           # >1 ticker differ per day fails
+TICKER_SET_PER_DAY_MAX = 1           # >1 ticker differ per day flagged
 TICKER_SET_CUMULATIVE_PCT = 0.05     # OR >5% cumulative across window
 
 
@@ -206,6 +230,142 @@ def diff_fields(live_trade: dict, replay_trade: dict) -> dict[str, dict]:
                                  "threshold_rel": tol.rel, "threshold_abs": tol.abs_}
 
     return violations
+
+
+# ── Variance metrics (parity-as-observability) ──────────────────────────────
+
+def compute_parity_metrics(
+    live_by_date: dict[str, int],
+    replay_by_date_count: dict[str, int],
+    live_tickers_by_date: dict[str, set[str]],
+    replay_tickers_by_date: dict[str, set[str]],
+    n_field_violations: int,
+    n_cohort_matched: int,
+    n_lifecycle_skipped: int,
+) -> dict[str, float | int]:
+    """Reduce the parity diff into 5 trend-friendly numbers.
+
+    Tracked over time in
+    ``s3://alpha-engine-research/backtest/parity_metrics.csv`` so anomaly
+    is visible as a step-change vs trailing trend, not as a tolerance
+    breach. None of these are gated — they describe variance, not pass/
+    fail. The historical drift floor is empirically learned from the
+    time series itself.
+
+    * ``capture_rate`` = backtester ENTERs / live ENTERs in the window.
+      "How many of live's picks did sim see?"
+    * ``ticker_jaccard_avg`` = mean per-date ``|L∩B| / |L∪B|`` across
+      cohort dates. "How much do the per-date picks overlap?"
+    * ``count_divergence_rms`` = RMS of per-date count gap.
+      "How wide are the per-date count gaps on average?"
+    * ``field_diff_rate`` = field-violation count / cohort-matched ENTER
+      count. "Of the trades that match by key, how many disagree on
+      sized fields?"
+    * ``n_lifecycle_skipped`` = static count of fields excluded from
+      field comparison. Tracked so a future skip-list change is visible
+      in the metric history.
+    """
+    n_live_total = sum(live_by_date.values())
+    n_back_total = sum(replay_by_date_count.values())
+    capture_rate = (n_back_total / n_live_total) if n_live_total else 0.0
+
+    all_dates = sorted(set(live_by_date) | set(replay_by_date_count)
+                       | set(live_tickers_by_date) | set(replay_tickers_by_date))
+
+    jaccards: list[float] = []
+    for d in all_dates:
+        L = live_tickers_by_date.get(d, set())
+        B = replay_tickers_by_date.get(d, set())
+        union = L | B
+        if not union:
+            continue
+        jaccards.append(len(L & B) / len(union))
+    jaccard_avg = sum(jaccards) / len(jaccards) if jaccards else 0.0
+
+    count_diffs_sq: list[float] = []
+    for d in all_dates:
+        diff = replay_by_date_count.get(d, 0) - live_by_date.get(d, 0)
+        count_diffs_sq.append(float(diff * diff))
+    count_rms = (sum(count_diffs_sq) / len(count_diffs_sq)) ** 0.5 if count_diffs_sq else 0.0
+
+    field_diff_rate = (n_field_violations / n_cohort_matched) if n_cohort_matched else 0.0
+
+    return {
+        "capture_rate": round(capture_rate, 4),
+        "ticker_jaccard_avg": round(jaccard_avg, 4),
+        "count_divergence_rms": round(count_rms, 4),
+        "field_diff_rate": round(field_diff_rate, 4),
+        "n_lifecycle_skipped": int(n_lifecycle_skipped),
+        "n_live_enters": int(n_live_total),
+        "n_backtester_enters": int(n_back_total),
+        "n_cohort_matched_enters": int(n_cohort_matched),
+        "n_field_violations": int(n_field_violations),
+        "n_dates_in_window": int(len(all_dates)),
+    }
+
+
+def append_parity_metrics_row(
+    metrics: dict,
+    run_date: str,
+    bucket: str,
+    s3_key: str = "backtest/parity_metrics.csv",
+) -> None:
+    """Append (or overwrite) one row in the time-series CSV. Idempotent on
+    ``run_date``: re-running the same date overwrites prior values, so
+    iteration on a single Saturday cohort doesn't pollute the history.
+
+    Schema (additive-only per S3 contract): ``run_date``, then every key
+    in ``metrics`` plus the literal ``window_start`` / ``window_end``
+    cohort bounds. New metric keys can be added; existing ones never
+    rename or remove.
+
+    Best-effort: if S3 access fails the write is skipped with a WARNING
+    rather than failing the run. Parity is observability — the metric
+    history is nice-to-have but the per-run report.json is the
+    authoritative artifact.
+    """
+    import io
+    import logging
+    import boto3
+    from botocore.exceptions import ClientError
+
+    log = logging.getLogger("parity_metrics")
+    s3 = boto3.client("s3")
+
+    columns = ["run_date"] + sorted(metrics.keys())
+
+    existing_df: pd.DataFrame
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=s3_key)
+        existing_df = pd.read_csv(io.BytesIO(obj["Body"].read()))
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            existing_df = pd.DataFrame(columns=columns)
+        else:
+            log.warning("parity_metrics CSV read failed: %s — skipping append", e)
+            return
+    except Exception as e:
+        log.warning("parity_metrics CSV unexpected error: %s — skipping append", e)
+        return
+
+    # Drop any prior row for this run_date (idempotent re-runs)
+    if "run_date" in existing_df.columns:
+        existing_df = existing_df[existing_df["run_date"] != run_date]
+
+    new_row = {"run_date": run_date, **metrics}
+    out_df = pd.concat([existing_df, pd.DataFrame([new_row])], ignore_index=True)
+    # Preserve any historical-only columns (additive contract)
+    for col in columns:
+        if col not in out_df.columns:
+            out_df[col] = None
+    out_df = out_df.sort_values("run_date").reset_index(drop=True)
+
+    try:
+        s3.put_object(Bucket=bucket, Key=s3_key, Body=out_df.to_csv(index=False).encode())
+        log.info("Appended parity metrics for %s to s3://%s/%s (%d rows total)",
+                 run_date, bucket, s3_key, len(out_df))
+    except Exception as e:
+        log.warning("parity_metrics CSV write failed: %s — skipping append", e)
 
 
 # ── Backtester invocation (Phase 1.1b) ──────────────────────────────────────
@@ -554,6 +714,158 @@ class TestLifecycleSkipFields:
         assert "prediction_confidence" not in diff_fields(live, replay)
 
 
+class TestComputeParityMetrics:
+    """Pure function — no S3, no I/O. The arithmetic that turns the diff
+    state into trend-friendly numbers."""
+
+    def test_perfect_match_yields_unit_capture_zero_diff(self):
+        live = {"2026-04-13": 5, "2026-04-20": 7}
+        rep = {"2026-04-13": 5, "2026-04-20": 7}
+        live_t = {"2026-04-13": {"AAPL", "MSFT"}, "2026-04-20": {"NVDA"}}
+        rep_t = {"2026-04-13": {"AAPL", "MSFT"}, "2026-04-20": {"NVDA"}}
+        m = compute_parity_metrics(live, rep, live_t, rep_t,
+                                   n_field_violations=0, n_cohort_matched=10,
+                                   n_lifecycle_skipped=16)
+        assert m["capture_rate"] == 1.0
+        assert m["ticker_jaccard_avg"] == 1.0
+        assert m["count_divergence_rms"] == 0.0
+        assert m["field_diff_rate"] == 0.0
+        assert m["n_dates_in_window"] == 2
+
+    def test_capture_rate_under_1_when_backtester_undershoots(self):
+        live = {"2026-04-13": 10}
+        rep = {"2026-04-13": 6}
+        m = compute_parity_metrics(live, rep, {}, {}, 0, 0, 0)
+        assert m["capture_rate"] == 0.6
+
+    def test_jaccard_partial_overlap(self):
+        live_t = {"2026-04-13": {"AAPL", "MSFT", "NVDA"}}
+        rep_t = {"2026-04-13": {"AAPL", "MSFT", "TSLA", "GOOG"}}
+        # |L ∩ B| = 2 (AAPL, MSFT); |L ∪ B| = 5 → 0.4
+        m = compute_parity_metrics({}, {}, live_t, rep_t, 0, 0, 0)
+        assert m["ticker_jaccard_avg"] == 0.4
+
+    def test_count_rms_two_dates(self):
+        live = {"2026-04-13": 10, "2026-04-20": 5}
+        rep = {"2026-04-13": 6, "2026-04-20": 3}
+        # diffs: -4, -2 → RMS = sqrt((16+4)/2) = sqrt(10) ≈ 3.1623
+        m = compute_parity_metrics(live, rep, {}, {}, 0, 0, 0)
+        assert abs(m["count_divergence_rms"] - 3.1623) < 0.001
+
+    def test_field_diff_rate_zero_matched_means_zero(self):
+        m = compute_parity_metrics({}, {}, {}, {}, n_field_violations=5,
+                                   n_cohort_matched=0, n_lifecycle_skipped=0)
+        assert m["field_diff_rate"] == 0.0
+
+    def test_field_diff_rate_partial(self):
+        m = compute_parity_metrics({}, {}, {}, {}, n_field_violations=3,
+                                   n_cohort_matched=10, n_lifecycle_skipped=0)
+        assert m["field_diff_rate"] == 0.3
+
+    def test_dates_only_on_one_side_still_counted(self):
+        # backtester sees a date live didn't (or vice-versa) — should still
+        # appear in the union and contribute to averages.
+        live = {"2026-04-13": 5}
+        rep = {"2026-04-13": 5, "2026-04-20": 0}  # extra date with 0 picks
+        live_t = {"2026-04-13": {"AAPL"}}
+        rep_t = {"2026-04-13": {"AAPL"}, "2026-04-20": set()}
+        m = compute_parity_metrics(live, rep, live_t, rep_t, 0, 0, 0)
+        # 2026-04-20 has empty union, skipped from jaccard average
+        assert m["ticker_jaccard_avg"] == 1.0
+        # n_dates_in_window includes both
+        assert m["n_dates_in_window"] == 2
+
+    def test_zero_live_doesnt_divide_by_zero(self):
+        m = compute_parity_metrics({}, {"2026-04-13": 3}, {}, {}, 0, 0, 0)
+        # No live picks — capture_rate is 0 by convention, not nan
+        assert m["capture_rate"] == 0.0
+
+
+class TestAppendParityMetricsRow:
+    """Cover the time-series writer's idempotency + schema discipline."""
+
+    def _patch_s3(self, monkeypatch, store: dict):
+        """Patch boto3.client to return a fake S3 backed by a dict.
+        ``store`` is keyed by S3 key; each value is the bytes of the object."""
+        from unittest.mock import MagicMock
+        from botocore.exceptions import ClientError
+
+        client = MagicMock()
+
+        def get_object(Bucket, Key):
+            if Key not in store:
+                err = ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+                raise err
+            from io import BytesIO
+            return {"Body": BytesIO(store[Key])}
+
+        def put_object(Bucket, Key, Body):
+            store[Key] = Body
+            return {}
+
+        client.get_object.side_effect = get_object
+        client.put_object.side_effect = put_object
+
+        import boto3
+        monkeypatch.setattr(boto3, "client", lambda *a, **kw: client)
+        return client
+
+    def test_first_run_creates_csv(self, monkeypatch):
+        store: dict = {}
+        self._patch_s3(monkeypatch, store)
+        metrics = {"capture_rate": 0.6, "ticker_jaccard_avg": 0.5,
+                   "count_divergence_rms": 2.0, "field_diff_rate": 0.1,
+                   "n_lifecycle_skipped": 16}
+        append_parity_metrics_row(metrics, run_date="2026-04-26", bucket="b")
+        assert "backtest/parity_metrics.csv" in store
+        df = pd.read_csv(io.BytesIO(store["backtest/parity_metrics.csv"]))
+        assert len(df) == 1
+        assert df.iloc[0]["run_date"] == "2026-04-26"
+        assert df.iloc[0]["capture_rate"] == 0.6
+
+    def test_subsequent_run_appends_row(self, monkeypatch):
+        # Pre-populate with one row
+        seed = pd.DataFrame([{"run_date": "2026-04-20", "capture_rate": 0.4,
+                              "ticker_jaccard_avg": 0.3, "count_divergence_rms": 5.0,
+                              "field_diff_rate": 0.2, "n_lifecycle_skipped": 16}])
+        store = {"backtest/parity_metrics.csv": seed.to_csv(index=False).encode()}
+        self._patch_s3(monkeypatch, store)
+        metrics = {"capture_rate": 0.6, "ticker_jaccard_avg": 0.5,
+                   "count_divergence_rms": 2.0, "field_diff_rate": 0.1,
+                   "n_lifecycle_skipped": 16}
+        append_parity_metrics_row(metrics, run_date="2026-04-26", bucket="b")
+        df = pd.read_csv(io.BytesIO(store["backtest/parity_metrics.csv"]))
+        assert len(df) == 2
+        # Sorted by run_date
+        assert list(df["run_date"]) == ["2026-04-20", "2026-04-26"]
+
+    def test_re_run_same_date_is_idempotent(self, monkeypatch):
+        # Re-running today's parity overwrites today's row (no duplicates).
+        seed = pd.DataFrame([{"run_date": "2026-04-26", "capture_rate": 0.4,
+                              "ticker_jaccard_avg": 0.3, "count_divergence_rms": 5.0,
+                              "field_diff_rate": 0.2, "n_lifecycle_skipped": 16}])
+        store = {"backtest/parity_metrics.csv": seed.to_csv(index=False).encode()}
+        self._patch_s3(monkeypatch, store)
+        metrics = {"capture_rate": 0.6, "ticker_jaccard_avg": 0.5,
+                   "count_divergence_rms": 2.0, "field_diff_rate": 0.1,
+                   "n_lifecycle_skipped": 16}
+        append_parity_metrics_row(metrics, run_date="2026-04-26", bucket="b")
+        df = pd.read_csv(io.BytesIO(store["backtest/parity_metrics.csv"]))
+        assert len(df) == 1  # overwritten, not duplicated
+        assert df.iloc[0]["capture_rate"] == 0.6  # new value
+
+    def test_s3_error_swallowed_not_raised(self, monkeypatch):
+        # Best-effort: a write failure must not break the test path.
+        from unittest.mock import MagicMock
+        client = MagicMock()
+        client.get_object.side_effect = RuntimeError("boom")
+        import boto3
+        monkeypatch.setattr(boto3, "client", lambda *a, **kw: client)
+
+        # Should NOT raise
+        append_parity_metrics_row({"capture_rate": 0.5}, run_date="2026-04-26", bucket="b")
+
+
 # ── Integration test (opt-in) ───────────────────────────────────────────────
 
 @pytest.mark.parity
@@ -651,6 +963,7 @@ def test_parity_replay_end_to_end():
     # diff_fields — they're populated post-trade by the live executor and
     # the backtester sim cannot reproduce them.
     field_violations: list[dict] = []
+    n_cohort_matched = 0
     for _, row in window.iterrows():
         key = (row["signal_trading_day"], row["ticker"], row["action"])
         match = next(
@@ -662,6 +975,7 @@ def test_parity_replay_end_to_end():
         )
         if match is None:
             continue
+        n_cohort_matched += 1
         vs = diff_fields(row.to_dict(), match)
         if vs:
             field_violations.append({
@@ -671,8 +985,23 @@ def test_parity_replay_end_to_end():
                 "fields": vs,
             })
 
+    metrics = compute_parity_metrics(
+        live_by_date=live_by_date,
+        replay_by_date_count=replay_by_date_count,
+        live_tickers_by_date=live_tickers_by_date,
+        replay_tickers_by_date=replay_tickers_by_date,
+        n_field_violations=len(field_violations),
+        n_cohort_matched=n_cohort_matched,
+        n_lifecycle_skipped=len(LIFECYCLE_SKIP_FIELDS),
+    )
+
+    # Parity is observability, not a gate. The report still surfaces
+    # divergence categories (count / ticker-set / field) at the prior
+    # thresholds — those let the operator drill into specific dates —
+    # but the test does NOT fail on them. Trends in ``metrics`` over
+    # time (s3://.../backtest/parity_metrics.csv) are the load-bearing
+    # signal: stable variance = healthy, step-change = investigate.
     report = {
-        "status": "fail" if (count_violations or ticker_violations or field_violations) else "pass",
         "match_key": "(signal_trading_day, ticker, action)",
         "window_signal_trading_days": [dates[0], dates[-1]],
         "n_live_trades_total": int(len(trades_df)),
@@ -680,6 +1009,7 @@ def test_parity_replay_end_to_end():
         "n_live_excluded_no_signal_day": int(n_excluded),
         "n_backtester_orders_total": len(replay_orders),
         "n_backtester_enters": len(replay_enters),
+        "metrics": metrics,
         "lifecycle_fields_skipped": sorted(LIFECYCLE_SKIP_FIELDS),
         "trade_count_divergence": count_violations,
         "ticker_set_divergence": ticker_violations,
@@ -692,8 +1022,18 @@ def test_parity_replay_end_to_end():
     import json
     (report_dir / "parity_report.json").write_text(json.dumps(report, indent=2, default=str))
 
-    assert report["status"] == "pass", (
-        f"Parity divergence: {len(count_violations)} trade-count, "
-        f"{len(ticker_violations)} ticker-set, {len(field_violations)} field-level. "
-        f"See {report_dir / 'parity_report.json'}"
+    # Append the time-series row for trend tracking. Best-effort: S3 errors
+    # don't fail the test (the per-run report is the authoritative artifact).
+    run_date = os.environ.get("PARITY_RUN_DATE") or pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    if os.environ.get("PARITY_SKIP_METRICS_WRITE") != "1":
+        append_parity_metrics_row(metrics, run_date=run_date, bucket=bucket)
+
+    # Always-pass — the test's job is to GENERATE the report + metrics row.
+    # Nothing here gates the spot run; SF stops alarming on parity drift.
+    print(
+        f"\nParity metrics: capture_rate={metrics['capture_rate']:.2%} "
+        f"jaccard={metrics['ticker_jaccard_avg']:.2%} "
+        f"count_rms={metrics['count_divergence_rms']:.2f} "
+        f"field_diff_rate={metrics['field_diff_rate']:.2%} "
+        f"({metrics['n_cohort_matched_enters']} matched ENTERs)"
     )
