@@ -107,14 +107,41 @@ def test_predictor_data_prep_roundtrip(s3):
         check_freq=False, check_names=False,
     )
 
-    # features_by_ticker — values preserved per column
-    assert set(reloaded["features_by_ticker"].keys()) == {"AAPL", "MSFT"}
+    # features_by_ticker is intentionally NOT in the reloaded dict
+    # post-Stage-3 (lazy-loaded by Phase 4a/4c via
+    # _load_features_by_ticker_only). The artifact IS persisted to S3
+    # though — verify by lazy-loading directly.
+    assert reloaded["features_by_ticker"] is None
+    lazy = bt._load_features_by_ticker_only("b", registry2)
+    assert set(lazy.keys()) == {"AAPL", "MSFT"}
     for ticker in ("AAPL", "MSFT"):
         orig = original["features_by_ticker"][ticker]
-        got = reloaded["features_by_ticker"][ticker]
+        got = lazy[ticker]
         assert set(got.columns) == set(orig.columns)
         for col in orig.columns:
             assert list(got[col].astype(float)) == list(orig[col].astype(float))
+
+
+def test_lazy_load_features_raises_when_marker_missing(s3):
+    """Phase 4a/4c must fail loud when the predictor_data_prep marker
+    is absent — silently returning {} would let evaluator skip the
+    feature input and produce wrong recommendations."""
+    registry = PhaseRegistry(date="2026-04-23", bucket="b", s3_client=s3)
+    with pytest.raises(RuntimeError, match="marker missing"):
+        bt._load_features_by_ticker_only("b", registry)
+
+
+def test_lazy_load_features_raises_when_artifact_key_absent(s3):
+    """Marker exists but doesn't contain features_by_ticker.parquet —
+    e.g. a degraded predictor_data_prep run that wrote partial state.
+    Stage 3 contract is hard-fail rather than silent fallback."""
+    registry = PhaseRegistry(date="2026-04-23", bucket="b", s3_client=s3)
+    with registry.phase("predictor_data_prep", supports_auto_skip=True) as ctx:
+        # Intentionally don't call _save_predictor_data_prep so the
+        # marker has no artifact_keys.
+        pass
+    with pytest.raises(RuntimeError, match="features_by_ticker.parquet"):
+        bt._load_features_by_ticker_only("b", registry)
 
 
 def test_save_skips_when_status_not_ok(s3):
