@@ -351,6 +351,18 @@ def predictions_to_signals(
         elif trading_score < 30:
             signal = "EXIT"
 
+        # Memory: this dict materializes ~2M times across a 10y backtest
+        # (911 tickers × 2316 dates). Each spare field carries ~80-120 B
+        # of dict-slot + key-string overhead, so dropping 3 unused
+        # diagnostic fields reclaims ~300 MB at peak. The full executor
+        # surface consumes only ticker / signal / score / conviction /
+        # sector / rating; technical_score / gbm_adjustment /
+        # alpha_predicted were preserved historically as human-readable
+        # diagnostics. Both upstream inputs (predictions, ohlcv,
+        # scoring formula) are deterministic and persisted, so a
+        # diagnostic field can be reconstructed offline from
+        # predictor/predictions/{date}.json + ArcticDB universe if
+        # needed. Stage 2 of the optimization arc.
         scored.append({
             "ticker": ticker,
             "score": trading_score,
@@ -358,9 +370,6 @@ def predictions_to_signals(
             "conviction": conviction,
             "sector": sector,
             "rating": "BUY" if signal == "ENTER" else ("SELL" if signal == "EXIT" else "HOLD"),
-            "technical_score": tech_score,
-            "gbm_adjustment": round(gbm_adj, 2),
-            "alpha_predicted": round(alpha, 6),
         })
 
     # Sort by score descending for top-N filtering
