@@ -1499,29 +1499,41 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     bucket = config.get("signals_bucket", "alpha-engine-research")
     s3 = registry.s3_client
 
-    # Prepare data once. ``keep_features=True`` ensures features land in
-    # the run() result dict so _save_predictor_data_prep can persist
-    # them — once on S3, they're dropped from in-memory immediately.
-    # Phase 4a/4c lazy-reload via _load_features_by_ticker_only.
-    # See Stage 3 of the c5.large optimization arc.
+    # Prepare data once. The persist_features_callback hook persists
+    # features inside run() right after inference and BEFORE
+    # build_signals_by_date — so features (~1.1 GB) and signals (~700
+    # MB-1 GB) never coexist in memory. This closes the
+    # post_build_signals=2768 MB OOM diagnosed 2026-04-26. Phase 4a/4c
+    # lazy-reload via _load_features_by_ticker_only when their
+    # evaluator runs. See Stage 4 of the c5.large optimization arc.
     with registry.phase(
         "predictor_data_prep", supports_auto_skip=True,
     ) as ctx:
         if ctx.skipped:
             result = _load_predictor_data_prep(bucket, registry)
         else:
-            result = run_predictor_pipeline(config, keep_features=True)
+            from phase_artifacts import save_dict_of_dataframes
+
+            def _persist_features_to_s3(features: dict) -> None:
+                """In-run persistence callback — saves features to S3 +
+                registers the artifact key on the predictor_data_prep
+                marker. Closure over ``ctx`` / ``bucket`` / ``s3``.
+                """
+                key = save_dict_of_dataframes(
+                    bucket, registry.date, "predictor_data_prep",
+                    "features_by_ticker", features, s3_client=s3,
+                )
+                ctx.record_artifact(key)
+
+            result = run_predictor_pipeline(
+                config, persist_features_callback=_persist_features_to_s3,
+            )
+            # ``features_by_ticker`` is already absent from result —
+            # run() persisted + dropped via the callback. _save_predictor_
+            # data_prep's features-save branch is a no-op here.
             _save_predictor_data_prep(
                 ctx, bucket, registry.date, result, s3_client=s3,
             )
-            # Free the in-memory features dict now that the artifact is
-            # on S3. Phase 4a/4c will lazy-reload only inside their own
-            # phase blocks. Saves ~1.1 GB peak across signal_gen +
-            # single_run + Phase 4b + param_sweep, which don't read
-            # features.
-            result.pop("features_by_ticker", None)
-            import gc
-            gc.collect()
 
     if result.get("status") != "ok":
         return result, pd.DataFrame()

@@ -760,7 +760,11 @@ def _resolve_trading_dates(
     return trading_dates
 
 
-def run(config: dict, keep_features: bool = False) -> dict:
+def run(
+    config: dict,
+    keep_features: bool = False,
+    persist_features_callback=None,
+) -> dict:
     """
     Full predictor-only backtest pipeline.
 
@@ -770,15 +774,45 @@ def run(config: dict, keep_features: bool = False) -> dict:
         3. Compute features for all stock tickers
         4. Download GBM model from S3
         5. Run inference across all trading dates
-        6. Generate synthetic signals
-        7. Build price matrix and OHLCV histories
+        6. (NEW) Persist features via callback if provided, then drop
+        7. Generate synthetic signals (without features in memory)
+        8. Build price matrix and OHLCV histories
 
     Returns a dict with all data needed by backtest.py's simulation loop:
         - signals_by_date: {date: signal_envelope}
         - price_matrix: DataFrame
-        - ohlcv_by_ticker: {ticker: [{date, open, high, low, close}, ...]}
+        - ohlcv_by_ticker: {ticker: pd.DataFrame}
         - metadata: {n_tickers, n_dates, date_range, ...}
+
+    Parameters
+    ----------
+    config : pipeline config dict (signals_bucket, predictor_paths,
+        predictor_backtest section, etc.)
+    keep_features : if True, ``features_by_ticker`` survives into the
+        returned dict (kept in memory through and beyond signal
+        generation). Legacy behavior; mutually exclusive with
+        ``persist_features_callback``.
+    persist_features_callback : optional ``Callable[[dict], None]``.
+        When provided, called with ``features_by_ticker`` right after
+        inference and BEFORE ``build_signals_by_date``. Caller is
+        responsible for durable persistence (typically S3 +
+        ``ctx.record_artifact``). After the callback returns, run()
+        drops the ~1.1 GB features dict and ``gc.collect()``s before
+        signal generation.
+
+        This is the Stage 4 c5.large fix: the 2026-04-26 OOM at
+        ``post_build_signals=2768 MB`` was dominated by features
+        coexisting with the just-built signals dict. Persisting +
+        dropping features here saves ~1.1 GB at that checkpoint; the
+        feature artifact is lazy-loaded by Phase 4a/4c via
+        ``backtest._load_features_by_ticker_only``.
     """
+    if keep_features and persist_features_callback is not None:
+        raise ValueError(
+            "run(): keep_features=True and persist_features_callback are "
+            "mutually exclusive. The callback already persists + drops "
+            "features; setting keep_features=True would un-drop them."
+        )
     # Resolve predictor path
     predictor_paths = config.get("predictor_paths", [])
     if isinstance(predictor_paths, str):
@@ -876,7 +910,22 @@ def run(config: dict, keep_features: bool = False) -> dict:
     )
     _log_rss("post_inference")
 
-    # Free features and model (no longer needed unless caller needs them)
+    # 6b. Persist features via caller-provided callback BEFORE dropping.
+    # Stage 4 fix for the post_build_signals OOM: without this, features
+    # (~1.1 GB) coexist with the just-built signals dict (~700 MB-1 GB)
+    # during the next phase, peaking RSS at ~2.7 GB on full universe.
+    # When the callback is provided, the caller is responsible for durable
+    # storage (typically S3) before run() drops the in-memory dict.
+    if persist_features_callback is not None:
+        persist_features_callback(features_by_ticker)
+        logger.info("Features persisted via caller callback")
+
+    # Free features and model. Drop unconditionally when keep_features
+    # is False (the default): downstream needs predictions_by_date but
+    # not features. The pre-Stage-4 ``keep_features=True`` path that
+    # held features through build_signals is preserved for tests +
+    # any caller that genuinely needs the in-memory dict, but the
+    # production path (backtest.py) now uses the callback instead.
     if not keep_features:
         del features_by_ticker
         gc.collect()
