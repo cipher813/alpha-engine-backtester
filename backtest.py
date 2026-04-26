@@ -284,9 +284,55 @@ def _save_predictor_data_prep(
         ))
 
 
+def _load_features_by_ticker_only(bucket: str, registry) -> dict:
+    """Lazy-load just the ``features_by_ticker`` parquet from the
+    predictor_data_prep marker. Used by Phase 4a (ensemble_modes) and
+    Phase 4c (feature_pruning) — the only consumers of features.
+
+    Avoids holding the ~1.1 GB features dict in memory across the entire
+    predictor pipeline (signal_gen, single_run sim, Phase 4b threshold
+    eval, param sweep don't read features). Each Phase 4 caller wraps
+    the load + run + ``del`` cycle so peak RSS only spikes during the
+    evaluator's actual work, not the whole pipeline.
+
+    Raises ``RuntimeError`` if the predictor_data_prep marker is missing
+    or its features artifact wasn't written — Phase 4 evaluators can't
+    run without features and the spot must surface that as a real
+    failure, not silently skip.
+    """
+    from phase_artifacts import load_dict_of_dataframes
+    s3 = registry.s3_client
+    marker = registry.load_marker("predictor_data_prep")
+    if marker is None:
+        raise RuntimeError(
+            "lazy features load: predictor_data_prep marker missing — "
+            "Phase 4 evaluator cannot run. Re-run predictor_data_prep "
+            "with --force-phases=predictor_data_prep."
+        )
+    keys = marker.get("artifact_keys") or []
+    features_key = next(
+        (k for k in keys if k.endswith("/features_by_ticker.parquet")),
+        None,
+    )
+    if features_key is None:
+        raise RuntimeError(
+            "lazy features load: predictor_data_prep marker has no "
+            "features_by_ticker.parquet artifact key. Phase 4 evaluator "
+            "cannot run. Re-run predictor_data_prep."
+        )
+    return load_dict_of_dataframes(bucket, features_key, s3_client=s3)
+
+
 def _load_predictor_data_prep(bucket: str, registry) -> dict:
-    """Inverse of _save_predictor_data_prep — returns a dict with the same
-    shape `synthetic.predictor_backtest.run(keep_features=True)` produces.
+    """Inverse of ``_save_predictor_data_prep`` — returns the result
+    dict shape ``synthetic.predictor_backtest.run`` produces, EXCEPT
+    ``features_by_ticker`` is NOT loaded here.
+
+    Stage 3 of the c5.large optimization arc moved the ~1.1 GB features
+    dict to lazy-load via ``_load_features_by_ticker_only``: held in
+    memory only during Phase 4a + Phase 4c evaluator runs, freed after
+    each. The auto-skip reload path mirrors the fresh-run path —
+    neither holds features across the wider pipeline.
 
     Raises loud if marker missing or a required artifact absent from the
     marker's artifact_keys list."""
@@ -330,17 +376,17 @@ def _load_predictor_data_prep(bucket: str, registry) -> dict:
     }
     spy_key = _find("/spy_prices.parquet", required=False)
     result["spy_prices"] = load_series(bucket, spy_key, s3_client=s3) if spy_key else None
-    features_key = _find("/features_by_ticker.parquet", required=False)
-    result["features_by_ticker"] = (
-        load_dict_of_dataframes(bucket, features_key, s3_client=s3)
-        if features_key else {}
-    )
+    # features_by_ticker is intentionally NOT loaded here — Phase 4a / 4c
+    # evaluators lazy-load via _load_features_by_ticker_only so we don't
+    # hold ~1.1 GB across the wider pipeline. Sentinel ``None`` flags
+    # "feature artifact persisted; load on demand" to downstream gating.
+    result["features_by_ticker"] = None
 
     logger.info(
         "predictor_data_prep auto-skip: reloaded %d signal dates, "
-        "price_matrix %s, %d tickers OHLCV, %d tickers features",
+        "price_matrix %s, %d tickers OHLCV, features deferred to lazy-load",
         len(result["signals_by_date"]), result["price_matrix"].shape,
-        len(result["ohlcv_by_ticker"]), len(result["features_by_ticker"]),
+        len(result["ohlcv_by_ticker"]),
     )
     return result
 
@@ -1453,7 +1499,11 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     bucket = config.get("signals_bucket", "alpha-engine-research")
     s3 = registry.s3_client
 
-    # Prepare data once — keep features for Phase 4 evaluations
+    # Prepare data once. ``keep_features=True`` ensures features land in
+    # the run() result dict so _save_predictor_data_prep can persist
+    # them — once on S3, they're dropped from in-memory immediately.
+    # Phase 4a/4c lazy-reload via _load_features_by_ticker_only.
+    # See Stage 3 of the c5.large optimization arc.
     with registry.phase(
         "predictor_data_prep", supports_auto_skip=True,
     ) as ctx:
@@ -1464,6 +1514,14 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             _save_predictor_data_prep(
                 ctx, bucket, registry.date, result, s3_client=s3,
             )
+            # Free the in-memory features dict now that the artifact is
+            # on S3. Phase 4a/4c will lazy-reload only inside their own
+            # phase blocks. Saves ~1.1 GB peak across signal_gen +
+            # single_run + Phase 4b + param_sweep, which don't read
+            # features.
+            result.pop("features_by_ticker", None)
+            import gc
+            gc.collect()
 
     if result.get("status") != "ok":
         return result, pd.DataFrame()
@@ -1473,7 +1531,6 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     ohlcv_by_ticker = result["ohlcv_by_ticker"]
     spy_prices = result.get("spy_prices")
     metadata = result["metadata"]
-    features_by_ticker = result.get("features_by_ticker")
     sector_map = result.get("sector_map", {})
     trading_dates = result.get("trading_dates", [])
 
@@ -1565,7 +1622,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
             "(skip_phase4_evaluations=true). Ensemble mode / signal "
             "threshold / feature pruning evaluators will not run."
         )
-    elif features_by_ticker and trading_dates:
+    elif trading_dates:
         try:
             from optimizer.predictor_optimizer import (
                 evaluate_ensemble_modes,
@@ -1574,8 +1631,10 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 apply_recommendations,
             )
             bucket = config.get("signals_bucket", "alpha-engine-research")
+            import gc
 
-            # Phase 4a: Ensemble mode evaluation
+            # Phase 4a: Ensemble mode evaluation. Lazy-loads features
+            # (~1.1 GB) only inside this phase block, frees on exit.
             ensemble_result = None
             try:
                 with registry.phase(
@@ -1586,11 +1645,16 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                         keys = marker.get("artifact_keys") or []
                         ensemble_result = _load_json_p(bucket, keys[0], s3_client=s3) if keys else None
                     else:
-                        ensemble_result = evaluate_ensemble_modes(
-                            features_by_ticker, price_matrix, ohlcv_by_ticker,
-                            spy_prices, sector_map, trading_dates,
-                            config, single_stats,
-                        )
+                        features_by_ticker = _load_features_by_ticker_only(bucket, registry)
+                        try:
+                            ensemble_result = evaluate_ensemble_modes(
+                                features_by_ticker, price_matrix, ohlcv_by_ticker,
+                                spy_prices, sector_map, trading_dates,
+                                config, single_stats,
+                            )
+                        finally:
+                            del features_by_ticker
+                            gc.collect()
                         if ensemble_result is not None:
                             p4a_ctx.record_artifact(_save_json_p(
                                 bucket, registry.date, "phase4a_ensemble_modes",
@@ -1610,7 +1674,8 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                     exc, exc_info=True,
                 )
 
-            # Phase 4b: Signal threshold sweep
+            # Phase 4b: Signal threshold sweep — does NOT consume features,
+            # so no lazy-load needed here.
             threshold_result = None
             if predictions_by_date:
                 try:
@@ -1640,7 +1705,8 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                         exc, exc_info=True,
                     )
 
-            # Phase 4c: Feature pruning evaluation
+            # Phase 4c: Feature pruning evaluation. Lazy-loads features
+            # again (Phase 4a already freed them), frees on exit.
             pruning_result = None
             try:
                 with registry.phase(
@@ -1651,11 +1717,16 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                         keys = marker.get("artifact_keys") or []
                         pruning_result = _load_json_p(bucket, keys[0], s3_client=s3) if keys else None
                     else:
-                        pruning_result = evaluate_feature_pruning(
-                            features_by_ticker, price_matrix, ohlcv_by_ticker,
-                            spy_prices, sector_map, trading_dates,
-                            config, single_stats,
-                        )
+                        features_by_ticker = _load_features_by_ticker_only(bucket, registry)
+                        try:
+                            pruning_result = evaluate_feature_pruning(
+                                features_by_ticker, price_matrix, ohlcv_by_ticker,
+                                spy_prices, sector_map, trading_dates,
+                                config, single_stats,
+                            )
+                        finally:
+                            del features_by_ticker
+                            gc.collect()
                         if pruning_result is not None:
                             p4c_ctx.record_artifact(_save_json_p(
                                 bucket, registry.date, "phase4c_feature_pruning",
@@ -1690,11 +1761,6 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 "Phase 4 optimizer not available (import failed): %s",
                 exc, exc_info=True,
             )
-
-        # Free features now that Phase 4 is done
-        del features_by_ticker
-        import gc
-        gc.collect()
 
     # Param sweep — seed grid with current S3 params for iterative learning
     sweep_df = pd.DataFrame()
