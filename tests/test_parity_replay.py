@@ -265,40 +265,6 @@ def _load_trades_from_db(db_path: str, since_date: str | None = None) -> pd.Data
         conn.close()
 
 
-def _get_bootstrap_as_of(db_path: str) -> str | None:
-    """Return the earliest ``eod_pnl`` row date with non-null ``total_cash``
-    AND non-empty ``positions_snapshot`` — the earliest date sim can
-    bootstrap from. Mirrors the predicate in
-    ``backtest._load_initial_state_from_eod_pnl``. Returns ``None`` when
-    no row qualifies (pre-PR #59 trades.db, or schema missing those
-    columns entirely).
-
-    Used to narrow the parity window to dates the bootstrap can actually
-    replay. Without this, parity sweeps in pre-bootstrap dates whose
-    backtester output is structurally always 0 — the divergence is real
-    but the divergence reason is "we can't replay this date", not
-    "logic divergence between live and sim". Pre-bootstrap blanket
-    failures dominated 2026-04-26's parity report (6 of 8 dates).
-    """
-    conn = sqlite3.connect(db_path)
-    try:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(eod_pnl)").fetchall()}
-        if "total_cash" not in cols or "positions_snapshot" not in cols:
-            return None
-        row = conn.execute(
-            "SELECT MIN(date) FROM eod_pnl "
-            "WHERE total_cash IS NOT NULL "
-            "AND positions_snapshot IS NOT NULL "
-            "AND length(positions_snapshot) > 2"
-        ).fetchone()
-        return row[0] if row and row[0] else None
-    except sqlite3.OperationalError:
-        # Table missing entirely — no bootstrap possible
-        return None
-    finally:
-        conn.close()
-
-
 def _last_n_trading_dates(trades_df: pd.DataFrame, n: int) -> list[str]:
     """Return the last n unique signal_trading_day values from the trades
     DataFrame — the parity cohort key per DATE_CONVENTIONS.md.
@@ -588,69 +554,6 @@ class TestLifecycleSkipFields:
         assert "prediction_confidence" not in diff_fields(live, replay)
 
 
-class TestGetBootstrapAsOf:
-    """Cover the helper that backstops the parity-window narrow filter.
-    Mirrors the predicate in ``backtest._load_initial_state_from_eod_pnl``
-    so the parity test only sweeps in dates the bootstrap can replay."""
-
-    def _write_eod_pnl(self, path: str, rows: list[tuple]):
-        """Schema parallels alpha-engine PR #59. ``rows`` shape:
-        (date, portfolio_nav, total_cash, positions_snapshot)."""
-        conn = sqlite3.connect(path)
-        conn.execute(
-            "CREATE TABLE eod_pnl ("
-            "  date TEXT PRIMARY KEY,"
-            "  portfolio_nav REAL,"
-            "  total_cash REAL,"
-            "  positions_snapshot TEXT)"
-        )
-        conn.executemany(
-            "INSERT INTO eod_pnl VALUES (?,?,?,?)", rows,
-        )
-        conn.commit()
-        conn.close()
-
-    def test_returns_earliest_meaningful_row(self, tmp_path):
-        db = tmp_path / "trades.db"
-        self._write_eod_pnl(str(db), [
-            # First two rows have NULL state (pre-PR-#59 era)
-            ("2026-03-01", 1_000_000.0, None, None),
-            ("2026-03-02", 1_001_000.0, None, ""),
-            # First meaningful row
-            ("2026-04-07", 1_020_000.0, 87_000.0, '{"AAPL": {"shares": 100}}'),
-            # Later meaningful rows
-            ("2026-04-10", 1_025_000.0, 90_000.0, '{"AAPL": {"shares": 100}}'),
-        ])
-        assert _get_bootstrap_as_of(str(db)) == "2026-04-07"
-
-    def test_no_meaningful_rows_returns_none(self, tmp_path):
-        db = tmp_path / "trades.db"
-        self._write_eod_pnl(str(db), [
-            ("2026-03-01", 1_000_000.0, None, None),
-            ("2026-03-02", 1_000_000.0, None, "{}"),
-            # length(positions_snapshot) <= 2 disqualifies — empty JSON
-            ("2026-03-03", 1_000_000.0, 50_000.0, "{}"),
-        ])
-        assert _get_bootstrap_as_of(str(db)) is None
-
-    def test_missing_columns_returns_none(self, tmp_path):
-        # Pre-PR-#59 schema lacks total_cash + positions_snapshot.
-        db = tmp_path / "trades.db"
-        conn = sqlite3.connect(str(db))
-        conn.execute(
-            "CREATE TABLE eod_pnl (date TEXT, portfolio_nav REAL)"
-        )
-        conn.execute("INSERT INTO eod_pnl VALUES ('2026-03-01', 1000000)")
-        conn.commit()
-        conn.close()
-        assert _get_bootstrap_as_of(str(db)) is None
-
-    def test_missing_table_returns_none(self, tmp_path):
-        db = tmp_path / "empty.db"
-        sqlite3.connect(str(db)).close()
-        assert _get_bootstrap_as_of(str(db)) is None
-
-
 # ── Integration test (opt-in) ───────────────────────────────────────────────
 
 @pytest.mark.parity
@@ -702,31 +605,6 @@ def test_parity_replay_end_to_end():
             f"scripts/backfill_trading_day.py to populate the column on "
             f"historical rows."
         )
-
-    # Narrow the parity window to dates the bootstrap can replay.
-    # ``backtest._load_initial_state_from_eod_pnl`` requires an eod_pnl row
-    # with non-null total_cash + non-empty positions_snapshot to bootstrap
-    # sim state (alpha-engine PR #59 added those columns 2026-04-17 — rows
-    # before then are unreplayable). Pre-bootstrap signal_trading_days
-    # always show backtester=0 in the diff because no replay ran for them;
-    # leaving them in the cohort makes parity unconditionally fail and
-    # buries the post-bootstrap divergence we actually care about. Filter
-    # them out and tag the report with the bootstrap as_of so reviewers
-    # see why the window narrowed.
-    bootstrap_as_of: str | None = _get_bootstrap_as_of(db_path)
-    n_pre_bootstrap = 0
-    if bootstrap_as_of:
-        pre = matchable[matchable["signal_trading_day"] < bootstrap_as_of]
-        n_pre_bootstrap = len(pre)
-        matchable = matchable[matchable["signal_trading_day"] >= bootstrap_as_of]
-        if matchable.empty:
-            pytest.skip(
-                f"All matchable ENTER rows predate bootstrap as_of="
-                f"{bootstrap_as_of}; no replayable parity dates. Backfill "
-                f"historical eod_pnl total_cash+positions_snapshot "
-                f"(see ROADMAP P1 'eod_pnl historical backfill') or wait "
-                f"for new live ENTERs to accumulate."
-            )
 
     dates = _last_n_trading_dates(matchable, window_days)
     if len(dates) < 3:
@@ -797,11 +675,9 @@ def test_parity_replay_end_to_end():
         "status": "fail" if (count_violations or ticker_violations or field_violations) else "pass",
         "match_key": "(signal_trading_day, ticker, action)",
         "window_signal_trading_days": [dates[0], dates[-1]],
-        "bootstrap_as_of": bootstrap_as_of,
         "n_live_trades_total": int(len(trades_df)),
         "n_live_enters_matchable": int(len(matchable)),
         "n_live_excluded_no_signal_day": int(n_excluded),
-        "n_live_excluded_pre_bootstrap": int(n_pre_bootstrap),
         "n_backtester_orders_total": len(replay_orders),
         "n_backtester_enters": len(replay_enters),
         "lifecycle_fields_skipped": sorted(LIFECYCLE_SKIP_FIELDS),
