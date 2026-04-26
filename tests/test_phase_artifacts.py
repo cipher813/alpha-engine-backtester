@@ -450,7 +450,14 @@ def test_dict_of_dataframes_homogeneous_columns_no_reindex(s3):
 def test_dict_of_dataframes_object_vs_numeric_still_raises(s3):
     """Non-numeric drift is intentionally left alone — string-vs-int
     or datetime-vs-object are real semantic divergences that should
-    still surface as pa.unify_schemas errors (not silent coercion)."""
+    still surface as a hard error (not silent coercion).
+
+    Post 2026-04-26 v5 stream-write: the error surface shifted from
+    pa.unify_schemas's ``Unable to merge`` to pa.Table.from_pandas's
+    ``Conversion failed for column ... with type ...`` because we
+    no longer materialize all tables before unifying schemas. Either
+    error means the operator must investigate; the test asserts the
+    failure happens, not the specific message."""
     str_frame = pd.DataFrame(
         {"col": ["a", "b"]},
         index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
@@ -460,5 +467,5 @@ def test_dict_of_dataframes_object_vs_numeric_still_raises(s3):
         index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
     )
     data = {"AAA": str_frame, "BBB": int_frame}
-    with pytest.raises(Exception, match="(?i)Unable to merge|incompatible"):
+    with pytest.raises(Exception, match="(?i)Unable to merge|incompatible|Conversion failed|expected.*dtype"):
         save_dict_of_dataframes("b", "2026-04-23", "p", "n", data, s3_client=s3)
