@@ -443,41 +443,66 @@ def save_dict_of_dataframes(
     # ranges); non-numeric drift still raises at unify_schemas.
     _promote_numeric_dtype_drift(ticker_frames)
 
-    # Column-order unification (added 2026-04-26 v4 after the dtype-
-    # drift fix unblocked the unify_schemas call but exposed a second
-    # issue: ``Table.cast(schema)`` fails when field names match but
-    # ordering differs). Per-ticker feature DataFrames historically
-    # came back from ArcticDB with column orders that depended on
-    # write-order — different ingest paths produced rotated views of
-    # the same column set. ``pd.concat`` (the pre-2026-04-23 producer)
-    # silently sorted columns; the streaming-write path doesn't.
-    # Reindex every frame to a stable union order before pyarrow
-    # conversion, NaN-filling any missing columns to preserve the
-    # original "compatible superset" semantic.
+    # Column-order unification (added 2026-04-26 v4): reindex every
+    # frame to a stable union order, NaN-filling missing columns, so
+    # the schema is identical across frames before pyarrow conversion.
     _unify_column_order(ticker_frames)
 
-    # Convert each DataFrame to a pyarrow Table. preserve_index=False
-    # because we materialized the original index into __idx__ above.
-    tables = [
-        (ticker, pa.Table.from_pandas(frame, preserve_index=False))
-        for ticker, frame in ticker_frames
-    ]
+    # After the two normalization passes above, every frame shares
+    # the same column set, dtype, and order — so pa.Table.from_pandas
+    # on any of them produces the same schema. Take the first frame's
+    # schema as the unified schema and stream-write the rest.
+    #
+    # Memory: pre-2026-04-26 v5 this function held a list of 911
+    # pa.Table objects (~1.1 GB raw data) + the original 911 DataFrames
+    # (~1.1 GB) + dtype-promoted copies (cast int→float and float32→
+    # float64 widen ~2×) + ParquetWriter buffer (grows to ~250 MB).
+    # The 2026-04-26 v5 spot showed RSS jumping from 1331 MB at
+    # post_inference to 2492 MB at post_feature_free — pyarrow's
+    # internal allocator pool retained the table memory even after
+    # the tables list went out of scope, contributing ~1 GB to the
+    # final OOM at post_build_signals.
+    #
+    # Stream-write fix: build one pa.Table at a time, write it, free
+    # immediately. Then ``pa.default_memory_pool().release_unused()``
+    # forces the pool to return memory to the OS rather than retain
+    # for reuse. Peak in this function drops from ~3.5 GB transient
+    # to ~1.5 GB transient (just the caller's features + one in-flight
+    # table + parquet buffer).
+    sample_ticker, sample_frame = ticker_frames[0]
+    sample_table = pa.Table.from_pandas(sample_frame, preserve_index=False)
+    unified_schema = sample_table.schema
+    del sample_table
 
-    # Unify schemas so row groups with missing columns widen to the
-    # union (NaN-filled on load). Matches the legacy pd.concat semantic.
-    unified_schema = pa.unify_schemas([t.schema for _, t in tables])
-    tables = [(ticker, t.cast(unified_schema)) for ticker, t in tables]
-
-    # Stream-write each table as its own row group. The ParquetWriter
-    # buffer is the only large allocation and grows only with compressed
-    # output size. No full-DataFrame concat ever materializes in memory.
     buf = io.BytesIO()
     writer = pq.ParquetWriter(buf, unified_schema, compression="snappy")
     try:
-        for _, table in tables:
+        for i in range(len(ticker_frames)):
+            ticker, frame = ticker_frames[i]
+            table = pa.Table.from_pandas(
+                frame, preserve_index=False, schema=unified_schema,
+            )
             writer.write_table(table)
+            # Drop our reference to the frame so GC can reclaim it
+            # before the next iteration's allocation. Caller still
+            # holds the original via the input dict; we only release
+            # the per-iteration reset+annotated copy.
+            ticker_frames[i] = (ticker, None)
+            del table, frame
     finally:
         writer.close()
+
+    # Force pyarrow's allocator pool to return unused memory to the
+    # OS. Without this, the 911-table allocation footprint stays
+    # resident as "free but reusable" pool memory, contributing to
+    # the post_feature_free RSS spike that took the 2026-04-26 v5
+    # spot to OOM at post_build_signals=3039 MB.
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        # Best effort — older pyarrow versions may not expose this
+        # API. Don't fail the save if the cleanup hint is rejected.
+        pass
 
     key = artifact_key(date, phase, name, "parquet")
     _client(s3_client).put_object(
