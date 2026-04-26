@@ -63,7 +63,7 @@ def _log_rss(label: str) -> None:
 
     Noisy but invaluable for catching OOM-class issues like the 2026-04-23
     SF dry-run where predictor_data_prep blew past c5.large's 4 GB budget
-    inside load_universe_from_arctic + build_ohlcv_by_ticker. Without
+    inside load_universe_from_arctic + build_ohlcv_df_by_ticker. Without
     these checkpoints we had to diagnose via CloudWatch CPU patterns +
     SSM-agent death instead of seeing the memory curve directly.
 
@@ -482,7 +482,7 @@ def run_inference(
 def build_signals_by_date(
     predictions_by_date: dict[str, dict[str, float]],
     sector_map: dict[str, str],
-    ohlcv_by_ticker: dict[str, list[dict]],
+    ohlcv_by_ticker: dict[str, pd.DataFrame],
     top_n: int = 20,
     min_score: float = 60,
 ) -> dict[str, dict]:
@@ -494,7 +494,8 @@ def build_signals_by_date(
     ----------
     predictions_by_date : {date: {ticker: alpha}} from run_inference()
     sector_map : {ticker: sector_etf} from sector_map.json
-    ohlcv_by_ticker : {ticker: [{date, open, high, low, close}, ...]}
+    ohlcv_by_ticker : {ticker: pd.DataFrame} (DatetimeIndex + lowercase
+        open/high/low/close columns) per ``build_ohlcv_df_by_ticker``.
     top_n : max ENTER signals per day (prevents unrealistic portfolio churn)
     min_score : minimum trading score for ENTER signal
 
@@ -603,46 +604,6 @@ def build_price_matrix(
     return matrix
 
 
-def build_ohlcv_by_ticker(
-    price_data: dict[str, pd.DataFrame],
-) -> dict[str, list[dict]]:
-    """
-    Convert DataFrames to the {ticker: [{date, open, high, low, close}, ...]}
-    format needed by _run_simulation_loop's price_histories parameter.
-
-    Non-destructive — callers that own `price_data` and can afford to
-    retain it use this. Memory-sensitive callers should use
-    `_drain_price_data_into_ohlcv` instead.
-    """
-    skip_tickers = _MACRO_TICKERS | _SECTOR_ETFS
-    ohlcv: dict[str, list[dict]] = {}
-
-    for ticker, df in price_data.items():
-        if ticker in skip_tickers:
-            continue
-        bars = _df_to_bars(df)
-        if bars:
-            ohlcv[ticker] = bars
-
-    return ohlcv
-
-
-def _df_to_bars(df: pd.DataFrame) -> list[dict]:
-    """Convert a single ticker's OHLCV DataFrame to the list-of-dicts form."""
-    bars = []
-    for dt, row in df.iterrows():
-        date_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
-        close = row.get("Close", row.get("close", 0))
-        bars.append({
-            "date": date_str,
-            "open": row.get("Open", row.get("open", close)),
-            "high": row.get("High", row.get("high", close)),
-            "low": row.get("Low", row.get("low", close)),
-            "close": close,
-        })
-    return bars
-
-
 def build_ohlcv_df_by_ticker(
     price_data: dict[str, pd.DataFrame],
 ) -> dict[str, pd.DataFrame]:
@@ -659,8 +620,7 @@ def build_ohlcv_df_by_ticker(
     column naming without per-site case handling.
 
     Missing OHL columns (frequent in thin-history tickers where only
-    Close is populated) fall back to the Close series — matches the
-    existing list-of-dicts producer's ``_df_to_bars`` semantic.
+    Close is populated) fall back to the Close series.
 
     Macro + sector ETFs are filtered at the producer boundary — they
     aren't used downstream in the list form either.
@@ -748,38 +708,6 @@ def _df_slice_to_bars(df: pd.DataFrame, until_date: str) -> list[dict]:
         {"date": d, "open": o, "high": h, "low": l, "close": c}
         for d, o, h, l, c in zip(dates, opens, highs, lows, closes)
     ]
-
-
-def _drain_price_data_into_ohlcv(
-    price_data: dict[str, pd.DataFrame],
-) -> dict[str, list[dict]]:
-    """Destructively pop each price_data[ticker] into ohlcv_by_ticker, so
-    both dicts never hold full-universe data simultaneously.
-
-    After this returns, `price_data` is empty (all entries popped).
-
-    Motivated by the 2026-04-23 OOM incident where coexisting full-
-    universe price_data (~91 MB of DataFrames) + ohlcv_by_ticker
-    (~1.1 GB of list-of-dicts due to Python overhead) pushed past
-    c5.large's 4 GB budget during predictor_data_prep. Saves ~91 MB at
-    the peak. The larger win lives in a follow-up PR that changes
-    ohlcv_by_ticker's shape itself (list-of-dicts → pd.DataFrame) —
-    that's a cross-repo contract change and tracked as P2 in
-    SYSTEM_STATE's backtester section.
-    """
-    skip_tickers = _MACRO_TICKERS | _SECTOR_ETFS
-    ohlcv: dict[str, list[dict]] = {}
-    tickers = list(price_data.keys())  # snapshot so we can mutate dict
-    for ticker in tickers:
-        df = price_data.pop(ticker)
-        if ticker in skip_tickers:
-            # skip_tickers' rows aren't needed downstream — drop silently
-            continue
-        bars = _df_to_bars(df)
-        if bars:
-            ohlcv[ticker] = bars
-    # price_data is now empty; caller can safely `del price_data`
-    return ohlcv
 
 
 def _extract_close(price_data: dict[str, pd.DataFrame], ticker: str | None) -> pd.Series | None:

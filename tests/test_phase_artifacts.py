@@ -90,18 +90,20 @@ def test_save_dataframe_without_index(s3):
 # ── OHLCV round-trips ────────────────────────────────────────────────────────
 
 
-def _sample_ohlcv() -> dict[str, list[dict]]:
-    return {
-        "AAPL": [
-            {"date": "2026-01-01", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5},
-            {"date": "2026-01-02", "open": 100.5, "high": 102.0, "low": 100.0, "close": 101.5},
-        ],
-        "MSFT": [
-            {"date": "2026-01-01", "open": 200.0, "high": 201.0, "low": 199.0, "close": 200.5},
-            {"date": "2026-01-02", "open": 200.5, "high": 202.0, "low": 200.0, "close": 201.5},
-            {"date": "2026-01-03", "open": 201.5, "high": 203.0, "low": 201.0, "close": 202.5},
-        ],
-    }
+def _sample_ohlcv() -> dict[str, pd.DataFrame]:
+    """DataFrame-shape fixture per Option A step 9. DatetimeIndex +
+    lowercase OHLCV columns (matches ``build_ohlcv_df_by_ticker``)."""
+    aapl = pd.DataFrame(
+        {"open": [100.0, 100.5], "high": [101.0, 102.0],
+         "low": [99.0, 100.0], "close": [100.5, 101.5]},
+        index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+    )
+    msft = pd.DataFrame(
+        {"open": [200.0, 200.5, 201.5], "high": [201.0, 202.0, 203.0],
+         "low": [199.0, 200.0, 201.0], "close": [200.5, 201.5, 202.5]},
+        index=pd.DatetimeIndex(["2026-01-01", "2026-01-02", "2026-01-03"]),
+    )
+    return {"AAPL": aapl, "MSFT": msft}
 
 
 def test_save_load_ohlcv_by_ticker_roundtrip(s3):
@@ -111,11 +113,13 @@ def test_save_load_ohlcv_by_ticker_roundtrip(s3):
     loaded = load_ohlcv_by_ticker("b", key, s3_client=s3)
 
     assert set(loaded.keys()) == set(original.keys())
-    for ticker, bars in original.items():
-        assert len(loaded[ticker]) == len(bars), f"ticker {ticker}"
-        for orig_bar, loaded_bar in zip(bars, loaded[ticker]):
-            for field in ("date", "open", "high", "low", "close"):
-                assert loaded_bar[field] == orig_bar[field], f"{ticker} field {field}"
+    for ticker, df in original.items():
+        loaded_df = loaded[ticker]
+        # Index round-trips as DatetimeIndex
+        assert list(pd.DatetimeIndex(loaded_df.index)) == list(df.index), f"{ticker} index"
+        # Columns round-trip with values
+        for col in ("open", "high", "low", "close"):
+            assert list(loaded_df[col]) == list(df[col]), f"{ticker} col {col}"
 
 
 def test_load_ohlcv_rejects_missing_ticker_column(s3):
@@ -129,21 +133,48 @@ def test_load_ohlcv_rejects_missing_ticker_column(s3):
         load_ohlcv_by_ticker("b", key, s3_client=s3)
 
 
+def test_load_ohlcv_rejects_legacy_list_of_dicts_artifact(s3):
+    """Step 9 invariant: a legacy artifact (no __idx__ column) must be
+    rejected hard so an auto-skip can't silently feed list-of-dicts
+    into the now-DataFrame-only consumers. Operator response is to
+    re-run upstream predictor_data_prep to regenerate."""
+    df = pd.DataFrame({
+        "ticker": ["AAPL", "AAPL"],
+        "date": ["2026-01-01", "2026-01-02"],
+        "close": [100.0, 101.0],
+    })
+    key = save_dataframe("b", "2026-04-23", "simulation_setup", "ohlcv",
+                         df, s3_client=s3, preserve_index=False)
+    with pytest.raises(ValueError, match="legacy list-of-dicts schema"):
+        load_ohlcv_by_ticker("b", key, s3_client=s3)
+
+
+def test_save_ohlcv_rejects_legacy_list_of_dicts_input(s3):
+    """Producer-side guardrail: passing list-of-dicts to save_ohlcv_by_ticker
+    raises immediately rather than silently writing the legacy schema."""
+    legacy = {"AAPL": [{"date": "2026-01-01", "close": 100.0}]}
+    with pytest.raises(TypeError, match="dict\\[str, pd.DataFrame\\]"):
+        save_ohlcv_by_ticker("b", "2026-04-23", "simulation_setup", "ohlcv",
+                             legacy, s3_client=s3)
+
+
 def test_ohlcv_preserves_date_order_per_ticker(s3):
-    """Regression guard: simulate relies on OHLCV bars being in date order."""
-    ohlcv = {
-        "AAPL": [
-            {"date": "2026-01-03", "close": 103.0},
-            {"date": "2026-01-01", "close": 101.0},
-            {"date": "2026-01-02", "close": 102.0},
-        ],
-    }
+    """Regression guard: simulate relies on OHLCV bars being in date order.
+    DataFrame producer (``build_ohlcv_df_by_ticker``) sorts on
+    construction, so unsorted input would only happen via direct
+    construction. This test asserts whatever index order the caller
+    provides round-trips intact."""
+    df = pd.DataFrame(
+        {"close": [103.0, 101.0, 102.0]},
+        index=pd.DatetimeIndex(["2026-01-03", "2026-01-01", "2026-01-02"]),
+    )
+    ohlcv = {"AAPL": df}
     key = save_ohlcv_by_ticker("b", "2026-04-23", "simulation_setup", "ohlcv",
                                ohlcv, s3_client=s3)
     loaded = load_ohlcv_by_ticker("b", key, s3_client=s3)
-    # Preserve original enumeration order — callers that want sorted
-    # dates should sort themselves (matches current in-process behavior).
-    assert [b["date"] for b in loaded["AAPL"]] == ["2026-01-03", "2026-01-01", "2026-01-02"]
+    assert [str(d.date()) for d in pd.DatetimeIndex(loaded["AAPL"].index)] == [
+        "2026-01-03", "2026-01-01", "2026-01-02",
+    ]
 
 
 # ── Series round-trip (spy_prices) ───────────────────────────────────────────

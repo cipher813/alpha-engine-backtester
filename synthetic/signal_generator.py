@@ -129,86 +129,15 @@ def _compute_momentum_percentiles(
 
 # ── Indicator computation from OHLCV ─────────────────────────────────────────
 
-def _compute_indicators_from_ohlcv(
-    price_history: list[dict],
-    min_bars: int = 210,
-) -> Optional[dict]:
-    """
-    Compute the 5 technical indicators from OHLCV bars.
-    Returns None if insufficient data.
-    """
-    if not price_history or len(price_history) < min_bars:
-        return None
-
-    close = pd.Series([bar["close"] for bar in price_history], dtype=float)
-
-    # RSI(14) — Wilder's smoothing
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=13, adjust=False).mean()
-    avg_loss = loss.ewm(com=13, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    rsi = 100 - (100 / (1 + rs))
-    rsi_14 = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
-
-    # MACD (12, 26, 9)
-    ema_fast = close.ewm(span=12, adjust=False).mean()
-    ema_slow = close.ewm(span=26, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    macd_above_zero = bool(macd_line.iloc[-1] > 0)
-
-    diff = macd_line - signal_line
-    macd_cross = 0.0
-    if len(diff) >= 2:
-        for i in range(max(len(diff) - 3, 0), len(diff)):
-            if i == 0:
-                continue
-            if diff.iloc[i] >= 0 and diff.iloc[i - 1] < 0:
-                macd_cross = 1.0
-            elif diff.iloc[i] < 0 and diff.iloc[i - 1] >= 0:
-                macd_cross = -1.0
-
-    # Price vs 50-day MA
-    ma50 = close.rolling(50).mean()
-    if pd.isna(ma50.iloc[-1]) or ma50.iloc[-1] == 0:
-        price_vs_ma50 = None
-    else:
-        price_vs_ma50 = ((close.iloc[-1] - ma50.iloc[-1]) / ma50.iloc[-1]) * 100
-
-    # Price vs 200-day MA
-    ma200 = close.rolling(200).mean()
-    if pd.isna(ma200.iloc[-1]) or ma200.iloc[-1] == 0:
-        price_vs_ma200 = None
-    else:
-        price_vs_ma200 = ((close.iloc[-1] - ma200.iloc[-1]) / ma200.iloc[-1]) * 100
-
-    # 20-day momentum
-    if len(close) >= 21:
-        momentum_20d = float((close.iloc[-1] / close.iloc[-21]) - 1) * 100
-    else:
-        momentum_20d = None
-
-    return {
-        "rsi_14": rsi_14,
-        "macd_cross": macd_cross,
-        "macd_above_zero": macd_above_zero,
-        "price_vs_ma50": price_vs_ma50,
-        "price_vs_ma200": price_vs_ma200,
-        "momentum_20d": momentum_20d,
-    }
-
-
 def precompute_indicator_series(
-    ohlcv_by_ticker: "dict[str, list[dict]] | dict[str, pd.DataFrame]",
+    ohlcv_by_ticker: "dict[str, pd.DataFrame]",
 ) -> dict[str, pd.DataFrame]:
     """
-    Vectorized pre-computation of the same 6 indicators as
-    ``_compute_indicators_from_ohlcv`` but as full date-indexed Series per
-    ticker. Used by ``build_signals_by_date`` to replace a O(dates × tickers
-    × bars) per-date Python rescan with a single O(tickers × bars) pandas
-    vectorized pass + O(dates × tickers) hashtable lookups.
+    Vectorized pre-computation of 6 technical indicators as full
+    date-indexed Series per ticker. Used by ``build_signals_by_date``
+    to replace a O(dates × tickers × bars) per-date Python rescan with
+    a single O(tickers × bars) pandas vectorized pass +
+    O(dates × tickers) hashtable lookups.
 
     Motivation: 2026-04-21 dry-run profiling showed ``build_signals_by_date``
     took ~75 minutes on 2277 dates × ~900 tickers — the per-date loop was
@@ -220,17 +149,11 @@ def precompute_indicator_series(
 
     Expected speedup: 50-100x for this phase.
 
-    Semantics match ``_compute_indicators_from_ohlcv`` byte-for-byte at each
-    row of the returned DataFrame: the row at date T is what
-    ``_compute_indicators_from_ohlcv(ohlcv_by_ticker[T].bars_up_to_T)`` would
-    have returned at that date. Early bars have NaN indicators (rolling-window
-    warmup) — consumer is expected to skip rows whose key fields are NaN.
-
-    Accepts either input shape (pandas refactor, plan 2026-04-23):
-      - ``dict[str, list[dict]]`` (legacy) — each value is
-        ``[{date, open, high, low, close}, ...]``
-      - ``dict[str, pd.DataFrame]`` (new) — each value has a DatetimeIndex
-        and a lowercase ``close`` column per ``build_ohlcv_df_by_ticker``
+    Input contract: ``dict[str, pd.DataFrame]`` per
+    ``build_ohlcv_df_by_ticker`` (DatetimeIndex + lowercase ``close``
+    column). The pre-2026-04-23 list-of-dicts producer was deleted in
+    Option A step 9 cleanup; legacy artifacts now hard-fail at the
+    ``load_ohlcv_by_ticker`` layer.
 
     Returns
     -------
@@ -241,24 +164,16 @@ def precompute_indicator_series(
     Tickers with zero bars are omitted.
     """
     out: dict[str, pd.DataFrame] = {}
-    for ticker, bars_or_df in ohlcv_by_ticker.items():
-        if isinstance(bars_or_df, pd.DataFrame):
-            # New shape: DatetimeIndex + lowercase "close" column. Copy the
-            # close series so the .index reassignment below doesn't mutate
-            # the caller's DataFrame. Convert index to YYYY-MM-DD strings so
-            # the output contract (string-date-indexed frames consumed by
-            # indicators_from_precomputed via df.index.get_loc) is preserved.
-            if bars_or_df.empty:
-                continue
-            close = bars_or_df["close"].astype(float).copy()
-            close.index = close.index.strftime("%Y-%m-%d")
-        else:
-            # Legacy list-of-dicts shape. Dates are strings (YYYY-MM-DD) so
-            # str ordering == chronological order.
-            if not bars_or_df:
-                continue
-            dates = [bar["date"] for bar in bars_or_df]
-            close = pd.Series([bar["close"] for bar in bars_or_df], index=dates, dtype=float)
+    for ticker, df in ohlcv_by_ticker.items():
+        if df is None or df.empty:
+            continue
+        # DatetimeIndex + lowercase "close" column. Copy the close series
+        # so the .index reassignment below doesn't mutate the caller's
+        # DataFrame. Convert index to YYYY-MM-DD strings so the output
+        # contract (string-date-indexed frames consumed by
+        # indicators_from_precomputed via df.index.get_loc) is preserved.
+        close = df["close"].astype(float).copy()
+        close.index = close.index.strftime("%Y-%m-%d")
 
         # RSI(14) via Wilder's smoothing — vectorized: one EWMA pass
         delta = close.diff()
@@ -317,9 +232,9 @@ def indicators_from_precomputed(
     min_bars: int = 210,
 ) -> dict[str, dict]:
     """Look up the indicator row for ``date_str`` from each ticker's
-    precomputed DataFrame. Returns ``{ticker: indicator_dict}`` matching the
-    shape of ``_compute_indicators_from_ohlcv``'s return value, with tickers
-    excluded when:
+    precomputed DataFrame. Returns ``{ticker: indicator_dict}`` with
+    keys ``rsi_14, macd_cross, macd_above_zero, price_vs_ma50,
+    price_vs_ma200, momentum_20d``. Tickers are excluded when:
       - the ticker is not in ``precomputed``,
       - ``date_str`` isn't in that ticker's index,
       - fewer than ``min_bars`` bars of history exist up to and including
@@ -371,18 +286,17 @@ def predictions_to_signals(
     predictions: dict[str, float],
     date: str,
     sector_map: dict[str, str],
-    ohlcv_by_ticker: dict[str, list[dict]] | None = None,
+    precomputed_indicators: dict[str, dict],
     market_regime: str = "neutral",
     top_n: int = 20,
     min_score: float = 60,
     gbm_enrichment_max: float = 10.0,
-    precomputed_indicators: dict[str, dict] | None = None,
 ) -> dict:
     """
-    Convert GBM alpha predictions + OHLCV price histories to executor signals.
+    Convert GBM alpha predictions + precomputed indicators to executor signals.
 
     For each ticker:
-    1. Compute 5 technical indicators from OHLCV bars up to this date
+    1. Look up technical indicators from ``precomputed_indicators``
     2. Score via _compute_technical_score() → 0-100
     3. Enrich with GBM alpha: ±gbm_enrichment_max pts
     4. Assign signal (ENTER/EXIT/HOLD) based on trading_score
@@ -392,40 +306,16 @@ def predictions_to_signals(
     predictions : {ticker: alpha_score} from GBM inference.
     date : date string (YYYY-MM-DD).
     sector_map : {ticker: sector_etf_symbol}.
-    ohlcv_by_ticker : {ticker: [{date, open, high, low, close}, ...]} —
-                      bars up to (and including) this date only (no lookahead).
-                      Optional when ``precomputed_indicators`` is provided.
     precomputed_indicators : {ticker: indicator_dict} — the result of
-                             ``indicators_from_precomputed`` for this date.
-                             When provided, skips the per-ticker inline
-                             indicator compute (the hot loop that was 2.2s
-                             per date in the 2026-04-21 profile). The
-                             ``ohlcv_by_ticker`` arg is then ignored.
+        ``indicators_from_precomputed`` for this date. Required input
+        (Option A step 9 cleanup deleted the scalar fallback path that
+        accepted raw OHLCV here).
     market_regime : 'bull' | 'neutral' | 'caution' | 'bear'.
     top_n : max ENTER signals per date.
     min_score : minimum trading_score for ENTER.
     gbm_enrichment_max : max ±pts GBM can adjust technical score.
     """
-    # Step 1: Compute technical indicators for all tickers with OHLCV data
-    if precomputed_indicators is not None:
-        # Fast path: caller already has a date-resolved indicator dict
-        # (typically from `indicators_from_precomputed`). Skip the per-
-        # ticker inline compute entirely. This is the hot-loop optimization
-        # used by build_signals_by_date across the 10y backtest window.
-        indicators_by_ticker = precomputed_indicators
-    else:
-        indicators_by_ticker: dict[str, dict] = {}
-        if ohlcv_by_ticker is None:
-            raise ValueError(
-                "predictions_to_signals: either ohlcv_by_ticker or "
-                "precomputed_indicators must be provided."
-            )
-        for ticker in predictions:
-            history = ohlcv_by_ticker.get(ticker)
-            if history:
-                ind = _compute_indicators_from_ohlcv(history)
-                if ind is not None:
-                    indicators_by_ticker[ticker] = ind
+    indicators_by_ticker = precomputed_indicators
 
     # Step 2: Compute momentum percentiles across all scored tickers
     momentum_data = {

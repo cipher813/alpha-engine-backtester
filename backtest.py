@@ -441,55 +441,17 @@ def _filter_signals_to_universe(
     return filtered
 
 
-def _build_ohlcv_date_index(ohlcv_by_ticker: dict) -> dict[str, list[str]]:
-    """Precompute the date axis for every ticker's OHLCV history.
-
-    Returns ``{ticker: [date0, date1, ...]}`` — parallel to
-    ``ohlcv_by_ticker[ticker]`` (same order, same length). The dates are
-    already-sorted ISO8601 strings (``loaders/price_loader.py:142`` sorts
-    bars by ``date`` string), so lexicographic comparison is chronological
-    and ``bisect.bisect_right(dates, signal_date)`` gives the "<= signal_date"
-    cut index in ``O(log N)``.
-
-    Built once per simulation pipeline; every per-date
-    ``_simulate_single_date`` call then slices with ``bars[:cut]`` instead
-    of the prior ``[b for b in bars if b["date"] <= signal_date]`` Python-
-    list comprehension. For a 900-ticker × 2500-bar × 2000-date predictor
-    param sweep (60 combos) this cuts the filter inner loop from
-    ~270B dict-lookup/compare ops to ~108B list-ref copies — roughly
-    10x faster per the same micro-benchmark shape that motivated PR #46
-    (2026-04-21 ``build_signals_by_date`` vectorization, 75min → ~1min).
-
-    2026-04-23 (pandas refactor): When ``ohlcv_by_ticker`` is the new
-    ``{ticker: pd.DataFrame}`` shape, returns an empty dict — the
-    bisect+list-slice path is unused there. Pandas ``.loc[:date]`` on a
-    DatetimeIndex is already O(log N) via its own binary search, and
-    ``_simulate_single_date`` dispatches on shape to
-    ``_df_slice_to_bars``. See plan doc for migration arc.
-    """
-    if not ohlcv_by_ticker:
-        return {}
-    sample = next(iter(ohlcv_by_ticker.values()))
-    if isinstance(sample, pd.DataFrame):
-        return {}
-    return {
-        ticker: [b["date"] for b in bars]
-        for ticker, bars in ohlcv_by_ticker.items()
-    }
-
-
 def _simulate_single_date(
     executor_run,
     sim_client,
     signal_date: str,
     price_matrix,
-    ohlcv_by_ticker: dict | None,
+    ohlcv_by_ticker: dict[str, pd.DataFrame] | None,
     bucket: str,
     config_override: dict | None,
     signals_override: dict | None = None,
     universe_symbols: set[str] | None = None,
     rejected_ticker_counter: dict[str, int] | None = None,
-    ohlcv_dates_index: dict[str, list[str]] | None = None,
     atr_by_ticker: dict[str, float] | None = None,
     vwap_series_by_ticker: dict[str, pd.Series] | None = None,
     coverage_by_ticker: dict[str, float] | None = None,
@@ -552,50 +514,20 @@ def _simulate_single_date(
     sim_client._prices = date_prices
     sim_client._simulation_date = signal_date
 
-    # Filter OHLCV histories to <= signal_date (no lookahead).
-    #
-    # 2026-04-22: vectorized from a per-date Python list comprehension to
-    # bisect+slice after the Saturday SF dry-run timed out at the 2h SSM
-    # ceiling. The old path iterated every bar of every ticker doing a
-    # dict-lookup + string compare per bar — for a 60-combo × 2000-date
-    # × 900-ticker × 2500-bar predictor param sweep that worked out to
-    # ~270B inner ops. bisect.bisect_right is O(log N) against the
-    # precomputed date axis; the list slice copies only references, not
-    # bar data. Same shape as PR #46's ``build_signals_by_date`` fix.
-    #
-    # ``ohlcv_dates_index`` is threaded from the caller when available.
-    # Fallback derivation keeps the old per-call callers working while
-    # we migrate — it's the scalar path, kept under test via
-    # ``test_price_histories_parity.py`` so future refactors can't drift.
-    #
-    # 2026-04-23 (pandas refactor): dispatch on ``ohlcv_by_ticker``'s shape.
-    # When DataFrame-form ({ticker: pd.DataFrame}), slice via
-    # ``_df_slice_to_bars``. Pandas ``.loc[:date]`` on a DatetimeIndex is
-    # O(log N) via its own binsearch — same complexity as the bisect
-    # path. The executor still consumes list-of-dicts at its boundary
-    # (Option A coexistence window), so we materialize the filtered
-    # slice back to the bar shape here. List-of-dicts path retained
-    # until all producers flip (plan step 9 cleanup).
+    # Filter OHLCV histories to <= signal_date (no lookahead). The
+    # canonical shape post Option A step 9 cleanup is
+    # ``dict[str, pd.DataFrame]`` (DatetimeIndex). The executor's
+    # boundary still consumes list-of-dicts (Option B is the executor-
+    # side migration that closes that gap), so ``_df_slice_to_bars``
+    # materializes the filtered slice. Pandas ``.loc[:date]`` is
+    # O(log N) via DatetimeIndex binsearch.
     price_histories = None
     if ohlcv_by_ticker:
-        sample = next(iter(ohlcv_by_ticker.values()), None)
-        if isinstance(sample, pd.DataFrame):
-            from synthetic.predictor_backtest import _df_slice_to_bars
-            price_histories = {
-                ticker: _df_slice_to_bars(df, signal_date)
-                for ticker, df in ohlcv_by_ticker.items()
-            }
-        elif ohlcv_dates_index is not None:
-            from bisect import bisect_right
-            price_histories = {
-                ticker: bars[:bisect_right(ohlcv_dates_index[ticker], signal_date)]
-                for ticker, bars in ohlcv_by_ticker.items()
-            }
-        else:
-            price_histories = {
-                ticker: [b for b in bars if b["date"] <= signal_date]
-                for ticker, bars in ohlcv_by_ticker.items()
-            }
+        from synthetic.predictor_backtest import _df_slice_to_bars
+        price_histories = {
+            ticker: _df_slice_to_bars(df, signal_date)
+            for ticker, df in ohlcv_by_ticker.items()
+        }
 
     # Precomputed feature-map injection (alpha-engine PR #91). When both
     # maps are available, resolve VWAP for this simulate date against the
@@ -651,10 +583,9 @@ def _run_simulation_loop(
     dates: list[str],
     price_matrix,
     config: dict,
-    ohlcv_by_ticker: dict | None = None,
+    ohlcv_by_ticker: dict[str, pd.DataFrame] | None = None,
     signals_by_date: dict | None = None,
     spy_prices: pd.Series | None = None,
-    ohlcv_dates_index: dict[str, list[str]] | None = None,
     atr_by_ticker: dict[str, float] | None = None,
     vwap_series_by_ticker: dict[str, pd.Series] | None = None,
     coverage_by_ticker: dict[str, float] | None = None,
@@ -688,23 +619,13 @@ def _run_simulation_loop(
     # Build config_override from swept params that need to reach the executor
     config_override = _build_config_override(config)
 
-    # Precompute OHLCV date axis once per simulate pass. Callers sharing
-    # ``ohlcv_by_ticker`` across many simulate runs (param sweep, Phase 4
-    # evaluations) can build this once at the top-level and pass it
-    # in — otherwise we derive it here so every per-date
-    # ``_simulate_single_date`` call gets the fast bisect+slice path
-    # regardless of caller. Cost is a single ``O(N_tickers × N_bars)``
-    # pass, negligible compared to the inner loop savings.
-    if ohlcv_by_ticker and ohlcv_dates_index is None:
-        ohlcv_dates_index = _build_ohlcv_date_index(ohlcv_by_ticker)
-
-    # Precompute ATR + VWAP maps once per simulate pass — same motivation
-    # as ohlcv_dates_index. The executor's ``load_atr_14_pct`` and
-    # ``load_daily_vwap`` both hit ArcticDB per ticker per call (20+
-    # round-trips per simulate call). The alpha-engine PR #91 kwargs
-    # ``atr_map`` + ``vwap_map`` let the backtester inject pre-resolved
-    # maps and skip those reads entirely. Callers can also pass in the
-    # pre-built maps to avoid rebuilding per combo in param sweep.
+    # Precompute ATR + VWAP maps once per simulate pass. The executor's
+    # ``load_atr_14_pct`` and ``load_daily_vwap`` both hit ArcticDB per
+    # ticker per call (20+ round-trips per simulate call). The
+    # alpha-engine PR #91 kwargs ``atr_map`` + ``vwap_map`` let the
+    # backtester inject pre-resolved maps and skip those reads entirely.
+    # Callers can also pass in the pre-built maps to avoid rebuilding per
+    # combo in param sweep.
     if (atr_by_ticker is None or vwap_series_by_ticker is None or coverage_by_ticker is None):
         from store.feature_maps import load_precomputed_feature_maps
         _smoke_tickers = config.get("smoke_tickers")
@@ -770,7 +691,6 @@ def _run_simulation_loop(
             signals_override=signals_override,
             universe_symbols=universe_symbols,
             rejected_ticker_counter=rejected_ticker_counter,
-            ohlcv_dates_index=ohlcv_dates_index,
             atr_by_ticker=atr_by_ticker,
             vwap_series_by_ticker=vwap_series_by_ticker,
             coverage_by_ticker=coverage_by_ticker,
@@ -1273,10 +1193,6 @@ def replay_for_dates(
     else:
         sim_dates = sorted(dates)
 
-    # One-time OHLCV date-axis build for the same reason as in
-    # ``_run_simulation_loop`` — avoids rebuilding per ``signal_date``.
-    ohlcv_dates_index = _build_ohlcv_date_index(ohlcv_by_ticker) if ohlcv_by_ticker else None
-
     captured: list[dict] = []
     for signal_date in sim_dates:
         # signals_by_date is set when bootstrap-mode replay extends sim to
@@ -1302,7 +1218,6 @@ def replay_for_dates(
             signals_override=signals_override,
             universe_symbols=universe_symbols,
             rejected_ticker_counter=rejected_ticker_counter,
-            ohlcv_dates_index=ohlcv_dates_index,
         )
         if orders and signal_date in requested:
             captured.extend(orders)
@@ -1439,10 +1354,6 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
         )
         return pd.DataFrame()
 
-    # Build the OHLCV date-axis index ONCE — every combo's simulate pass
-    # would otherwise rebuild it redundantly in _run_simulation_loop.
-    ohlcv_dates_index = _build_ohlcv_date_index(ohlcv) if ohlcv else None
-
     # Precompute ATR + VWAP + coverage maps ONCE across the full combo
     # sweep. Without this, _run_simulation_loop derives them lazily per
     # combo and we repay the ~900-ticker ArcticDB bulk read 60 times.
@@ -1458,7 +1369,6 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
         return _run_simulation_loop(
             executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
             ohlcv_by_ticker=ohlcv,
-            ohlcv_dates_index=ohlcv_dates_index,
             atr_by_ticker=atr_by_ticker,
             vwap_series_by_ticker=vwap_series_by_ticker,
             coverage_by_ticker=coverage_by_ticker,
@@ -1567,16 +1477,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     sector_map = result.get("sector_map", {})
     trading_dates = result.get("trading_dates", [])
 
-    # One-time OHLCV date axis build. Shared across the single-run sim,
-    # every Phase 4 evaluation that also runs a full simulation
-    # (ensemble_modes, signal_thresholds, feature_pruning), and every
-    # param-sweep combo. Without this, each of those would rebuild the
-    # index redundantly — 60+ rebuilds for a full predictor-param-sweep
-    # over 2000+ dates, each ~2s. See _build_ohlcv_date_index docstring
-    # for the inner-loop cost math.
-    ohlcv_dates_index = _build_ohlcv_date_index(ohlcv_by_ticker) if ohlcv_by_ticker else None
-
-    # Same one-time-share logic for ATR + VWAP precomputed maps. The
+    # One-time-share logic for ATR + VWAP precomputed maps. The
     # predictor-param-sweep is the bottleneck the Saturday SF dry-run
     # timed out on: 60 combos × 2000+ dates × per-ticker ArcticDB reads.
     # Loading once up front collapses that to a single bulk scan (~1-2
@@ -1639,7 +1540,6 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 ohlcv_by_ticker=ohlcv_by_ticker,
                 signals_by_date=signals_by_date,
                 spy_prices=spy_prices,
-                ohlcv_dates_index=ohlcv_dates_index,
                 atr_by_ticker=atr_by_ticker,
                 vwap_series_by_ticker=vwap_series_by_ticker,
                 coverage_by_ticker=coverage_by_ticker,
@@ -1811,7 +1711,6 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 ohlcv_by_ticker=ohlcv_by_ticker,
                 signals_by_date=signals_by_date,
                 spy_prices=spy_prices,
-                ohlcv_dates_index=ohlcv_dates_index,
                 atr_by_ticker=atr_by_ticker,
                 vwap_series_by_ticker=vwap_series_by_ticker,
                 coverage_by_ticker=coverage_by_ticker,
@@ -2473,7 +2372,6 @@ def _run_simulation_pipeline(
     # combo was re-entering load_precomputed_feature_maps). The guard
     # matches the shape of the simulate/sweep blocks: skip the read
     # entirely when _sim_setup is None or price_matrix is empty.
-    ohlcv_dates_index = None
     atr_by_ticker = None
     vwap_series_by_ticker = None
     coverage_by_ticker = None
@@ -2482,9 +2380,6 @@ def _run_simulation_pipeline(
         and _sim_setup[3] is not None  # price_matrix
         and args.mode in ("simulate", "param-sweep", "all")
     ):
-        _ohlcv = _sim_setup[5]
-        if _ohlcv:
-            ohlcv_dates_index = _build_ohlcv_date_index(_ohlcv)
         try:
             from store.feature_maps import load_precomputed_feature_maps
             bucket = config.get("signals_bucket", "alpha-engine-research")
@@ -2538,7 +2433,6 @@ def _run_simulation_pipeline(
                         portfolio_stats = _run_simulation_loop(
                             executor_run, SimulatedIBKRClient, dates, price_matrix, config,
                             ohlcv_by_ticker=ohlcv,
-                            ohlcv_dates_index=ohlcv_dates_index,
                             atr_by_ticker=atr_by_ticker,
                             vwap_series_by_ticker=vwap_series_by_ticker,
                             coverage_by_ticker=coverage_by_ticker,
@@ -2582,7 +2476,6 @@ def _run_simulation_pipeline(
                             return _run_simulation_loop(
                                 executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
                                 ohlcv_by_ticker=ohlcv,
-                                ohlcv_dates_index=ohlcv_dates_index,
                                 atr_by_ticker=atr_by_ticker,
                                 vwap_series_by_ticker=vwap_series_by_ticker,
                                 coverage_by_ticker=coverage_by_ticker,
@@ -2631,7 +2524,6 @@ def _run_simulation_pipeline(
                                 return _run_simulation_loop(
                                     executor_run_fn, SimClientCls, sim_dates, pm, combo_config,
                                     ohlcv_by_ticker=ohlcv_data,
-                                    ohlcv_dates_index=ohlcv_dates_index,
                                     atr_by_ticker=atr_by_ticker,
                                     vwap_series_by_ticker=vwap_series_by_ticker,
                                     coverage_by_ticker=coverage_by_ticker,
@@ -2661,7 +2553,6 @@ def _run_simulation_pipeline(
                                 return _run_simulation_loop(
                                     executor_run_fn, SimClientCls, sim_dates, pm, cfg,
                                     ohlcv_by_ticker=ohlcv_data,
-                                    ohlcv_dates_index=ohlcv_dates_index,
                                     atr_by_ticker=atr_by_ticker,
                                     vwap_series_by_ticker=vwap_series_by_ticker,
                                     coverage_by_ticker=coverage_by_ticker,

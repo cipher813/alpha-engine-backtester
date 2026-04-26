@@ -105,55 +105,43 @@ def load_dataframe(bucket: str, key: str, *, s3_client=None) -> pd.DataFrame:
 
 def save_ohlcv_by_ticker(
     bucket: str, date: str, phase: str, name: str,
-    ohlcv_by_ticker,
+    ohlcv_by_ticker: dict,
     *, s3_client=None,
 ) -> str:
-    """Persist ohlcv_by_ticker in whichever shape the caller produced.
+    """Persist ``ohlcv_by_ticker`` (DataFrame shape only — Option A
+    step 9 cleanup deleted the legacy list-of-dicts producer).
 
-    Accepts either:
-      - ``dict[str, list[dict]]`` (legacy) — stacks bars into one parquet
-        frame with a ``ticker`` column and one row per bar.
-      - ``dict[str, pd.DataFrame]`` (new, post-2026-04-23 pandas refactor) —
-        delegates to ``save_dict_of_dataframes`` which adds a ``ticker``
-        column and an ``__idx__`` column carrying the DatetimeIndex.
-
-    The load side (``load_ohlcv_by_ticker``) detects which schema is on
-    disk via the presence of ``__idx__`` and returns the matching shape.
-    Downstream consumers dispatch on shape (see
-    ``_simulate_single_date``'s isinstance branch and
-    ``precompute_indicator_series``) so both schemas round-trip without
-    any caller coordination.
+    Delegates to ``save_dict_of_dataframes`` which adds a ``ticker``
+    column and an ``__idx__`` column carrying the DatetimeIndex.
     """
-    sample = next(iter(ohlcv_by_ticker.values()), None) if ohlcv_by_ticker else None
-    if isinstance(sample, pd.DataFrame):
+    if not ohlcv_by_ticker:
         return save_dict_of_dataframes(
             bucket, date, phase, name, ohlcv_by_ticker, s3_client=s3_client,
         )
-    rows = []
-    for ticker, bars in ohlcv_by_ticker.items():
-        for bar in bars:
-            rows.append({"ticker": ticker, **bar})
-    df = pd.DataFrame(rows)
-    return save_dataframe(
-        bucket, date, phase, name, df,
-        s3_client=s3_client, preserve_index=False,
+    sample = next(iter(ohlcv_by_ticker.values()))
+    if not isinstance(sample, pd.DataFrame):
+        raise TypeError(
+            f"save_ohlcv_by_ticker: expected dict[str, pd.DataFrame] post "
+            f"Option A step 9 cleanup; got value of type "
+            f"{type(sample).__name__}. Producer must use "
+            f"build_ohlcv_df_by_ticker."
+        )
+    return save_dict_of_dataframes(
+        bucket, date, phase, name, ohlcv_by_ticker, s3_client=s3_client,
     )
 
 
 def load_ohlcv_by_ticker(
     bucket: str, key: str, *, s3_client=None,
-):
-    """Inverse of ``save_ohlcv_by_ticker``. Detects on-disk schema by
-    the presence of the ``__idx__`` column (added by
-    ``save_dict_of_dataframes``) and returns the matching in-memory
-    shape: ``dict[str, pd.DataFrame]`` for the new schema or
-    ``dict[str, list[dict]]`` for the legacy one.
+) -> dict:
+    """Inverse of ``save_ohlcv_by_ticker``. Returns
+    ``dict[str, pd.DataFrame]`` (DatetimeIndex per ticker).
 
-    Auto-skip robustness: a Saturday rerun can touch a marker from the
-    prior run whose artifact is on the OTHER schema. Downstream
-    consumers (simulate's slice dispatch, precompute_indicator_series)
-    shape-dispatch on whatever this function returns — no coordination
-    needed between producer and consumer.
+    Hard-fails on legacy artifacts (parquet without ``__idx__`` column)
+    so a stale pre-Option-A artifact from a prior run can't silently
+    feed list-of-dicts shape to the now-DataFrame-only consumers. The
+    auto-skip layer treats this as a real failure and re-runs the
+    upstream phase.
     """
     df = load_dataframe(bucket, key, s3_client=s3_client)
     if df.empty:
@@ -163,18 +151,21 @@ def load_ohlcv_by_ticker(
             f"load_ohlcv_by_ticker: parquet at {key!r} missing 'ticker' column "
             f"(found: {list(df.columns)})"
         )
-    if "__idx__" in df.columns:
-        out_df: dict[str, pd.DataFrame] = {}
-        for ticker, group in df.groupby("ticker", sort=False):
-            frame = group.drop(columns=["ticker"]).copy()
-            frame = frame.set_index("__idx__")
-            frame.index.name = None
-            out_df[str(ticker)] = frame
-        return out_df
-    out_list: dict[str, list[dict]] = {}
+    if "__idx__" not in df.columns:
+        raise ValueError(
+            f"load_ohlcv_by_ticker: parquet at {key!r} is on the legacy "
+            f"list-of-dicts schema (no '__idx__' column). Option A step 9 "
+            f"cleanup removed legacy support — re-run the upstream "
+            f"predictor_data_prep phase to regenerate the artifact in "
+            f"DataFrame shape."
+        )
+    out_df: dict[str, pd.DataFrame] = {}
     for ticker, group in df.groupby("ticker", sort=False):
-        out_list[str(ticker)] = group.drop(columns=["ticker"]).to_dict("records")
-    return out_list
+        frame = group.drop(columns=["ticker"]).copy()
+        frame = frame.set_index("__idx__")
+        frame.index.name = None
+        out_df[str(ticker)] = frame
+    return out_df
 
 
 # ── Series artifacts (e.g. spy_prices) ───────────────────────────────────────
