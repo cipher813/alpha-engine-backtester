@@ -228,24 +228,57 @@ def _load_simulation_setup(config: dict, registry) -> tuple:
 def _save_predictor_data_prep(
     ctx, bucket: str, date: str, result: dict, *, s3_client=None,
 ) -> None:
-    """Persist every output of synthetic.predictor_backtest.run(keep_features=True).
+    """Persist every output of ``synthetic.predictor_backtest.run``.
 
-    8 artifacts on disk (JSON + parquet). The one big one is features_by_ticker
-    (stacked parquet, ~150-250 MB for ~900 tickers × 2500 rows × 59 cols).
     Skips persistence when status != 'ok' — a failed prep should re-run,
     not replay a degraded snapshot.
+
+    Memory-shape decisions on disk + on the in-memory result dict:
+
+    * ``features_by_ticker`` is persisted by the run() callback (Stage 4)
+      before this function is called. The result dict's
+      ``features_by_ticker`` slot is None at this point; we don't try
+      to re-save it here.
+    * ``signals_by_date`` is persisted as flat parquets via
+      ``save_signals_by_date_flat`` (Stage 4b) instead of a single
+      ~1 GB JSON. The 2026-04-26 v6 spot validated that the JSON path
+      took 27 minutes and tripped the predictor_data_prep watchdog;
+      the flat-parquet path completes in ~30-60s.
+    * After the flat-parquet save completes, ``result["signals_by_date"]``
+      is REPLACED IN PLACE with a ``LazySignalsByDate`` handle pointing
+      at the artifact. This drops the ~1 GB dict from memory and
+      mirrors the shape produced by the auto-skip reload path —
+      downstream consumers (single_run sim, param_sweep) see the same
+      Mapping interface regardless of which branch produced ``result``.
     """
     from phase_artifacts import (
-        save_dataframe, save_dict_of_dataframes, save_json,
+        save_dataframe, save_json,
         save_ohlcv_by_ticker, save_series,
+        save_signals_by_date_flat,
+        load_signals_by_date_lazy,
     )
     if result.get("status") != "ok":
         return
     phase_name = "predictor_data_prep"
-    ctx.record_artifact(save_json(
-        bucket, date, phase_name, "signals_by_date", result["signals_by_date"],
-        s3_client=s3_client,
-    ))
+
+    # signals_by_date — flat parquet (records + metadata)
+    records_key, metadata_key = save_signals_by_date_flat(
+        bucket, date, phase_name, "signals_by_date",
+        result["signals_by_date"], s3_client=s3_client,
+    )
+    ctx.record_artifact(records_key)
+    ctx.record_artifact(metadata_key)
+
+    # Swap the in-memory dict for a lazy handle — releases ~1 GB and
+    # mirrors the auto-skip reload shape. Caller does NOT need its
+    # own gc.collect() afterward; we run one here so the dict is
+    # actually reclaimed before the caller touches result again.
+    result["signals_by_date"] = load_signals_by_date_lazy(
+        bucket, records_key, metadata_key, s3_client=s3_client,
+    )
+    import gc
+    gc.collect()
+
     ctx.record_artifact(save_dataframe(
         bucket, date, phase_name, "price_matrix", result["price_matrix"],
         s3_client=s3_client,
@@ -276,6 +309,14 @@ def _save_predictor_data_prep(
         result.get("predictions_by_date", {}),
         s3_client=s3_client,
     ))
+    # features_by_ticker is normally persisted by the Stage 4 callback
+    # inside run() — by the time we get here ``result["features_by_
+    # ticker"]`` is None and this branch is a no-op. The branch is
+    # retained for callers (typically unit tests) that bypass run() and
+    # populate features_by_ticker directly into the result dict. In that
+    # path we save to S3 here using the same artifact key the callback
+    # would use, so the lazy-load helper finds it either way.
+    from phase_artifacts import save_dict_of_dataframes
     features = result.get("features_by_ticker") or {}
     if features:
         ctx.record_artifact(save_dict_of_dataframes(
@@ -337,8 +378,9 @@ def _load_predictor_data_prep(bucket: str, registry) -> dict:
     Raises loud if marker missing or a required artifact absent from the
     marker's artifact_keys list."""
     from phase_artifacts import (
-        load_dataframe, load_dict_of_dataframes, load_json,
+        load_dataframe, load_json,
         load_ohlcv_by_ticker, load_series,
+        load_signals_by_date_lazy,
     )
     s3 = registry.s3_client
     marker = registry.load_marker("predictor_data_prep")
@@ -360,9 +402,18 @@ def _load_predictor_data_prep(bucket: str, registry) -> dict:
             return None
         return matches[0]
 
+    # signals_by_date — Stage 4b flat-parquet shape: two artifacts
+    # (records + metadata) lazy-loaded via LazySignalsByDate. Replaces
+    # the pre-2026-04-26 single signals_by_date.json that took 27 min
+    # to serialize and tripped the predictor_data_prep watchdog.
+    signals_records_key = _find("/signals_by_date_records.parquet")
+    signals_metadata_key = _find("/signals_by_date_metadata.parquet")
+
     result = {
         "status": "ok",
-        "signals_by_date": load_json(bucket, _find("/signals_by_date.json"), s3_client=s3),
+        "signals_by_date": load_signals_by_date_lazy(
+            bucket, signals_records_key, signals_metadata_key, s3_client=s3,
+        ),
         "price_matrix": load_dataframe(bucket, _find("/price_matrix.parquet"), s3_client=s3),
         "ohlcv_by_ticker": load_ohlcv_by_ticker(
             bucket, _find("/ohlcv_by_ticker.parquet"), s3_client=s3,
@@ -383,9 +434,9 @@ def _load_predictor_data_prep(bucket: str, registry) -> dict:
     result["features_by_ticker"] = None
 
     logger.info(
-        "predictor_data_prep auto-skip: reloaded %d signal dates, "
+        "predictor_data_prep auto-skip: reloaded signals_by_date (lazy), "
         "price_matrix %s, %d tickers OHLCV, features deferred to lazy-load",
-        len(result["signals_by_date"]), result["price_matrix"].shape,
+        result["price_matrix"].shape,
         len(result["ohlcv_by_ticker"]),
     )
     return result
