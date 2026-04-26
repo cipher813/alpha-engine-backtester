@@ -46,11 +46,40 @@ def _sample_result() -> dict:
             {"feat1": [0.5, 0.6], "feat2": [1.5, 1.6]}, index=dates[:2],
         ),
     }
+    # Realistic envelope shape — matches what
+    # synthetic.signal_generator.predictions_to_signals produces
+    # (ticker, signal, score, conviction, sector, rating per record;
+    # market_regime + sector_ratings on the envelope). Stage 4b's
+    # flat-parquet round-trip normalizes types (int score → float,
+    # missing strings → ""), so the fixture explicitly sets every
+    # field so the assertion can compare for equality.
     return {
         "status": "ok",
         "signals_by_date": {
-            "2026-01-01": {"buy_candidates": [{"ticker": "AAPL", "score": 80}]},
-            "2026-01-02": {"buy_candidates": [{"ticker": "MSFT", "score": 75}]},
+            "2026-01-01": {
+                "date": "2026-01-01",
+                "market_regime": "neutral",
+                "sector_ratings": {"Technology": {"rating": "market_weight"}},
+                "buy_candidates": [
+                    {"ticker": "AAPL", "signal": "ENTER", "score": 80.0,
+                     "conviction": "rising", "sector": "Technology", "rating": "BUY"},
+                ],
+                "universe": [],
+            },
+            "2026-01-02": {
+                "date": "2026-01-02",
+                "market_regime": "bull",
+                "sector_ratings": {"Technology": {"rating": "overweight"}},
+                "buy_candidates": [
+                    {"ticker": "MSFT", "signal": "ENTER", "score": 75.0,
+                     "conviction": "stable", "sector": "Technology", "rating": "BUY"},
+                ],
+                "universe": [
+                    {"ticker": "TSLA", "signal": "HOLD", "score": 50.0,
+                     "conviction": "stable", "sector": "Consumer Cyclical",
+                     "rating": "HOLD"},
+                ],
+            },
         },
         "price_matrix": price_matrix,
         "ohlcv_by_ticker": ohlcv,
@@ -67,8 +96,16 @@ def _sample_result() -> dict:
 
 
 def test_predictor_data_prep_roundtrip(s3):
-    """Save on run 1, load on run 2 reconstructs the full result dict."""
+    """Save on run 1, load on run 2 reconstructs the full result dict.
+
+    ``_save_predictor_data_prep`` mutates the passed-in result by
+    swapping ``signals_by_date`` from a dict to a ``LazySignalsByDate``
+    handle (Stage 4b memory optimization). Capture the original dict
+    before the save so we can compare the round-tripped envelopes
+    field-for-field."""
     original = _sample_result()
+    # Snapshot the dict-of-envelopes shape before _save mutates result.
+    original_signals_dict = dict(original["signals_by_date"])
 
     registry1 = PhaseRegistry(date="2026-04-23", bucket="b", s3_client=s3)
     with registry1.phase("predictor_data_prep", supports_auto_skip=True) as ctx:
@@ -76,6 +113,10 @@ def test_predictor_data_prep_roundtrip(s3):
         bt._save_predictor_data_prep(
             ctx, "b", "2026-04-23", original, s3_client=registry1.s3_client,
         )
+
+    # After save, original["signals_by_date"] has been swapped for a lazy handle
+    from phase_artifacts import LazySignalsByDate
+    assert isinstance(original["signals_by_date"], LazySignalsByDate)
 
     # Retry: fresh registry, same S3
     registry2 = PhaseRegistry(date="2026-04-23", bucket="b", s3_client=s3)
@@ -86,7 +127,31 @@ def test_predictor_data_prep_roundtrip(s3):
     reloaded = bt._load_predictor_data_prep("b", registry2)
 
     assert reloaded["status"] == "ok"
-    assert reloaded["signals_by_date"] == original["signals_by_date"]
+    # signals_by_date is a LazySignalsByDate handle (both fresh-run swap
+    # and auto-skip reload produce the same shape). Verify the
+    # round-trip via the Mapping interface — keys + per-date envelopes
+    # must match the original dict.
+    assert isinstance(reloaded["signals_by_date"], LazySignalsByDate)
+    assert set(reloaded["signals_by_date"].keys()) == set(original_signals_dict.keys())
+    for date_key in original_signals_dict:
+        orig_env = original_signals_dict[date_key]
+        got_env = reloaded["signals_by_date"][date_key]
+        # Envelope structural fields
+        assert got_env["date"] == date_key
+        assert got_env["market_regime"] == orig_env.get("market_regime", "neutral")
+        assert got_env["sector_ratings"] == orig_env.get("sector_ratings", {})
+        # Buy candidates: same set of tickers + matching field values
+        orig_buy = {e["ticker"]: e for e in (orig_env.get("buy_candidates") or [])}
+        got_buy = {e["ticker"]: e for e in got_env.get("buy_candidates") or []}
+        assert set(got_buy.keys()) == set(orig_buy.keys())
+        for ticker, orig_entry in orig_buy.items():
+            got_entry = got_buy[ticker]
+            for field in ("ticker", "signal", "score"):
+                assert got_entry.get(field) == orig_entry.get(field), (
+                    f"buy.{ticker}.{field}: orig={orig_entry.get(field)} "
+                    f"got={got_entry.get(field)}"
+                )
+
     assert reloaded["metadata"] == original["metadata"]
     assert reloaded["sector_map"] == original["sector_map"]
     assert reloaded["trading_dates"] == original["trading_dates"]

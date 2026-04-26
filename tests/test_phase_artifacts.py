@@ -447,6 +447,169 @@ def test_dict_of_dataframes_homogeneous_columns_no_reindex(s3):
     assert list(loaded["BBB"]["b"]) == [7.0, 8.0]
 
 
+class TestSignalsByDateFlatPersistence:
+    """Stage 4b: signals_by_date persisted as two flat parquets +
+    lazy-loaded as ``LazySignalsByDate``. Replaces the pre-2026-04-26
+    ~1 GB JSON serialization that took 27 min on the v6 spot."""
+
+    def _envelope(self, date_str, regime, buy_tickers, universe_tickers):
+        """Build an envelope shape matching what
+        synthetic.signal_generator.predictions_to_signals produces."""
+        return {
+            "date": date_str,
+            "market_regime": regime,
+            "sector_ratings": {
+                "Technology": {"rating": "market_weight", "modifier": 1.0,
+                               "rationale": "synthetic"},
+            },
+            "buy_candidates": [
+                {"ticker": t, "signal": "ENTER", "score": 80.0,
+                 "conviction": "rising", "sector": "Technology", "rating": "BUY"}
+                for t in buy_tickers
+            ],
+            "universe": [
+                {"ticker": t, "signal": "HOLD", "score": 50.0,
+                 "conviction": "stable", "sector": "Technology", "rating": "HOLD"}
+                for t in universe_tickers
+            ],
+        }
+
+    def test_save_and_lazy_load_roundtrip(self, s3):
+        """Two-date dict round-trips via flat parquet + lazy mapping."""
+        from phase_artifacts import (
+            LazySignalsByDate, save_signals_by_date_flat,
+            load_signals_by_date_lazy,
+        )
+        signals = {
+            "2026-01-01": self._envelope("2026-01-01", "neutral",
+                                         ["AAPL", "MSFT"], ["TSLA"]),
+            "2026-01-02": self._envelope("2026-01-02", "bull",
+                                         ["NVDA"], ["AMD", "INTC"]),
+        }
+        records_key, metadata_key = save_signals_by_date_flat(
+            "b", "2026-04-26", "predictor_data_prep", "signals_by_date",
+            signals, s3_client=s3,
+        )
+        assert records_key.endswith("/signals_by_date_records.parquet")
+        assert metadata_key.endswith("/signals_by_date_metadata.parquet")
+
+        lazy = load_signals_by_date_lazy("b", records_key, metadata_key, s3_client=s3)
+        assert isinstance(lazy, LazySignalsByDate)
+
+        # Mapping interface
+        assert set(lazy.keys()) == {"2026-01-01", "2026-01-02"}
+        assert len(lazy) == 2
+        assert "2026-01-01" in lazy
+        assert "2026-04-99" not in lazy
+
+        # Per-date envelope materialization
+        env = lazy["2026-01-01"]
+        assert env["date"] == "2026-01-01"
+        assert env["market_regime"] == "neutral"
+        assert env["sector_ratings"]["Technology"]["rating"] == "market_weight"
+        assert {e["ticker"] for e in env["buy_candidates"]} == {"AAPL", "MSFT"}
+        assert {e["ticker"] for e in env["universe"]} == {"TSLA"}
+
+        env = lazy["2026-01-02"]
+        assert env["market_regime"] == "bull"
+        assert {e["ticker"] for e in env["buy_candidates"]} == {"NVDA"}
+        assert {e["ticker"] for e in env["universe"]} == {"AMD", "INTC"}
+
+    def test_empty_signals_by_date(self, s3):
+        """Empty dict produces empty-header parquets; lazy load returns
+        a LazySignalsByDate with len()==0."""
+        from phase_artifacts import (
+            save_signals_by_date_flat, load_signals_by_date_lazy,
+        )
+        records_key, metadata_key = save_signals_by_date_flat(
+            "b", "2026-04-26", "p", "signals_by_date", {}, s3_client=s3,
+        )
+        lazy = load_signals_by_date_lazy("b", records_key, metadata_key, s3_client=s3)
+        assert len(lazy) == 0
+        assert list(lazy.keys()) == []
+        assert "any_date" not in lazy
+
+    def test_lazy_keyerror_on_unknown_date(self, s3):
+        from phase_artifacts import (
+            save_signals_by_date_flat, load_signals_by_date_lazy,
+        )
+        signals = {"2026-01-01": self._envelope("2026-01-01", "neutral",
+                                                ["AAPL"], [])}
+        records_key, metadata_key = save_signals_by_date_flat(
+            "b", "2026-04-26", "p", "signals_by_date", signals, s3_client=s3,
+        )
+        lazy = load_signals_by_date_lazy("b", records_key, metadata_key, s3_client=s3)
+        with pytest.raises(KeyError):
+            _ = lazy["2099-12-31"]
+
+    def test_lazy_get_returns_default_on_missing(self, s3):
+        from phase_artifacts import (
+            save_signals_by_date_flat, load_signals_by_date_lazy,
+        )
+        signals = {"2026-01-01": self._envelope("2026-01-01", "neutral",
+                                                ["AAPL"], [])}
+        records_key, metadata_key = save_signals_by_date_flat(
+            "b", "2026-04-26", "p", "signals_by_date", signals, s3_client=s3,
+        )
+        lazy = load_signals_by_date_lazy("b", records_key, metadata_key, s3_client=s3)
+        assert lazy.get("2099-12-31") is None
+        assert lazy.get("2099-12-31", "fallback") == "fallback"
+
+    def test_lazy_pickling_preserves_keys(self, s3):
+        """LazySignalsByDate must survive pickle (param_sweep
+        multiprocessing pickled the closure carrying signals_by_date).
+        After unpickle, the lazy state reinitializes — load happens
+        fresh in the child process."""
+        import pickle
+        from phase_artifacts import (
+            save_signals_by_date_flat, load_signals_by_date_lazy,
+        )
+        signals = {
+            "2026-01-01": self._envelope("2026-01-01", "neutral",
+                                         ["AAPL"], ["TSLA"]),
+        }
+        records_key, metadata_key = save_signals_by_date_flat(
+            "b", "2026-04-26", "p", "signals_by_date", signals, s3_client=s3,
+        )
+        lazy = load_signals_by_date_lazy("b", records_key, metadata_key, s3_client=s3)
+        # Pickle round-trip: __getstate__ drops the loaded internal state
+        # and the s3_client; __setstate__ reinitializes.
+        # The unpickled instance can't actually reload without a real
+        # s3_client; we just verify the pickle/unpickle path itself
+        # works without raising.
+        pickled = pickle.dumps(lazy)
+        unpickled = pickle.loads(pickled)
+        assert unpickled._records_key == records_key
+        assert unpickled._metadata_key == metadata_key
+        assert unpickled._records_by_date is None  # state reset
+
+    def test_lazy_records_only_loaded_once(self, s3):
+        """Repeated __getitem__ calls don't re-fetch from S3 — the
+        first access loads, subsequent calls hit the cached
+        DataFrames."""
+        from phase_artifacts import (
+            save_signals_by_date_flat, load_signals_by_date_lazy,
+        )
+        signals = {
+            "2026-01-01": self._envelope("2026-01-01", "neutral",
+                                         ["AAPL"], ["TSLA"]),
+        }
+        records_key, metadata_key = save_signals_by_date_flat(
+            "b", "2026-04-26", "p", "signals_by_date", signals, s3_client=s3,
+        )
+        lazy = load_signals_by_date_lazy("b", records_key, metadata_key, s3_client=s3)
+
+        # First access loads
+        assert lazy._records_by_date is None
+        _ = lazy["2026-01-01"]
+        assert lazy._records_by_date is not None
+        loaded_id = id(lazy._records_by_date)
+
+        # Second access reuses
+        _ = lazy["2026-01-01"]
+        assert id(lazy._records_by_date) == loaded_id
+
+
 def test_dict_of_dataframes_object_vs_numeric_still_raises(s3):
     """Non-numeric drift is intentionally left alone — string-vs-int
     or datetime-vs-object are real semantic divergences that should

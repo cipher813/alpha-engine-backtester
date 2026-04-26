@@ -532,3 +532,318 @@ def load_dict_of_dataframes(
             df.index.name = None
         out[str(ticker)] = df.reset_index(drop=True) if df.index.name == "index" else df
     return out
+
+
+# ── signals_by_date — flat parquet persistence + lazy load ──────────────────
+#
+# Pre-2026-04-26: persisted as a single ``signals_by_date.json`` blob via
+# ``save_json``. With ~38k buy_candidates + ~2M universe records across
+# ~2,316 dates, the JSON serialization step took 27 minutes per Saturday
+# SF run on c5.large — a single ``json.dumps`` on a ~1 GB dict-of-dicts
+# without streaming. The 2026-04-26 v6 c5.large optimization-arc
+# validation tripped the predictor_data_prep watchdog at 32 min, with
+# all the slowness in this serialize step.
+#
+# Solution: split the envelope into two flat parquets — one row per
+# ticker entry, one row per date for metadata. Stream-write per-date so
+# memory peak stays bounded. Load as a ``LazySignalsByDate`` mapping
+# wrapper that materializes per-date envelopes on demand from the
+# in-memory DataFrames. Resident set drops from ~1 GB dict-of-dicts to
+# ~150 MB DataFrame; serialize time drops from ~27 min to ~30-60s.
+#
+# Schema:
+#   records.parquet  — columns: date, bucket, ticker, signal, score,
+#                      conviction, sector, rating
+#                      (one row per ticker entry, both buckets)
+#   metadata.parquet — columns: date, market_regime, sector_ratings_json
+#                      (one row per signal date)
+
+
+def save_signals_by_date_flat(
+    bucket: str, date: str, phase: str, name: str,
+    signals_by_date,
+    *, s3_client=None,
+) -> tuple[str, str]:
+    """Stream-write ``signals_by_date`` as two flat parquets.
+
+    Returns ``(records_key, metadata_key)`` for the caller to register
+    on the phase artifact list. Records and metadata are written to
+    ``{name}_records.parquet`` and ``{name}_metadata.parquet``
+    respectively under the canonical phase-artifact path.
+
+    Stream-writes per-date so the in-memory peak during this function
+    stays bounded by one date's records (~900 rows × 8 cols = ~50 KB).
+    The records ParquetWriter buffer accumulates compressed output as
+    rows append.
+
+    Empty ``signals_by_date`` produces empty-header parquets so
+    downstream load returns an empty Mapping.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    records_key = artifact_key(date, phase, f"{name}_records", "parquet")
+    metadata_key = artifact_key(date, phase, f"{name}_metadata", "parquet")
+
+    # Empty fallback — write empty headers so the load path's strict
+    # column checks don't trip on a missing artifact.
+    if not signals_by_date:
+        empty_records = pd.DataFrame(columns=[
+            "date", "bucket", "ticker", "signal", "score",
+            "conviction", "sector", "rating",
+        ])
+        empty_metadata = pd.DataFrame(columns=[
+            "date", "market_regime", "sector_ratings_json",
+        ])
+        save_dataframe(
+            bucket, date, phase, f"{name}_records", empty_records,
+            s3_client=s3_client, preserve_index=False,
+        )
+        save_dataframe(
+            bucket, date, phase, f"{name}_metadata", empty_metadata,
+            s3_client=s3_client, preserve_index=False,
+        )
+        return records_key, metadata_key
+
+    records_buf = io.BytesIO()
+    records_writer: pq.ParquetWriter | None = None
+    metadata_rows: list[dict] = []
+
+    for sig_date in signals_by_date:
+        envelope = signals_by_date[sig_date]
+        rows: list[dict] = []
+        for entry in (envelope.get("buy_candidates") or []):
+            rows.append({
+                "date": sig_date,
+                "bucket": "buy",
+                "ticker": str(entry.get("ticker") or ""),
+                "signal": str(entry.get("signal") or ""),
+                "score": float(entry.get("score") or 0.0),
+                "conviction": str(entry.get("conviction") or ""),
+                "sector": str(entry.get("sector") or ""),
+                "rating": str(entry.get("rating") or ""),
+            })
+        for entry in (envelope.get("universe") or []):
+            rows.append({
+                "date": sig_date,
+                "bucket": "universe",
+                "ticker": str(entry.get("ticker") or ""),
+                "signal": str(entry.get("signal") or ""),
+                "score": float(entry.get("score") or 0.0),
+                "conviction": str(entry.get("conviction") or ""),
+                "sector": str(entry.get("sector") or ""),
+                "rating": str(entry.get("rating") or ""),
+            })
+        if rows:
+            df = pd.DataFrame(rows)
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if records_writer is None:
+                records_writer = pq.ParquetWriter(
+                    records_buf, table.schema, compression="snappy",
+                )
+            records_writer.write_table(table)
+            del table, df, rows
+
+        metadata_rows.append({
+            "date": str(sig_date),
+            "market_regime": str(envelope.get("market_regime") or "neutral"),
+            "sector_ratings_json": json.dumps(envelope.get("sector_ratings") or {}),
+        })
+
+    if records_writer is not None:
+        records_writer.close()
+
+    metadata_df = pd.DataFrame(metadata_rows)
+    metadata_table = pa.Table.from_pandas(metadata_df, preserve_index=False)
+    metadata_buf = io.BytesIO()
+    metadata_writer = pq.ParquetWriter(
+        metadata_buf, metadata_table.schema, compression="snappy",
+    )
+    metadata_writer.write_table(metadata_table)
+    metadata_writer.close()
+
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+
+    s3 = _client(s3_client)
+    s3.put_object(
+        Bucket=bucket, Key=records_key, Body=records_buf.getvalue(),
+        ContentType="application/vnd.apache.parquet",
+    )
+    s3.put_object(
+        Bucket=bucket, Key=metadata_key, Body=metadata_buf.getvalue(),
+        ContentType="application/vnd.apache.parquet",
+    )
+
+    return records_key, metadata_key
+
+
+class LazySignalsByDate:
+    """Mapping-shaped lazy-load wrapper around the flat-parquet
+    signals_by_date artifacts produced by ``save_signals_by_date_flat``.
+
+    On first access (any of ``__getitem__``, ``__iter__``, ``__len__``,
+    ``__contains__``, ``keys``, ``values``, ``items``, ``get``) reads
+    both parquets into pandas DataFrames and groups records by date for
+    O(N_dates) per-date envelope lookup. Per-date envelope
+    materialization happens on each ``__getitem__`` call from the
+    in-memory grouped DataFrame slice.
+
+    Memory: 911-ticker × 2316-date corpus is ~150 MB resident as
+    DataFrames + transient ~430 KB per envelope materialization,
+    versus ~1 GB for the dict-of-dicts shape this replaces.
+
+    Used by ``backtest._run_simulation_loop`` (single_run sim,
+    param_sweep) which iterates as ``for d in sorted(signals_by_date.
+    keys()): env = signals_by_date[d]`` — supported. Phase 4 evaluators
+    rebuild their own signals via ``build_signals_by_date``; they don't
+    consume this lazy handle.
+
+    Pickle-friendly (lazy state is reinitialized via ``__getstate__``).
+    """
+
+    def __init__(
+        self,
+        bucket: str,
+        records_key: str,
+        metadata_key: str,
+        s3_client=None,
+    ):
+        self._bucket = bucket
+        self._records_key = records_key
+        self._metadata_key = metadata_key
+        self._s3 = s3_client
+        self._records_by_date: dict | None = None
+        self._metadata_by_date: dict | None = None
+
+    def __getstate__(self):
+        # Drop loaded state on pickle so the unpickled instance reloads
+        # lazily in the new process. Spot-side multiprocessing in
+        # param_sweep historically pickled the closure carrying
+        # signals_by_date — keep that path working.
+        return {
+            "_bucket": self._bucket,
+            "_records_key": self._records_key,
+            "_metadata_key": self._metadata_key,
+            "_s3": None,  # boto3 clients aren't picklable; reload uses default
+        }
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._records_by_date = None
+        self._metadata_by_date = None
+
+    def _load(self) -> None:
+        if self._records_by_date is not None:
+            return
+        records_df = load_dataframe(self._bucket, self._records_key, s3_client=self._s3)
+        metadata_df = load_dataframe(self._bucket, self._metadata_key, s3_client=self._s3)
+        # Group records by date — empty groupby on empty DataFrame is
+        # fine, returns an empty dict.
+        if records_df.empty:
+            self._records_by_date = {}
+        else:
+            self._records_by_date = {
+                str(d): group for d, group in records_df.groupby("date", sort=False)
+            }
+        if metadata_df.empty:
+            self._metadata_by_date = {}
+        else:
+            self._metadata_by_date = {
+                str(row["date"]): row for _, row in metadata_df.iterrows()
+            }
+
+    def _materialize_envelope(self, date_str: str) -> dict:
+        """Build the per-date envelope dict from the loaded DataFrames.
+        Caller is responsible for ensuring ``date_str`` is in the
+        metadata index (or accept the KeyError)."""
+        meta = self._metadata_by_date[date_str]
+        records = self._records_by_date.get(date_str)
+        buy: list[dict] = []
+        universe: list[dict] = []
+        if records is not None:
+            for _, row in records.iterrows():
+                entry = {
+                    "ticker": str(row["ticker"]),
+                    "signal": str(row["signal"]),
+                    "score": float(row["score"]),
+                    "conviction": str(row["conviction"]),
+                    "sector": str(row["sector"]),
+                    "rating": str(row["rating"]),
+                }
+                if str(row["bucket"]) == "buy":
+                    buy.append(entry)
+                else:
+                    universe.append(entry)
+        sr_raw = meta["sector_ratings_json"]
+        if sr_raw is None or (isinstance(sr_raw, float) and pd.isna(sr_raw)):
+            sector_ratings = {}
+        else:
+            sector_ratings = json.loads(sr_raw or "{}")
+        return {
+            "date": date_str,
+            "market_regime": str(meta["market_regime"]),
+            "sector_ratings": sector_ratings,
+            "buy_candidates": buy,
+            "universe": universe,
+        }
+
+    # ── Mapping interface ──────────────────────────────────────────
+
+    def __getitem__(self, date_str):
+        self._load()
+        if date_str not in self._metadata_by_date:
+            raise KeyError(date_str)
+        return self._materialize_envelope(str(date_str))
+
+    def __contains__(self, date_str):
+        self._load()
+        return date_str in self._metadata_by_date
+
+    def __iter__(self):
+        self._load()
+        return iter(self._metadata_by_date)
+
+    def __len__(self):
+        self._load()
+        return len(self._metadata_by_date)
+
+    def keys(self):
+        self._load()
+        return list(self._metadata_by_date.keys())
+
+    def values(self):
+        # Eagerly materializes all envelopes. Acceptable because the
+        # only legitimate caller is the metadata-totals computation in
+        # ``predictor_backtest.run`` which runs BEFORE the lazy handle
+        # is created (operates on the in-memory dict). Downstream
+        # consumers iterate via ``keys()`` + ``__getitem__`` instead.
+        self._load()
+        return [self._materialize_envelope(d) for d in self._metadata_by_date]
+
+    def items(self):
+        self._load()
+        return [(d, self._materialize_envelope(d)) for d in self._metadata_by_date]
+
+    def get(self, date_str, default=None):
+        try:
+            return self[date_str]
+        except KeyError:
+            return default
+
+
+def load_signals_by_date_lazy(
+    bucket: str, records_key: str, metadata_key: str,
+    *, s3_client=None,
+) -> LazySignalsByDate:
+    """Construct a ``LazySignalsByDate`` from the artifact keys produced
+    by ``save_signals_by_date_flat``. Symmetric helper for the
+    auto-skip reload path."""
+    return LazySignalsByDate(
+        bucket=bucket,
+        records_key=records_key,
+        metadata_key=metadata_key,
+        s3_client=s3_client,
+    )
