@@ -290,3 +290,62 @@ def test_dict_of_dataframes_drops_empty_frames(s3):
     loaded = load_dict_of_dataframes("b", key, s3_client=s3)
     assert "AAPL" in loaded
     assert "MSFT" not in loaded
+
+
+def test_dict_of_dataframes_promotes_int_float_drift(s3):
+    """Regression guard for the 2026-04-26 ``post_inference`` failure:
+    ``predictor_data_prep`` aborted with ``Unable to merge: Field
+    Volume has incompatible types: int64 vs double`` because 804
+    tickers had int64 Volume and 107 had float64 (the float ones are
+    recent listings whose early bars had NaN volumes that pandas
+    auto-cast to float64).
+
+    ``pa.unify_schemas`` doesn't auto-promote int→float; it raises.
+    Save path now pre-casts on int-vs-float drift in any column,
+    matching the wider float type. This test reproduces the drift
+    pattern and asserts the save+load round-trips clean."""
+    int_volume = pd.DataFrame(
+        {"Close": [100.0, 101.0], "Volume": [1000, 2000]},  # int64
+        index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+    )
+    float_volume = pd.DataFrame(
+        {"Close": [50.0, 51.0], "Volume": [3000.0, 4000.0]},  # float64
+        index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+    )
+    assert str(int_volume["Volume"].dtype) == "int64"
+    assert str(float_volume["Volume"].dtype) == "float64"
+
+    data = {"AAA": int_volume, "BBB": float_volume}
+    key = save_dict_of_dataframes("b", "2026-04-23", "p", "n", data, s3_client=s3)
+    loaded = load_dict_of_dataframes("b", key, s3_client=s3)
+
+    # Both tickers round-trip; both Volume columns are float64 on load
+    # (the int instances were promoted on save).
+    assert set(loaded.keys()) == {"AAA", "BBB"}
+    assert str(loaded["AAA"]["Volume"].dtype) == "float64"
+    assert str(loaded["BBB"]["Volume"].dtype) == "float64"
+    # Values preserved (1000, 2000 → 1000.0, 2000.0)
+    assert list(loaded["AAA"]["Volume"]) == [1000.0, 2000.0]
+    assert list(loaded["BBB"]["Volume"]) == [3000.0, 4000.0]
+
+
+def test_dict_of_dataframes_homogeneous_int_unchanged(s3):
+    """When all frames have the same int dtype, no promotion happens —
+    the column stays int on save+load. Avoids unnecessary widening
+    when there's no drift."""
+    int_only = {
+        "AAA": pd.DataFrame(
+            {"Volume": [1000, 2000]},
+            index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+        ),
+        "BBB": pd.DataFrame(
+            {"Volume": [3000, 4000]},
+            index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+        ),
+    }
+    key = save_dict_of_dataframes("b", "2026-04-23", "p", "n", int_only, s3_client=s3)
+    loaded = load_dict_of_dataframes("b", key, s3_client=s3)
+    # Stays int — pyarrow round-trips int64 cleanly when all tickers
+    # agree on the type.
+    assert str(loaded["AAA"]["Volume"].dtype).startswith("int")
+    assert str(loaded["BBB"]["Volume"].dtype).startswith("int")

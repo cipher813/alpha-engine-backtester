@@ -247,6 +247,64 @@ def load_dict_of_series(
 # ── Dict-of-DataFrames artifacts (e.g. features_by_ticker) ───────────────────
 
 
+def _promote_int_to_float_on_drift(
+    ticker_frames: list[tuple[str, pd.DataFrame]],
+) -> None:
+    """In-place: for any column that's integer in some frames and float
+    in others, cast every integer instance to float64. Float64 is the
+    wider type and lossless for the value ranges typical of OHLCV data.
+
+    Motivated by the 2026-04-26 spot OOM-RECOVERY validation run, where
+    ``predictor_data_prep`` aborted at the post_inference checkpoint
+    with ``Unable to merge: Field Volume has incompatible types:
+    int64 vs double``. Audit of the live ArcticDB universe library found
+    804 tickers with int64 Volume, 107 with float64 — the float ones
+    are mostly recent listings (UBER, APP, VRT, DT, KD) where early
+    bars had NaN volumes that pandas auto-cast to float64.
+
+    The previous behavior was a hard-fail in ``pa.unify_schemas`` —
+    which is correct for genuinely incompatible types but unhelpful
+    for the int→float promotion case where the wider type
+    semantically subsumes the narrower one. We handle int→float here
+    as the only safe auto-promotion; anything else still raises at
+    ``unify_schemas`` (e.g. string vs numeric, datetime vs object —
+    real semantic divergences worth investigating).
+
+    No-op when zero columns drift, so the common case (all tickers
+    homogeneous) pays only an O(N_frames × N_cols) dtype scan.
+    """
+    if not ticker_frames:
+        return
+    from collections import defaultdict
+    col_dtypes: dict[str, set[str]] = defaultdict(set)
+    for _, frame in ticker_frames:
+        for col in frame.columns:
+            col_dtypes[col].add(str(frame[col].dtype))
+
+    drift_cols: list[str] = []
+    for col, dtypes in col_dtypes.items():
+        has_int = any(d.startswith("int") or d.startswith("uint") for d in dtypes)
+        has_float = any(d.startswith("float") for d in dtypes)
+        if has_int and has_float:
+            drift_cols.append(col)
+
+    if not drift_cols:
+        return
+
+    import logging
+    logging.getLogger(__name__).info(
+        "save_dict_of_dataframes: promoting %d int-vs-float drift column(s) "
+        "to float64: %s",
+        len(drift_cols), drift_cols,
+    )
+    for _, frame in ticker_frames:
+        for col in drift_cols:
+            if col in frame.columns:
+                dtype_str = str(frame[col].dtype)
+                if dtype_str.startswith("int") or dtype_str.startswith("uint"):
+                    frame[col] = frame[col].astype("float64")
+
+
 def save_dict_of_dataframes(
     bucket: str, date: str, phase: str, name: str,
     data: dict[str, pd.DataFrame],
@@ -300,6 +358,17 @@ def save_dict_of_dataframes(
             bucket, date, phase, name, empty,
             s3_client=s3_client, preserve_index=False,
         )
+
+    # Type-drift unification (added 2026-04-26 after Volume int64-vs-float64
+    # mismatch on the universe library — 804 tickers had int64, 107 had
+    # float64 because their early bars contained NaNs). pyarrow's
+    # ``unify_schemas`` doesn't auto-promote int→float; it raises
+    # ``Unable to merge: Field X has incompatible types: int64 vs double``.
+    # We pre-promote at the pandas layer: any column whose dtype family
+    # differs across ticker frames (int in some, float in others) gets
+    # cast to float64 on the int instances. Float64 is the wider type
+    # and is lossless for typical Volume values.
+    _promote_int_to_float_on_drift(ticker_frames)
 
     # Convert each DataFrame to a pyarrow Table. preserve_index=False
     # because we materialized the original index into __idx__ above.
