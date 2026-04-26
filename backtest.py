@@ -972,9 +972,49 @@ def _load_initial_state_from_eod_pnl(
             positions[ticker] = {
                 "shares": shares,
                 "avg_cost": float(p.get("avg_cost") or 0.0),
-                "entry_date": p.get("entry_date"),
+                "entry_date": p.get("entry_date"),  # usually missing — enriched below
                 "sector": p.get("sector", ""),
             }
+
+        # Enrich entry_date from trades.db. The eod_pnl positions_snapshot
+        # JSON omits entry_date, but the strategy layer's time-decay-EXIT
+        # and ATR-trailing-stop logic both depend on it (executor/strategies/
+        # exit_manager.py). Live executor enriches via
+        # ``trade_logger.get_entry_dates`` post-position-load. Mirror that
+        # lookup here so bootstrapped positions carry an entry_date.
+        # Use most-recent ENTER strictly on-or-before bootstrap.as_of
+        # (anything after as_of doesn't exist yet at bootstrap time).
+        if positions:
+            as_of = row["date"]
+            placeholders = ",".join("?" for _ in positions)
+            entry_rows = conn.execute(
+                "SELECT ticker, MAX(date) AS entry_date "
+                "FROM trades WHERE action='ENTER' AND date <= ? "
+                f"AND ticker IN ({placeholders}) "
+                "GROUP BY ticker",
+                [as_of, *positions.keys()],
+            ).fetchall()
+            n_enriched = 0
+            for r in entry_rows:
+                ticker, entry_date = r["ticker"], r["entry_date"]
+                if ticker in positions and entry_date:
+                    positions[ticker]["entry_date"] = entry_date
+                    n_enriched += 1
+            # Fall back to as_of for positions that have no ENTER on or before
+            # the bootstrap date (manually-seeded positions, pre-system holds,
+            # or trades.db rows missing the legacy `date` column). They get
+            # treated as fresh-at-bootstrap by the strategy layer — slightly
+            # pessimistic but not silently broken.
+            for ticker in positions:
+                if not positions[ticker].get("entry_date"):
+                    positions[ticker]["entry_date"] = as_of
+            logger.info(
+                "Enriched entry_date on %d/%d bootstrapped positions from "
+                "trades.db; %d fell back to bootstrap as_of=%s",
+                n_enriched, len(positions),
+                len(positions) - n_enriched, as_of,
+            )
+
         return {
             "positions": positions,
             "cash": float(row["total_cash"] or 0.0),
