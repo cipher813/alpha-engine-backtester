@@ -94,6 +94,28 @@ LIFECYCLE_SKIP_FIELDS = frozenset({
     # migration is fully rolled out. Cohort matching uses signal_trading_day,
     # so the per-row `date` field check would always trip on the legacy column.
     "date",
+    # Daemon-stage fields. Live populates these when the intraday daemon's
+    # trigger (VWAP / pullback / support / time-expiry / graduated_entry)
+    # fires and IB returns a fill: trigger_type names the rule that fired,
+    # trigger_price is the gate, signal_price is the daemon's snapshot at
+    # decision time, fill_price is what IB filled at. Backtester sim runs
+    # the morning planner only — none of these exist at planner stage,
+    # so they're null in replay output. Including them as required-match
+    # fields produced spurious divergence on every cohort-matched ENTER
+    # (observed 2026-04-26 ROST 4/12 trade). Phase 2 (entry_triggers.py
+    # daily-bar port) will eventually populate them in sim, but until
+    # then they're a pure noise floor. ROADMAP P1 "Backtester ↔ executor
+    # parity divergence" root cause #3.
+    "trigger_type",
+    "trigger_price",
+    "signal_price",
+    "fill_price",
+    # Live writes ``prediction_confidence=NaN`` when GBM coverage is
+    # missing for the ticker; backtester serializes the same absent
+    # value as ``null``. Float comparison treats NaN != null even though
+    # they encode the same "no prediction" semantics. Skip until the
+    # serialization gap is closed at the writer side.
+    "prediction_confidence",
 })
 
 # Per-day divergence thresholds (see docs/trade_mapping.md)
@@ -243,6 +265,40 @@ def _load_trades_from_db(db_path: str, since_date: str | None = None) -> pd.Data
         conn.close()
 
 
+def _get_bootstrap_as_of(db_path: str) -> str | None:
+    """Return the earliest ``eod_pnl`` row date with non-null ``total_cash``
+    AND non-empty ``positions_snapshot`` — the earliest date sim can
+    bootstrap from. Mirrors the predicate in
+    ``backtest._load_initial_state_from_eod_pnl``. Returns ``None`` when
+    no row qualifies (pre-PR #59 trades.db, or schema missing those
+    columns entirely).
+
+    Used to narrow the parity window to dates the bootstrap can actually
+    replay. Without this, parity sweeps in pre-bootstrap dates whose
+    backtester output is structurally always 0 — the divergence is real
+    but the divergence reason is "we can't replay this date", not
+    "logic divergence between live and sim". Pre-bootstrap blanket
+    failures dominated 2026-04-26's parity report (6 of 8 dates).
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(eod_pnl)").fetchall()}
+        if "total_cash" not in cols or "positions_snapshot" not in cols:
+            return None
+        row = conn.execute(
+            "SELECT MIN(date) FROM eod_pnl "
+            "WHERE total_cash IS NOT NULL "
+            "AND positions_snapshot IS NOT NULL "
+            "AND length(positions_snapshot) > 2"
+        ).fetchone()
+        return row[0] if row and row[0] else None
+    except sqlite3.OperationalError:
+        # Table missing entirely — no bootstrap possible
+        return None
+    finally:
+        conn.close()
+
+
 def _last_n_trading_dates(trades_df: pd.DataFrame, n: int) -> list[str]:
     """Return the last n unique signal_trading_day values from the trades
     DataFrame — the parity cohort key per DATE_CONVENTIONS.md.
@@ -354,16 +410,19 @@ class TestDiffFields:
         b = self._base_trade()
         assert diff_fields(a, b) == {}
 
-    def test_fill_price_within_rel(self):
-        a = self._base_trade(fill_price=172.34)
-        b = self._base_trade(fill_price=172.42)  # 0.046% — under 0.1%
+    def test_price_at_order_within_rel(self):
+        # price_at_order is the planner-stage price both sides should have;
+        # fill_price moved to LIFECYCLE_SKIP_FIELDS so it's no longer the
+        # canonical "rel-tolerance compared field" in the test surface.
+        a = self._base_trade(price_at_order=172.30)
+        b = self._base_trade(price_at_order=172.39)  # 0.052% — under 0.1%
         assert diff_fields(a, b) == {}
 
-    def test_fill_price_outside_rel(self):
-        a = self._base_trade(fill_price=172.34)
-        b = self._base_trade(fill_price=173.00)  # 0.38% — exceeds 0.1%
+    def test_price_at_order_outside_rel(self):
+        a = self._base_trade(price_at_order=172.30)
+        b = self._base_trade(price_at_order=173.00)  # 0.41% — exceeds 0.1%
         v = diff_fields(a, b)
-        assert "fill_price" in v
+        assert "price_at_order" in v
 
     def test_action_exact_mismatch(self):
         a = self._base_trade(action="ENTER")
@@ -382,11 +441,15 @@ class TestDiffFields:
         v = diff_fields(a, b)
         assert "shares" in v
 
-    def test_trigger_type_null_vs_value(self):
-        a = self._base_trade(trigger_type=None)
-        b = self._base_trade(trigger_type="vwap")
+    def test_predicted_direction_exact_mismatch(self):
+        # Replaces the prior test_trigger_type_null_vs_value — trigger_type
+        # is now in LIFECYCLE_SKIP_FIELDS. predicted_direction stays in
+        # EXACT_FIELDS as the remaining backtester-vs-live exact-match
+        # field that's not skipped, so it stands in for the same code path.
+        a = self._base_trade(predicted_direction="UP")
+        b = self._base_trade(predicted_direction="DOWN")
         v = diff_fields(a, b)
-        assert "trigger_type" in v
+        assert "predicted_direction" in v and v["predicted_direction"]["match_rule"] == "exact"
 
 
 class TestLoadTradesFromDB:
@@ -491,6 +554,102 @@ class TestLifecycleSkipFields:
         v = diff_fields(live, replay)
         assert "ticker" in v
 
+    def test_trigger_type_difference_not_flagged(self):
+        # Daemon-stage field — backtester sim cannot produce a trigger_type
+        # at planner stage. ROST 4/12 incident 2026-04-26.
+        live = self._trade(trigger_type="graduated_entry (+0.0% vs morning)")
+        replay = self._trade(trigger_type=None)
+        assert "trigger_type" not in diff_fields(live, replay)
+
+    def test_trigger_price_difference_not_flagged(self):
+        live = self._trade(trigger_price=220.59)
+        replay = self._trade(trigger_price=None)
+        assert "trigger_price" not in diff_fields(live, replay)
+
+    def test_signal_price_difference_not_flagged(self):
+        live = self._trade(signal_price=220.56)
+        replay = self._trade(signal_price=None)
+        assert "signal_price" not in diff_fields(live, replay)
+
+    def test_fill_price_difference_not_flagged(self):
+        # Live fill_price comes from IB at fill time; backtester sim has
+        # no fill stage. Skip — same posture as the other daemon-stage
+        # fields; replaces the prior FIELD_TOLERANCES entry.
+        live = self._trade(fill_price=220.53)
+        replay = self._trade(fill_price=None)
+        assert "fill_price" not in diff_fields(live, replay)
+
+    def test_prediction_confidence_nan_vs_null_not_flagged(self):
+        # Live writes NaN when GBM coverage missing; backtester serializes
+        # the same absent value as None. Float-compare treats them as
+        # different even though the semantics match.
+        live = self._trade(prediction_confidence=float("nan"))
+        replay = self._trade(prediction_confidence=None)
+        assert "prediction_confidence" not in diff_fields(live, replay)
+
+
+class TestGetBootstrapAsOf:
+    """Cover the helper that backstops the parity-window narrow filter.
+    Mirrors the predicate in ``backtest._load_initial_state_from_eod_pnl``
+    so the parity test only sweeps in dates the bootstrap can replay."""
+
+    def _write_eod_pnl(self, path: str, rows: list[tuple]):
+        """Schema parallels alpha-engine PR #59. ``rows`` shape:
+        (date, portfolio_nav, total_cash, positions_snapshot)."""
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE eod_pnl ("
+            "  date TEXT PRIMARY KEY,"
+            "  portfolio_nav REAL,"
+            "  total_cash REAL,"
+            "  positions_snapshot TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO eod_pnl VALUES (?,?,?,?)", rows,
+        )
+        conn.commit()
+        conn.close()
+
+    def test_returns_earliest_meaningful_row(self, tmp_path):
+        db = tmp_path / "trades.db"
+        self._write_eod_pnl(str(db), [
+            # First two rows have NULL state (pre-PR-#59 era)
+            ("2026-03-01", 1_000_000.0, None, None),
+            ("2026-03-02", 1_001_000.0, None, ""),
+            # First meaningful row
+            ("2026-04-07", 1_020_000.0, 87_000.0, '{"AAPL": {"shares": 100}}'),
+            # Later meaningful rows
+            ("2026-04-10", 1_025_000.0, 90_000.0, '{"AAPL": {"shares": 100}}'),
+        ])
+        assert _get_bootstrap_as_of(str(db)) == "2026-04-07"
+
+    def test_no_meaningful_rows_returns_none(self, tmp_path):
+        db = tmp_path / "trades.db"
+        self._write_eod_pnl(str(db), [
+            ("2026-03-01", 1_000_000.0, None, None),
+            ("2026-03-02", 1_000_000.0, None, "{}"),
+            # length(positions_snapshot) <= 2 disqualifies — empty JSON
+            ("2026-03-03", 1_000_000.0, 50_000.0, "{}"),
+        ])
+        assert _get_bootstrap_as_of(str(db)) is None
+
+    def test_missing_columns_returns_none(self, tmp_path):
+        # Pre-PR-#59 schema lacks total_cash + positions_snapshot.
+        db = tmp_path / "trades.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "CREATE TABLE eod_pnl (date TEXT, portfolio_nav REAL)"
+        )
+        conn.execute("INSERT INTO eod_pnl VALUES ('2026-03-01', 1000000)")
+        conn.commit()
+        conn.close()
+        assert _get_bootstrap_as_of(str(db)) is None
+
+    def test_missing_table_returns_none(self, tmp_path):
+        db = tmp_path / "empty.db"
+        sqlite3.connect(str(db)).close()
+        assert _get_bootstrap_as_of(str(db)) is None
+
 
 # ── Integration test (opt-in) ───────────────────────────────────────────────
 
@@ -543,6 +702,31 @@ def test_parity_replay_end_to_end():
             f"scripts/backfill_trading_day.py to populate the column on "
             f"historical rows."
         )
+
+    # Narrow the parity window to dates the bootstrap can replay.
+    # ``backtest._load_initial_state_from_eod_pnl`` requires an eod_pnl row
+    # with non-null total_cash + non-empty positions_snapshot to bootstrap
+    # sim state (alpha-engine PR #59 added those columns 2026-04-17 — rows
+    # before then are unreplayable). Pre-bootstrap signal_trading_days
+    # always show backtester=0 in the diff because no replay ran for them;
+    # leaving them in the cohort makes parity unconditionally fail and
+    # buries the post-bootstrap divergence we actually care about. Filter
+    # them out and tag the report with the bootstrap as_of so reviewers
+    # see why the window narrowed.
+    bootstrap_as_of: str | None = _get_bootstrap_as_of(db_path)
+    n_pre_bootstrap = 0
+    if bootstrap_as_of:
+        pre = matchable[matchable["signal_trading_day"] < bootstrap_as_of]
+        n_pre_bootstrap = len(pre)
+        matchable = matchable[matchable["signal_trading_day"] >= bootstrap_as_of]
+        if matchable.empty:
+            pytest.skip(
+                f"All matchable ENTER rows predate bootstrap as_of="
+                f"{bootstrap_as_of}; no replayable parity dates. Backfill "
+                f"historical eod_pnl total_cash+positions_snapshot "
+                f"(see ROADMAP P1 'eod_pnl historical backfill') or wait "
+                f"for new live ENTERs to accumulate."
+            )
 
     dates = _last_n_trading_dates(matchable, window_days)
     if len(dates) < 3:
@@ -613,9 +797,11 @@ def test_parity_replay_end_to_end():
         "status": "fail" if (count_violations or ticker_violations or field_violations) else "pass",
         "match_key": "(signal_trading_day, ticker, action)",
         "window_signal_trading_days": [dates[0], dates[-1]],
+        "bootstrap_as_of": bootstrap_as_of,
         "n_live_trades_total": int(len(trades_df)),
         "n_live_enters_matchable": int(len(matchable)),
         "n_live_excluded_no_signal_day": int(n_excluded),
+        "n_live_excluded_pre_bootstrap": int(n_pre_bootstrap),
         "n_backtester_orders_total": len(replay_orders),
         "n_backtester_enters": len(replay_enters),
         "lifecycle_fields_skipped": sorted(LIFECYCLE_SKIP_FIELDS),
