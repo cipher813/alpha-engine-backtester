@@ -381,6 +381,72 @@ def test_dict_of_dataframes_promotes_float32_float64_drift(s3):
     np.testing.assert_allclose(loaded["BBB"]["rsi_14"], [60.0, 61.5], rtol=1e-9)
 
 
+def test_dict_of_dataframes_column_order_drift_handled(s3):
+    """Third regression in the c5.large validation arc: with dtype
+    drift fixed, the 2026-04-26 v4 spot then hit ``Target schema's
+    field names are not matching the table's field names`` because
+    different ticker DataFrames had the same column SET but different
+    ORDER. ``pa.Table.cast(schema)`` requires order match; reindex
+    pass before pyarrow conversion locks every frame to a stable
+    union ordering.
+
+    Test: two tickers with identical columns in different orders +
+    one ticker missing a column. After save+load, all three should
+    round-trip clean with NaN-fill on the missing column."""
+    aaa = pd.DataFrame(
+        {"momentum_5d": [0.01, 0.02], "rsi_14": [50.0, 51.5],
+         "rel_volume_ratio": [1.0, 1.1]},
+        index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+    )
+    bbb = pd.DataFrame(
+        # Same columns, different order
+        {"rsi_14": [60.0, 61.5], "rel_volume_ratio": [0.9, 1.0],
+         "momentum_5d": [0.03, 0.04]},
+        index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+    )
+    ccc = pd.DataFrame(
+        # Subset: missing rel_volume_ratio
+        {"momentum_5d": [0.05, 0.06], "rsi_14": [70.0, 71.5]},
+        index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+    )
+    data = {"AAA": aaa, "BBB": bbb, "CCC": ccc}
+    key = save_dict_of_dataframes("b", "2026-04-23", "p", "n", data, s3_client=s3)
+    loaded = load_dict_of_dataframes("b", key, s3_client=s3)
+
+    assert set(loaded.keys()) == {"AAA", "BBB", "CCC"}
+    # All three frames have all three columns now (CCC's missing one
+    # comes back as NaN-filled)
+    for ticker in ("AAA", "BBB", "CCC"):
+        assert set(loaded[ticker].columns) == {
+            "momentum_5d", "rsi_14", "rel_volume_ratio",
+        }, f"{ticker} columns: {list(loaded[ticker].columns)}"
+
+    # Values preserved on populated cols; NaN on the missing one
+    assert list(loaded["AAA"]["momentum_5d"]) == [0.01, 0.02]
+    assert list(loaded["BBB"]["rsi_14"]) == [60.0, 61.5]
+    assert list(loaded["CCC"]["momentum_5d"]) == [0.05, 0.06]
+    assert loaded["CCC"]["rel_volume_ratio"].isna().all()
+
+
+def test_dict_of_dataframes_homogeneous_columns_no_reindex(s3):
+    """No-op fast path: when every frame has identical column order,
+    skip the reindex (no unnecessary allocations)."""
+    same_order = {
+        "AAA": pd.DataFrame(
+            {"a": [1.0, 2.0], "b": [3.0, 4.0]},
+            index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+        ),
+        "BBB": pd.DataFrame(
+            {"a": [5.0, 6.0], "b": [7.0, 8.0]},  # same column order
+            index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+        ),
+    }
+    key = save_dict_of_dataframes("b", "2026-04-23", "p", "n", same_order, s3_client=s3)
+    loaded = load_dict_of_dataframes("b", key, s3_client=s3)
+    assert list(loaded["AAA"]["a"]) == [1.0, 2.0]
+    assert list(loaded["BBB"]["b"]) == [7.0, 8.0]
+
+
 def test_dict_of_dataframes_object_vs_numeric_still_raises(s3):
     """Non-numeric drift is intentionally left alone — string-vs-int
     or datetime-vs-object are real semantic divergences that should

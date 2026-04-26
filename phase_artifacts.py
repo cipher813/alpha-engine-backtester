@@ -322,6 +322,64 @@ def _promote_numeric_dtype_drift(
                     frame[col] = frame[col].astype("float64")
 
 
+def _unify_column_order(
+    ticker_frames: list[tuple[str, pd.DataFrame]],
+) -> None:
+    """In-place: reindex every DataFrame to a common column order
+    (the union of all observed columns, in stable first-seen order),
+    NaN-filling any missing columns.
+
+    Motivated by the 2026-04-26 v4 spot validation: the dtype-drift
+    fix unblocked ``unify_schemas`` but exposed the next layer —
+    ``pa.Table.cast(unified_schema)`` raises ``Target schema's field
+    names are not matching the table's field names`` when the field
+    names match by SET but differ in ORDER. Different ArcticDB ingest
+    paths produced rotated views of the same column set across
+    tickers; the legacy ``pd.concat`` producer sorted columns
+    silently, but the streaming-write path doesn't.
+
+    Algorithm: stable first-seen union. Walk each frame in order,
+    append unseen columns to a master list. Then reindex every frame
+    to that master list. Missing columns become NaN. Order is
+    deterministic (depends only on dict-iter order) so the on-disk
+    schema is reproducible run-to-run.
+
+    Reindexing returns a new DataFrame — we replace ticker_frames
+    entries in place via index assignment so the caller's list
+    reflects the canonicalized frames.
+    """
+    if not ticker_frames:
+        return
+    seen: set = set()
+    union_cols: list[str] = []
+    for _, frame in ticker_frames:
+        for col in frame.columns:
+            if col not in seen:
+                seen.add(col)
+                union_cols.append(col)
+
+    # Skip the reindex pass entirely if every frame already has the
+    # same column ordering as the union — common case is homogeneous
+    # tickers, no-op shouldn't allocate.
+    needs_reindex = any(
+        list(frame.columns) != union_cols
+        for _, frame in ticker_frames
+    )
+    if not needs_reindex:
+        return
+
+    import logging
+    logging.getLogger(__name__).info(
+        "save_dict_of_dataframes: reindexing %d ticker frame(s) to a "
+        "common %d-column order (column-order drift across ingest paths)",
+        sum(1 for _, f in ticker_frames if list(f.columns) != union_cols),
+        len(union_cols),
+    )
+    for i, (ticker, frame) in enumerate(ticker_frames):
+        if list(frame.columns) != union_cols:
+            ticker_frames[i] = (ticker, frame.reindex(columns=union_cols))
+
+
 def save_dict_of_dataframes(
     bucket: str, date: str, phase: str, name: str,
     data: dict[str, pd.DataFrame],
@@ -384,6 +442,19 @@ def save_dict_of_dataframes(
     # casts every drift column to float64 (lossless for OHLCV/feature
     # ranges); non-numeric drift still raises at unify_schemas.
     _promote_numeric_dtype_drift(ticker_frames)
+
+    # Column-order unification (added 2026-04-26 v4 after the dtype-
+    # drift fix unblocked the unify_schemas call but exposed a second
+    # issue: ``Table.cast(schema)`` fails when field names match but
+    # ordering differs). Per-ticker feature DataFrames historically
+    # came back from ArcticDB with column orders that depended on
+    # write-order — different ingest paths produced rotated views of
+    # the same column set. ``pd.concat`` (the pre-2026-04-23 producer)
+    # silently sorted columns; the streaming-write path doesn't.
+    # Reindex every frame to a stable union order before pyarrow
+    # conversion, NaN-filling any missing columns to preserve the
+    # original "compatible superset" semantic.
+    _unify_column_order(ticker_frames)
 
     # Convert each DataFrame to a pyarrow Table. preserve_index=False
     # because we materialized the original index into __idx__ above.
