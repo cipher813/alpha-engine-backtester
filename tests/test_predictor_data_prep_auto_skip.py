@@ -30,10 +30,12 @@ def _sample_result() -> dict:
         index=dates,
     )
     ohlcv = {
-        "AAPL": [
-            {"date": "2026-01-01", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5},
-            {"date": "2026-01-02", "open": 100.5, "high": 102.0, "low": 100.0, "close": 101.5},
-        ],
+        # DataFrame shape per Option A step 9 (DatetimeIndex + lowercase OHLC)
+        "AAPL": pd.DataFrame(
+            {"open": [100.0, 100.5], "high": [101.0, 102.0],
+             "low": [99.0, 100.0], "close": [100.5, 101.5]},
+            index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+        ),
     }
     spy = pd.Series([400.0, 401.0, 402.0], index=dates, name="SPY")
     features = {
