@@ -1025,6 +1025,77 @@ def _load_initial_state_from_eod_pnl(
         conn.close()
 
 
+def _build_replay_signals_by_date(
+    bucket: str,
+    sim_dates: list[str],
+    signal_dates: list[str],
+) -> dict[str, dict]:
+    """Pre-build ``{sim_date: signals_dict}`` for the bootstrap-mode replay.
+
+    On signal-generation days: load that day's signals.json verbatim.
+    On non-signal trading days: use the most-recent prior signal date's
+    signals.json with ``buy_candidates`` stripped — no new ENTERs fire
+    on those days. Phase 2 will port ``entry_triggers.py`` to a
+    daily-bar approximation; until then, ENTERs only fire on signal
+    days. This mirrors the live executor's ``read_signals_with_fallback``
+    semantics: every weekday's executor run uses the most recent signals
+    available, then the daemon's intraday triggers gate when ENTERs fill.
+
+    Sparse map: dates with no loadable signals (S3 NoSuchKey, no prior
+    signals before the date) are simply omitted. Caller treats absence
+    as "skip this date".
+
+    See ROADMAP P0 "2026-04-26 (Sun) — Finalize parity + downstream"
+    sim-on-every-weekday Phase 1 for the alpha-bearing rationale: live's
+    daemon runs EXIT/REDUCE/strategy-exit on every weekday between
+    signal generation, so sim must do the same to avoid NAV / equity-
+    exposure divergence.
+    """
+    from bisect import bisect_right
+    from botocore.exceptions import ClientError
+    from loaders import signal_loader
+
+    sorted_signal_dates = sorted(signal_dates)
+    signal_dates_set = set(sorted_signal_dates)
+    cache: dict[str, dict | None] = {}
+    out: dict[str, dict] = {}
+
+    def _load(d: str) -> dict | None:
+        if d in cache:
+            return cache[d]
+        try:
+            data = signal_loader.load(bucket, d)
+        except (FileNotFoundError, ClientError):
+            cache[d] = None
+            return None
+        cache[d] = data
+        return data
+
+    for d in sim_dates:
+        if d in signal_dates_set:
+            base = _load(d)
+            if base is not None:
+                out[d] = base
+            continue
+        # Non-signal day — fall back to most-recent prior signal date.
+        idx = bisect_right(sorted_signal_dates, d)
+        if idx == 0:
+            continue
+        prior = sorted_signal_dates[idx - 1]
+        base = _load(prior)
+        if base is None:
+            continue
+        # Strip buy_candidates so no new ENTERs fire on non-signal days.
+        # Held-position EXIT/REDUCE/HOLD live in ``universe`` and are
+        # left untouched. Strategy-layer exits (ATR, time-decay) read
+        # sim_client._positions directly and don't touch this dict.
+        stripped = dict(base)
+        stripped["buy_candidates"] = []
+        out[d] = stripped
+
+    return out
+
+
 def replay_for_dates(
     dates: list[str],
     config: dict,
@@ -1061,6 +1132,17 @@ def replay_for_dates(
     backtester's simulated P&L can drift from. ``position_pct`` tolerance
     in ``docs/trade_mapping.md`` accounts for small drift; large drift is
     a signal of logic divergence worth investigating.
+
+    When ``trades_db_path`` is configured and an ``eod_pnl`` snapshot exists
+    strictly before ``min(dates)``, sim bootstraps from that snapshot and
+    runs the full daily-heartbeat path (Phase 1, sim-on-every-weekday):
+    every trading day in ``[bootstrap.as_of, max(dates)]`` invokes the
+    executor — signal days use that day's signals.json; non-signal days
+    use the most-recent prior signals.json with ``buy_candidates`` stripped
+    so EXIT/REDUCE/strategy-exit fire while ENTERs are gated until Phase 2
+    ports ``entry_triggers.py`` to a daily-bar approximation. Without
+    bootstrap, the legacy paths apply (warmup_from_full_history or simple
+    requested-dates-only).
     """
     executor_run, SimulatedIBKRClient, all_signal_dates, price_matrix, init_cash, ohlcv_by_ticker = \
         _setup_simulation(config)
@@ -1130,16 +1212,19 @@ def replay_for_dates(
             f"ArcticDB universe symbols from bucket {bucket!r}: {exc}"
         ) from exc
 
+    signals_by_date: dict[str, dict] | None = None
     if bootstrap_state is not None:
         # Bootstrap pinned sim to live state at as_of. From there we run
-        # sim continuously through every signal date up to max(dates),
+        # sim continuously through every TRADING DAY up to max(dates),
         # capturing orders only on the requested dates. Running just the
-        # requested dates would skip state evolution on every date in
-        # between — sim's positions/cash at parity_date_2 would still
-        # reflect bootstrap state, ignoring everything sim "did" between
-        # bootstrap and parity_date_1. Continuous replay from bootstrap
-        # is the Option A contract: live and sim share a starting state
-        # then evolve forward through the same trading days.
+        # signal dates skipped the 2-5 weekdays between signal generation
+        # where live's daemon ran EXIT/REDUCE/strategy-exit logic — sim's
+        # NAV diverged within hours of bootstrap (see 2026-04-25 handoff:
+        # equity exposure stuck at 90%+ → all parity-window ENTERs blocked).
+        # Phase 1 (sim-on-every-weekday) closes that gap by iterating the
+        # canonical NYSE-trading-day axis from price_matrix.index, with
+        # buy_candidates stripped on non-signal days so no new ENTERs fire
+        # without intraday-trigger evaluation (Phase 2 territory).
         #
         # Clip captured orders to dates >= bootstrap.as_of: pre-bootstrap
         # parity dates can't be validated (sim's state came from after
@@ -1158,12 +1243,27 @@ def replay_for_dates(
             )
         if post_bootstrap_requested:
             latest_requested = max(post_bootstrap_requested)
-            # All signal dates in [as_of, latest_requested] — sim evolves
-            # state on every one, parity captures only the requested set.
+            ts_low = pd.Timestamp(as_of)
+            ts_high = pd.Timestamp(latest_requested)
             sim_dates = [
-                d for d in all_signal_dates
-                if as_of <= d <= latest_requested
+                d.strftime("%Y-%m-%d")
+                for d in price_matrix.index
+                if ts_low <= d <= ts_high
             ]
+            signals_by_date = _build_replay_signals_by_date(
+                bucket, sim_dates, all_signal_dates,
+            )
+            n_signal_days = sum(1 for d in sim_dates if d in set(all_signal_dates))
+            n_carry_days = len(signals_by_date) - n_signal_days
+            logger.info(
+                "Phase 1 daily-heartbeat: %d trading days in [%s, %s] — "
+                "%d signal-days + %d carry-forward days (buy_candidates "
+                "stripped). %d trading days have no prior signals available "
+                "and will be skipped.",
+                len(sim_dates), as_of, latest_requested,
+                n_signal_days, n_carry_days,
+                len(sim_dates) - len(signals_by_date),
+            )
         else:
             sim_dates = []
         requested = set(post_bootstrap_requested)
@@ -1179,6 +1279,18 @@ def replay_for_dates(
 
     captured: list[dict] = []
     for signal_date in sim_dates:
+        # signals_by_date is set when bootstrap-mode replay extends sim to
+        # every trading day in the parity window (Phase 1). Absence at a
+        # given date means no prior signals.json exists yet — skip without
+        # invoking the executor (avoids "no_signals" log spam on early
+        # parity windows). When unset (long-warmup or simple paths),
+        # _simulate_single_date loads signals per date from S3 itself.
+        if signals_by_date is not None:
+            signals_override = signals_by_date.get(signal_date)
+            if signals_override is None:
+                continue
+        else:
+            signals_override = None
         orders, _skip = _simulate_single_date(
             executor_run=executor_run,
             sim_client=sim_client,
@@ -1187,7 +1299,7 @@ def replay_for_dates(
             ohlcv_by_ticker=ohlcv_by_ticker,
             bucket=bucket,
             config_override=config_override,
-            signals_override=None,  # load from S3 per date
+            signals_override=signals_override,
             universe_symbols=universe_symbols,
             rejected_ticker_counter=rejected_ticker_counter,
             ohlcv_dates_index=ohlcv_dates_index,
