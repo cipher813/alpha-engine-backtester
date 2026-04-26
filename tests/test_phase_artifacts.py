@@ -349,3 +349,50 @@ def test_dict_of_dataframes_homogeneous_int_unchanged(s3):
     # agree on the type.
     assert str(loaded["AAA"]["Volume"].dtype).startswith("int")
     assert str(loaded["BBB"]["Volume"].dtype).startswith("int")
+
+
+def test_dict_of_dataframes_promotes_float32_float64_drift(s3):
+    """Second-pass regression: 2026-04-26 v2 validation surfaced
+    ``rsi_14: float vs double`` after the int64-vs-float64 fix. Same
+    underlying problem (numeric-width drift), different column. The
+    helper now handles all numeric drift, not just int↔float."""
+    import numpy as np
+    f32_frame = pd.DataFrame(
+        {"rsi_14": np.array([50.0, 51.5], dtype=np.float32)},
+        index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+    )
+    f64_frame = pd.DataFrame(
+        {"rsi_14": np.array([60.0, 61.5], dtype=np.float64)},
+        index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+    )
+    assert str(f32_frame["rsi_14"].dtype) == "float32"
+    assert str(f64_frame["rsi_14"].dtype) == "float64"
+
+    data = {"AAA": f32_frame, "BBB": f64_frame}
+    key = save_dict_of_dataframes("b", "2026-04-23", "p", "n", data, s3_client=s3)
+    loaded = load_dict_of_dataframes("b", key, s3_client=s3)
+
+    assert set(loaded.keys()) == {"AAA", "BBB"}
+    assert str(loaded["AAA"]["rsi_14"].dtype) == "float64"
+    assert str(loaded["BBB"]["rsi_14"].dtype) == "float64"
+    # Float32→float64 introduces tiny rep error; tolerance check:
+    import numpy as np
+    np.testing.assert_allclose(loaded["AAA"]["rsi_14"], [50.0, 51.5], rtol=1e-6)
+    np.testing.assert_allclose(loaded["BBB"]["rsi_14"], [60.0, 61.5], rtol=1e-9)
+
+
+def test_dict_of_dataframes_object_vs_numeric_still_raises(s3):
+    """Non-numeric drift is intentionally left alone — string-vs-int
+    or datetime-vs-object are real semantic divergences that should
+    still surface as pa.unify_schemas errors (not silent coercion)."""
+    str_frame = pd.DataFrame(
+        {"col": ["a", "b"]},
+        index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+    )
+    int_frame = pd.DataFrame(
+        {"col": [1, 2]},
+        index=pd.DatetimeIndex(["2026-01-01", "2026-01-02"]),
+    )
+    data = {"AAA": str_frame, "BBB": int_frame}
+    with pytest.raises(Exception, match="(?i)Unable to merge|incompatible"):
+        save_dict_of_dataframes("b", "2026-04-23", "p", "n", data, s3_client=s3)
