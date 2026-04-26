@@ -149,6 +149,8 @@ def evaluate_ensemble_modes(
     # Run backtest for each variant. Each variant is wrapped in a
     # PHASE_START/END marker so a stall inside one variant's inference
     # or simulation loop is attributable to a specific mode.
+    import gc
+
     variant_results = {}
     for mode, variant_info in available_variants.items():
         try:
@@ -170,6 +172,14 @@ def evaluate_ensemble_modes(
         except Exception as exc:
             log.warning("Ensemble eval [%s]: failed — %s", mode, exc)
             variant_results[mode] = {"status": "error", "error": str(exc)}
+        finally:
+            # Force gc between variants. _run_variant_backtest already
+            # frees its locals on return, but Python's cycle collector
+            # may delay reclamation past the NEXT variant's allocation
+            # peak — doubling the transient working set across the
+            # iteration boundary. Explicit collect ensures memory drops
+            # before the next variant pulls in another ~1 GB of signals.
+            gc.collect()
 
     # Compare variants to baseline
     recommendation = _pick_best_mode(baseline_stats, variant_results, has_sufficient_data)
@@ -274,6 +284,8 @@ def _run_variant_backtest(
     min_score: float,
 ) -> dict:
     """Download a model variant, run inference + signal gen + simulation."""
+    import gc
+
     bucket = config.get("signals_bucket", "alpha-engine-research")
 
     # Download model to temp file
@@ -291,6 +303,10 @@ def _run_variant_backtest(
             predictions_by_date, sector_map, ohlcv_by_ticker,
             top_n=top_n, min_score=min_score,
         )
+        # Predictions live inside signals_by_date now — drop the
+        # standalone dict (~50 MB) before sim starts.
+        del predictions_by_date
+        gc.collect()
 
         # Run simulation
         from backtest import _run_simulation_loop
@@ -311,6 +327,14 @@ def _run_variant_backtest(
             signals_by_date=signals_by_date,
             spy_prices=spy_prices,
         )
+        # Free signals_by_date (~700 MB-1 GB) before returning. Without
+        # this, Python's refcount-based collection may delay release
+        # past the next variant's allocation peak — which is the same
+        # 1 GB allocation again, doubling the working set during the
+        # iteration boundary. ``gc.collect()`` forces immediate cycle
+        # collection too.
+        del signals_by_date
+        gc.collect()
         return stats
     finally:
         _cleanup_model_files(model_path)
@@ -605,6 +629,24 @@ def evaluate_signal_thresholds(
                 "status": "error",
                 "error": str(exc),
             })
+        finally:
+            # Force gc between threshold iterations. Each iteration's
+            # ``signals_by_date`` peaks at ~700 MB-1 GB; refcount-only
+            # release may delay collection past the next iteration's
+            # build_signals_by_date allocation. Without explicit
+            # collect, peak working set doubles across the boundary.
+            # Python's bound names persist across loop iterations, so
+            # explicit ``del`` (guarded for early-continue paths)
+            # ensures the next iteration's ``build_signals_by_date``
+            # allocates from a clean baseline.
+            import gc
+            try: del signals_by_date  # noqa: E702
+            except (NameError, UnboundLocalError): pass
+            try: del filtered_predictions  # noqa: E702
+            except (NameError, UnboundLocalError): pass
+            try: del stats  # noqa: E702
+            except (NameError, UnboundLocalError): pass
+            gc.collect()
 
     # Pick the best threshold
     valid_results = [r for r in threshold_results if "sharpe_ratio" in r]
@@ -744,6 +786,11 @@ def evaluate_feature_pruning(
             predictions_by_date, sector_map, ohlcv_by_ticker,
             top_n=top_n, min_score=min_score,
         )
+        # Predictions are now baked into signals_by_date — drop the
+        # standalone ~50 MB dict before sim allocates its working set.
+        del predictions_by_date
+        import gc
+        gc.collect()
         log.info(
             "Feature pruning: signal build complete (%d dates, %.1fs)",
             len(signals_by_date), time.monotonic() - t0,
@@ -772,6 +819,12 @@ def evaluate_feature_pruning(
                 spy_prices=spy_prices,
             )
         log.info("Feature pruning: simulation complete (%.1fs)", time.monotonic() - t0)
+        # Free signals_by_date now (~700 MB-1 GB) before this function
+        # returns. apply_recommendations + the rest of the predictor
+        # pipeline don't need it; freeing here clears the working set
+        # for whatever runs next (param sweep, evaluator export).
+        del signals_by_date
+        gc.collect()
     finally:
         _cleanup_model_files(model_path)
 
