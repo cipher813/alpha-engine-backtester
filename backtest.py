@@ -1687,7 +1687,10 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 )
 
             # Phase 4b: Signal threshold sweep — does NOT consume features,
-            # so no lazy-load needed here.
+            # so no lazy-load needed here. The evaluator itself iterates
+            # several thresholds; ``evaluate_signal_thresholds`` handles
+            # per-iteration cleanup via its own gc.collect() in the loop's
+            # finally:.
             threshold_result = None
             if predictions_by_date:
                 try:
@@ -1716,6 +1719,12 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                         "Phase 4b signal threshold evaluation failed: %s",
                         exc, exc_info=True,
                     )
+                finally:
+                    # Phase 4b's loop did per-iteration cleanup; force
+                    # a top-level collect too so any inter-iteration
+                    # allocations are reclaimed before Phase 4c starts
+                    # (which lazy-loads features again, ~1.1 GB).
+                    gc.collect()
 
             # Phase 4c: Feature pruning evaluation. Lazy-loads features
             # again (Phase 4a already freed them), frees on exit.
