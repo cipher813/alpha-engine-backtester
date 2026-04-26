@@ -110,8 +110,31 @@ full_run_hard_caps_seconds:
   predictor_data_prep: 1800.0
 
   # Predictor-side pipeline (encompasses data_prep → inference → signal
-  # generation → primary sim). Typical 10–20 min. Cap at 60 min.
-  predictor_pipeline: 3600.0
+  # generation → primary sim → Phase 4a/b/c → param sweep). Cap was
+  # 3600s (1 hr) under the assumption "typical 10–20 min". 2026-04-26
+  # v7 c5.large optimization-arc validation produced empirical numbers
+  # that the assumption was off by ~3x for predictor_single_run alone:
+  #   data_prep:                300s   (5 min, was 32 min pre-PR-#100)
+  #   feature_maps_bulk_load:   110s   (2 min)
+  #   predictor_single_run:    3188s   (53 min for 2316 dates × ~1.4s
+  #                                     per date executor invocation —
+  #                                     full risk_guard + position_sizer
+  #                                     + strategy layer + ATR per call)
+  #   data_prep + feature_maps + single_run alone = 3598s (right at the
+  #   1-hr cap, before Phase 4 or param_sweep ran).
+  #
+  # Cap bumped to 6900s (1h55m) to fit data_prep + feature_maps +
+  # single_run + Phase 4a/b/c + param_sweep within the spot's 7200s
+  # MAX_RUNTIME_SECONDS budget. Sub-phase caps (phase4a/b/c, etc.)
+  # remain authoritative for diagnosing which sub-phase stalled — this
+  # parent cap is the safety net.
+  #
+  # Follow-up tracked: investigate why predictor_single_run takes ~1.4s
+  # per date (lazy signals access, executor strategy layer overhead, or
+  # genuinely-required compute). If it can be reduced to ~0.3s per
+  # date, the pipeline runtime drops to ~30 min and the parent cap
+  # could come back down.
+  predictor_pipeline: 6900.0
 
   # Main simulation pipeline (signals → orders → vectorbt). Typical
   # 5–15 min for a single-run. Cap at 45 min.
