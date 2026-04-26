@@ -368,6 +368,70 @@ def append_parity_metrics_row(
         log.warning("parity_metrics CSV write failed: %s — skipping append", e)
 
 
+def _emit_degraded_parity_result(
+    data_state: str,
+    n_live_trades_total: int,
+    n_excluded: int,
+    bucket: str,
+    note: str,
+    n_live_enters_matchable: int = 0,
+) -> None:
+    """Always-emit fallback when the integration test can't run a full
+    cohort comparison. Writes a parity_report.json with zero metrics + an
+    explicit ``data_state`` field, AND appends a metrics row to the
+    time-series CSV so the trend never has gaps.
+
+    Trend behavior: a switch from healthy data_state="ok" to a
+    degraded data_state value will show up as zeros in the metrics
+    (capture_rate/jaccard/RMS all 0). The data_state field on the
+    report drill-down explains why; the operator sees an anomaly in
+    the dashboard and reads the report to find out.
+
+    See module docstring "PARITY IS OBSERVABILITY, NOT A GATE" — every
+    Saturday SF run must produce one CSV row regardless of data shape.
+    Skipping breaks the always-emit contract.
+    """
+    import json
+    metrics = {
+        "capture_rate": 0.0,
+        "ticker_jaccard_avg": 0.0,
+        "count_divergence_rms": 0.0,
+        "field_diff_rate": 0.0,
+        "n_lifecycle_skipped": int(len(LIFECYCLE_SKIP_FIELDS)),
+        "n_live_enters": 0,
+        "n_backtester_enters": 0,
+        "n_cohort_matched_enters": 0,
+        "n_field_violations": 0,
+        "n_dates_in_window": 0,
+        "data_state": data_state,
+    }
+    report = {
+        "match_key": "(signal_trading_day, ticker, action)",
+        "window_signal_trading_days": [None, None],
+        "n_live_trades_total": int(n_live_trades_total),
+        "n_live_enters_matchable": int(n_live_enters_matchable),
+        "n_live_excluded_no_signal_day": int(n_excluded),
+        "n_backtester_orders_total": 0,
+        "n_backtester_enters": 0,
+        "metrics": metrics,
+        "lifecycle_fields_skipped": sorted(LIFECYCLE_SKIP_FIELDS),
+        "trade_count_divergence": {},
+        "ticker_set_divergence": {},
+        "field_divergence": [],
+        "data_state": data_state,
+        "data_state_note": note,
+    }
+    report_dir = Path(os.environ.get("PARITY_REPORT_DIR", tempfile.gettempdir()))
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / "parity_report.json").write_text(json.dumps(report, indent=2, default=str))
+
+    run_date = os.environ.get("PARITY_RUN_DATE") or pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    if os.environ.get("PARITY_SKIP_METRICS_WRITE") != "1":
+        append_parity_metrics_row(metrics, run_date=run_date, bucket=bucket)
+
+    print(f"\nParity DEGRADED state={data_state}: {note}")
+
+
 # ── Backtester invocation (Phase 1.1b) ──────────────────────────────────────
 
 def _run_backtester_for_dates(dates: list[str], bucket: str,
@@ -866,6 +930,91 @@ class TestAppendParityMetricsRow:
         append_parity_metrics_row({"capture_rate": 0.5}, run_date="2026-04-26", bucket="b")
 
 
+class TestEmitDegradedParityResult:
+    """The data-shape conditions formerly handled by ``pytest.skip`` now
+    flow through ``_emit_degraded_parity_result``. The invariant: every
+    invocation produces a parity_report.json AND a metrics-CSV row, even
+    on degraded data states. Skipping breaks the always-emit contract."""
+
+    def _patch_s3(self, monkeypatch, store: dict):
+        from unittest.mock import MagicMock
+        from botocore.exceptions import ClientError
+        client = MagicMock()
+
+        def get_object(Bucket, Key):
+            if Key not in store:
+                raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+            return {"Body": io.BytesIO(store[Key])}
+
+        def put_object(Bucket, Key, Body):
+            store[Key] = Body
+            return {}
+
+        client.get_object.side_effect = get_object
+        client.put_object.side_effect = put_object
+        import boto3
+        monkeypatch.setattr(boto3, "client", lambda *a, **kw: client)
+
+    def test_writes_report_with_data_state(self, monkeypatch, tmp_path):
+        store: dict = {}
+        self._patch_s3(monkeypatch, store)
+        monkeypatch.setenv("PARITY_REPORT_DIR", str(tmp_path))
+        monkeypatch.setenv("PARITY_RUN_DATE", "2026-04-26")
+        _emit_degraded_parity_result(
+            data_state="empty_trades_db",
+            n_live_trades_total=0,
+            n_excluded=0,
+            bucket="test-bucket",
+            note="trades.db has 0 rows",
+        )
+        report_path = tmp_path / "parity_report.json"
+        assert report_path.exists()
+        import json
+        report = json.loads(report_path.read_text())
+        assert report["data_state"] == "empty_trades_db"
+        assert report["metrics"]["data_state"] == "empty_trades_db"
+        assert report["metrics"]["capture_rate"] == 0.0
+        assert report["n_live_trades_total"] == 0
+
+    def test_appends_metrics_row(self, monkeypatch, tmp_path):
+        store: dict = {}
+        self._patch_s3(monkeypatch, store)
+        monkeypatch.setenv("PARITY_REPORT_DIR", str(tmp_path))
+        monkeypatch.setenv("PARITY_RUN_DATE", "2026-04-26")
+        _emit_degraded_parity_result(
+            data_state="insufficient_cohort_dates",
+            n_live_trades_total=10,
+            n_excluded=8,
+            n_live_enters_matchable=2,
+            bucket="test-bucket",
+            note="Only 2 cohort dates",
+        )
+        # Metrics row appended
+        assert "backtest/parity_metrics.csv" in store
+        df = pd.read_csv(io.BytesIO(store["backtest/parity_metrics.csv"]))
+        assert len(df) == 1
+        assert df.iloc[0]["data_state"] == "insufficient_cohort_dates"
+        assert df.iloc[0]["capture_rate"] == 0.0
+        assert df.iloc[0]["run_date"] == "2026-04-26"
+
+    def test_skip_metrics_write_env_honored(self, monkeypatch, tmp_path):
+        # Local dev runs may want to skip the S3 append; the env flag
+        # must still produce a per-run report.
+        store: dict = {}
+        self._patch_s3(monkeypatch, store)
+        monkeypatch.setenv("PARITY_REPORT_DIR", str(tmp_path))
+        monkeypatch.setenv("PARITY_SKIP_METRICS_WRITE", "1")
+        _emit_degraded_parity_result(
+            data_state="empty_trades_db",
+            n_live_trades_total=0, n_excluded=0,
+            bucket="test-bucket", note="dev run",
+        )
+        # Report still written
+        assert (tmp_path / "parity_report.json").exists()
+        # CSV NOT written
+        assert "backtest/parity_metrics.csv" not in store
+
+
 # ── Integration test (opt-in) ───────────────────────────────────────────────
 
 @pytest.mark.parity
@@ -888,42 +1037,68 @@ def test_parity_replay_end_to_end():
     if not Path(db_path).exists():
         pytest.skip(f"trades.db not found at {db_path}")
 
+    # ── Pre-flight invariant: schema must support cohort matching. ────────
+    # signal_trading_day was added by alpha-engine PR #98 (DATE_CONVENTIONS
+    # migration, deployed 2026-04-24) and backfilled the same day. If a
+    # current trades.db lacks that column, something has regressed (rolled
+    # back deploy, restored stale snapshot, wrong trades.db file). Raise
+    # rather than skip so the SF alarm fires — this is real infra breakage,
+    # NOT bounded variance.
     trades_df = _load_trades_from_db(db_path)
-    if trades_df.empty:
-        pytest.skip("trades.db is empty — no history to parity-check against")
-
     if "signal_trading_day" not in trades_df.columns:
-        pytest.skip(
-            "trades.db missing `signal_trading_day` column — run "
-            "alpha-engine PR 2 migration (init_db on next executor start "
-            "applies the schema; then run scripts/backfill_trading_day.py)."
+        raise RuntimeError(
+            f"trades.db at {db_path} is missing the signal_trading_day column. "
+            f"Schema regression — alpha-engine PR #98 (DATE_CONVENTIONS) added "
+            f"this column 2026-04-24. Verify trades.db is current; do NOT "
+            f"silently skip. Spot run should fail."
         )
 
-    # Cohort matching: filter live trades to ENTERs with a populated
-    # signal_trading_day. Exits leave signal_trading_day NULL by design (PR 2);
-    # pre-backfill rows would also be NULL. Those rows are excluded from
-    # cohort-level comparison — they're not signal-driven decisions and
-    # shouldn't be expected to round-trip against backtester output.
+    # ── Data-shape conditions: emit a degraded but always-present result.
+    # Per "parity is observability": every Saturday SF run MUST append a
+    # row to parity_metrics.csv so a missing data-shape (empty cohort,
+    # too few dates) shows up as a step-change in the trend, not as a
+    # silently-skipped run that leaves a gap in the time series.
+    # Schema for the degraded path is identical to the full path; missing
+    # values are zeros + an explicit ``data_state`` field on the report.
     matchable = trades_df[
         (trades_df["action"] == "ENTER")
         & trades_df["signal_trading_day"].notna()
     ]
     n_excluded = len(trades_df) - len(matchable)
 
-    if matchable.empty:
-        pytest.skip(
-            f"trades.db has {len(trades_df)} rows but 0 are matchable ENTER "
-            f"+ signal_trading_day populated rows. Run "
-            f"scripts/backfill_trading_day.py to populate the column on "
-            f"historical rows."
+    if trades_df.empty or matchable.empty:
+        data_state = (
+            "empty_trades_db" if trades_df.empty
+            else "no_matchable_enter_rows"
         )
+        _emit_degraded_parity_result(
+            data_state=data_state,
+            n_live_trades_total=len(trades_df),
+            n_excluded=n_excluded,
+            bucket=bucket,
+            note=(
+                f"trades.db has {len(trades_df)} rows total, "
+                f"{len(matchable)} matchable ENTERs (action='ENTER' AND "
+                f"signal_trading_day NOT NULL)."
+            ),
+        )
+        return
 
     dates = _last_n_trading_dates(matchable, window_days)
     if len(dates) < 3:
-        pytest.skip(
-            f"Need >=3 signal_trading_days with matchable trades; have "
-            f"{len(dates)} (matchable rows: {len(matchable)})"
+        _emit_degraded_parity_result(
+            data_state="insufficient_cohort_dates",
+            n_live_trades_total=len(trades_df),
+            n_excluded=n_excluded,
+            n_live_enters_matchable=len(matchable),
+            bucket=bucket,
+            note=(
+                f"Only {len(dates)} signal_trading_day(s) in matchable rows; "
+                f"need >=3 for a meaningful cohort. Trend will show this as "
+                f"low data points until live history accumulates."
+            ),
         )
+        return
 
     # Run backtester replay over the same signal_trading_day cohorts.
     # backtest.replay_for_dates iterates the input dates as signal_dates,
@@ -994,6 +1169,9 @@ def test_parity_replay_end_to_end():
         n_cohort_matched=n_cohort_matched,
         n_lifecycle_skipped=len(LIFECYCLE_SKIP_FIELDS),
     )
+    # Schema parity with _emit_degraded_parity_result: always include
+    # data_state so the time-series CSV column is consistent across paths.
+    metrics["data_state"] = "ok"
 
     # Parity is observability, not a gate. The report still surfaces
     # divergence categories (count / ticker-set / field) at the prior
