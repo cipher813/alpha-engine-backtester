@@ -2817,7 +2817,11 @@ def _run_simulation_pipeline(
                         s3_client=s3,
                     ))
         except Exception as e:
-            logger.error("Mode 2 simulation failed: %s", e)
+            # Tier 2 diagnostic (2026-04-27): include full traceback in
+            # the error log so the smoke catch doesn't swallow the stack
+            # frame that triggered the failure. Without exc_info=True the
+            # smoke harness reports "RecursionError" with no source site.
+            logger.error("Mode 2 simulation failed: %s", e, exc_info=True)
             if fd:
                 fd.report(e, severity="error", context={
                     "site": "simulation", "mode": args.mode})
