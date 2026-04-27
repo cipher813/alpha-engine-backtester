@@ -231,6 +231,10 @@ class TestBuildMergedSimulateConfig:
         assert isinstance(strategy_config, dict)
         assert merged["init_cash"] == 100.0
 
+    @pytest.mark.skipif(
+        not os.path.isdir(_EXECUTOR_ROOT),
+        reason="alpha-engine sibling repo not present at ~/Development/alpha-engine",
+    )
     def test_evaluate_exits_with_feature_lookup_matches_without(self):
         """Tier 3 Part C parity (2026-04-27): evaluate_exits called with
         a FeatureLookup must produce byte-equal output to the same call
