@@ -35,6 +35,7 @@ import logging
 import tempfile
 import os
 import time as _time
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -498,6 +499,106 @@ def _load_predictor_feature_maps(bucket: str, registry) -> tuple[dict, dict, dic
 _SIGNAL_LIST_FIELDS = ("universe", "buy_candidates", "enter", "exit", "reduce", "hold")
 
 
+@dataclass(frozen=True)
+class SignalLookup:
+    """Per-date precomputed signal-derived lookups (Tier 3 Part A,
+    2026-04-27).
+
+    Built once per ``(signal_date, signals_raw, universe_symbols)``
+    tuple at simulation-loop bootstrap. Shared across all 60 combos in
+    a ``predictor_param_sweep`` — these dicts are cross-sectional and
+    don't depend on per-combo state (sim_client, NAV, held positions).
+
+    Attributes
+    ----------
+    signals_raw_filtered : dict
+        ``signals_raw`` post ``_filter_signals_to_universe``. Carries
+        ``enter`` / ``exit`` / ``reduce`` / ``hold`` / ``universe`` /
+        ``buy_candidates`` lists with since-dropped tickers removed.
+    signals_by_ticker : dict[str, dict]
+        ``{ticker: signal_entry}`` lookup built from the merged
+        ``universe`` + ``buy_candidates`` lists. Used by
+        ``evaluate_strategy_exits`` and ``decide_drawdown_forced_exits``.
+    universe_sectors : dict[str, str]
+        ``{ticker: sector}`` map. Passed to
+        ``executor.deciders.enrich_positions(universe_sectors=...)``
+        which (post-PR-#111) skips its internal rebuild when this is
+        provided.
+    """
+    signals_raw_filtered: dict
+    signals_by_ticker: dict
+    universe_sectors: dict
+
+
+def _build_signal_lookup(
+    signals_raw: dict,
+    universe_symbols: set[str] | None = None,
+    rejected_counter: dict[str, int] | None = None,
+) -> "SignalLookup":
+    """Build a ``SignalLookup`` for one signal date.
+
+    Single-pass construction over the merged ``universe`` +
+    ``buy_candidates`` lists — the prior per-call rebuild path
+    iterated those lists THREE times (filter, signals_by_ticker rebuild,
+    universe_sectors rebuild). Fusing them halves walk cost per build.
+
+    The filter call still walks separately because it touches all six
+    ``_SIGNAL_LIST_FIELDS`` (enter / exit / reduce / hold / universe /
+    buy_candidates), not just the two that feed the lookups.
+    """
+    if universe_symbols is not None:
+        signals_raw = _filter_signals_to_universe(
+            signals_raw, universe_symbols, rejected_counter,
+        )
+
+    signals_by_ticker: dict[str, dict] = {}
+    universe_sectors: dict[str, str] = {}
+    for s in (signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])):
+        if not isinstance(s, dict):
+            continue
+        t = s.get("ticker")
+        if not t:
+            continue
+        # signals_by_ticker uses first-write-wins (matches the prior
+        # ``if t not in signals_by_ticker`` semantic)
+        if t not in signals_by_ticker:
+            signals_by_ticker[t] = s
+        # universe_sectors uses last-write-wins (matches the prior
+        # dict-comprehension semantic — duplicates resolve to the last
+        # entry's sector)
+        universe_sectors[t] = s.get("sector", "")
+
+    return SignalLookup(
+        signals_raw_filtered=signals_raw,
+        signals_by_ticker=signals_by_ticker,
+        universe_sectors=universe_sectors,
+    )
+
+
+def _precompute_signal_lookups(
+    signals_by_date: dict | None,
+    universe_symbols: set[str] | None = None,
+    rejected_counter: dict[str, int] | None = None,
+) -> dict | None:
+    """Precompute ``SignalLookup`` for each date in ``signals_by_date``.
+
+    Returns ``None`` when ``signals_by_date`` is ``None`` (live
+    signal-replay path that loads per-date from S3 inside
+    ``_simulate_single_date``).
+
+    Cross-combo amortization win: ``run_predictor_param_sweep`` calls
+    this ONCE before defining the per-combo ``sim_fn`` closure. All 60
+    combos then share the precomputed lookups instead of rebuilding
+    2316 dicts × 60 combos = 139k rebuilds.
+    """
+    if signals_by_date is None:
+        return None
+    return {
+        date_str: _build_signal_lookup(signals_raw, universe_symbols, rejected_counter)
+        for date_str, signals_raw in signals_by_date.items()
+    }
+
+
 def _filter_signals_to_universe(
     signals: dict,
     universe_symbols: set[str],
@@ -696,6 +797,7 @@ def _simulate_single_date(
     merged_config: dict,
     strategy_config: dict,
     signals_override: dict | None = None,
+    signal_lookup: "SignalLookup | None" = None,
     universe_symbols: set[str] | None = None,
     rejected_ticker_counter: dict[str, int] | None = None,
     atr_by_ticker: dict[str, float] | None = None,
@@ -739,7 +841,15 @@ def _simulate_single_date(
     if not date_prices:
         return None, "empty_prices"
 
-    if signals_override is not None:
+    # Tier 3 Part A (2026-04-27): when ``signal_lookup`` is provided,
+    # the caller has already filtered + built signals_by_ticker +
+    # universe_sectors at simulation-loop bootstrap. Skip the per-call
+    # rebuild path entirely. ``signals_override`` falls back to the
+    # legacy path (for tests + replay_for_dates that pre-date the
+    # lookup amortization).
+    if signal_lookup is not None:
+        signals_raw = signal_lookup.signals_raw_filtered
+    elif signals_override is not None:
         signals_raw = signals_override
     else:
         from loaders import signal_loader
@@ -765,11 +875,12 @@ def _simulate_single_date(
     from executor.strategies.exit_manager import SECTOR_ETF_MAP, evaluate_exits
 
     # Pre-filter signals against the simulation-bootstrap universe set
-    # (loaded once at simulation-loop startup). Live executor's
-    # filter_buy_candidates_to_universe is gated `if not simulate`
-    # post-PR #109 specifically so we don't pay the per-call
-    # ArcticDB.list_symbols round-trip here.
-    if universe_symbols is not None:
+    # (loaded once at simulation-loop startup). Skipped when
+    # ``signal_lookup`` was provided — the lookup already carries the
+    # filtered signals. Live executor's filter_buy_candidates_to_universe
+    # is gated `if not simulate` post-PR #109 specifically so we don't
+    # pay the per-call ArcticDB.list_symbols round-trip here.
+    if signal_lookup is None and universe_symbols is not None:
         signals_raw = _filter_signals_to_universe(
             signals_raw, universe_symbols, rejected_ticker_counter,
         )
@@ -811,12 +922,21 @@ def _simulate_single_date(
     sector_ratings = signals["sector_ratings"]
     enter_signals = signals["enter"]
 
-    # Build per-call lookup dicts (cheap — bounded by signal/universe size).
-    signals_by_ticker: dict[str, dict] = {}
-    for s in (signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])):
-        t = s.get("ticker")
-        if t and t not in signals_by_ticker:
-            signals_by_ticker[t] = s
+    # Tier 3 Part A: prefer the precomputed lookup when caller provided
+    # one. Falls back to per-call rebuild if signal_lookup is None
+    # (run_simulate single-pass + replay_for_dates paths that haven't
+    # been migrated to the precompute pattern yet, plus tests that
+    # construct fixtures inline).
+    if signal_lookup is not None:
+        signals_by_ticker = signal_lookup.signals_by_ticker
+        universe_sectors_for_enrich = signal_lookup.universe_sectors
+    else:
+        signals_by_ticker = {}
+        universe_sectors_for_enrich = None  # let enrich_positions rebuild from signals_raw
+        for s in (signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])):
+            t = s.get("ticker")
+            if t and t not in signals_by_ticker:
+                signals_by_ticker[t] = s
 
     sector_etf_histories: dict | None = None
     if price_histories:
@@ -835,7 +955,10 @@ def _simulate_single_date(
     entry_dates = {
         t: pos.get("entry_date") for t, pos in raw_positions.items()
     }
-    current_positions = enrich_positions(raw_positions, signals_raw, entry_dates)
+    current_positions = enrich_positions(
+        raw_positions, signals_raw, entry_dates,
+        universe_sectors=universe_sectors_for_enrich,
+    )
 
     dd_multiplier, dd_reason = decide_drawdown_response(
         portfolio_nav, peak_nav, merged_config,
@@ -937,6 +1060,7 @@ def _run_simulation_loop(
     atr_by_ticker: dict[str, float] | None = None,
     vwap_series_by_ticker: dict[str, pd.Series] | None = None,
     coverage_by_ticker: dict[str, float] | None = None,
+    signal_lookups: dict | None = None,
 ) -> dict:
     """
     Run one full simulation pass with the given config and pre-built price matrix.
@@ -949,6 +1073,13 @@ def _run_simulation_loop(
         Filtered to <= signal_date before each executor call to prevent lookahead.
     signals_by_date: optional pre-built signals for each date (predictor-only mode).
         When provided, uses these instead of loading from S3 via signal_loader.
+    signal_lookups: optional ``{date_str: SignalLookup}`` precomputed at a
+        higher scope (e.g. ``run_predictor_param_sweep``). Each
+        ``SignalLookup`` carries the filtered signals_raw, signals_by_ticker,
+        and universe_sectors derived from a single (signals_raw,
+        universe_symbols) tuple. Cross-combo amortization: 60 combos in
+        a param sweep all reference the same precomputed lookups
+        instead of rebuilding 139k dicts. Tier 3 Part A (2026-04-27).
     """
     from vectorbt_bridge import orders_to_portfolio
     from vectorbt_bridge import portfolio_stats as compute_portfolio_stats
@@ -1021,6 +1152,17 @@ def _run_simulation_loop(
     else:
         sim_dates = dates
 
+    # Tier 3 Part A: if caller didn't precompute signal_lookups (i.e.
+    # we're called from run_simulate, NOT from run_predictor_param_sweep),
+    # build them ONCE here so the per-date loop within this combo gets
+    # the same amortization. The win is smaller for run_simulate (single
+    # combo) but consistent — and run_predictor_param_sweep amortizes
+    # across all 60 combos by precomputing at its scope.
+    if signal_lookups is None and signals_by_date is not None:
+        signal_lookups = _precompute_signal_lookups(
+            signals_by_date, universe_symbols, rejected_ticker_counter,
+        )
+
     # Per-date heartbeat — emit an INFO line every N dates so a long sim
     # can't go fully silent for more than a minute or two at a time. Before
     # this, ~2000 signal dates iterated with zero log output; combined with
@@ -1033,6 +1175,7 @@ def _run_simulation_loop(
 
     for idx, signal_date in enumerate(sim_dates):
         signals_override = signals_by_date[signal_date] if signals_by_date is not None else None
+        signal_lookup = signal_lookups.get(signal_date) if signal_lookups is not None else None
         orders, skip = _simulate_single_date(
             sim_client=sim_client,
             signal_date=signal_date,
@@ -1042,6 +1185,7 @@ def _run_simulation_loop(
             merged_config=merged_config,
             strategy_config=strategy_config,
             signals_override=signals_override,
+            signal_lookup=signal_lookup,
             universe_symbols=universe_symbols,
             rejected_ticker_counter=rejected_ticker_counter,
             atr_by_ticker=atr_by_ticker,
@@ -2096,6 +2240,43 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     if grid:
         bucket = config.get("signals_bucket", "alpha-engine-research")
         grid = _seed_grid_with_current(grid, executor_optimizer.read_current_params(bucket))
+
+        # Tier 3 Part A (2026-04-27): precompute SignalLookup ONCE here,
+        # before the sim_fn closure is constructed. All 60 combos in
+        # the sweep capture the same precomputed lookups via closure.
+        # Without this hoist, each combo's _run_simulation_loop call
+        # would rebuild signals_by_ticker + universe_sectors + filter
+        # ~900 universe entries × 2316 dates from scratch — ~22 min of
+        # redundant compute across the sweep. Universe filtering
+        # happens here too: the filter walks the same lists, so fold
+        # it into the per-date precompute and skip the per-call
+        # _filter_signals_to_universe inside _simulate_single_date.
+        try:
+            from alpha_engine_lib.arcticdb import get_universe_symbols
+            _universe_symbols_for_sweep = get_universe_symbols(bucket)
+        except Exception as exc:
+            raise RuntimeError(
+                f"predictor_param_sweep universe-filter bootstrap failed: "
+                f"could not read ArcticDB universe symbols from bucket "
+                f"{bucket!r}: {exc}"
+            ) from exc
+        _sweep_rejected_counter: dict[str, int] = {}
+        signal_lookups = _precompute_signal_lookups(
+            signals_by_date,
+            _universe_symbols_for_sweep,
+            _sweep_rejected_counter,
+        )
+        if _sweep_rejected_counter:
+            top = sorted(_sweep_rejected_counter.items(), key=lambda kv: -kv[1])
+            total = sum(_sweep_rejected_counter.values())
+            logger.warning(
+                "predictor_param_sweep precompute: filtered %d signal "
+                "entries across %d tickers absent from current ArcticDB "
+                "universe. Top: %s",
+                total, len(_sweep_rejected_counter),
+                [f"{t}={n}" for t, n in top[:10]],
+            )
+
         def sim_fn(combo_config: dict) -> dict:
             return _run_simulation_loop(
                 executor_run, SimulatedIBKRClient,
@@ -2108,6 +2289,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 atr_by_ticker=atr_by_ticker,
                 vwap_series_by_ticker=vwap_series_by_ticker,
                 coverage_by_ticker=coverage_by_ticker,
+                signal_lookups=signal_lookups,
             )
 
         sweep_settings = config.get("param_sweep_settings", {})
