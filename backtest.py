@@ -605,14 +605,77 @@ def _build_filtered_price_histories(
     return out
 
 
+def _build_merged_simulate_config(config: dict) -> tuple[dict, dict]:
+    """Build the merged config + flat strategy_config for one simulate
+    pass (one param-sweep combo).
+
+    Replaces the per-call config-merge that ``executor.run()`` did under
+    ``config_override=`` for every simulate date. Backtester runs this
+    ONCE per ``_run_simulation_loop`` call so the 100k+ per-date deciders
+    invocations don't repay deepcopy + ``_PARAM_MAP`` traversal each time.
+
+    The merge logic mirrors ``executor.main.run()``'s ``config_override``
+    branch byte-for-byte:
+      * ``key == "strategy"`` and dict-of-dicts: nested ``.update`` into
+        ``config["strategy"][sub_key]``
+      * ``key in _PARAM_MAP``: traverse the canonical nested path and
+        write the leaf
+      * else: top-level assignment
+
+    Imports from ``executor`` are deferred so this function works in
+    isolated unit tests (which mock ``_setup_simulation`` and never
+    install the executor on sys.path). When the import fails the
+    fallback uses an empty ``_PARAM_MAP`` + a no-op
+    ``load_strategy_config`` — this is sufficient for test stubs that
+    mock ``_simulate_single_date``. Production paths (``run_simulate``,
+    ``run_param_sweep``, ``replay_for_dates``) call ``_setup_simulation``
+    upfront which puts the executor on sys.path before this runs, so
+    the real merge runs there.
+    """
+    import copy
+
+    try:
+        from executor.main import _PARAM_MAP  # type: ignore[import-not-found]
+        from executor.strategies.config import (  # type: ignore[import-not-found]
+            load_strategy_config,
+        )
+    except ImportError:
+        _PARAM_MAP = {}
+
+        def load_strategy_config(_cfg):
+            return {}
+
+    merged: dict = copy.deepcopy(config)
+    override = _build_config_override(config)
+    if override:
+        for key, val in override.items():
+            if key == "strategy" and isinstance(val, dict) and "strategy" in merged:
+                for sub_key, sub_val in val.items():
+                    if isinstance(sub_val, dict) and isinstance(merged["strategy"].get(sub_key), dict):
+                        merged["strategy"][sub_key].update(sub_val)
+                    else:
+                        merged["strategy"][sub_key] = sub_val
+            elif key in _PARAM_MAP:
+                path = _PARAM_MAP[key]
+                target = merged
+                for p in path[:-1]:
+                    target = target.setdefault(p, {})
+                target[path[-1]] = val
+            else:
+                merged[key] = val
+
+    strategy_config = load_strategy_config(merged)
+    return merged, strategy_config
+
+
 def _simulate_single_date(
-    executor_run,
     sim_client,
     signal_date: str,
     price_matrix,
     ohlcv_by_ticker: dict[str, pd.DataFrame] | None,
     bucket: str,
-    config_override: dict | None,
+    merged_config: dict,
+    strategy_config: dict,
     signals_override: dict | None = None,
     universe_symbols: set[str] | None = None,
     rejected_ticker_counter: dict[str, int] | None = None,
@@ -620,32 +683,36 @@ def _simulate_single_date(
     vwap_series_by_ticker: dict[str, pd.Series] | None = None,
     coverage_by_ticker: dict[str, float] | None = None,
 ) -> tuple[list[dict] | None, str | None]:
+    """Run one simulate date through the deciders directly (Tier 2).
+
+    Replaces the prior ``executor_run(simulate=True, ...)`` shell call —
+    backtester now invokes ``executor.deciders.decide_entries`` and
+    ``decide_exits_and_reduces`` directly with already-loaded state,
+    skipping the live shell entirely (~150 ms of per-call overhead from
+    ``load_config`` + ``_read_signals`` defense-in-depth checks +
+    ``signals_by_ticker`` rebuild + ``universe_sectors`` dict-comp +
+    ``OrderBook.load`` etc.).
+
+    Returns ``(orders_or_none, skip_reason)``. On successful run returns
+    ``(orders_list, None)`` — may be an empty list. On skip returns
+    ``(None, reason_key)`` where reason_key ∈ {no_price_index,
+    empty_prices, no_signals}.
+
+    Side effects:
+      * ``sim_client._prices`` and ``_simulation_date`` set per call so
+        ``sim_client.get_current_price`` returns this date's prices.
+      * ``sim_client.place_market_order`` invoked per accepted order so
+        position state carries forward across dates.
     """
-    Run the executor once for a single signal date.
-
-    Returns ``(orders_or_none, skip_reason)``. On successful run, returns
-    ``(orders_list, None)`` — orders may be an empty list. On skip, returns
-    ``(None, reason_key)`` where reason_key ∈ {no_price_index, empty_prices,
-    no_signals}.
-
-    Side effect: mutates ``sim_client._prices`` and ``sim_client._simulation_date``
-    so state carries forward across calls (matching the existing simulation
-    loop's semantics).
-
-    Extracted from _run_simulation_loop in 2026-04-16 to support the replay
-    parity test (Phase 1.1b of backtester-audit-260415.md) without duplicating
-    the per-date orchestration logic.
-    """
-    import pandas as pd
-
     ts = pd.Timestamp(signal_date)
     if ts not in price_matrix.index:
-        # Weekend/holiday signal dates: use next available trading day's prices
         later = price_matrix.index[price_matrix.index > ts]
         if len(later) > 0:
             ts = later[0]
-            logger.debug("Signal date %s not in price index — using next trading day %s",
-                         signal_date, ts.date())
+            logger.debug(
+                "Signal date %s not in price index — using next trading day %s",
+                signal_date, ts.date(),
+            )
         else:
             return None, "no_price_index"
 
@@ -662,14 +729,27 @@ def _simulate_single_date(
         except FileNotFoundError:
             return None, "no_signals"
 
-    # Filter historical signals against TODAY's ArcticDB universe. Signals
-    # from weeks past may contain tickers that have since been dropped from
-    # the universe (2026-04-20 TSM/ASML Research↔Executor coverage-gap fix,
-    # future constituent turnover, etc.). The executor's hard-fail guards
-    # (load_daily_vwap, load_atr_14_pct) raise NoSuchVersionException on any
-    # such ticker and abort the whole simulate run. Dropping them per-date
-    # before executor_run is the simulate-specific defense-in-depth that
-    # pairs with the live-executor buy_candidate filter (alpha-engine PR #77).
+    # Deferred executor imports — kept after the early-return guards so
+    # tests that bypass _setup_simulation (and don't put executor on
+    # sys.path) can still hit the no_price_index / empty_prices /
+    # no_signals paths without ImportError. Production callers go
+    # through _setup_simulation which sets sys.path before this fires.
+    from executor.deciders import (
+        compute_signal_age_days,
+        decide_drawdown_forced_exits,
+        decide_drawdown_response,
+        decide_entries,
+        decide_exits_and_reduces,
+        enrich_positions,
+    )
+    from executor.signal_reader import get_actionable_signals
+    from executor.strategies.exit_manager import SECTOR_ETF_MAP, evaluate_exits
+
+    # Pre-filter signals against the simulation-bootstrap universe set
+    # (loaded once at simulation-loop startup). Live executor's
+    # filter_buy_candidates_to_universe is gated `if not simulate`
+    # post-PR #109 specifically so we don't pay the per-call
+    # ArcticDB.list_symbols round-trip here.
     if universe_symbols is not None:
         signals_raw = _filter_signals_to_universe(
             signals_raw, universe_symbols, rejected_ticker_counter,
@@ -678,18 +758,6 @@ def _simulate_single_date(
     sim_client._prices = date_prices
     sim_client._simulation_date = signal_date
 
-    # Slice OHLCV histories to <= signal_date (no lookahead) for tickers
-    # the executor will actually query. Pre-2026-04-26 v8 built entries for
-    # ALL 911 tickers in ohlcv_by_ticker — but the executor (verified by
-    # grep across executor/main.py + risk_guard.py + exit_manager.py)
-    # only accesses tickers via ``.get(ticker)`` for:
-    # (1) currently-held positions, (2) signals' candidate + universe
-    # entries, (3) the 11 sector ETFs + SPY. For a typical signal date
-    # that's ~50 tickers, not 911. PR #102 (2026-04-26) added the
-    # ticker filter; alpha-engine PR #108 (2026-04-27) flipped the
-    # output shape to DataFrames so the executor's per-bar consumers
-    # vectorize via pandas/numpy. The slice itself is ``df.loc[:ts]``
-    # — pandas binary search on the DatetimeIndex, no per-row materialization.
     price_histories = None
     if ohlcv_by_ticker:
         price_histories = _build_filtered_price_histories(
@@ -699,25 +767,9 @@ def _simulate_single_date(
             held_tickers=set(getattr(sim_client, "_positions", {}).keys()),
         )
 
-    # Precomputed feature-map injection (alpha-engine PR #91). When both
-    # maps are available, resolve VWAP for this simulate date against the
-    # in-memory series, then pass atr_map + vwap_map via the executor
-    # kwargs to skip the per-call ArcticDB reads (``load_atr_14_pct``
-    # and ``load_daily_vwap``). The roadmap's Saturday SF dry-run timed
-    # out at 2h in precisely these two ArcticDB hot paths.
-    #
-    # Semantics: ``atr_by_ticker`` is a flat {ticker: value} dict — the
-    # executor does ``.get(ticker)`` lookups and tolerates missing
-    # tickers via fall-through. VWAP is resolved per simulate date via
-    # ``resolve_vwap_map_for_date`` which mirrors
-    # ``load_daily_vwap``'s walk-back semantics (up to 5 trading days).
-    atr_map: dict | None = None
-    vwap_map: dict | None = None
-    coverage_map: dict | None = None
-    if atr_by_ticker is not None:
-        atr_map = atr_by_ticker  # executor filters via .get() per ticker
-    if coverage_by_ticker is not None:
-        coverage_map = coverage_by_ticker  # executor filters via .get() per ticker
+    atr_map: dict = atr_by_ticker if atr_by_ticker is not None else {}
+    coverage_map: dict = coverage_by_ticker if coverage_by_ticker is not None else {}
+    vwap_map: dict = {}
     if vwap_series_by_ticker is not None:
         from store.feature_maps import resolve_vwap_map_for_date
         enter_tickers = [
@@ -729,22 +781,129 @@ def _simulate_single_date(
             vwap_series_by_ticker, enter_tickers, signal_date,
         )
 
-    orders = executor_run(
-        simulate=True,
+    # ── Deciders ────────────────────────────────────────────────────
+    # All side-effecting layer (place_market_order, ob.add_entry, S3,
+    # logger inside live shell) is owned by THIS function for sim mode;
+    # the deciders themselves are pure.
+
+    # Resolve actionable signals (enter/exit/reduce/hold) + market regime.
+    signals = get_actionable_signals(signals_raw)
+    market_regime = signals["market_regime"]
+    sector_ratings = signals["sector_ratings"]
+    enter_signals = signals["enter"]
+
+    # Build per-call lookup dicts (cheap — bounded by signal/universe size).
+    signals_by_ticker: dict[str, dict] = {}
+    for s in (signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])):
+        t = s.get("ticker")
+        if t and t not in signals_by_ticker:
+            signals_by_ticker[t] = s
+
+    sector_etf_histories: dict | None = None
+    if price_histories:
+        sector_etf_histories = {
+            t: price_histories[t]
+            for t in SECTOR_ETF_MAP.values()
+            if t in price_histories
+        }
+        if "SPY" in price_histories:
+            sector_etf_histories["SPY"] = price_histories["SPY"]
+
+    portfolio_nav = sim_client.get_portfolio_nav()
+    peak_nav = sim_client.get_peak_nav(None)
+    raw_positions = sim_client.get_positions()
+    # Pull entry_date from sim positions (set by SimulatedIBKRClient.place_market_order).
+    entry_dates = {
+        t: pos.get("entry_date") for t, pos in raw_positions.items()
+    }
+    current_positions = enrich_positions(raw_positions, signals_raw, entry_dates)
+
+    dd_multiplier, dd_reason = decide_drawdown_response(
+        portfolio_nav, peak_nav, merged_config,
+    )
+    if dd_multiplier < 1.0:
+        logger.info("Drawdown tier active: %s", dd_reason)
+
+    # Strategy-layer exit signals (ATR trailing, profit-take, momentum,
+    # time decay, sector-relative veto). evaluate_exits already accepts
+    # any ibkr_client with .get_current_price(); SimulatedIBKRClient's
+    # get_current_price is a dict lookup against ._prices set above.
+    strategy_exits = evaluate_exits(
+        current_positions=current_positions,
+        signals_by_ticker=signals_by_ticker,
+        run_date=signal_date,
+        price_histories=price_histories or {},
         ibkr_client=sim_client,
-        signals_override=signals_raw,
+        strategy_config=strategy_config,
+        sector_etf_histories=sector_etf_histories,
+    )
+
+    # Forced exits when drawdown is severe (tiers 2/3 of graduated dd).
+    strategy_exits.extend(
+        decide_drawdown_forced_exits(
+            current_positions=current_positions,
+            exit_signals=signals.get("exit", []),
+            strategy_exits=strategy_exits,
+            signals_by_ticker=signals_by_ticker,
+            dd_multiplier=dd_multiplier,
+            strategy_config=strategy_config,
+        )
+    )
+
+    signal_age_days = compute_signal_age_days(signals_raw, signal_date)
+
+    # Entry pipeline.
+    entry_plan = decide_entries(
+        enter_signals=enter_signals,
+        signals_raw=signals_raw,
+        predictions_by_ticker={},  # backtester intentionally empty (no GBM veto in sim)
+        config=merged_config,
+        strategy_config=strategy_config,
+        market_regime=market_regime,
+        sector_ratings=sector_ratings,
+        portfolio_nav=portfolio_nav,
+        peak_nav=peak_nav,
+        current_positions=current_positions,
+        prices_now=date_prices,
         price_histories=price_histories,
-        config_override=config_override,
         atr_map=atr_map,
         vwap_map=vwap_map,
         coverage_map=coverage_map,
+        dd_multiplier=dd_multiplier,
+        signal_age_days=signal_age_days,
+        earnings_by_ticker={},  # backtester intentionally empty
+        run_date=signal_date,
     )
+
+    # Apply ENTER orders to sim_client so position state carries forward
+    # to the next simulate date (already-held check on next iteration).
+    for o in entry_plan.orders:
+        if o["action"] == "ENTER":
+            sim_client.place_market_order(o["ticker"], "BUY", o["shares"])
+
+    # Exit + reduce pipeline.
+    exit_plan = decide_exits_and_reduces(
+        signals=signals,
+        strategy_exits=strategy_exits,
+        current_positions=current_positions,
+        prices_now=date_prices,
+        predictions_by_ticker={},
+        config=merged_config,
+        market_regime=market_regime,
+        portfolio_nav=portfolio_nav,
+        run_date=signal_date,
+    )
+
+    # Apply EXIT/REDUCE orders to sim_client.
+    for o in exit_plan.orders:
+        if o["action"] in ("EXIT", "REDUCE"):
+            sim_client.place_market_order(o["ticker"], "SELL", o["shares"])
+
+    orders = list(entry_plan.orders) + list(exit_plan.orders)
     # Tag each order with the simulation date for downstream parity diffing.
-    # Executor-emitted orders may not include a date field (they carry
-    # fill_time instead); parity needs a `date` key per docs/trade_mapping.md.
-    for order in (orders or []):
+    for order in orders:
         order.setdefault("date", signal_date)
-    return list(orders or []), None
+    return orders, None
 
 
 def _run_simulation_loop(
@@ -786,8 +945,13 @@ def _run_simulation_loop(
             "note": "Price data too stale for reliable simulation",
         }
 
-    # Build config_override from swept params that need to reach the executor
-    config_override = _build_config_override(config)
+    # Tier 2 (2026-04-27) — build merged_config + strategy_config ONCE per
+    # simulation loop instead of per simulate date. The deciders accept
+    # already-merged config; live executor.run() does the same merge per
+    # call, but for the backtester's 100k+ calls per param sweep this is
+    # the single biggest per-call overhead remaining (each merge is ~1 ms
+    # under deepcopy + _PARAM_MAP traversal).
+    merged_config, strategy_config = _build_merged_simulate_config(config)
 
     # Precompute ATR + VWAP maps once per simulate pass. The executor's
     # ``load_atr_14_pct`` and ``load_daily_vwap`` both hit ArcticDB per
@@ -851,13 +1015,13 @@ def _run_simulation_loop(
     for idx, signal_date in enumerate(sim_dates):
         signals_override = signals_by_date[signal_date] if signals_by_date is not None else None
         orders, skip = _simulate_single_date(
-            executor_run=executor_run,
             sim_client=sim_client,
             signal_date=signal_date,
             price_matrix=price_matrix,
             ohlcv_by_ticker=ohlcv_by_ticker,
             bucket=bucket,
-            config_override=config_override,
+            merged_config=merged_config,
+            strategy_config=strategy_config,
             signals_override=signals_override,
             universe_symbols=universe_symbols,
             rejected_ticker_counter=rejected_ticker_counter,
@@ -1257,7 +1421,7 @@ def replay_for_dates(
 
     requested = set(dates)
     bucket = config.get("signals_bucket", "alpha-engine-research")
-    config_override = _build_config_override(config)
+    merged_config, strategy_config = _build_merged_simulate_config(config)
     sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
 
     # Bootstrap sim_client state from live's eod_pnl if a trades.db is
@@ -1378,13 +1542,13 @@ def replay_for_dates(
         else:
             signals_override = None
         orders, _skip = _simulate_single_date(
-            executor_run=executor_run,
             sim_client=sim_client,
             signal_date=signal_date,
             price_matrix=price_matrix,
             ohlcv_by_ticker=ohlcv_by_ticker,
             bucket=bucket,
-            config_override=config_override,
+            merged_config=merged_config,
+            strategy_config=strategy_config,
             signals_override=signals_override,
             universe_symbols=universe_symbols,
             rejected_ticker_counter=rejected_ticker_counter,
