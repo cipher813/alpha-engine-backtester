@@ -631,6 +631,15 @@ def _build_merged_simulate_config(config: dict) -> tuple[dict, dict]:
     ``run_param_sweep``, ``replay_for_dates``) call ``_setup_simulation``
     upfront which puts the executor on sys.path before this runs, so
     the real merge runs there.
+
+    Runtime-object protection: the ``config`` dict carries non-data
+    runtime handles under sentinel keys (``_phase_registry`` holds a
+    PhaseRegistry whose ``.s3_client`` is a botocore S3Client with
+    circular service-model references). ``copy.deepcopy`` blows the
+    recursion stack on those (caught 2026-04-27 spot smoke v2 — the
+    botocore service_model traversal). Strip these keys before deepcopy
+    and re-attach the original handle on the merged result so consumers
+    still see the runtime objects without the merge attempting to copy them.
     """
     import copy
 
@@ -645,7 +654,17 @@ def _build_merged_simulate_config(config: dict) -> tuple[dict, dict]:
         def load_strategy_config(_cfg):
             return {}
 
-    merged: dict = copy.deepcopy(config)
+    _RUNTIME_HANDLE_KEYS = ("_phase_registry",)
+    runtime_handles = {k: config[k] for k in _RUNTIME_HANDLE_KEYS if k in config}
+    config_for_copy = {k: v for k, v in config.items() if k not in _RUNTIME_HANDLE_KEYS}
+
+    merged: dict = copy.deepcopy(config_for_copy)
+    # Re-attach runtime handles post-deepcopy. Downstream callers
+    # (e.g. _run_simulation_pipeline reads merged["_phase_registry"])
+    # still see the same object the live shell registered.
+    for k, v in runtime_handles.items():
+        merged[k] = v
+
     override = _build_config_override(config)
     if override:
         for key, val in override.items():

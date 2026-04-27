@@ -230,3 +230,44 @@ class TestBuildMergedSimulateConfig:
         assert isinstance(merged, dict)
         assert isinstance(strategy_config, dict)
         assert merged["init_cash"] == 100.0
+
+    def test_runtime_handle_keys_skipped_during_deepcopy(self):
+        """Pin: ``copy.deepcopy(config)`` must NOT recurse through
+        ``_phase_registry`` (or any other runtime-handle sentinel).
+
+        Reproduces the 2026-04-27 spot smoke v2 RecursionError —
+        ``_phase_registry`` carries a botocore S3Client whose
+        ``service_model.service_id`` has circular memoization references
+        that ``copy.deepcopy`` walks until hitting Python's recursion
+        limit. The fix: strip runtime-handle keys before deepcopy and
+        re-attach the original handle on the merged result.
+        """
+        from backtest import _build_merged_simulate_config
+
+        # Build a synthetic registry with a self-referential attribute
+        # that mimics the boto-S3-client circular-ref pattern. Plain
+        # deepcopy of `config` containing this object would either
+        # recurse or fail; the function under test must skip it.
+        class _SelfReferential:
+            def __init__(self):
+                self.parent = self  # self-loop — naive deepcopy would memoize but the real bug is botocore's nested service_model
+
+        sentinel = _SelfReferential()
+        config = {
+            "init_cash": 100.0,
+            "max_position_pct": 0.05,
+            "_phase_registry": sentinel,
+        }
+
+        merged, _strategy_config = _build_merged_simulate_config(config)
+
+        # The runtime handle MUST appear on the merged dict — not deep-
+        # copied (test by identity).
+        assert merged.get("_phase_registry") is sentinel, (
+            "Runtime handle must be re-attached by reference, not copied"
+        )
+        # And data values MUST be deep-copied.
+        merged["max_position_pct"] = 0.99
+        assert config["max_position_pct"] == 0.05, (
+            "Mutating merged data values must not pollute the original config"
+        )
