@@ -231,6 +231,75 @@ class TestBuildMergedSimulateConfig:
         assert isinstance(strategy_config, dict)
         assert merged["init_cash"] == 100.0
 
+    @pytest.mark.skipif(
+        not os.path.isdir(_EXECUTOR_ROOT),
+        reason="alpha-engine sibling repo not present at ~/Development/alpha-engine",
+    )
+    def test_evaluate_exits_with_feature_lookup_matches_without(self):
+        """Tier 3 Part C parity (2026-04-27): evaluate_exits called with
+        a FeatureLookup must produce byte-equal output to the same call
+        with feature_lookup=None (fallback to per-call _compute_atr /
+        _compute_rsi). This pins the lookup-on vs lookup-off equivalence
+        at the integration level (the per-feature parity tests in
+        alpha-engine pin the unit level)."""
+        from executor.feature_lookup import FeatureLookup
+        from executor.ibkr import SimulatedIBKRClient
+        from executor.strategies.exit_manager import evaluate_exits
+
+        # Synthetic 100-bar fixture with a small downtrend so the ATR
+        # trailing stop has a chance to fire on the held position.
+        df = pd.DataFrame(
+            {
+                "open": [100 + i * 0.1 for i in range(100)],
+                "high": [100 + i * 0.1 + 0.5 for i in range(100)],
+                "low":  [100 + i * 0.1 - 0.5 for i in range(100)],
+                "close": [100 + i * 0.1 + 0.2 for i in range(100)],
+            },
+            index=pd.bdate_range("2024-01-01", periods=100),
+        )
+        ohlcv = {"AAPL": df}
+        feature_lookup = FeatureLookup.from_ohlcv_by_ticker(ohlcv)
+
+        sim = SimulatedIBKRClient(prices={"AAPL": 110.0}, nav=1_000_000)
+        sim._positions = {
+            "AAPL": {
+                "shares": 100,
+                "avg_cost": 95.0,
+                "sector": "Tech",
+                "entry_date": "2024-04-01",
+            },
+        }
+        strategy_config = {
+            "atr_trailing_enabled": True,
+            "atr_period": 14,
+            "atr_multiplier": 3.0,
+            "fallback_stop_enabled": False,
+            "profit_take_enabled": False,
+            "momentum_exit_enabled": True,
+            "time_decay_enabled": False,
+            "sector_relative_veto_enabled": False,
+            "momentum_exit_threshold": -15.0,
+            "momentum_exit_rsi": 30,
+        }
+        run_date = df.index[-1].strftime("%Y-%m-%d")
+        common = dict(
+            current_positions=sim.get_positions(),
+            signals_by_ticker={},
+            run_date=run_date,
+            price_histories=ohlcv,
+            ibkr_client=sim,
+            strategy_config=strategy_config,
+        )
+
+        with_lookup = evaluate_exits(**common, feature_lookup=feature_lookup)
+        without_lookup = evaluate_exits(**common, feature_lookup=None)
+
+        assert with_lookup == without_lookup, (
+            "Tier 3 Part C parity break: evaluate_exits with FeatureLookup "
+            f"diverges from fallback path.\n  with={with_lookup}\n"
+            f"  without={without_lookup}"
+        )
+
     def test_runtime_handle_keys_skipped_during_deepcopy(self):
         """Pin: ``copy.deepcopy(config)`` must NOT recurse through
         ``_phase_registry`` (or any other runtime-handle sentinel).

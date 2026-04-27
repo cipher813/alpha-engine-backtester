@@ -803,6 +803,7 @@ def _simulate_single_date(
     atr_by_ticker: dict[str, float] | None = None,
     vwap_series_by_ticker: dict[str, pd.Series] | None = None,
     coverage_by_ticker: dict[str, float] | None = None,
+    feature_lookup=None,
 ) -> tuple[list[dict] | None, str | None]:
     """Run one simulate date through the deciders directly (Tier 2).
 
@@ -978,6 +979,7 @@ def _simulate_single_date(
         ibkr_client=sim_client,
         strategy_config=strategy_config,
         sector_etf_histories=sector_etf_histories,
+        feature_lookup=feature_lookup,
     )
 
     # Forced exits when drawdown is severe (tiers 2/3 of graduated dd).
@@ -1061,6 +1063,7 @@ def _run_simulation_loop(
     vwap_series_by_ticker: dict[str, pd.Series] | None = None,
     coverage_by_ticker: dict[str, float] | None = None,
     signal_lookups: dict | None = None,
+    feature_lookup=None,
 ) -> dict:
     """
     Run one full simulation pass with the given config and pre-built price matrix.
@@ -1163,6 +1166,26 @@ def _run_simulation_loop(
             signals_by_date, universe_symbols, rejected_ticker_counter,
         )
 
+    # Tier 3 Part C: precompute FeatureLookup ONCE (vectorized ATR /
+    # RSI / momentum / returns / support across all tickers × all
+    # dates). Same in-loop / cross-combo amortization story as
+    # signal_lookups: built here for run_simulate, hoisted to
+    # run_predictor_param_sweep scope to share across 60 combos.
+    if feature_lookup is None and ohlcv_by_ticker:
+        try:
+            from executor.feature_lookup import FeatureLookup
+            feature_lookup = FeatureLookup.from_ohlcv_by_ticker(ohlcv_by_ticker)
+            logger.info(
+                "FeatureLookup built: %d tickers (atr_dollar=%d, rsi=%d)",
+                len(ohlcv_by_ticker),
+                len(feature_lookup.atr_dollar),
+                len(feature_lookup.rsi),
+            )
+        except ImportError:
+            # Test environment without executor on sys.path. Fall
+            # through to per-call recompute (legacy behavior).
+            feature_lookup = None
+
     # Per-date heartbeat — emit an INFO line every N dates so a long sim
     # can't go fully silent for more than a minute or two at a time. Before
     # this, ~2000 signal dates iterated with zero log output; combined with
@@ -1190,6 +1213,7 @@ def _run_simulation_loop(
             rejected_ticker_counter=rejected_ticker_counter,
             atr_by_ticker=atr_by_ticker,
             vwap_series_by_ticker=vwap_series_by_ticker,
+            feature_lookup=feature_lookup,
             coverage_by_ticker=coverage_by_ticker,
         )
         if skip is not None:
@@ -2277,6 +2301,33 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 [f"{t}={n}" for t, n in top[:10]],
             )
 
+        # Tier 3 Part C (2026-04-27): build FeatureLookup ONCE here so
+        # all 60 combos share the precomputed ATR / RSI / momentum /
+        # returns / support series. Without this hoist, each combo's
+        # _run_simulation_loop call would re-vectorize the bulk
+        # precompute (~5-30 sec), wasting 60× the cost. With this
+        # hoist: ~5-30 sec ONCE, all combos lookup-hit.
+        try:
+            from executor.feature_lookup import FeatureLookup
+            _t0 = _time.monotonic()
+            sweep_feature_lookup = FeatureLookup.from_ohlcv_by_ticker(
+                ohlcv_by_ticker,
+            )
+            logger.info(
+                "predictor_param_sweep FeatureLookup precompute: "
+                "%d tickers, %.1fs (atr_dollar=%d, rsi=%d, "
+                "momentum_20d_pct=%d, returns=%d, support_20_low=%d)",
+                len(ohlcv_by_ticker),
+                _time.monotonic() - _t0,
+                len(sweep_feature_lookup.atr_dollar),
+                len(sweep_feature_lookup.rsi),
+                len(sweep_feature_lookup.momentum_20d_pct),
+                len(sweep_feature_lookup.returns),
+                len(sweep_feature_lookup.support_20_low),
+            )
+        except ImportError:
+            sweep_feature_lookup = None
+
         def sim_fn(combo_config: dict) -> dict:
             return _run_simulation_loop(
                 executor_run, SimulatedIBKRClient,
@@ -2290,6 +2341,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 vwap_series_by_ticker=vwap_series_by_ticker,
                 coverage_by_ticker=coverage_by_ticker,
                 signal_lookups=signal_lookups,
+                feature_lookup=sweep_feature_lookup,
             )
 
         sweep_settings = config.get("param_sweep_settings", {})
