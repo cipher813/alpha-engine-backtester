@@ -663,6 +663,9 @@ def build_ohlcv_df_by_ticker(
     return out
 
 
+_MAX_BARS_FOR_EXECUTOR = 400
+
+
 def _df_slice_to_bars(df: pd.DataFrame, until_date: str) -> list[dict]:
     """Materialize the <= until_date slice of a single ticker's OHLCV
     DataFrame as the list-of-dicts form the executor still consumes.
@@ -685,11 +688,38 @@ def _df_slice_to_bars(df: pd.DataFrame, until_date: str) -> list[dict]:
     cap inside param_sweep, with iterrows at the top of the stuck
     traceback. Column-wise ``.tolist()`` extraction is C-level and
     avoids the per-row Series allocation entirely.
+
+    Trailing-window cap (2026-04-27): output is capped to the last
+    ``_MAX_BARS_FOR_EXECUTOR`` (400) bars, regardless of how much
+    history is available before ``until_date``. Without this cap, the
+    slice grows from ~500 bars at the first synthetic signal date to
+    ~2500 bars at the last — a 5× materialization-cost growth that
+    dominated the v9 predictor_single_run rate decay (0.80s/date at
+    block 1 → 2.04s/date at block 6). 400 bars is a comfortable upper
+    bound for every executor consumer of ``price_histories``:
+
+      * ``check_correlation`` — 60-day lookback (risk_guard.py)
+      * ``check_momentum_exit`` — 21 bars (exit_manager.py:351)
+      * ``_compute_support_level`` — 20 bars (main.py:227)
+      * ``check_sector_relative_veto`` — 20 bars (exit_manager.py:303)
+      * ``_compute_atr`` / ``_compute_rsi`` — Wilder's smoothing
+        converges to within float-precision identity vs full history
+        after ~5×period bars (≈70 for default period=14)
+      * ``check_atr_trailing_stop`` post_entry filter — bars on/after
+        the held position's entry_date; realistic max holding ~3-6
+        months (~120 bars) under the system's exit rules (time-decay,
+        ATR stops, drawdown forced exits)
+
+    The cap applies to the simulate path only. Live executor reads
+    full history via ``executor.price_cache.load_price_histories``
+    once per boot — its O(N) iterrows cost is paid once, not 2316×.
     """
     ts = pd.Timestamp(until_date)
     sliced = df.loc[:ts]
     if sliced.empty:
         return []
+    if len(sliced) > _MAX_BARS_FOR_EXECUTOR:
+        sliced = sliced.iloc[-_MAX_BARS_FOR_EXECUTOR:]
     # strftime on a DatetimeIndex returns an Index of str; .tolist()
     # yields native Python str values. If the index is already str-like
     # (non-Datetime), fall back to a list-comp str coercion.
