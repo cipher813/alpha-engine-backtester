@@ -256,7 +256,7 @@ echo "  Public IP: $PUBLIC_IP"
 
 # ── Wait for SSH ──────────────────────────────────────────────────────────────
 echo "==> Waiting for SSH to become available..."
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR"
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o LogLevel=ERROR"
 
 for i in $(seq 1 30); do
     if ssh $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" "echo ok" 2>/dev/null; then
