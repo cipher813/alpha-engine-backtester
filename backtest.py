@@ -554,13 +554,12 @@ def _build_filtered_price_histories(
     signal_date: str,
     signals_raw: dict,
     held_tickers: set[str],
-    slice_fn,
-) -> dict[str, list[dict]]:
-    """Materialize ``price_histories`` only for tickers the executor will
+) -> dict[str, "pd.DataFrame"]:
+    """Slice ``price_histories`` only for tickers the executor will
     query at this signal date.
 
-    The executor accesses ``price_histories`` via ``.get(ticker, [])``
-    or ``[ticker]`` exclusively — verified by grep across
+    The executor accesses ``price_histories`` via ``.get(ticker)``
+    exclusively — verified by grep across
     ``alpha-engine/executor/main.py``, ``risk_guard.py``, and
     ``strategies/exit_manager.py``. There is no path that iterates
     keys/values/items, so building entries for tickers the executor
@@ -577,9 +576,12 @@ def _build_filtered_price_histories(
       * ``_SECTOR_ETF_TICKERS`` — always; sector_relative_veto and
         SPY-relative metrics reference them every call
 
-    For a typical 911-ticker universe, this drops the per-date slice
-    cost from ~555 ms to ~30 ms (18× speedup on the slicing portion of
-    each simulate iteration).
+    Output shape (2026-04-27): ``dict[str, pd.DataFrame]`` to match
+    the executor's vectorized per-bar access (alpha-engine PR #108).
+    The slice itself is ``df.loc[:signal_date]`` — pandas binary search
+    on the DatetimeIndex, no per-row materialization. Each slice is a
+    cheap view into the underlying ``ohlcv_by_ticker`` DataFrame; no
+    copy until a downstream consumer demands one.
     """
     queried: set[str] = set(_SECTOR_ETF_TICKERS)
     queried.update(held_tickers)
@@ -590,12 +592,16 @@ def _build_filtered_price_histories(
                 if ticker:
                     queried.add(ticker)
 
-    out: dict[str, list[dict]] = {}
+    ts = pd.Timestamp(signal_date)
+    out: dict[str, "pd.DataFrame"] = {}
     for ticker in queried:
         df = ohlcv_by_ticker.get(ticker)
         if df is None or df.empty:
             continue
-        out[ticker] = slice_fn(df, signal_date)
+        sliced = df.loc[:ts]
+        if sliced.empty:
+            continue
+        out[ticker] = sliced
     return out
 
 
@@ -672,35 +678,25 @@ def _simulate_single_date(
     sim_client._prices = date_prices
     sim_client._simulation_date = signal_date
 
-    # Filter OHLCV histories to <= signal_date (no lookahead).
-    #
-    # Materialize price_histories ONLY for tickers the executor will
-    # actually query. Pre-2026-04-26 v8 we built list-of-dicts for ALL
-    # 911 tickers in ohlcv_by_ticker — but the executor (verified by
+    # Slice OHLCV histories to <= signal_date (no lookahead) for tickers
+    # the executor will actually query. Pre-2026-04-26 v8 built entries for
+    # ALL 911 tickers in ohlcv_by_ticker — but the executor (verified by
     # grep across executor/main.py + risk_guard.py + exit_manager.py)
-    # only accesses tickers via ``.get(ticker, [])`` or ``[ticker]``
-    # for: (1) currently-held positions, (2) signals' candidate +
-    # universe entries, (3) the 11 sector ETFs + SPY referenced by
-    # sector_relative_veto. For a typical signal date that's ~50
-    # tickers, not 911.
-    #
-    # Per-call benchmark on a 1500-bar slice: ``_df_slice_to_bars`` is
-    # 0.61 ms. 911 tickers × 0.61ms = 555 ms per simulate call;
-    # 50 tickers × 0.61ms = 30 ms. Across a 2316-date single_run that's
-    # the difference between 21 minutes and 1 minute spent slicing.
-    # Surfaced by 2026-04-26 v7 c5.large validation: predictor_single_run
-    # at 53 min exceeded predictor_pipeline's 60 min cap with the
-    # full-universe materialization; targeted filter brings it well
-    # within budget.
+    # only accesses tickers via ``.get(ticker)`` for:
+    # (1) currently-held positions, (2) signals' candidate + universe
+    # entries, (3) the 11 sector ETFs + SPY. For a typical signal date
+    # that's ~50 tickers, not 911. PR #102 (2026-04-26) added the
+    # ticker filter; alpha-engine PR #108 (2026-04-27) flipped the
+    # output shape to DataFrames so the executor's per-bar consumers
+    # vectorize via pandas/numpy. The slice itself is ``df.loc[:ts]``
+    # — pandas binary search on the DatetimeIndex, no per-row materialization.
     price_histories = None
     if ohlcv_by_ticker:
-        from synthetic.predictor_backtest import _df_slice_to_bars
         price_histories = _build_filtered_price_histories(
             ohlcv_by_ticker=ohlcv_by_ticker,
             signal_date=signal_date,
             signals_raw=signals_raw,
             held_tickers=set(getattr(sim_client, "_positions", {}).keys()),
-            slice_fn=_df_slice_to_bars,
         )
 
     # Precomputed feature-map injection (alpha-engine PR #91). When both
