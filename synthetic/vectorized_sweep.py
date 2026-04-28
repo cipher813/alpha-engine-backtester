@@ -749,6 +749,16 @@ def run_vectorized_sweep(
 
     prices_arr = price_matrix.to_numpy(dtype=np.float64)
 
+    # Per-combo NAV trajectory. Recorded each date AFTER `sim.update_nav`
+    # (so it reflects mark-to-market on yesterday's prices, before
+    # today's exits/entries fire). Drives the post-loop stats compute
+    # in `synthetic.vectorized_stats` — replaces the per-combo
+    # `vectorbt.Portfolio.from_orders` + `sharpe_ratio()` path that
+    # hung the v16 (2026-04-28) Layer 3 dispatch (60 combos × 26k orders
+    # each × 6 vectorbt stat calls = >90 min, watchdog tripped).
+    # Memory: 60 × 2500 × 8 bytes = 1.2 MB. Trivial.
+    nav_history = np.zeros((n_combos, n_dates), dtype=np.float64)
+
     for date_idx in range(n_dates):
         date_ts = dates[date_idx]
         date_str = date_ts.strftime("%Y-%m-%d")
@@ -773,6 +783,12 @@ def run_vectorized_sweep(
 
         sim.update_nav(prices)
         sim.update_highest_high(highs)
+
+        # Snapshot post-MTM NAV for every combo at this date. .copy()
+        # is critical — sim.nav is mutated in place by subsequent
+        # update_nav calls, so a view assignment would leave every
+        # date_idx pointing at the final-date NAV.
+        nav_history[:, date_idx] = sim.nav
 
         if signal_lookup is None:
             continue
@@ -946,5 +962,6 @@ def run_vectorized_sweep(
         "walltime_sec": walltime,
         "entries_applied": n_entries_total,
         "exits_applied": n_exits_total,
+        "nav_history": nav_history,  # [n_combos, n_dates], for stats
     }
     return orders_per_combo, diagnostics
