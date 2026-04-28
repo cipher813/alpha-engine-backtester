@@ -486,3 +486,164 @@ class TestParityVsScalarSimulatedIBKRClient:
         assert "AAPL" not in scalar[0]._positions
         assert vsim.positions[1, 1] == 50
         assert scalar[1]._positions["MSFT"]["shares"] == 50
+
+
+# ── Fee-rate parity (added 2026-04-28 to close v17 absolute-stats gap) ──────
+
+
+class TestFeeRate:
+    """Pin per-side fee semantics. Mirrors vectorbt's
+    `Portfolio.from_orders(fees=...)` convention: fees are a per-side
+    fraction applied to BOTH buy and sell sides.
+    """
+
+    def test_default_fee_rate_is_zero_preserves_legacy_behavior(self):
+        """Backward-compat invariant: tests + fixtures that don't pass
+        fee_rate get zero-fee accounting (matches the pre-2026-04-28
+        contract)."""
+        sim = VectorizedSimulator(
+            n_combos=1, ticker_index=_ticker_index("AAPL"),
+            init_cash=1_000_000,
+        )
+        assert sim.fee_rate == 0.0
+        sim.apply_buy(
+            combo_idx=np.array([0]), ticker_idx=np.array([0]),
+            shares=np.array([100]), prices=np.array([150.0]), date_idx=0,
+        )
+        # No fee → cash debit is exactly shares × price
+        assert sim.cash[0] == 1_000_000 - 100 * 150
+
+    def test_buy_with_fee_rate_deducts_extra(self):
+        """fee_rate=0.001 → cash -= shares × price × 1.001."""
+        sim = VectorizedSimulator(
+            n_combos=1, ticker_index=_ticker_index("AAPL"),
+            init_cash=1_000_000, fee_rate=0.001,
+        )
+        sim.apply_buy(
+            combo_idx=np.array([0]), ticker_idx=np.array([0]),
+            shares=np.array([100]), prices=np.array([150.0]), date_idx=0,
+        )
+        # 100 × 150 = 15000 notional; fee = 15000 × 0.001 = 15
+        # cash debit = 15015
+        expected = 1_000_000 - 15_000 - 15
+        assert sim.cash[0] == pytest.approx(expected)
+
+    def test_sell_with_fee_rate_credits_less(self):
+        """fee_rate=0.001 → cash += shares × price × 0.999."""
+        sim = VectorizedSimulator(
+            n_combos=1, ticker_index=_ticker_index("AAPL"),
+            init_cash=1_000_000, fee_rate=0.001,
+        )
+        # Buy 100 shares at $150
+        sim.apply_buy(
+            combo_idx=np.array([0]), ticker_idx=np.array([0]),
+            shares=np.array([100]), prices=np.array([150.0]), date_idx=0,
+        )
+        cash_after_buy = sim.cash[0]
+        # Sell at $160 — proceeds 16000 minus fee 16
+        sim.apply_sell(
+            combo_idx=np.array([0]), ticker_idx=np.array([0]),
+            shares=np.array([100]), prices=np.array([160.0]),
+        )
+        expected_credit = 100 * 160 - 100 * 160 * 0.001
+        assert sim.cash[0] == pytest.approx(cash_after_buy + expected_credit)
+
+    def test_round_trip_at_flat_price_loses_two_fees(self):
+        """Buy at $150 → Sell at $150 with fee_rate=0.001 should leave
+        cash at init - 2 × (notional × fee_rate). Mirrors vectorbt's
+        round-trip fee handling."""
+        sim = VectorizedSimulator(
+            n_combos=1, ticker_index=_ticker_index("AAPL"),
+            init_cash=1_000_000, fee_rate=0.001,
+        )
+        sim.apply_buy(
+            np.array([0]), np.array([0]), np.array([100]), np.array([150.0]), 0,
+        )
+        sim.apply_sell(
+            np.array([0]), np.array([0]), np.array([100]), np.array([150.0]),
+        )
+        # Each side: 100 × 150 × 0.001 = 15. Round-trip total: 30.
+        assert sim.cash[0] == pytest.approx(1_000_000 - 30)
+        assert sim.positions[0, 0] == 0.0
+
+    def test_fee_rate_applies_independently_per_combo(self):
+        """All combos share one fee_rate; per-combo cash effects scale
+        with each combo's order activity."""
+        sim = VectorizedSimulator(
+            n_combos=3, ticker_index=_ticker_index("AAPL"),
+            init_cash=1_000_000, fee_rate=0.001,
+        )
+        # Combo 0: 100 shares × $150
+        # Combo 1: 200 shares × $100
+        # Combo 2: untouched
+        sim.apply_buy(
+            combo_idx=np.array([0, 1]),
+            ticker_idx=np.array([0, 0]),
+            shares=np.array([100, 200]),
+            prices=np.array([150.0, 100.0]),
+            date_idx=0,
+        )
+        # Combo 0: 15000 notional + 15 fee = 15015
+        # Combo 1: 20000 notional + 20 fee = 20020
+        # Combo 2: untouched
+        assert sim.cash[0] == pytest.approx(1_000_000 - 15015)
+        assert sim.cash[1] == pytest.approx(1_000_000 - 20020)
+        assert sim.cash[2] == pytest.approx(1_000_000)
+
+    def test_partial_sell_applies_fee_to_actual_shares(self):
+        """Sell half a position with fee → cash credit = (shares × price)
+        × (1 - fee_rate) on the actual shares sold (not the requested)."""
+        sim = VectorizedSimulator(
+            n_combos=1, ticker_index=_ticker_index("AAPL"),
+            init_cash=1_000_000, fee_rate=0.001,
+        )
+        sim.apply_buy(
+            np.array([0]), np.array([0]), np.array([100]), np.array([150.0]), 0,
+        )
+        cash_after_buy = sim.cash[0]
+        # Sell 40 of 100 shares at $160
+        sim.apply_sell(
+            np.array([0]), np.array([0]), np.array([40]), np.array([160.0]),
+        )
+        # Proceeds: 40 × 160 × 0.999 = 6396
+        expected = cash_after_buy + 40 * 160 * 0.999
+        assert sim.cash[0] == pytest.approx(expected)
+        assert sim.positions[0, 0] == 60  # 100 - 40 remaining
+
+    def test_oversell_applies_fee_to_held_amount(self):
+        """Sell shares > held → only `held` shares actually transact,
+        fee applies to the held amount (matches scalar
+        SimulatedIBKRClient.place_market_order semantics)."""
+        sim = VectorizedSimulator(
+            n_combos=1, ticker_index=_ticker_index("AAPL"),
+            init_cash=1_000_000, fee_rate=0.001,
+        )
+        sim.apply_buy(
+            np.array([0]), np.array([0]), np.array([100]), np.array([150.0]), 0,
+        )
+        cash_after_buy = sim.cash[0]
+        sim.apply_sell(
+            np.array([0]), np.array([0]), np.array([200]), np.array([160.0]),
+        )
+        # Only 100 shares actually sold; fee on 100 × 160
+        expected = cash_after_buy + 100 * 160 * 0.999
+        assert sim.cash[0] == pytest.approx(expected)
+        assert sim.positions[0, 0] == 0.0
+
+    def test_round_trip_at_higher_price_yields_net_gain_minus_fees(self):
+        """Realistic case: buy at $150, sell at $160. Gross gain = $1000
+        on 100 shares. With 10 bps fees: net = 1000 - 15 (buy fee) - 16
+        (sell fee) = 969."""
+        sim = VectorizedSimulator(
+            n_combos=1, ticker_index=_ticker_index("AAPL"),
+            init_cash=1_000_000, fee_rate=0.001,
+        )
+        sim.apply_buy(
+            np.array([0]), np.array([0]), np.array([100]), np.array([150.0]), 0,
+        )
+        sim.apply_sell(
+            np.array([0]), np.array([0]), np.array([100]), np.array([160.0]),
+        )
+        # Net: 1_000_000 + (160 - 150) × 100 - 15 - 16 = 1_000_969
+        expected = 1_000_000 + 1000 - 15 - 16
+        assert sim.cash[0] == pytest.approx(expected)

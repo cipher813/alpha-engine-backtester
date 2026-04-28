@@ -101,6 +101,15 @@ class VectorizedSimulator:
     n_combos: int
     ticker_index: dict
     init_cash: float = 1_000_000.0
+    # Per-side fee fraction (e.g. 0.001 = 10 bps). Mirrors vectorbt's
+    # `Portfolio.from_orders(fees=...)` semantics — applied to BOTH buys
+    # and sells. apply_buy: cash -= shares × price × (1 + fee_rate).
+    # apply_sell: cash += shares × price × (1 - fee_rate). Default 0.0
+    # preserves prior test fixtures + sim contracts; production
+    # callers (run_vectorized_sweep) read `simulation_fees` from config
+    # (default 0.001, same key the scalar path reads). Closes the
+    # 2026-04-28 v17 absolute-stats gap with scalar single_run.
+    fee_rate: float = 0.0
 
     positions: np.ndarray = field(init=False)
     cash: np.ndarray = field(init=False)
@@ -297,7 +306,14 @@ class VectorizedSimulator:
         # cash debit: scatter-subtract per combo. np.add.at handles
         # duplicate combo_idx entries correctly (a single combo doing
         # multiple BUYs in one date — rare but possible).
-        np.add.at(self.cash, combo_idx, -(shares.astype(np.float64) * prices.astype(np.float64)))
+        # Fees applied as `shares × price × (1 + fee_rate)` to mirror
+        # vectorbt's per-side fee semantics; fee_rate=0.0 (default)
+        # preserves the legacy zero-fee accounting.
+        notional = shares.astype(np.float64) * prices.astype(np.float64)
+        if self.fee_rate != 0.0:
+            np.add.at(self.cash, combo_idx, -(notional * (1.0 + self.fee_rate)))
+        else:
+            np.add.at(self.cash, combo_idx, -notional)
 
     def apply_sell(
         self,
@@ -357,7 +373,12 @@ class VectorizedSimulator:
         # Cash credit: scatter-add proceeds. Use the lesser of
         # sell_shares vs held (you can't sell more than you hold —
         # scalar reference clips this implicitly via the held check).
-        proceeds = np.where(full_exit_mask, held, sell_shares) * prices.astype(np.float64)
+        # Fees applied as `shares × price × (1 - fee_rate)` to mirror
+        # vectorbt's per-side fee semantics on the sell side.
+        actual_shares = np.where(full_exit_mask, held, sell_shares)
+        proceeds = actual_shares * prices.astype(np.float64)
+        if self.fee_rate != 0.0:
+            proceeds = proceeds * (1.0 - self.fee_rate)
         np.add.at(self.cash, combo_idx, proceeds)
 
     # ── Convenience accessors ────────────────────────────────────────

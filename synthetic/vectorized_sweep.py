@@ -649,6 +649,7 @@ def run_vectorized_sweep(
     drawdown_circuit_breaker: float = 0.08,
     drawdown_tiers: list | None = None,
     market_regime: str = "neutral",
+    fee_rate: float = 0.0,
 ) -> tuple[list, dict]:
     """Run all combos in parallel via VectorizedSimulator.
 
@@ -714,9 +715,13 @@ def run_vectorized_sweep(
         _time.monotonic() - t_setup, n_dates, n_tickers,
     )
 
-    # Initialize simulator
+    # Initialize simulator. fee_rate flows from production config
+    # (`simulation_fees`, default 0.001) to mirror scalar single_run's
+    # vectorbt fee semantics. Default 0.0 in this signature preserves
+    # zero-fee accounting for unit-test fixtures that don't pass a rate.
     sim = VectorizedSimulator(
-        n_combos=n_combos, ticker_index=ticker_to_idx, init_cash=init_cash,
+        n_combos=n_combos, ticker_index=ticker_to_idx,
+        init_cash=init_cash, fee_rate=fee_rate,
     )
 
     # Sweep market regime to int code (single value per sweep — current

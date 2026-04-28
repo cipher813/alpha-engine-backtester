@@ -2143,6 +2143,14 @@ def _run_vectorized_param_sweep(
             break
 
     init_cash = float(base_config.get("init_cash", 1_000_000.0))
+    # Per-side fee fraction — same key the scalar path reads at
+    # backtest.py:2171 prior to vectorbt dispatch. Default 0.001 (10 bps)
+    # matches scalar `vectorbt_bridge.orders_to_portfolio` and closes
+    # the v17 absolute-stats gap (vectorized fee-free → vectorbt
+    # fee-aware divergence: ~50% on a $1M / 9k-order config). Relative
+    # ranking was unaffected pre-fix; absolute alpha numbers are now
+    # comparable to scalar.
+    fee_rate = float(base_config.get("simulation_fees", 0.001))
 
     orders_per_combo, diagnostics = run_vectorized_sweep(
         combo_configs=merged_combo_configs,
@@ -2157,6 +2165,7 @@ def _run_vectorized_param_sweep(
         predictions_by_date=predictions_by_date,
         init_cash=init_cash,
         market_regime=market_regime,
+        fee_rate=fee_rate,
     )
 
     logger.info(
