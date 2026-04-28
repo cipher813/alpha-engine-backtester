@@ -2167,54 +2167,29 @@ def _run_vectorized_param_sweep(
         diagnostics["entries_applied"], diagnostics["exits_applied"],
     )
 
-    # Per-combo portfolio stats — one orders_to_portfolio call per combo.
-    fees = base_config.get("simulation_fees", 0.001)
-    sim_cfg = base_config.get("simulation", {})
-    slippage_bps = float(sim_cfg.get("slippage_bps", 0))
-    assume_next_day_fill = bool(sim_cfg.get("assume_next_day_fill", False))
-
-    rows: list[dict] = []
-    for combo_idx, params in enumerate(combinations):
-        # `orders_per_combo` is a VectorizedOrderStore — __getitem__
-        # materializes one combo's orders to dict-list on demand.
-        # `release(combo_idx)` after consumption drops the buffer so
-        # peak memory stays bounded to one materialized combo at a
-        # time instead of all 60 combos held simultaneously (root
-        # cause of the 2026-04-28 v15 OOM kill on c5.large).
-        orders = orders_per_combo[combo_idx]
-        try:
-            if not orders:
-                rows.append({
-                    **params, "status": "no_orders", "total_orders": 0,
-                    "total_return": 0.0, "sharpe_ratio": 0.0,
-                    "max_drawdown": 0.0, "calmar_ratio": 0.0,
-                    "total_trades": 0, "win_rate": 0.0,
-                    "spy_return": None, "total_alpha": None,
-                })
-                continue
-            try:
-                pf = orders_to_portfolio(
-                    orders, price_matrix, init_cash=init_cash, fees=fees,
-                    slippage_bps=slippage_bps,
-                    assume_next_day_fill=assume_next_day_fill,
-                )
-                stats = compute_pf_stats(pf, spy_prices=spy_prices)
-                stats["status"] = "ok"
-                stats["total_orders"] = len(orders)
-                rows.append({**params, **stats})
-            except Exception as exc:
-                logger.warning(
-                    "Vectorized sweep stats failed for combo %d: %s",
-                    combo_idx, exc,
-                )
-                rows.append({
-                    **params, "error": str(exc),
-                    "total_orders": len(orders),
-                })
-        finally:
-            orders_per_combo.release(combo_idx)
-
-    df = pd.DataFrame(rows)
+    # Per-combo stats — vectorized numpy ops over the [n_combos, n_dates]
+    # NAV trajectory the sweep loop tracked. Replaces the prior per-combo
+    # `vectorbt.Portfolio.from_orders` + `compute_pf_stats` chain that
+    # hung the v16 (2026-04-28) Layer 3 dispatch (60 combos × 26k orders
+    # each × 6 vectorbt stat calls = >90 min, watchdog tripped).
+    # See `synthetic.vectorized_stats` docstring for the fee-parity
+    # caveat (vectorized sim is fee-free; ~0.9% NAV offset vs scalar's
+    # vectorbt-with-fees path; relative ranking unaffected).
+    from synthetic.vectorized_stats import compute_vectorized_stats
+    nav_history = diagnostics["nav_history"]
+    t_stats = _time.monotonic()
+    df = compute_vectorized_stats(
+        nav_history=nav_history,
+        init_cash=init_cash,
+        spy_prices=spy_prices,
+        dates=price_matrix.index,
+        orders_per_combo=orders_per_combo,
+        combo_params=combinations,
+    )
+    logger.info(
+        "Vectorized sweep stats: %d combos in %.2fs",
+        len(df), _time.monotonic() - t_stats,
+    )
     if "total_alpha" in df.columns and df["total_alpha"].notna().any():
         df.sort_values("total_alpha", ascending=False, inplace=True)
     elif "sharpe_ratio" in df.columns:
