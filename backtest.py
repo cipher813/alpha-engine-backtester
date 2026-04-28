@@ -3167,6 +3167,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--force-phases", default="",
                         help="Comma-separated list of phase names to force-rerun (overrides markers "
                              "for those phases only). More surgical than --force.")
+    parser.add_argument("--use-vectorized-sweep", action="store_true",
+                        help="Run predictor_param_sweep through the matrix-axis vectorized engine "
+                             "(synthetic.vectorized_sweep) instead of the scalar per-combo loop. "
+                             "All N combos evaluate simultaneously per date. Tier 4, 2026-04-27. "
+                             "Default off until v14 spot validation confirms output parity vs scalar.")
     return parser.parse_args()
 
 
@@ -3545,6 +3550,8 @@ def main() -> None:
     # and below) can read them without threading args all the way down.
     if args.skip_phase4_evaluations:
         config["skip_phase4_evaluations"] = True
+    if args.use_vectorized_sweep:
+        config["use_vectorized_sweep"] = True
 
     # Smoke-phase mode: apply the fixture BEFORE phase-selection parsing
     # so the fixture's only_phases/skip_phases/force flow through the

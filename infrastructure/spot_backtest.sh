@@ -17,6 +17,10 @@
 #                                                       #   optimizer config writes, no
 #                                                       #   reporter upload. Safe to run
 #                                                       #   concurrently with scheduled SF.
+#   ./infrastructure/spot_backtest.sh --use-vectorized-sweep  # run predictor_param_sweep
+#                                                       #   through the matrix-axis vectorized
+#                                                       #   engine (Tier 4). Default off until
+#                                                       #   v14 spot validation confirms parity.
 #
 # Prerequisites:
 #   - AWS CLI configured (uses alpha-engine-executor-profile for S3/SES access)
@@ -102,6 +106,7 @@ SKIP_STAGES="${SKIP_STAGES:-}"
 # CheckEvaluatorFreeze Choice state (evaluator consolidated into spot
 # 2026-04-24); the freeze_evaluator SF input param is no longer honored.
 FREEZE_EVALUATOR="${FREEZE_EVALUATOR:-false}"
+USE_VECTORIZED_SWEEP="${USE_VECTORIZED_SWEEP:-false}"
 # Accept both --flag value and --flag=value forms for every value-taking
 # flag. The equals form is GNU-getopt-style muscle memory and it's cheap to
 # support — each value flag gets a companion `--foo=*` case that splits on
@@ -128,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --skip-stages) SKIP_STAGES="$2"; shift 2 ;;
         --skip-stages=*) SKIP_STAGES="${1#*=}"; shift ;;
         --freeze-evaluator) FREEZE_EVALUATOR="true"; shift ;;
+        --use-vectorized-sweep) USE_VECTORIZED_SWEEP="true"; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
@@ -176,6 +182,9 @@ fi
 if [ "$DRY_RUN" = "true" ]; then
     BACKTEST_PHASE_FLAGS="$BACKTEST_PHASE_FLAGS --dry-run"
 fi
+if [ "$USE_VECTORIZED_SWEEP" = "true" ]; then
+    BACKTEST_PHASE_FLAGS="$BACKTEST_PHASE_FLAGS --use-vectorized-sweep"
+fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Backtester Spot Run — $(date +%Y-%m-%d)"
@@ -194,6 +203,7 @@ echo "  Force phases  : ${FORCE_PHASES:-(none)}"
 echo "  Dry-run       : $DRY_RUN"
 echo "  Skip stages   : ${SKIP_STAGES:-(none)}"
 echo "  Freeze eval   : $FREEZE_EVALUATOR"
+echo "  Vectorized sw : $USE_VECTORIZED_SWEEP"
 echo "  S3 bucket     : $S3_BUCKET"
 echo ""
 
