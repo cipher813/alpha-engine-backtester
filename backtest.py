@@ -2063,8 +2063,11 @@ def _run_vectorized_param_sweep(
     fallback), with sweep metadata in ``df.attrs``.
 
     Tier 4 PR 5 wire-in (2026-04-27). Gated via
-    ``config["use_vectorized_sweep"]`` — default OFF until v14 spot
-    validation confirms output parity vs the scalar path.
+    ``config["use_vectorized_sweep"]`` — DEFAULT ON since 2026-04-28
+    after v18 validated stats parity (post fee-rate alignment) +
+    cap retighten 5400→1800. Pass ``--use-scalar-sweep`` (or set
+    ``use_vectorized_sweep: false`` in config.yaml) for explicit
+    opt-out / emergency rollback.
 
     Known parity caveats (documented for v14 validation):
       * ``market_regime`` is read from the first signal_lookup with a
@@ -2621,10 +2624,11 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                     sweep_df = pd.DataFrame()
             else:
                 # Tier 4 PR 5 (2026-04-27): vectorized sweep behind a config
-                # flag. When ``use_vectorized_sweep`` is True, all combos
-                # run in parallel as a numpy axis via run_vectorized_sweep.
-                # Default off until v14 spot validation confirms output
-                # parity vs the scalar path; PR 5 follow-up will flip.
+                # flag. When ``use_vectorized_sweep`` is True (DEFAULT
+                # since 2026-04-28 v18 deploy), all combos run in parallel
+                # as a numpy axis via run_vectorized_sweep. Set to False
+                # via `--use-scalar-sweep` CLI or `use_vectorized_sweep:
+                # false` in config.yaml for emergency rollback.
                 if config.get("use_vectorized_sweep"):
                     sweep_df = _run_vectorized_param_sweep(
                         grid=grid,
@@ -3281,11 +3285,27 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--force-phases", default="",
                         help="Comma-separated list of phase names to force-rerun (overrides markers "
                              "for those phases only). More surgical than --force.")
-    parser.add_argument("--use-vectorized-sweep", action="store_true",
-                        help="Run predictor_param_sweep through the matrix-axis vectorized engine "
-                             "(synthetic.vectorized_sweep) instead of the scalar per-combo loop. "
-                             "All N combos evaluate simultaneously per date. Tier 4, 2026-04-27. "
-                             "Default off until v14 spot validation confirms output parity vs scalar.")
+    # Tier 4 vectorized predictor_param_sweep — default ON since
+    # 2026-04-28 v18 validated stats parity (post fee-rate alignment)
+    # + cap retighten 5400→1800. Two flags retained for explicit control:
+    #   --use-vectorized-sweep : redundant under default-on, kept for
+    #                            backward-compat with operator scripts.
+    #   --use-scalar-sweep     : opt-out / emergency rollback. The scalar
+    #                            path remains in-tree and is one-flag away.
+    # See `synthetic.vectorized_sweep` + `synthetic.vectorized_stats` for
+    # the matrix-first architecture.
+    sweep_engine = parser.add_mutually_exclusive_group()
+    sweep_engine.add_argument("--use-vectorized-sweep", action="store_true",
+                              help="(default behavior since 2026-04-28) Run "
+                                   "predictor_param_sweep through the matrix-axis "
+                                   "vectorized engine. All N combos evaluate "
+                                   "simultaneously per date.")
+    sweep_engine.add_argument("--use-scalar-sweep", action="store_true",
+                              help="Opt out of the vectorized sweep — fall back to "
+                                   "the scalar per-combo loop (vectorbt path). "
+                                   "Reserved for emergency rollback if the "
+                                   "vectorized stats diverge from scalar in a "
+                                   "spot run; default-on flip happened 2026-04-28.")
     return parser.parse_args()
 
 
@@ -3664,8 +3684,17 @@ def main() -> None:
     # and below) can read them without threading args all the way down.
     if args.skip_phase4_evaluations:
         config["skip_phase4_evaluations"] = True
-    if args.use_vectorized_sweep:
+    # Default-on the vectorized sweep (2026-04-28). Explicit opt-out via
+    # `--use-scalar-sweep`; explicit opt-in via `--use-vectorized-sweep`
+    # is redundant but kept for backward-compat with operator scripts.
+    # config.yaml may also set `use_vectorized_sweep: false` to opt out
+    # from a config file rather than CLI.
+    if args.use_scalar_sweep:
+        config["use_vectorized_sweep"] = False
+    elif args.use_vectorized_sweep:
         config["use_vectorized_sweep"] = True
+    else:
+        config.setdefault("use_vectorized_sweep", True)
 
     # Smoke-phase mode: apply the fixture BEFORE phase-selection parsing
     # so the fixture's only_phases/skip_phases/force flow through the
