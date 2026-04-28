@@ -124,16 +124,19 @@ full_run_hard_caps_seconds:
   # validation (v12). Pre-Tier 2 (v11) showed 144 ms/date production →
   # 60 combos × 2316 dates × 0.144 = ~333s/combo = ~5.5h total — orders
   # of magnitude over the prior 60-min cap. Tier 2 forecast: 30-50 ms/
-  # date → 60 combos × ~93s = ~93 min. The 5400s (90 min) cap matches
-  # the forecast with no margin. If v12 lands well under cap (Tier 2
-  # over-delivers) we should TIGHTEN this back down in the same PR;
-  # if v12 hits cap exactly we keep it; if v12 trips, Tier 3 becomes
-  # urgent rather than the queued P1.
+  # date → 60 combos × ~93s = ~93 min. The 5400s (90 min) cap matched
+  # the Tier 2 forecast with no margin.
   #
-  # Tier 3 (vectorized cross-sectional precompute, ROADMAP P1 next-step)
-  # forecast drops per-date cost to ~5-10 ms → ~12-15 min total. This
-  # cap will be retightened to ~1800s (30 min) once Tier 3 lands.
-  predictor_pipeline: 5400.0
+  # Tier 4 vectorized sweep landed 2026-04-28 (PRs #119/#120/#121); v17
+  # measured `predictor_pipeline` at 244s (4 min) — sweep loop 149s,
+  # numpy stats 0.36s, surrounding bookkeeping ~95s. The 5400s cap was
+  # 22× the actual; retightened to 1800s (30 min) here. 1800s gives
+  # 7.4× headroom over v17's measured walltime, comfortably absorbs
+  # cold-spot variance + 200-combo grid expansion + future feature
+  # additions. If a future spot run trips this, that's the signal a
+  # real regression has landed — fix the regression, don't widen
+  # the cap silently.
+  predictor_pipeline: 1800.0
 
   # Main simulation pipeline (signals → orders → vectorbt). Typical
   # 5–15 min for a single-run. Cap at 45 min.
