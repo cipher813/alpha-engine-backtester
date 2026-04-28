@@ -141,6 +141,16 @@ class BacktesterPreflight(BasePreflight):
             # caught the 2026-04-21 80-minute burn.
             self._check_lib_version()
             self._check_imports()
+            # Schema bridge between scalar signal-generation contract and
+            # the vectorized engine's signal-consumption contract. Cheap
+            # (~50 ms): builds a synthetic envelope, runs through
+            # `_build_signal_lookup` + `extract_signal_arrays`, asserts
+            # non-zero output. Catches the class of bug shipped by
+            # 2026-04-27 PR #114 + caught by 2026-04-28 Layer 3 v14
+            # (vectorized read `signals_raw_filtered.get("enter")`
+            # directly; synthetic envelope has no top-level `enter` key,
+            # so 0 orders across 60 combos × 2500 dates).
+            self._check_vectorized_signal_extraction()
             self._check_predictor_weights()
             # synthetic/predictor_backtest.py reads from ArcticDB. SPY
             # lives in the ``macro`` library (market-wide series); its
@@ -264,6 +274,162 @@ class BacktesterPreflight(BasePreflight):
                     f"to real directories on this host. Underlying "
                     f"error: {exc}"
                 ) from exc
+
+    def _check_vectorized_signal_extraction(self) -> None:
+        """Pin the schema bridge between scalar signal generation and
+        the vectorized sweep's signal consumption.
+
+        Background: the scalar path runs each per-date envelope through
+        ``executor.signal_reader.get_actionable_signals``, which segments
+        ``buy_candidates`` + ``universe`` (each carrying a per-entry
+        ``signal`` field) into top-level ``enter`` / ``exit`` / ``reduce``
+        / ``hold`` lists. The vectorized engine reads
+        ``signal_lookup.actionable.get("enter")`` — populated once per
+        date in ``_build_signal_lookup``. If either side regresses
+        (vectorized starts reading a non-actionable key, or
+        ``_build_signal_lookup`` stops populating ``actionable``), the
+        sweep silently produces 0 orders across every combo.
+
+        2026-04-28 Layer 3 v14 caught this: vectorized read
+        ``signals_raw_filtered.get("enter")`` directly, the synthetic
+        envelope has no top-level ``enter`` key, sweep emitted 0 orders
+        × 60 combos × 2500 dates. 90 minutes of c5.large spot burned to
+        find a missing dictionary key. This check runs the entire
+        translation in ~50 ms against a known-shape envelope and fails
+        loud at startup if the contract drifts again.
+
+        Cost: ~50 ms. Catches: schema-drift between the two paths;
+        regressions in ``_build_signal_lookup`` (missing actionable
+        field, wrong key); regressions in
+        ``synthetic.vectorized_sweep.extract_signal_arrays`` (reads
+        wrong attribute, signal-shape changes).
+        """
+        from backtest import _build_signal_lookup
+        from synthetic.vectorized_sweep import (
+            extract_signal_arrays,
+            extract_research_actions,
+        )
+        import numpy as np
+
+        # Mirror exactly what `synthetic.signal_generator.predictions_to_signals`
+        # emits: top-level keys are date / market_regime / sector_ratings /
+        # buy_candidates / universe — NO top-level enter / exit / reduce /
+        # hold lists. Per-entry `signal` field carries the segmentation.
+        synthetic_envelope = {
+            "date": "2026-01-01",
+            "market_regime": "neutral",
+            "sector_ratings": {"Technology": {"rating": "market_weight"}},
+            "buy_candidates": [
+                {"ticker": "AAPL", "score": 85, "signal": "ENTER",
+                 "conviction": "rising", "sector": "Technology",
+                 "rating": "BUY"},
+                {"ticker": "MSFT", "score": 78, "signal": "ENTER",
+                 "conviction": "stable", "sector": "Technology",
+                 "rating": "BUY"},
+            ],
+            "universe": [
+                {"ticker": "JPM", "score": 50, "signal": "HOLD",
+                 "conviction": "stable", "sector": "Financial",
+                 "rating": "HOLD"},
+                {"ticker": "BAC", "score": 25, "signal": "EXIT",
+                 "conviction": "declining", "sector": "Financial",
+                 "rating": "SELL"},
+            ],
+        }
+
+        try:
+            lookup = _build_signal_lookup(synthetic_envelope)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Pre-flight: _build_signal_lookup raised on a known-"
+                f"shape synthetic envelope. The signal-precompute path "
+                f"that feeds both scalar and vectorized sweeps is "
+                f"broken. Underlying error: {exc}"
+            ) from exc
+
+        if not hasattr(lookup, "actionable"):
+            raise RuntimeError(
+                "Pre-flight: SignalLookup is missing the `actionable` "
+                "field. The vectorized sweep depends on it (see "
+                "synthetic/vectorized_sweep.py:465 / 574). If "
+                "`actionable` was removed, the vectorized path will "
+                "silently emit 0 orders — same failure mode as Layer "
+                "3 v14 (2026-04-28)."
+            )
+
+        enter_list = lookup.actionable.get("enter", [])
+        if not enter_list:
+            raise RuntimeError(
+                "Pre-flight: lookup.actionable['enter'] is empty for a "
+                "synthetic envelope with 2 buy_candidates carrying "
+                "signal=ENTER. The actionable transformation in "
+                "_build_signal_lookup is broken or bypassed. Verify "
+                "`get_actionable_signals` is being called and is "
+                "iterating buy_candidates + universe correctly."
+            )
+
+        # End-to-end gate: drive the vectorized signal extractor with
+        # the same lookup the sweep would feed it. Any regression in
+        # how `extract_signal_arrays` reads from the lookup surfaces
+        # here as size==0.
+        ticker_to_idx = {"AAPL": 0, "MSFT": 1, "JPM": 2, "BAC": 3}
+        try:
+            sig_arrays = extract_signal_arrays(
+                lookup,
+                predictions={},
+                ticker_to_idx=ticker_to_idx,
+                sector_label_to_idx={"Technology": 0, "Financial": 1},
+                atr_pct_by_ticker={},
+                coverage_by_ticker={},
+                earnings_by_ticker={},
+                momentum_at_date_per_ticker=np.zeros(len(ticker_to_idx)),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Pre-flight: synthetic.vectorized_sweep."
+                f"extract_signal_arrays raised on a valid SignalLookup. "
+                f"Vectorized sweep would crash on every signal date. "
+                f"Underlying error: {exc}"
+            ) from exc
+
+        if sig_arrays["signal_ticker_idx"].size == 0:
+            raise RuntimeError(
+                "Pre-flight: extract_signal_arrays returned 0 enter "
+                "signals despite the lookup carrying 2 entries in "
+                "actionable['enter']. The vectorized engine is reading "
+                "from the wrong attribute (regressed from `actionable` "
+                "back to `signals_raw_filtered`?). See the 2026-04-28 "
+                "v14 incident — this is the exact failure mode that "
+                "produced 0 orders × 60 combos × 2500 dates."
+            )
+
+        # Spot-check extract_research_actions too — same schema bridge,
+        # different vectorized read site.
+        try:
+            actions = extract_research_actions(
+                lookup, ticker_to_idx, n_tickers=4,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Pre-flight: extract_research_actions raised. "
+                f"Vectorized sweep would crash. Error: {exc}"
+            ) from exc
+
+        # AAPL + MSFT must register as ENTER, BAC as EXIT — anything
+        # else means the action-segmentation regressed.
+        from synthetic.vectorized_exits import RA_ENTER, RA_EXIT
+        if actions[ticker_to_idx["AAPL"]] != RA_ENTER:
+            raise RuntimeError(
+                "Pre-flight: extract_research_actions did not flag "
+                "AAPL as RA_ENTER on a synthetic envelope where AAPL "
+                "carries signal=ENTER. Action segmentation regressed."
+            )
+        if actions[ticker_to_idx["BAC"]] != RA_EXIT:
+            raise RuntimeError(
+                "Pre-flight: extract_research_actions did not flag "
+                "BAC as RA_EXIT on a synthetic envelope where BAC "
+                "carries signal=EXIT. Action segmentation regressed."
+            )
 
     def _check_predictor_weights(self) -> None:
         """S3 HEAD on the Layer-1A momentum GBM weights + metadata.
