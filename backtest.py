@@ -513,8 +513,10 @@ class SignalLookup:
     ----------
     signals_raw_filtered : dict
         ``signals_raw`` post ``_filter_signals_to_universe``. Carries
-        ``enter`` / ``exit`` / ``reduce`` / ``hold`` / ``universe`` /
-        ``buy_candidates`` lists with since-dropped tickers removed.
+        ``universe`` and ``buy_candidates`` lists (always present) and
+        optionally ``enter`` / ``exit`` / ``reduce`` / ``hold`` lists
+        (live signals.json may pre-segment these; the synthetic
+        envelope from ``predictions_to_signals`` does not).
     signals_by_ticker : dict[str, dict]
         ``{ticker: signal_entry}`` lookup built from the merged
         ``universe`` + ``buy_candidates`` lists. Used by
@@ -524,10 +526,21 @@ class SignalLookup:
         ``executor.deciders.enrich_positions(universe_sectors=...)``
         which (post-PR-#111) skips its internal rebuild when this is
         provided.
+    actionable : dict
+        Output of ``executor.signal_reader.get_actionable_signals``
+        applied to ``signals_raw_filtered``: keys ``enter`` / ``exit`` /
+        ``reduce`` / ``hold`` carry stocks segmented by their ``signal``
+        field; ``market_regime`` and ``sector_ratings`` carry the
+        envelope-level fields. Required for the Tier 4 vectorized
+        sweep, which previously read ``signals_raw_filtered.get("enter")``
+        directly and produced 0 entries on the synthetic envelope shape
+        (no ``enter`` key). Computed once per date here so the 60-combo
+        sweep doesn't re-run ``get_actionable_signals`` 60×.
     """
     signals_raw_filtered: dict
     signals_by_ticker: dict
     universe_sectors: dict
+    actionable: dict
 
 
 def _build_signal_lookup(
@@ -568,10 +581,35 @@ def _build_signal_lookup(
         # entry's sector)
         universe_sectors[t] = s.get("sector", "")
 
+    # Run the canonical scalar-side actionable-signal transformation
+    # ONCE here so the vectorized sweep can read pre-segmented enter /
+    # exit / reduce / hold lists. Scalar `_simulate_single_date` calls
+    # `get_actionable_signals(signals_raw)` per-call (line 921); the
+    # vectorized engine previously bypassed this and read raw envelope
+    # keys directly, which produced 0 entries on the synthetic envelope
+    # shape (no `enter` key — only `buy_candidates` + `universe`).
+    # Single source of truth: both paths now consume the same actionable
+    # dict, so they can never drift apart on signal segmentation.
+    #
+    # `_filter_signals_to_universe` above silently drops non-dict entries
+    # when `universe_symbols` is provided (the production path), but
+    # callers may pass `universe_symbols=None` (live signal-replay
+    # fallback / unit tests with garbage entries). `get_actionable_signals`
+    # in alpha-engine has no defensive `isinstance(s, dict)` guard, so
+    # pre-sanitize here for the no-filter path.
+    from executor.signal_reader import get_actionable_signals
+    sanitized = dict(signals_raw)
+    for _key in ("universe", "buy_candidates"):
+        _items = sanitized.get(_key, [])
+        if isinstance(_items, list):
+            sanitized[_key] = [e for e in _items if isinstance(e, dict)]
+    actionable = get_actionable_signals(sanitized)
+
     return SignalLookup(
         signals_raw_filtered=signals_raw,
         signals_by_ticker=signals_by_ticker,
         universe_sectors=universe_sectors,
+        actionable=actionable,
     )
 
 

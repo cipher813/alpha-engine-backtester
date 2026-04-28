@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -36,6 +36,7 @@ class FakeSignalLookup:
     signals_raw_filtered: dict
     signals_by_ticker: dict
     universe_sectors: dict
+    actionable: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -105,12 +106,15 @@ def _build_fixture():
             }]
         signal_lookups[ds] = FakeSignalLookup(
             signals_raw_filtered={
-                "enter": enter, "exit": [], "reduce": [], "hold": [],
                 "universe": [], "buy_candidates": [], "date": ds,
                 "market_regime": "bull",
             },
             signals_by_ticker={},
             universe_sectors={"AAPL": "Technology", "MSFT": "Technology"},
+            actionable={
+                "enter": enter, "exit": [], "reduce": [], "hold": [],
+                "market_regime": "bull",
+            },
         )
 
     sector_map = {"AAPL": "Technology", "MSFT": "Technology", "JNJ": "Healthcare"}

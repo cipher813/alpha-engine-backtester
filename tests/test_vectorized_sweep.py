@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -45,10 +45,15 @@ from synthetic.vectorized_sweep import (
 
 @dataclass
 class FakeSignalLookup:
-    """Stand-in for backtest.SignalLookup — same three-attribute shape."""
+    """Stand-in for backtest.SignalLookup — must mirror four-attribute
+    shape including `actionable` (added 2026-04-28 after the Tier 4
+    Layer 3 v14 parity bug — vectorized engine reads `actionable.get(
+    "enter")`, not `signals_raw_filtered.get("enter")`).
+    """
     signals_raw_filtered: dict
     signals_by_ticker: dict
     universe_sectors: dict
+    actionable: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -207,20 +212,22 @@ class TestBuildSectorArrays:
 
 class TestExtractSignalArrays:
     def test_extracts_basic_fields(self):
+        # `actionable` carries the post-`get_actionable_signals` shape that
+        # extract_signal_arrays reads. signals_raw_filtered keeps the `date`
+        # for signal_age_days computation in the run loop.
+        enter_list = [
+            {"ticker": "AAPL", "score": 85, "sector": "Technology",
+             "sector_rating": "overweight", "conviction": "rising",
+             "price_target_upside": 0.20},
+            {"ticker": "JNJ", "score": 72, "sector": "Healthcare",
+             "sector_rating": "market_weight", "conviction": "stable",
+             "price_target_upside": 0.10},
+        ]
         sl = FakeSignalLookup(
-            signals_raw_filtered={
-                "enter": [
-                    {"ticker": "AAPL", "score": 85, "sector": "Technology",
-                     "sector_rating": "overweight", "conviction": "rising",
-                     "price_target_upside": 0.20},
-                    {"ticker": "JNJ", "score": 72, "sector": "Healthcare",
-                     "sector_rating": "market_weight", "conviction": "stable",
-                     "price_target_upside": 0.10},
-                ],
-                "date": "2024-02-01",
-            },
+            signals_raw_filtered={"date": "2024-02-01"},
             signals_by_ticker={},
             universe_sectors={},
+            actionable={"enter": enter_list},
         )
         ti = {"AAPL": 0, "JNJ": 1, "XLK": 2}
         label_to_idx = {"Technology": 0, "Healthcare": 1}
@@ -249,17 +256,16 @@ class TestExtractSignalArrays:
         assert out["signal_momentum_at_date"][1] == pytest.approx(-2.0)
 
     def test_skips_signals_missing_from_ticker_index(self):
+        enter_list = [
+            {"ticker": "AAPL", "score": 80, "sector": "Technology",
+             "conviction": "stable", "price_target_upside": 0.10},
+            {"ticker": "GHOST", "score": 80, "sector": "Technology",
+             "conviction": "stable", "price_target_upside": 0.10},
+        ]
         sl = FakeSignalLookup(
-            signals_raw_filtered={
-                "enter": [
-                    {"ticker": "AAPL", "score": 80, "sector": "Technology",
-                     "conviction": "stable", "price_target_upside": 0.10},
-                    {"ticker": "GHOST", "score": 80, "sector": "Technology",
-                     "conviction": "stable", "price_target_upside": 0.10},
-                ],
-                "date": "2024-01-01",
-            },
+            signals_raw_filtered={"date": "2024-01-01"},
             signals_by_ticker={}, universe_sectors={},
+            actionable={"enter": enter_list},
         )
         ti = {"AAPL": 0}
         out = extract_signal_arrays(
@@ -278,13 +284,14 @@ class TestExtractResearchActions:
         from synthetic.vectorized_exits import RA_ENTER, RA_EXIT, RA_HOLD, RA_REDUCE
 
         sl = FakeSignalLookup(
-            signals_raw_filtered={
+            signals_raw_filtered={},
+            signals_by_ticker={}, universe_sectors={},
+            actionable={
                 "enter": [{"ticker": "AAPL"}],
                 "exit": [{"ticker": "MSFT"}],
                 "reduce": [{"ticker": "JNJ"}],
                 "hold": [{"ticker": "TSLA"}],
             },
-            signals_by_ticker={}, universe_sectors={},
         )
         ti = {"AAPL": 0, "MSFT": 1, "JNJ": 2, "TSLA": 3, "GHOST": 4}
         actions = extract_research_actions(sl, ti, n_tickers=5)
@@ -334,11 +341,13 @@ class TestEndToEndSweep:
                 enter = []
             signal_lookups[ds] = FakeSignalLookup(
                 signals_raw_filtered={
-                    "enter": enter, "exit": [], "reduce": [], "hold": [],
                     "universe": [], "buy_candidates": [], "date": ds,
                 },
                 signals_by_ticker={},
                 universe_sectors={"AAPL": "Technology", "MSFT": "Technology"},
+                actionable={
+                    "enter": enter, "exit": [], "reduce": [], "hold": [],
+                },
             )
 
         combos = [
@@ -412,10 +421,12 @@ class TestEndToEndSweep:
                           "price_target_upside": 0.20}]
             signal_lookups[ds] = FakeSignalLookup(
                 signals_raw_filtered={
-                    "enter": enter, "exit": [], "reduce": [], "hold": [],
                     "universe": [], "buy_candidates": [], "date": ds,
                 },
                 signals_by_ticker={}, universe_sectors={},
+                actionable={
+                    "enter": enter, "exit": [], "reduce": [], "hold": [],
+                },
             )
 
         combos = [{
