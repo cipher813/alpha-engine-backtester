@@ -730,8 +730,13 @@ def run_vectorized_sweep(
     earnings_by_ticker = earnings_by_ticker or {}
     predictions_by_date = predictions_by_date or {}
 
-    # Per-combo order accumulators
-    orders_per_combo: list = [[] for _ in range(n_combos)]
+    # Per-combo order accumulators — columnar storage to bound memory.
+    # Replaces the prior `list[list[dict]]` (~300 B/order × 1.49M orders
+    # ≈ 450 MB on a typical 60-combo × 2500-date × 907-ticker run, which
+    # OOM-killed v15 on c5.large 2026-04-28). Columnar storage drops
+    # this to ~90 MB at sweep end + ~7 MB peak materialization per combo.
+    from synthetic.vectorized_orders import VectorizedOrderStore
+    orders_per_combo = VectorizedOrderStore(n_combos)
 
     # Correlation lookback (max across combos — caller must precompute
     # returns history >= max). For initial implementation use a uniform
@@ -805,7 +810,10 @@ def run_vectorized_sweep(
         )
 
         # Record exit orders BEFORE applying (we need positions / avg_costs
-        # to construct order dicts; apply_sell would mutate them).
+        # for sizing — apply_sell would mutate them). Columnar
+        # accumulator: integer date_idx + ticker_idx + reason_code, no
+        # dict allocation per order. Final string materialization happens
+        # at consumer-time per combo via VectorizedOrderStore.__getitem__.
         if np.any(exit_decisions.exit_action != 0):
             ec, et = np.nonzero(exit_decisions.exit_action != 0)
             for c, t in zip(ec, et):
@@ -814,19 +822,17 @@ def run_vectorized_sweep(
                 if shares <= 0:
                     continue
                 t_idx = int(t)
-                ticker = tickers[t_idx]
-                price = float(prices[t_idx])
-                action_str = "EXIT" if action_code == ACTION_EXIT else "REDUCE"
-                reason = _exit_reason_str(int(exit_decisions.exit_reason[c, t]))
-                orders_per_combo[int(c)].append({
-                    "date": date_str,
-                    "ticker": ticker,
-                    "action": action_str,
-                    "shares": int(shares),
-                    "price_at_order": price,
-                    "portfolio_nav_at_order": float(nav_before[int(c)]),
-                    "exit_reason": reason,
-                })
+                c_idx = int(c)
+                orders_per_combo.add_exit(
+                    combo_idx=c_idx,
+                    date_idx=date_idx,
+                    ticker_idx=t_idx,
+                    action_code=action_code,
+                    shares=int(shares),
+                    price=float(prices[t_idx]),
+                    nav=float(nav_before[c_idx]),
+                    reason_code=int(exit_decisions.exit_reason[c, t]),
+                )
             n_exits_total += int(ec.size)
 
         apply_vectorized_exits(sim, exit_decisions, prices)
@@ -887,30 +893,32 @@ def run_vectorized_sweep(
             sector_idx_per_ticker=sector_idx_per_ticker,
         )
 
-        # Record entry orders before applying
+        # Record entry orders before applying — columnar accumulator,
+        # see exits-side comment above.
         if np.any(entry_decisions.entry_passed):
             ec, es = np.nonzero(entry_decisions.entry_passed)
             for c, s_idx in zip(ec, es):
                 shares = float(entry_decisions.entry_shares[c, s_idx])
                 if shares <= 0:
                     continue
-                ticker = signal_tickers_list[int(s_idx)]
+                s_int = int(s_idx)
+                ticker = signal_tickers_list[s_int]
                 t_idx = ticker_to_idx[ticker]
-                price = float(prices[t_idx])
-                nav_at_order = float(nav_before_entries[int(c)])
+                c_idx = int(c)
+                nav_at_order = float(nav_before_entries[c_idx])
                 position_pct = (
                     float(entry_decisions.entry_dollar[c, s_idx]) / nav_at_order
                     if nav_at_order > 0 else 0.0
                 )
-                orders_per_combo[int(c)].append({
-                    "date": date_str,
-                    "ticker": ticker,
-                    "action": "ENTER",
-                    "shares": int(shares),
-                    "price_at_order": price,
-                    "portfolio_nav_at_order": nav_at_order,
-                    "position_pct": position_pct,
-                })
+                orders_per_combo.add_entry(
+                    combo_idx=c_idx,
+                    date_idx=date_idx,
+                    ticker_idx=t_idx,
+                    shares=int(shares),
+                    price=float(prices[t_idx]),
+                    nav=nav_at_order,
+                    position_pct=position_pct,
+                )
             n_entries_total += int(ec.size)
 
         apply_vectorized_entries(
@@ -925,6 +933,12 @@ def run_vectorized_sweep(
         "(entries=%d, exits=%d)",
         n_combos, n_dates, walltime, n_entries_total, n_exits_total,
     )
+
+    # Provide the lookups consumers need to materialize per-combo
+    # dict-lists. Producer-side: the tickers list and price_matrix.index
+    # are stable across the sweep, so handing them to the store now
+    # gives __getitem__ everything it needs.
+    orders_per_combo.finalize(price_matrix.index, tickers)
 
     diagnostics = {
         "n_combos": n_combos,
