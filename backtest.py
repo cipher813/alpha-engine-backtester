@@ -2175,35 +2175,44 @@ def _run_vectorized_param_sweep(
 
     rows: list[dict] = []
     for combo_idx, params in enumerate(combinations):
+        # `orders_per_combo` is a VectorizedOrderStore — __getitem__
+        # materializes one combo's orders to dict-list on demand.
+        # `release(combo_idx)` after consumption drops the buffer so
+        # peak memory stays bounded to one materialized combo at a
+        # time instead of all 60 combos held simultaneously (root
+        # cause of the 2026-04-28 v15 OOM kill on c5.large).
         orders = orders_per_combo[combo_idx]
-        if not orders:
-            rows.append({
-                **params, "status": "no_orders", "total_orders": 0,
-                "total_return": 0.0, "sharpe_ratio": 0.0,
-                "max_drawdown": 0.0, "calmar_ratio": 0.0,
-                "total_trades": 0, "win_rate": 0.0,
-                "spy_return": None, "total_alpha": None,
-            })
-            continue
         try:
-            pf = orders_to_portfolio(
-                orders, price_matrix, init_cash=init_cash, fees=fees,
-                slippage_bps=slippage_bps,
-                assume_next_day_fill=assume_next_day_fill,
-            )
-            stats = compute_pf_stats(pf, spy_prices=spy_prices)
-            stats["status"] = "ok"
-            stats["total_orders"] = len(orders)
-            rows.append({**params, **stats})
-        except Exception as exc:
-            logger.warning(
-                "Vectorized sweep stats failed for combo %d: %s",
-                combo_idx, exc,
-            )
-            rows.append({
-                **params, "error": str(exc),
-                "total_orders": len(orders),
-            })
+            if not orders:
+                rows.append({
+                    **params, "status": "no_orders", "total_orders": 0,
+                    "total_return": 0.0, "sharpe_ratio": 0.0,
+                    "max_drawdown": 0.0, "calmar_ratio": 0.0,
+                    "total_trades": 0, "win_rate": 0.0,
+                    "spy_return": None, "total_alpha": None,
+                })
+                continue
+            try:
+                pf = orders_to_portfolio(
+                    orders, price_matrix, init_cash=init_cash, fees=fees,
+                    slippage_bps=slippage_bps,
+                    assume_next_day_fill=assume_next_day_fill,
+                )
+                stats = compute_pf_stats(pf, spy_prices=spy_prices)
+                stats["status"] = "ok"
+                stats["total_orders"] = len(orders)
+                rows.append({**params, **stats})
+            except Exception as exc:
+                logger.warning(
+                    "Vectorized sweep stats failed for combo %d: %s",
+                    combo_idx, exc,
+                )
+                rows.append({
+                    **params, "error": str(exc),
+                    "total_orders": len(orders),
+                })
+        finally:
+            orders_per_combo.release(combo_idx)
 
     df = pd.DataFrame(rows)
     if "total_alpha" in df.columns and df["total_alpha"].notna().any():
