@@ -513,8 +513,10 @@ class SignalLookup:
     ----------
     signals_raw_filtered : dict
         ``signals_raw`` post ``_filter_signals_to_universe``. Carries
-        ``enter`` / ``exit`` / ``reduce`` / ``hold`` / ``universe`` /
-        ``buy_candidates`` lists with since-dropped tickers removed.
+        ``universe`` and ``buy_candidates`` lists (always present) and
+        optionally ``enter`` / ``exit`` / ``reduce`` / ``hold`` lists
+        (live signals.json may pre-segment these; the synthetic
+        envelope from ``predictions_to_signals`` does not).
     signals_by_ticker : dict[str, dict]
         ``{ticker: signal_entry}`` lookup built from the merged
         ``universe`` + ``buy_candidates`` lists. Used by
@@ -524,10 +526,75 @@ class SignalLookup:
         ``executor.deciders.enrich_positions(universe_sectors=...)``
         which (post-PR-#111) skips its internal rebuild when this is
         provided.
+    actionable : dict
+        Output of ``executor.signal_reader.get_actionable_signals``
+        applied to ``signals_raw_filtered``: keys ``enter`` / ``exit`` /
+        ``reduce`` / ``hold`` carry stocks segmented by their ``signal``
+        field; ``market_regime`` and ``sector_ratings`` carry the
+        envelope-level fields. Required for the Tier 4 vectorized
+        sweep, which previously read ``signals_raw_filtered.get("enter")``
+        directly and produced 0 entries on the synthetic envelope shape
+        (no ``enter`` key). Computed once per date here so the 60-combo
+        sweep doesn't re-run ``get_actionable_signals`` 60×.
     """
     signals_raw_filtered: dict
     signals_by_ticker: dict
     universe_sectors: dict
+    actionable: dict
+
+
+def _build_actionable_signals_local(signals_raw: dict) -> dict:
+    """Local copy of `executor.signal_reader.get_actionable_signals`.
+
+    Vendored here so `_build_signal_lookup` does not require the
+    alpha-engine repo to be importable. The vectorized sweep depends
+    on this transformation running at precompute time (Tier 4 Layer 3
+    v14 incident, 2026-04-28); the unit-test surface that exercises
+    `_build_signal_lookup` runs in CI where the executor repo is not
+    checked out (CI installs alpha-engine-lib from PyPI but not the
+    full executor repo).
+
+    The canonical implementation lives at
+    `alpha-engine/executor/signal_reader.py::get_actionable_signals`.
+    Both copies must stay byte-equivalent — the parity test
+    `tests/test_actionable_signals_parity.py::test_local_matches_executor`
+    asserts this when the executor repo is available on sys.path
+    (skip-on-import-error otherwise so CI stays green).
+
+    Schema contract:
+        Input  : dict with `universe`, `buy_candidates` lists (each
+                 entry carries a `signal` field) plus envelope-level
+                 `market_regime` and `sector_ratings`.
+        Output : dict with `enter`/`exit`/`reduce`/`hold` lists
+                 segmented by `signal`, plus `market_regime` and
+                 `sector_ratings` propagated through.
+
+    Implementation notes:
+        - Defensively skips non-dict entries (the executor's version
+          does not — kept here to match `_filter_signals_to_universe`'s
+          tolerance for garbage input).
+        - Candidates take precedence over universe in the dedup walk
+          (matches `executor.signal_reader.get_actionable_signals`).
+    """
+    universe = signals_raw.get("universe", []) or []
+    candidates = signals_raw.get("buy_candidates", []) or []
+    seen: set[str] = set()
+    all_stocks: list[dict] = []
+    for s in list(candidates) + list(universe):
+        if not isinstance(s, dict):
+            continue
+        ticker = s.get("ticker")
+        if ticker and ticker not in seen:
+            seen.add(ticker)
+            all_stocks.append(s)
+    return {
+        "enter":  [s for s in all_stocks if s.get("signal") == "ENTER"],
+        "exit":   [s for s in all_stocks if s.get("signal") == "EXIT"],
+        "reduce": [s for s in all_stocks if s.get("signal") == "REDUCE"],
+        "hold":   [s for s in all_stocks if s.get("signal") == "HOLD"],
+        "market_regime": signals_raw.get("market_regime", "neutral"),
+        "sector_ratings": signals_raw.get("sector_ratings", {}),
+    }
 
 
 def _build_signal_lookup(
@@ -568,10 +635,22 @@ def _build_signal_lookup(
         # entry's sector)
         universe_sectors[t] = s.get("sector", "")
 
+    # Run the actionable-signal transformation ONCE here so the
+    # vectorized sweep can read pre-segmented enter / exit / reduce /
+    # hold lists. The scalar path `_simulate_single_date` calls
+    # `executor.signal_reader.get_actionable_signals(signals_raw)`
+    # per-call (line 921); the vectorized engine previously bypassed
+    # this and read raw envelope keys directly, which produced 0 entries
+    # on the synthetic envelope shape (no `enter` key — only
+    # `buy_candidates` + `universe`). Both paths now consume the same
+    # actionable dict so they can never drift apart on segmentation.
+    actionable = _build_actionable_signals_local(signals_raw)
+
     return SignalLookup(
         signals_raw_filtered=signals_raw,
         signals_by_ticker=signals_by_ticker,
         universe_sectors=universe_sectors,
+        actionable=actionable,
     )
 
 

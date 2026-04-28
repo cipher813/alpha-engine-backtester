@@ -191,3 +191,136 @@ class TestCrossComboAmortization:
         # mapping, deciders that try to mutate will surface immediately.
         # For now, the contract is "deciders read-only by convention."
         assert isinstance(lookup.signals_by_ticker, dict)
+
+
+# ── Synthetic-envelope parity (Tier 4 Layer 3 v14 regression guard) ─────────
+#
+# The synthetic envelope from `synthetic.signal_generator.predictions_to_signals`
+# carries `buy_candidates` + `universe` lists with each entry's `signal` field
+# set to "ENTER" / "HOLD" / "EXIT". It does NOT pre-segment into
+# `enter`/`exit`/`reduce`/`hold` lists at the top level. The vectorized sweep
+# previously read raw envelope keys directly (`signals_raw_filtered.get("enter")`)
+# and produced 0 entries on this shape. After the fix, `_build_signal_lookup`
+# runs `get_actionable_signals` once per date so both scalar and vectorized
+# paths consume the same `actionable` dict.
+
+def _synthetic_envelope(date_str: str = "2026-04-25") -> dict:
+    """Mirror the shape `predictions_to_signals` actually emits.
+
+    No pre-segmented enter/exit/reduce/hold lists at top-level — only
+    buy_candidates (signal=ENTER) and universe (signal=HOLD/EXIT).
+    """
+    return {
+        "date": date_str,
+        "market_regime": "neutral",
+        "sector_ratings": {"Technology": {"rating": "market_weight"}},
+        "buy_candidates": [
+            {"ticker": "AAPL", "score": 85, "signal": "ENTER",
+             "conviction": "rising", "sector": "Technology", "rating": "BUY"},
+            {"ticker": "MSFT", "score": 78, "signal": "ENTER",
+             "conviction": "stable", "sector": "Technology", "rating": "BUY"},
+        ],
+        "universe": [
+            {"ticker": "JPM", "score": 50, "signal": "HOLD",
+             "conviction": "stable", "sector": "Financial", "rating": "HOLD"},
+            {"ticker": "BAC", "score": 25, "signal": "EXIT",
+             "conviction": "declining", "sector": "Financial", "rating": "SELL"},
+        ],
+    }
+
+
+class TestActionableFieldOnSyntheticEnvelope:
+    """The bug Layer 3 v14 caught (2026-04-28): vectorized sweep produced
+    0 orders across 60 combos because it read `signals_raw_filtered.get
+    ("enter")` directly, but the synthetic envelope shape doesn't have an
+    `enter` key. Pin both halves of the fix:
+
+      1. SignalLookup.actionable is populated for every build path.
+      2. On a synthetic envelope (no top-level enter list), actionable
+         carries the right segmentation.
+    """
+
+    def test_actionable_field_present_on_lookup(self):
+        lookup = _build_signal_lookup(_synthetic_envelope())
+        assert hasattr(lookup, "actionable"), (
+            "SignalLookup must expose `actionable` — vectorized sweep "
+            "depends on it (synthetic/vectorized_sweep.py:465 / 574)"
+        )
+        assert isinstance(lookup.actionable, dict)
+        for key in ("enter", "exit", "reduce", "hold"):
+            assert key in lookup.actionable, (
+                f"actionable missing `{key}` — keys present: "
+                f"{list(lookup.actionable)}"
+            )
+
+    def test_synthetic_envelope_extracts_enter_signals(self):
+        """Real shape: `buy_candidates` carries signal=ENTER stocks; no
+        top-level `enter` list. The pre-fix code returned [] here."""
+        lookup = _build_signal_lookup(_synthetic_envelope())
+        enter_tickers = {s["ticker"] for s in lookup.actionable["enter"]}
+        assert enter_tickers == {"AAPL", "MSFT"}, (
+            f"Expected AAPL + MSFT (signal=ENTER in buy_candidates); "
+            f"got {enter_tickers}. If empty, the actionable transformation "
+            f"was bypassed — that's the v14 parity bug."
+        )
+
+    def test_synthetic_envelope_extracts_exit_signals(self):
+        lookup = _build_signal_lookup(_synthetic_envelope())
+        exit_tickers = {s["ticker"] for s in lookup.actionable["exit"]}
+        assert exit_tickers == {"BAC"}, (
+            f"Expected BAC (signal=EXIT in universe); got {exit_tickers}"
+        )
+
+    def test_synthetic_envelope_extracts_hold_signals(self):
+        lookup = _build_signal_lookup(_synthetic_envelope())
+        hold_tickers = {s["ticker"] for s in lookup.actionable["hold"]}
+        assert hold_tickers == {"JPM"}
+
+    def test_vectorized_extract_signal_arrays_returns_non_zero(self):
+        """End-to-end gate: feed a synthetic envelope through the same
+        path predictor_param_sweep uses, verify the vectorized extractor
+        produces non-zero entries. This is the test that would have
+        caught Tier 4 Layer 3 v14 BEFORE a 90-min spot run.
+        """
+        import numpy as np
+        from synthetic.vectorized_sweep import extract_signal_arrays
+
+        lookup = _build_signal_lookup(_synthetic_envelope())
+        ticker_to_idx = {"AAPL": 0, "MSFT": 1, "JPM": 2, "BAC": 3}
+        out = extract_signal_arrays(
+            lookup,
+            predictions={},
+            ticker_to_idx=ticker_to_idx,
+            sector_label_to_idx={"Technology": 0, "Financial": 1},
+            atr_pct_by_ticker={},
+            coverage_by_ticker={},
+            earnings_by_ticker={},
+            momentum_at_date_per_ticker=np.zeros(len(ticker_to_idx)),
+        )
+        assert out["signal_ticker_idx"].size == 2, (
+            f"Vectorized engine must extract 2 enter signals (AAPL, MSFT) "
+            f"from a synthetic envelope; got {out['signal_ticker_idx'].size}. "
+            f"Zero means the actionable-key bug regressed."
+        )
+        assert set(out["tickers"]) == {"AAPL", "MSFT"}
+
+    def test_vectorized_research_actions_segments_correctly(self):
+        """The other vectorized read site (extract_research_actions) must
+        ALSO consume actionable, not the raw envelope."""
+        import numpy as np
+        from synthetic.vectorized_sweep import extract_research_actions
+        from synthetic.vectorized_exits import (
+            RA_ENTER, RA_EXIT, RA_HOLD,
+        )
+
+        lookup = _build_signal_lookup(_synthetic_envelope())
+        ticker_to_idx = {"AAPL": 0, "MSFT": 1, "JPM": 2, "BAC": 3}
+        actions = extract_research_actions(lookup, ticker_to_idx, n_tickers=4)
+
+        assert actions[ticker_to_idx["AAPL"]] == RA_ENTER
+        assert actions[ticker_to_idx["MSFT"]] == RA_ENTER
+        assert actions[ticker_to_idx["BAC"]] == RA_EXIT
+        # JPM has signal=HOLD — get_actionable_signals filters it INTO the
+        # hold list but extract_research_actions doesn't override HOLD
+        # (default is already RA_HOLD), so JPM stays RA_HOLD.
+        assert actions[ticker_to_idx["JPM"]] == RA_HOLD

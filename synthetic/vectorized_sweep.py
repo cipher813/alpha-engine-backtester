@@ -461,8 +461,18 @@ def extract_signal_arrays(
 
     Returns a dict with the kwargs ``compute_vectorized_entries``
     expects. Skips signals whose ticker isn't in ``ticker_to_idx``.
+
+    Reads from ``signal_lookup.actionable`` — the post-
+    ``get_actionable_signals`` transformation populated once per date by
+    ``_build_signal_lookup``. The raw envelope from
+    ``synthetic.signal_generator.predictions_to_signals`` carries
+    ``buy_candidates`` + ``universe`` keys but NOT ``enter`` —
+    historically reading ``signals_raw_filtered.get("enter")`` here
+    silently returned ``[]`` and the vectorized sweep produced zero
+    orders on the full 10y fixture (caught by Tier 4 Layer 3 v14
+    parity vs scalar predictor_single_run on 2026-04-28).
     """
-    enter_signals = signal_lookup.signals_raw_filtered.get("enter", [])
+    enter_signals = signal_lookup.actionable.get("enter", [])
     valid: list[dict] = []
     for s in enter_signals:
         if not isinstance(s, dict):
@@ -569,9 +579,14 @@ def extract_research_actions(
 
     HOLD is the default; entries from ``enter`` / ``exit`` / ``reduce``
     lists override at their ticker positions.
+
+    Reads from ``signal_lookup.actionable`` for the same reason as
+    ``extract_signal_arrays``: the synthetic envelope shape doesn't
+    pre-segment by signal. See the docstring there for the full bug
+    history.
     """
     actions = np.full(n_tickers, RA_HOLD, dtype=np.int8)
-    raw = signal_lookup.signals_raw_filtered
+    raw = signal_lookup.actionable
 
     def _set(field: str, code: int) -> None:
         for s in raw.get(field, []):
