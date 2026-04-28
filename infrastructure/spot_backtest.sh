@@ -186,6 +186,20 @@ if [ "$USE_VECTORIZED_SWEEP" = "true" ]; then
     BACKTEST_PHASE_FLAGS="$BACKTEST_PHASE_FLAGS --use-vectorized-sweep"
 fi
 
+# Smoke-safe subset of BACKTEST_PHASE_FLAGS. Smoke modes set their own
+# only-/skip-phases via `_apply_smoke_fixture`, so propagating the
+# operator's --skip-phases / --only-phases / --force-phases would
+# conflict with the fixture's narrowing semantics. Only flags that
+# affect compute behavior (not phase selection) flow through. Currently
+# just --use-vectorized-sweep — added for Tier 4 Layer 2 smoke
+# validation (ROADMAP P0 2026-04-27). Without this, the host parses
+# --use-vectorized-sweep but no smoke command ever sees the flag, so
+# `smoke-predictor-param-sweep` would silently exercise the scalar path.
+SMOKE_PHASE_FLAGS=""
+if [ "$USE_VECTORIZED_SWEEP" = "true" ]; then
+    SMOKE_PHASE_FLAGS="$SMOKE_PHASE_FLAGS --use-vectorized-sweep"
+fi
+
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Backtester Spot Run — $(date +%Y-%m-%d)"
 echo "═══════════════════════════════════════════════════════════════"
@@ -536,8 +550,8 @@ _smoke_run_mode() {
     local status="ok"
 
     echo ""
-    echo "==> Smoke: backtest.py --mode=\$mode"
-    if ! $REMOTE_PYTHON -u backtest.py --mode=\$mode --log-level INFO 2>&1 | tee "\$log_file"; then
+    echo "==> Smoke: backtest.py --mode=\$mode $SMOKE_PHASE_FLAGS"
+    if ! $REMOTE_PYTHON -u backtest.py --mode=\$mode --log-level INFO $SMOKE_PHASE_FLAGS 2>&1 | tee "\$log_file"; then
         status="FAIL"
     fi
     local dur=\$((SECONDS - start))
@@ -592,7 +606,7 @@ fi
 # enforce per-mode wall-clock budgets from timing_budget.yaml. Ordered
 # fastest → slowest so a failure in an earlier mode short-circuits
 # the harder ones. ROADMAP Backtester P0 #3.
-for SMOKE_PHASE_MODE in smoke-simulate smoke-param-sweep smoke-predictor-backtest smoke-phase4; do
+for SMOKE_PHASE_MODE in smoke-simulate smoke-param-sweep smoke-predictor-backtest smoke-phase4 smoke-predictor-param-sweep; do
     if ! _smoke_run_mode "\$SMOKE_PHASE_MODE"; then
         echo "ERROR: smoke phase \$SMOKE_PHASE_MODE FAILED — aborting smoke-only run"
         exit 1

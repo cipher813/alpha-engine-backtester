@@ -67,6 +67,14 @@ smoke_budgets_seconds:
   # Estimated 250-400s typical.
   smoke-phase4: 700.0
 
+  # smoke-predictor-backtest baseline (~120-200s) + predictor_param_sweep
+  # phase running 2 combos. Scalar path: ~5-15s/combo on the 5-ticker
+  # smoke fixture. Vectorized path (Tier 4, --use-vectorized-sweep):
+  # collapses to ~1-3s for both combos as a single matmul. Estimated
+  # 150-250s typical; 600s headroom covers cold-spot variance + the
+  # FeatureLookup/ohlcv-precompute setup which runs once per sweep.
+  smoke-predictor-param-sweep: 600.0
+
 # ── Full-run hard caps (tripwire) ────────────────────────────────────────────
 #
 # Per-phase hard-cap watchdog for non-smoke runs. Exceeding the cap:

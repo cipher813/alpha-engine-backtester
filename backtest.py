@@ -2747,6 +2747,47 @@ _SMOKE_PHASE_MODES: dict[str, dict] = {
         ],
         "skip_phases": None,
     },
+    "smoke-predictor-param-sweep": {
+        # Exercises the predictor_param_sweep phase end-to-end on a tiny
+        # 2-combo grid. The only smoke mode that routes through
+        # predictor_param_sweep — required to validate the Tier 4
+        # vectorized branch (gated on config["use_vectorized_sweep"]).
+        # Without this, --use-vectorized-sweep on the smoke path is a
+        # no-op because no smoke mode reaches that phase.
+        "route_mode": "predictor-backtest",
+        "overrides": {
+            "smoke_tickers": _SMOKE_FIXTURE_TICKERS,
+            "predictor_backtest": {
+                "min_trading_days": 30,
+                "max_trading_days": 60,
+                "top_n_signals_per_day": 5,
+            },
+            # Single-value lists per param keep the cartesian space at 2
+            # (driven by min_score). max_trials=2 caps regardless via
+            # _generate_random_combos. Validates plumbing, not coverage.
+            "param_sweep": {
+                "min_score": [65, 70],
+                "max_position_pct": [0.10],
+                "atr_multiplier": [2.5],
+                "time_decay_reduce_days": [7],
+                "time_decay_exit_days": [15],
+                "profit_take_pct": [0.20],
+            },
+            "param_sweep_settings": {
+                "mode": "random", "max_trials": 2, "seed": 0,
+            },
+        },
+        "only_phases": [
+            "preflight",
+            "runtime_smoke",
+            "predictor_pipeline",
+            "predictor_data_prep",
+            "predictor_feature_maps_bulk_load",
+            "predictor_single_run",
+            "predictor_param_sweep",
+        ],
+        "skip_phases": None,
+    },
 }
 
 
@@ -3105,6 +3146,7 @@ def _parse_args() -> argparse.Namespace:
             "simulate", "param-sweep", "all", "predictor-backtest", "smoke",
             "smoke-simulate", "smoke-param-sweep",
             "smoke-predictor-backtest", "smoke-phase4",
+            "smoke-predictor-param-sweep",
         ],
         default="simulate",
         help=(
