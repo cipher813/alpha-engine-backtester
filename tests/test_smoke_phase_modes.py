@@ -28,6 +28,7 @@ import backtest
     "smoke-param-sweep",
     "smoke-predictor-backtest",
     "smoke-phase4",
+    "smoke-predictor-param-sweep",
 ])
 def test_smoke_phase_mode_accepted(mode: str):
     with patch.object(sys, "argv", ["backtest.py", "--mode", mode]):
@@ -43,6 +44,7 @@ def test_smoke_phase_mode_registry_exact():
     assert mode_registry_keys == {
         "smoke-simulate", "smoke-param-sweep",
         "smoke-predictor-backtest", "smoke-phase4",
+        "smoke-predictor-param-sweep",
     }
 
 
@@ -85,6 +87,7 @@ def test_smoke_simulate_routes_to_simulate():
 @pytest.mark.parametrize("mode", [
     "smoke-simulate", "smoke-param-sweep",
     "smoke-predictor-backtest", "smoke-phase4",
+    "smoke-predictor-param-sweep",
 ])
 def test_smoke_fixture_namespaces_date_to_isolate_markers(mode: str):
     """Fix for 2026-04-23 SF dry-run failure: smoke markers at
@@ -105,6 +108,7 @@ def test_smoke_fixture_namespaces_date_to_isolate_markers(mode: str):
 @pytest.mark.parametrize("mode", [
     "smoke-simulate", "smoke-param-sweep",
     "smoke-predictor-backtest", "smoke-phase4",
+    "smoke-predictor-param-sweep",
 ])
 def test_smoke_fixture_disables_upload(mode: str):
     """Smoke must not write top-level backtest/{date}/ artifacts (report,
@@ -121,6 +125,7 @@ def test_smoke_fixture_disables_upload(mode: str):
 @pytest.mark.parametrize("mode", [
     "smoke-simulate", "smoke-param-sweep",
     "smoke-predictor-backtest", "smoke-phase4",
+    "smoke-predictor-param-sweep",
 ])
 def test_every_smoke_mode_sets_smoke_tickers(mode: str):
     """Every smoke fixture must set `smoke_tickers` — it's the dominant
@@ -203,6 +208,40 @@ def test_smoke_phase4_includes_phase4_evaluators():
     # Still includes data_prep + single_run as upstream deps
     assert "predictor_data_prep" in only
     assert "predictor_single_run" in only
+
+
+def test_smoke_predictor_param_sweep_includes_predictor_param_sweep_phase():
+    """The smoke mode added for Tier 4 Layer 2 validation MUST include
+    `predictor_param_sweep` in only_phases — this is the only smoke mode
+    that reaches the vectorized branch (gated on
+    config["use_vectorized_sweep"] inside that phase). Without it,
+    --use-vectorized-sweep on the smoke path is a silent no-op."""
+    args = _blank_args("smoke-predictor-param-sweep")
+    config: dict = {}
+    backtest._apply_smoke_fixture("smoke-predictor-param-sweep", args, config)
+
+    assert args.mode == "predictor-backtest"
+    only = set(args.only_phases.split(","))
+    assert "predictor_param_sweep" in only, (
+        "smoke-predictor-param-sweep must include predictor_param_sweep "
+        "in only_phases — that's the only phase exercising the Tier 4 "
+        "vectorized branch"
+    )
+    # Upstream deps that produce the inputs predictor_param_sweep needs.
+    assert "predictor_data_prep" in only
+    assert "predictor_feature_maps_bulk_load" in only
+    assert "predictor_single_run" in only
+
+    # Tiny grid, 2-trial cap, deterministic seed — same posture as
+    # smoke-param-sweep but routed through predictor_param_sweep.
+    settings = config["param_sweep_settings"]
+    assert settings["mode"] == "random"
+    assert settings["max_trials"] == 2
+    assert settings["seed"] == 0
+    # Grid must be present (not None — that would shortcircuit the phase).
+    assert config["param_sweep"] is not None
+    assert isinstance(config["param_sweep"], dict)
+    assert "min_score" in config["param_sweep"]
 
 
 def test_fixture_deep_merge_preserves_sibling_keys():
