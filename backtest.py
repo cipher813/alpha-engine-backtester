@@ -1957,6 +1957,193 @@ def run_predictor_backtest(config: dict) -> dict:
     return stats
 
 
+def _run_vectorized_param_sweep(
+    *,
+    grid: dict,
+    base_config: dict,
+    sweep_settings: dict | None,
+    price_matrix,
+    ohlcv_by_ticker: dict | None,
+    signal_lookups: dict,
+    feature_lookup,
+    spy_prices,
+    sector_map: dict,
+    atr_pct_by_ticker: dict | None = None,
+    coverage_by_ticker: dict | None = None,
+    predictions_by_date: dict | None = None,
+) -> pd.DataFrame:
+    """Vectorized batch dispatch for ``run_predictor_param_sweep``.
+
+    Builds the same combinations ``param_sweep.sweep`` would, runs
+    them all in parallel via ``synthetic.vectorized_sweep.run_vectorized_sweep``,
+    then computes per-combo portfolio stats by piping each combo's
+    order list through ``vectorbt_bridge.orders_to_portfolio``.
+
+    Returns a DataFrame with the same shape as the scalar sweep output:
+    one row per combo, sorted by ``total_alpha`` (or ``sharpe_ratio``
+    fallback), with sweep metadata in ``df.attrs``.
+
+    Tier 4 PR 5 wire-in (2026-04-27). Gated via
+    ``config["use_vectorized_sweep"]`` — default OFF until v14 spot
+    validation confirms output parity vs the scalar path.
+
+    Known parity caveats (documented for v14 validation):
+      * ``market_regime`` is read from the first signal_lookup with a
+        ``market_regime`` key and applied as a constant across the
+        sweep window. The scalar path reads it per-date. Affects bear
+        regime gates if the regime changes mid-window — vanishingly
+        rare in practice (sweep windows are 10y, regime classification
+        is monthly cadence).
+      * Time-decay days-held arithmetic uses ``date_idx - entry_dates``
+        on the simulator's date axis (per-signal-date trading days).
+        Scalar uses ``_approx_trading_days`` from ISO date strings,
+        weekday-walking. Equivalent when the sweep date axis is
+        trading days only (the standard predictor_param_sweep config).
+    """
+    import itertools
+    from analysis import param_sweep
+    from synthetic.vectorized_sweep import run_vectorized_sweep
+    from vectorbt_bridge import orders_to_portfolio
+    from vectorbt_bridge import portfolio_stats as compute_pf_stats
+
+    settings = sweep_settings or {}
+    mode = settings.get("mode", "random")
+    seed = settings.get("seed")
+
+    keys = list(grid.keys())
+    values = list(grid.values())
+    total_grid = 1
+    for v in values:
+        total_grid *= len(v)
+
+    if mode == "random":
+        explicit_max = settings.get("max_trials")
+        if explicit_max is not None:
+            n = int(explicit_max)
+        else:
+            n = param_sweep.auto_n_trials(
+                total_grid,
+                trial_pct=settings.get("trial_pct"),
+                min_trials=settings.get("min_trials"),
+                max_trials=settings.get("max_trials_cap"),
+            )
+        combinations = param_sweep._generate_random_combos(grid, n, seed=seed)
+        actual_mode = "random" if len(combinations) < total_grid else "grid (auto-fallback)"
+        coverage = len(combinations) / total_grid
+    else:
+        combinations = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+        actual_mode = "grid"
+        coverage = 1.0
+
+    logger.info(
+        "Vectorized param sweep: %d combos × %d dates × %d tickers (mode=%s)",
+        len(combinations), len(price_matrix), len(price_matrix.columns), actual_mode,
+    )
+
+    # Build per-combo merged configs by repeating the same merge
+    # _run_simulation_loop / executor.run() does (deepcopy base, update
+    # with combo overrides, push flat sweep keys into nested strategy
+    # paths via _PARAM_MAP).
+    merged_combo_configs: list = []
+    for params in combinations:
+        combo_config = param_sweep._deepcopy_safe_config(base_config)
+        combo_config.update(params)
+        merged, _ = _build_merged_simulate_config(combo_config)
+        merged_combo_configs.append(merged)
+
+    # Read market_regime from first available signal_lookup (assumes
+    # constant regime across sweep window — see docstring caveat).
+    market_regime = "neutral"
+    for sl in signal_lookups.values():
+        regime_str = (
+            sl.signals_raw_filtered.get("market_regime")
+            if hasattr(sl, "signals_raw_filtered") else None
+        )
+        if regime_str:
+            market_regime = regime_str
+            break
+
+    init_cash = float(base_config.get("init_cash", 1_000_000.0))
+
+    orders_per_combo, diagnostics = run_vectorized_sweep(
+        combo_configs=merged_combo_configs,
+        price_matrix=price_matrix,
+        ohlcv_by_ticker=ohlcv_by_ticker or {},
+        signal_lookups=signal_lookups,
+        feature_lookup=feature_lookup,
+        spy_prices=spy_prices,
+        sector_map=sector_map,
+        atr_pct_by_ticker=atr_pct_by_ticker,
+        coverage_by_ticker=coverage_by_ticker,
+        predictions_by_date=predictions_by_date,
+        init_cash=init_cash,
+        market_regime=market_regime,
+    )
+
+    logger.info(
+        "Vectorized sweep loop: %d combos × %d dates in %.1fs "
+        "(entries=%d, exits=%d)",
+        diagnostics["n_combos"], diagnostics["n_dates"],
+        diagnostics["walltime_sec"],
+        diagnostics["entries_applied"], diagnostics["exits_applied"],
+    )
+
+    # Per-combo portfolio stats — one orders_to_portfolio call per combo.
+    fees = base_config.get("simulation_fees", 0.001)
+    sim_cfg = base_config.get("simulation", {})
+    slippage_bps = float(sim_cfg.get("slippage_bps", 0))
+    assume_next_day_fill = bool(sim_cfg.get("assume_next_day_fill", False))
+
+    rows: list[dict] = []
+    for combo_idx, params in enumerate(combinations):
+        orders = orders_per_combo[combo_idx]
+        if not orders:
+            rows.append({
+                **params, "status": "no_orders", "total_orders": 0,
+                "total_return": 0.0, "sharpe_ratio": 0.0,
+                "max_drawdown": 0.0, "calmar_ratio": 0.0,
+                "total_trades": 0, "win_rate": 0.0,
+                "spy_return": None, "total_alpha": None,
+            })
+            continue
+        try:
+            pf = orders_to_portfolio(
+                orders, price_matrix, init_cash=init_cash, fees=fees,
+                slippage_bps=slippage_bps,
+                assume_next_day_fill=assume_next_day_fill,
+            )
+            stats = compute_pf_stats(pf, spy_prices=spy_prices)
+            stats["status"] = "ok"
+            stats["total_orders"] = len(orders)
+            rows.append({**params, **stats})
+        except Exception as exc:
+            logger.warning(
+                "Vectorized sweep stats failed for combo %d: %s",
+                combo_idx, exc,
+            )
+            rows.append({
+                **params, "error": str(exc),
+                "total_orders": len(orders),
+            })
+
+    df = pd.DataFrame(rows)
+    if "total_alpha" in df.columns and df["total_alpha"].notna().any():
+        df.sort_values("total_alpha", ascending=False, inplace=True)
+    elif "sharpe_ratio" in df.columns:
+        df.sort_values("sharpe_ratio", ascending=False, inplace=True)
+
+    if not df.empty:
+        df.attrs["sweep_mode"] = f"{actual_mode} (vectorized)"
+        df.attrs["sweep_total_grid"] = total_grid
+        df.attrs["sweep_trials"] = len(combinations)
+        df.attrs["sweep_coverage"] = coverage
+        df.attrs["vectorized_walltime_sec"] = diagnostics["walltime_sec"]
+        df.attrs["vectorized_entries"] = diagnostics["entries_applied"]
+        df.attrs["vectorized_exits"] = diagnostics["exits_applied"]
+
+    return df
+
+
 def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     """
     Run predictor-only backtest with param sweep.
@@ -2361,7 +2548,28 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 else:
                     sweep_df = pd.DataFrame()
             else:
-                sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
+                # Tier 4 PR 5 (2026-04-27): vectorized sweep behind a config
+                # flag. When ``use_vectorized_sweep`` is True, all combos
+                # run in parallel as a numpy axis via run_vectorized_sweep.
+                # Default off until v14 spot validation confirms output
+                # parity vs the scalar path; PR 5 follow-up will flip.
+                if config.get("use_vectorized_sweep"):
+                    sweep_df = _run_vectorized_param_sweep(
+                        grid=grid,
+                        base_config=config,
+                        sweep_settings=sweep_settings,
+                        price_matrix=price_matrix,
+                        ohlcv_by_ticker=ohlcv_by_ticker,
+                        signal_lookups=signal_lookups,
+                        feature_lookup=sweep_feature_lookup,
+                        spy_prices=spy_prices,
+                        sector_map=sector_map,
+                        atr_pct_by_ticker=atr_by_ticker,
+                        coverage_by_ticker=coverage_by_ticker,
+                        predictions_by_date=predictions_by_date,
+                    )
+                else:
+                    sweep_df = param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
                 if sweep_df is not None and not sweep_df.empty:
                     ps_ctx.record_artifact(_save_df_p(
                         bucket, registry.date, "predictor_param_sweep",
