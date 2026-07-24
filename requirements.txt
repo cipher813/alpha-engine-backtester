@@ -115,7 +115,7 @@ scipy>=1.18.0
 lightgbm>=4.6.0
 catboost>=1.2.10
 hmmlearn>=0.3.3
-tqdm>=4.68.4
+tqdm>=4.69.0
 optuna>=4.9.0
 psutil>=5.9.0
 
@@ -138,4 +138,4 @@ psutil>=5.9.0
 # v0.12.2 is the earliest krepis tag carrying the OpenRouter unresolved/
 # leaked-tool-call safety fix in krepis.llm; the >=0.12.0 floor here is one
 # patch below that — bumped alongside this change (see the pin below).
-krepis[openai]>=0.12.2
+krepis[openai]>=0.18.0
