@@ -138,11 +138,32 @@ class TestInitDataSources:
 
     # -- skip-flagged: tolerant ---------------------------------------------------
 
-    def test_skip_flag_all_artifacts_missing_logs_warning(self, caplog):
-        """With --skip-backtester, missing all artifacts logs a WARNING and
-        does NOT set the degraded marker."""
+    def test_skip_flag_all_artifacts_missing_logs_warning(self, caplog, monkeypatch):
+        """With --skip-backtester, missing ALL backtester artifacts logs a
+        WARNING and does NOT set the degraded marker. Predictor artifacts are
+        present — only the backtester was skipped."""
         from evaluate import _init_data_sources
         import evaluate
+
+        # Provide predictor artifacts so the predictor_critical gate does not
+        # fire (predictor absence always raises, even with --skip-backtester).
+        def _predictor_ok_s3(**kwargs):
+            key = kwargs.get("Key", "")
+            if key.endswith("predictor_sweep_df.parquet"):
+                return {"Body": _parquet_body()}
+            if key.endswith("predictor_stats.json"):
+                return {"Body": _json_body()}
+            # Backtester artifacts: simulate intentionally skipped → NoSuchKey
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
+                "GetObject",
+            )
+
+        class _S3:
+            def get_object(self, **kwargs):
+                return _predictor_ok_s3(**kwargs)
+
+        monkeypatch.setattr("evaluate.boto3.client", lambda s, **kw: _S3())
 
         cfg = {"output_bucket": "alpha-engine-research"}
         caplog.set_level(logging.WARNING)
@@ -153,11 +174,13 @@ class TestInitDataSources:
         assert not avail.get("_degraded", False), \
             "skip-flagged run must not produce a degraded marker"
 
-        # Should have all artifacts listed as unavailable
+        # Backtester artifacts are absent (the operator skipped the backtester);
+        # predictor artifacts are present (they were not skipped and the
+        # predictor_critical gate is what keeps this test from raising).
         assert avail["sweep_df"] is False
         assert avail["portfolio_stats"] is False
-        assert avail["predictor_sweep_df"] is False
-        assert avail["predictor_stats"] is False
+        assert avail["predictor_sweep_df"] is True
+        assert avail["predictor_stats"] is True
 
         # Should have a WARNING-level log that mentions "intentionally skipped"
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -168,10 +191,30 @@ class TestInitDataSources:
         assert not unexpected_logs, \
             "skip-flagged run must NOT log UNEXPECTED"
 
-    def test_skip_flag_single_artifact_missing_does_not_raise(self):
-        """With --skip-backtester, single artifact missing does not raise."""
+    def test_skip_flag_single_artifact_missing_does_not_raise(self, monkeypatch):
+        """With --skip-backtester, missing backtester artifacts does not raise.
+        Predictor artifacts are present so the predictor_critical gate (which
+        always raises on total predictor absence) remains satisfied."""
+        # Provide predictor artifacts; backtester artifacts raise NoSuchKey.
+        def _predictor_ok_s3(**kwargs):
+            key = kwargs.get("Key", "")
+            if key.endswith("predictor_sweep_df.parquet"):
+                return {"Body": _parquet_body()}
+            if key.endswith("predictor_stats.json"):
+                return {"Body": _json_body()}
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
+                "GetObject",
+            )
+
+        class _S3:
+            def get_object(self, **kwargs):
+                return _predictor_ok_s3(**kwargs)
+
+        monkeypatch.setattr("evaluate.boto3.client", lambda s, **kw: _S3())
+
         avail = self._call_init(skip_backtester=True)
-        # All missing is expected for the stub — no RuntimeError should be raised
+        # All backtester artifacts missing is expected — no RuntimeError raised
         assert avail["sweep_df"] is False
         assert avail["_skip_backtester"] is True
 
@@ -339,8 +382,26 @@ class TestInitDataSources:
 class TestArtifactCompletenessManifest:
     """Verify the completeness manifest distinguishes skip vs degraded."""
 
-    def test_skip_flagged_has_skip_marker(self):
+    def test_skip_flagged_has_skip_marker(self, monkeypatch):
         """A skip-flagged run returns _skip_backtester=True in the avail map."""
+        # Provide predictor artifacts so the predictor_critical gate doesn't fire.
+        def _predictor_ok_s3(**kwargs):
+            key = kwargs.get("Key", "")
+            if key.endswith("predictor_sweep_df.parquet"):
+                return {"Body": _parquet_body()}
+            if key.endswith("predictor_stats.json"):
+                return {"Body": _json_body()}
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
+                "GetObject",
+            )
+
+        class _S3:
+            def get_object(self, **kwargs):
+                return _predictor_ok_s3(**kwargs)
+
+        monkeypatch.setattr("evaluate.boto3.client", lambda s, **kw: _S3())
+
         avail = self._call_init(skip_backtester=True)
         assert avail.get("_skip_backtester") is True
 

@@ -238,9 +238,14 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
     # Backtester-critical: both ``sweep_df.parquet`` AND
     # ``portfolio_stats.json`` missing means no simulation output at all —
     # optimizers would run against zero data and produce garbage config
-    # recommendations. Hard-fail regardless of skip flag.
+    # recommendations. On a normal (non-skip) run this is a hard failure.
+    # When the operator explicitly skipped the backtester
+    # (--skip-backtester), this absence is expected and tolerated rather
+    # than hard-failing — the individual per-artifact WARNING logs above
+    # already record it, and the completeness manifest carries the skip
+    # marker for the report card.
     backtester_critical = {"sweep_df.parquet", "portfolio_stats.json"}
-    if backtester_critical.issubset(set(missing_artifacts)):
+    if not skip_bt and backtester_critical.issubset(set(missing_artifacts)):
         raise RuntimeError(
             f"All critical backtester artifacts missing from "
             f"s3://{bucket}/{prefix}/: {sorted(backtester_critical)}. "
