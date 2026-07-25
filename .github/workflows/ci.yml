@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
 
@@ -66,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
 
@@ -89,21 +89,30 @@ jobs:
           pip install ruff
           ruff check --select F821 .
 
+      # config#3219 §121 hermetic-vs-live test split lint: every test file that
+      # imports a live-service module (boto3, requests, arcticdb, …) at module
+      # level must carry @pytest.mark.live (or @pytest.mark.skipif /
+      # @pytest.mark.parity / test_live_* naming) so it is excluded from the
+      # default hermetic suite via addopts = -m "not parity and not live".
+      - name: Hermetic-vs-live marker lint
+        run: python3 scripts/lint_hermetic_test_marker.py
+
       # --cov-fail-under not passed explicitly: pytest-cov reads
       # [tool.coverage.report] fail_under from pyproject.toml automatically
       # once --cov is passed (config#2533 coverage ratchet).
       - name: Run tests
         run: pytest tests/ -v --cov=. --cov-report=term-missing
 
-      # Advisory-only: pip-audit's newer releases emit a GH Actions error
-      # annotation for any finding, which the runner honors as a step failure
-      # independent of the shell exit code — `|| true` no longer suppresses
-      # it (discovered 2026-07-13 when a newly-published langchain-core/
-      # pyarrow CVE tripped every PR's security-audit step red). continue-on-
-      # error is the runner-level equivalent of the `|| true` this step
-      # always intended: report findings, never block the job on them.
+      # Blocking (config#2530): flipped from continue-on-error: true to
+      # blocking as part of the fleet-wide pip-audit standardization. The
+      # pre-existing GHA annotation quirk (pip-audit's newer releases emit
+      # GH Actions error annotations that the runner honors independent of
+      # the shell exit code) was the reason continue-on-error was used
+      # originally — now that behavior is INTENTIONAL: findings fail the
+      # step. Pre-cleared via .github/pip-audit-ignore.txt with documented
+      # rationale per entry (mirroring crucible-executor's ignore-file
+      # pattern, config#2530).
       - name: Security audit
-        continue-on-error: true
         run: |
           pip install pip-audit
           IGNORE_ARGS=()
@@ -138,7 +147,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
 
