@@ -114,7 +114,7 @@ logger = logging.getLogger(__name__)
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Alpha Engine Evaluator")
     parser.add_argument(
         "--mode", choices=["all", "diagnostics", "optimize"],
@@ -147,7 +147,7 @@ def _parse_args() -> argparse.Namespace:
         help="Backtester was intentionally skipped — tolerate missing simulation "
              "artifacts as expected rather than marking the evaluator run degraded",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 # ── Data source initialization ───────────────────────────────────────────────

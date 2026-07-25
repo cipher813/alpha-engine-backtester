@@ -8,12 +8,26 @@ elevated to criticality parity with backtester artifacts.
 """
 
 import argparse
+import io
 import json
 import logging
 
 import pandas as pd
 import pytest
 from botocore.exceptions import ClientError
+
+
+def _parquet_body():
+    """Return a Body-like object containing minimal valid parquet bytes."""
+    buf = io.BytesIO()
+    pd.DataFrame({"mock": [True]}).to_parquet(buf)
+    return type("Bytes", (), {"read": lambda s, _b=buf.getvalue(): _b})()
+
+
+def _json_body(data=None):
+    """Return a Body-like object containing JSON bytes."""
+    data = data or {"mock": True}
+    return type("Bytes", (), {"read": lambda s: json.dumps(data).encode()})()
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +88,7 @@ def _s3_stub_client(service: str, **_):
     if service != "s3":
         raise ValueError(f"unexpected service: {service}")
 
-    client = boto3.session.Session().create_client("s3", region_name="us-east-1")
+    client = boto3.session.Session().client("s3", region_name="us-east-1")
 
     real_get = client.get_object
 
@@ -184,19 +198,17 @@ class TestInitDataSources:
         def _partial_get(**kwargs):
             key = kwargs.get("Key", "")
             call_count["get_object"] += 1
-            if key.endswith("predictor_sweep_df.parquet") or key.endswith("predictor_stats.json"):
-                # Return valid data for predictor artifacts
-                body = {"Body": type("Bytes", (), {"read": lambda s: json.dumps({"mock": True}).encode()})()}
-                return body
+            if key.endswith("predictor_sweep_df.parquet"):
+                return {"Body": _parquet_body()}
+            if key.endswith("predictor_stats.json"):
+                return {"Body": _json_body()}
             if key.endswith("sweep_df.parquet"):
                 raise ClientError(
                     {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
                     "GetObject",
                 )
             if key.endswith("portfolio_stats.json"):
-                # Return valid portfolio_stats
-                body = {"Body": type("Bytes", (), {"read": lambda s: json.dumps({"mock": True}).encode()})()}
-                return body
+                return {"Body": _json_body()}
             raise ClientError(
                 {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
                 "GetObject",
@@ -242,9 +254,9 @@ class TestInitDataSources:
                     {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
                     "GetObject",
                 )
-            # Return valid data for everything else
-            body = type("Bytes", (), {"read": lambda s: json.dumps({"mock": True}).encode()})()
-            return {"Body": body}
+            if key.endswith(".parquet"):
+                return {"Body": _parquet_body()}
+            return {"Body": _json_body()}
 
         class _PartialS3:
             def get_object(self, **kwargs):
@@ -278,8 +290,9 @@ class TestInitDataSources:
                     {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
                     "GetObject",
                 )
-            body = type("Bytes", (), {"read": lambda s: json.dumps({"mock": True}).encode()})()
-            return {"Body": body}
+            if key.endswith(".parquet"):
+                return {"Body": _parquet_body()}
+            return {"Body": _json_body()}
 
         class _S3:
             def get_object(self, **kwargs):
@@ -306,8 +319,9 @@ class TestInitDataSources:
                     {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
                     "GetObject",
                 )
-            body = type("Bytes", (), {"read": lambda s: json.dumps({"mock": True}).encode()})()
-            return {"Body": body}
+            if key.endswith(".parquet"):
+                return {"Body": _parquet_body()}
+            return {"Body": _json_body()}
 
         class _S3:
             def get_object(self, **kwargs):
