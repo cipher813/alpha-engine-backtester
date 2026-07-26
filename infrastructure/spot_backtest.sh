@@ -1378,9 +1378,9 @@ echo "════════════════════════�
 echo ""
 
 run_ssm "backtest" "$MAX_RUNTIME_SECONDS" <<BACKTEST
-# MUST precede `set -euo pipefail` — any code path (including sourced files
+# MUST precede set -euo pipefail — any code path (including sourced files
 # from ${ENV_SOURCE}) that references this variable before its main init at
-# line ~1423 will trigger an unbound-variable fatal exit under `set -u`.
+# line ~1423 will trigger an unbound-variable fatal exit under set -u.
 export _BACKTEST_WAS_SKIPPED=false
 set -eo pipefail
 cd /home/ec2-user/alpha-engine-backtester
