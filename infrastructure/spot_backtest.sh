@@ -1378,13 +1378,12 @@ echo "════════════════════════�
 echo ""
 
 run_ssm "backtest" "$MAX_RUNTIME_SECONDS" <<BACKTEST
+# MUST precede set -euo pipefail — any code path (including sourced files
+# from ${ENV_SOURCE}) that references this variable before its main init at
+# line ~1423 will trigger an unbound-variable fatal exit under set -u.
+export _BACKTEST_WAS_SKIPPED=false
 set -eo pipefail
 cd /home/ec2-user/alpha-engine-backtester
-# Guard against any code path that reads _BACKTEST_WAS_SKIPPED before
-# the main initialization below (line ~1418). The heredoc is single-quoted
-# on the dispatcher side but interpolated by the spot's shell; some
-# spot-AMI cached versions of this script reference it earlier.
-export _BACKTEST_WAS_SKIPPED=false
 ${ENV_SOURCE}
 
 # BUCKET used across all three stages. OUTPUT_BUCKET formerly came from the
