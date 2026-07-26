@@ -1380,6 +1380,11 @@ echo ""
 run_ssm "backtest" "$MAX_RUNTIME_SECONDS" <<BACKTEST
 set -eo pipefail
 cd /home/ec2-user/alpha-engine-backtester
+# Guard against any code path that reads _BACKTEST_WAS_SKIPPED before
+# the main initialization below (line ~1418). The heredoc is single-quoted
+# on the dispatcher side but interpolated by the spot's shell; some
+# spot-AMI cached versions of this script reference it earlier.
+export _BACKTEST_WAS_SKIPPED=false
 ${ENV_SOURCE}
 
 # BUCKET used across all three stages. OUTPUT_BUCKET formerly came from the
