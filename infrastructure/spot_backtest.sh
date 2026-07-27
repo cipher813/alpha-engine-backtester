@@ -436,7 +436,14 @@ echo "  Spot attempt  : $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS  (#883 — relaunch on 
 echo ""
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
-if [ ! -f "$REPO_ROOT/config.yaml" ]; then
+# Preflight-only runs only backtest.py --mode=smoke (reads-only, zero
+# writes, zero external API calls) and exits BEFORE the full-backtest
+# path — it does not need config.yaml. The unconditional check here
+# broke the Friday shell_run dry path on fresh spot instances that
+# hadn't yet provisioned config.yaml (the check ran before the
+# PREFLIGHT_ONLY short-circuit at ~line 1147). Guard the check so
+# preflight-only is exempt.
+if [ "$PREFLIGHT_ONLY" != "1" ] && [ ! -f "$REPO_ROOT/config.yaml" ]; then
     echo "ERROR: config.yaml not found — copy from config.yaml.example"
     exit 1
 fi
