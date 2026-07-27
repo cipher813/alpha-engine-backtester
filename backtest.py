@@ -2910,9 +2910,13 @@ def _load_alpha_uncertainty_from_predictions_archive(
             doc = json.loads(obj["Body"].read())
         except Exception:
             continue
+        predictions = doc.get("predictions")
+        if not isinstance(predictions, dict):
+            # List form (or absent/malformed) — skip silently.
+            continue
         per_ticker = {
             ticker: float(entry["predicted_alpha_std"])
-            for ticker, entry in (doc.get("predictions") or {}).items()
+            for ticker, entry in predictions.items()
             if isinstance(entry, dict)
             and entry.get("predicted_alpha_std") is not None
         }
