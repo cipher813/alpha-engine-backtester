@@ -55,7 +55,7 @@ setuptools>=83.0.0
 # metadata (numpy-2 support landed at 1.4.2); a naive reading of `~=1.4`
 # as "1.4.x only" would wrongly assume this pin needs bumping for
 # numpy-2 compat. Verified via `pip install --dry-run`, config#2815.
-scikit-learn~=1.4
+scikit-learn~=1.9
 # cvxpy added 2026-05-11 for analysis/portfolio_optimizer_backtest.py — replays
 # the constrained MVO optimizer (alpha-engine PR #157) over historical synthetic
 # predictions. Bumped to >=1.9.2,<1.10 for numpy 2 compat (config#2815) — same
