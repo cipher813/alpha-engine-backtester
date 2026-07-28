@@ -520,8 +520,27 @@ def test_backtest_main_pit_parity_branch_uses_handle_pit_parity_failure():
     import backtest as bt
 
     src = inspect.getsource(bt)
-    idx = src.index("if args.pit_parity:")
-    branch_src = src[idx:idx + 2500]
+    lines = src.splitlines(keepends=True)
+    start = next(
+        i for i, ln in enumerate(lines) if ln.strip() == "if args.pit_parity:"
+    )
+    # Bound the branch by INDENTATION, not by a fixed character count. The
+    # previous form sliced a magic 2500-char window, so any legitimate
+    # addition inside this branch (config#3121 added the smoke-phase budget
+    # block) silently pushed the asserted lines out of the window and failed
+    # a test whose subject had not changed. Scan to the first subsequent
+    # non-blank, non-comment line indented at or below `if args.pit_parity:`
+    # — that is the real end of the block, whatever its length.
+    base_indent = len(lines[start]) - len(lines[start].lstrip())
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if len(lines[i]) - len(lines[i].lstrip()) <= base_indent:
+            end = i
+            break
+    branch_src = "".join(lines[start:end])
     assert "handle_pit_parity_failure(config, e)" in branch_src
     assert "from analysis.pit_parity import handle_pit_parity_failure" in branch_src
 
