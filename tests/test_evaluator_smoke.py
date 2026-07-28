@@ -18,22 +18,47 @@ from unittest.mock import MagicMock, patch
 import pytest
 from botocore.exceptions import ClientError
 
-import evaluate
+
+@pytest.fixture
+def evaluate():
+    """Import ``evaluate`` LAZILY, inside the test, not at module scope.
+
+    ``evaluate.py`` is a script module: importing it executes
+    ``setup_logging("evaluate", flow_doctor_yaml=..., ...)`` at import time
+    (evaluate.py:58) and pulls in a large ``analysis.*`` / ``nousergon_lib``
+    chain. At module scope that fires during pytest COLLECTION — i.e. before
+    any test runs, reconfiguring global logging for the whole session and
+    leaking into every test file collected afterwards.
+
+    That is not hypothetical here. When this import sat at module scope, this
+    PR's CI showed 12 failures across ``tests/test_replay_runner.py`` and
+    ``tests/test_replay_comparison.py`` — files this branch does not touch,
+    which pass on ``main``'s CI at the same base sha (run 30374545755:
+    3270 passed, 0 failed). ``test_evaluator_smoke`` sorts before
+    ``test_replay_*``, so the side effect landed upstream of them.
+    See alpha-engine-config-I5227.
+
+    Scoping the import to a fixture keeps it out of collection. The deeper
+    defect — ``evaluate.py`` configuring global logging as an import side
+    effect at all — is tracked in that issue; this is the local containment.
+    """
+    import evaluate as _evaluate
+    return _evaluate
 
 
-def test_smoke_flag_accepted():
+def test_smoke_flag_accepted(evaluate):
     with patch("sys.argv", ["evaluate.py", "--smoke"]):
         args = evaluate._parse_args()
     assert args.smoke is True
 
 
-def test_smoke_flag_defaults_false():
+def test_smoke_flag_defaults_false(evaluate):
     with patch("sys.argv", ["evaluate.py"]):
         args = evaluate._parse_args()
     assert args.smoke is False
 
 
-def test_smoke_probe_s3_calls_list_objects_v2_on_backtest_prefix():
+def test_smoke_probe_s3_calls_list_objects_v2_on_backtest_prefix(evaluate):
     fake_s3 = MagicMock()
     with patch("boto3.client", return_value=fake_s3):
         evaluate._smoke_probe_s3({"signals_bucket": "my-bucket"})
@@ -43,7 +68,7 @@ def test_smoke_probe_s3_calls_list_objects_v2_on_backtest_prefix():
     )
 
 
-def test_smoke_probe_s3_raises_on_failure():
+def test_smoke_probe_s3_raises_on_failure(evaluate):
     """The whole point of a smoke step is to fail loud and fast — a
     ClientError (bad credentials, wrong region, etc.) must propagate,
     not be swallowed."""
@@ -56,7 +81,7 @@ def test_smoke_probe_s3_raises_on_failure():
             evaluate._smoke_probe_s3({"signals_bucket": "my-bucket"})
 
 
-def test_smoke_probe_s3_defaults_bucket_when_unset():
+def test_smoke_probe_s3_defaults_bucket_when_unset(evaluate):
     fake_s3 = MagicMock()
     with patch("boto3.client", return_value=fake_s3):
         evaluate._smoke_probe_s3({})
@@ -66,7 +91,7 @@ def test_smoke_probe_s3_defaults_bucket_when_unset():
     )
 
 
-def test_main_impl_smoke_returns_before_data_source_init():
+def test_main_impl_smoke_returns_before_data_source_init(evaluate):
     """Source pin: --smoke must exit BEFORE _init_data_sources (which
     would raise on a real run with no backtest artifacts for --date —
     not a condition a smoke run should depend on) and before any
@@ -86,7 +111,7 @@ def test_main_impl_smoke_returns_before_data_source_init():
     assert "_smoke_probe_s3(config)" in branch
 
 
-def test_main_impl_smoke_runs_after_preflight():
+def test_main_impl_smoke_runs_after_preflight(evaluate):
     """--smoke must run AFTER BacktesterPreflight (so preflight's own
     checks — bucket exists, imports — still apply) but the smoke check
     supersedes needing simulation artifacts to exist."""
