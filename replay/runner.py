@@ -345,7 +345,18 @@ def _invoke_target_with_schema(
             structured_outputs=False,
             reasoning={"exclude": True},
         )
-        client = LLMClient(spec, api_key=resolved_key, client_factory=client_factory)
+        # krepis >=0.23.0 requires callsite_id as a keyword-only argument
+        # (added as a breaking change — the param has no default). The
+        # replay runner has no canonical "which agent" context since it
+        # replays arbitrary past runs; use a static identifier scoped to
+        # this module, distinct from the live agent callsite_id values
+        # the fleet's executors pass.
+        client = LLMClient(
+            spec,
+            callsite_id="crucible-backtester/replay-runner",
+            api_key=resolved_key,
+            client_factory=client_factory,
+        )
         result = client.structured(
             system=system_prompt,
             user_content=user_prompt,

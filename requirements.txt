@@ -141,4 +141,11 @@ psutil>=5.9.0
 # a None default, so this bump is required for the field to ever be
 # non-None, not for correctness against an older krepis (that path already
 # degrades gracefully).
-krepis[openai]>=0.18.0
+#
+# Bumped to >=0.23.0 (alpha-engine-config-I5227, 2026-07-29): krepis 0.23.0
+# added callsite_id as a REQUIRED keyword-only argument to LLMClient.__init__
+# (a breaking change with no default) — replay/runner.py's
+# _invoke_target_with_schema now passes callsite_id="crucible-backtester/
+# replay-runner". krepis <0.23.0 raises TypeError on that keyword, so the
+# floor must match the actual parameter the code passes.
+krepis[openai]>=0.23.0
