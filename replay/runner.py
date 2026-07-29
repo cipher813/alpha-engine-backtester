@@ -345,7 +345,18 @@ def _invoke_target_with_schema(
             structured_outputs=False,
             reasoning={"exclude": True},
         )
-        client = LLMClient(spec, api_key=resolved_key, client_factory=client_factory)
+        client = LLMClient(
+            spec,
+            # REQUIRED since the 2026-07-28 cost-telemetry change made
+            # callsite_id mandatory on LLMClient. This id is the row this
+            # call site already owns in alpha-engine-config's
+            # LLM_CALLSITE_REGISTRY.yaml (`replay-concordance`), so spend
+            # lands under the callsite the registry says produces it —
+            # inventing a new string here would attribute it to nothing.
+            callsite_id="replay-concordance",
+            api_key=resolved_key,
+            client_factory=client_factory,
+        )
         result = client.structured(
             system=system_prompt,
             user_content=user_prompt,
