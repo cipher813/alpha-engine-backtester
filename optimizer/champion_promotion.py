@@ -1,6 +1,7 @@
 """champion_promotion.py — weekly winner-take-all champion/challenger gate
 (config#2364 / config#2367 origin; redesigned alpha-engine-config-I2518 /
-epic I2515, 2026-07-14 ruling).
+epic I2515, 2026-07-14 ruling; scoring redesigned to direct per-arm lift,
+no shared comparator, alpha-engine-config-I2998, 2026-07-20 ruling).
 
 Writes the live pointer ``config/producer_champion.json`` that the
 alpha-engine executor's ``executor/champion.py::load_champion_pointer``
@@ -50,36 +51,68 @@ stale) is a NO-CONTEST: the pointer is left unchanged and the outcome
 record says so explicitly via a machine-readable ``blocked_by`` slug. A
 no-contest NEVER defaults a win to either side.
 
-**Evidence sourcing — two different repos' artifacts, joined via a shared
-comparator (Bucher-style indirect/common-comparator comparison — standard
-in network meta-analysis when no directly-joined head-to-head dataset
-exists between two arms that were each measured against a common
-reference):**
+**Evidence sourcing — DIRECT per-arm realized lift, NO shared comparator
+(alpha-engine-config-I2998, 2026-07-20 ruling — supersedes the
+Bucher-style indirect/common-comparator design below this module shipped
+with under I2518):**
+
+  The pre-I2998 design scored both arms as "lift vs the live
+  ``agentic_sector_teams``/CIO-ADVANCE baseline" on the premise that
+  Research kept running its full agentic pipeline weekly regardless of
+  which arm the executor traded. config-I2993 (2026-07-19/20) found that
+  premise false: ``agentic_sector_teams`` retired 2026-07-12 with no
+  successor ``kind=="champion"`` producer registered, so BOTH arms'
+  "vs agentic" scores could go simultaneously no-contest — a materially
+  worse failure than either arm alone going stale, since a no-contest week
+  is a legitimate, non-alerting outcome by design (freezing
+  ``config/producer_champion.json`` silently). I2998's fix removes the
+  shared-comparator dependency entirely: each arm now scores its OWN
+  realized lift against a FIXED, always-available neutral baseline, so
+  neither arm's score can ever depend on whether Research's agentic
+  pipeline (or any future comparator) happens to be live that week.
 
   - ``scanner_predictor_direct``'s weekly score is this run's
     ``analysis.end_to_end.compute_lift_metrics()['scanner_then_predictor_counterfactual']
-    ['methods']['scanner_then_predictor_topN']['sn_lift_vs_agentic_cio']`` —
-    a backtester-internal counterfactual (research.db-derived) already
+    ['methods']['scanner_then_predictor_topN']['sector_neutral_mean_alpha_21d']``
+    — the arm's own realized, sector-neutral 21d alpha, ALREADY benchmark
+    -relative (realized log return minus the log SPY return over the same
+    window, at the source, ``analysis/end_to_end.py::_scanner_then_predictor_topN``) —
+    i.e. lift vs the SPY zero-line, not vs any live comparator arm. A
+    backtester-internal counterfactual (research.db-derived) already
     computed earlier in the same ``evaluate.py`` run, extracted via
-    ``leaderboard_entry_from_e2e_lift`` (unchanged from the pre-I2518
-    engine; this module's OWN ``research/producer_leaderboard_champion_gate/
-    {date}.json`` history artifact is STILL maintained for observability
-    and to keep config#2452's in-flight live-verification intact — see
+    ``leaderboard_entry_from_e2e_lift`` (this module's OWN
+    ``research/producer_leaderboard_champion_gate/{date}.json`` history
+    artifact is STILL maintained for observability and to keep
+    config#2452's in-flight live-verification intact — see
     ``update_leaderboard_and_get_gate_inputs`` — but its accumulated
     ``weekly_points`` series is no longer consumed by the gate itself,
     since winner-take-all needs only THIS week's point, not a multi-week
-    HAC-adjusted series).
+    HAC-adjusted series). The retired ``sn_lift_vs_agentic_cio`` field is
+    still carried on the leaderboard-history entry for observability but
+    is no longer the gate's score source.
   - ``thinktank_coverage``'s weekly score is read from crucible-research's
     real champion/challenger producer leaderboard,
     ``research/producer_leaderboard/{date}.json``
-    (``scoring/leaderboard_producers.py::build_producer_leaderboard``,
-    config#1221/#1223) — verified schema (2026-07-14, read from the
-    crucible-research checkout, NOT guessed): ``{"champion": <research
-    producer champion name>, "horizon_days": 21, "top_n": 50, "n_dates":
-    int, "specs": [{"name", "kind", "realized_rank_ic", "n_dates_scored",
-    "topn_alpha_vs_champion": {"mean","se","t_stat","n_dates"} | None},
-    ...]}``. We read the ``specs`` row named ``"thinktank_coverage"`` and
-    take its ``topn_alpha_vs_champion.mean``. ``coverage_complete``
+    (``scoring/leaderboard_producers.py::build_producer_leaderboard`` +
+    ``scoring/leaderboard_scoring.py::score_leaderboard``, config#1221/
+    #1223, made champion-optional under I2998) — verified schema
+    (2026-07-20, read from the crucible-research checkout, NOT guessed):
+    ``{"champion": <research producer champion name> | None,
+    "horizon_days": 21, "top_n": 50, "benchmark_ticker": "SPY", "n_dates":
+    int, "specs": [{"name", "kind", "realized_rank_ic",
+    "topn_alpha_vs_champion": {...} | None,
+    "topn_alpha_vs_benchmark": {"mean","se","t_stat","n_dates"} | None,
+    "n_dates_scored"}, ...]}``. We read the ``specs`` row named
+    ``"thinktank_coverage"`` and take its ``topn_alpha_vs_benchmark.mean``
+    — the SAME kind of statistic as ``scanner_predictor_direct``'s score
+    (a mean top-N realized return lift vs the SPY benchmark, date
+    -clustered), so the two scores remain apples-to-apples comparable
+    under winner-take-all's direct "higher wins" rule. This field is
+    computed champion-free (``score_leaderboard`` degrades to
+    champion-free metrics for every spec when no producer is registered
+    ``kind=="champion"`` — see I2998) — unlike the retired
+    ``topn_alpha_vs_champion``, it is available even while config-I2993's
+    "no successor champion registered" state persists. ``coverage_complete``
     validity (the full current-scan top-60 rule, Brian's ruling
     config#1580) is enforced UPSTREAM at the artifact boundary —
     crucible-research PR427 writes ``signals_shadow/thinktank_coverage/
@@ -111,34 +144,29 @@ reference):**
     .schema.json) so the audit trail always shows which week's evidence
     decided (or declined to decide) a flip.
 
-  **Both scores share the SAME underlying reference** — crucible-research's
-  live ``agentic_sector_teams`` signal producer / the CIO ADVANCE
-  selection it feeds — even though one score is computed by this repo
-  (research.db-derived) and the other by crucible-research
-  (signals_shadow-derived): the Research module keeps running its full
-  agentic pipeline weekly regardless of which arm the EXECUTOR trades
-  (config-I2515's "champion being live does NOT mean Research is
-  consumer-less" finding), so ``agentic`` remains a valid, currently-live
-  common comparator for both sides. Winner-take-all only needs the two
-  point estimates compared directly (no combined-variance step, since no
-  significance test is performed) — whichever ``vs agentic`` lift is
-  larger this week is presumed the better arm, which is the standard,
-  well-documented logic of an indirect/common-comparator comparison
-  (Bucher et al., 1997) when a direct joint dataset isn't available.
+  **config-I2993 item 2 (windowing ``end_to_end.py``'s
+  ``sn_lift_vs_agentic_cio`` aggregation) is NO LONGER a dependency for
+  this gate's correctness** — that field is retired as this gate's score
+  source under I2998 (still computed and carried for observability/other
+  consumers, e.g. the evaluator tile, but this module reads
+  ``sector_neutral_mean_alpha_21d`` instead). It may still be worth doing
+  for the evaluator tile's own accuracy, independent of this gate.
 
-  **KNOWN, TRACKED GAP as of 2026-07-14 (filed
-  alpha-engine-config-I2519):** ``thinktank_coverage`` is NOT YET
-  registered in crucible-research's ``producers/registry.py::
-  RESEARCH_PRODUCERS`` / ``challenger_producers()`` — PR427's own commit
-  message explicitly deferred that wiring ("Not registered in
-  producers/registry.py ... being decided separately per config#1683's
-  fail-hard challenger-gap doctrine"). Until that registration lands,
-  ``research/producer_leaderboard/{date}.json``'s ``specs`` list will
-  NEVER contain a ``"thinktank_coverage"`` row, so
+  **KNOWN, TRACKED GAP as of 2026-07-20 (filed
+  alpha-engine-config-I2519, unaffected by this redesign):**
+  ``thinktank_coverage`` is NOT YET registered in crucible-research's
+  ``producers/registry.py::RESEARCH_PRODUCERS`` / ``challenger_producers()``
+  — PR427's own commit message explicitly deferred that wiring ("Not
+  registered in producers/registry.py ... being decided separately per
+  config#1683's fail-hard challenger-gap doctrine"). Until that
+  registration lands, ``research/producer_leaderboard/{date}.json``'s
+  ``specs`` list will NEVER contain a ``"thinktank_coverage"`` row, so
   ``_score_thinktank_coverage`` below will correctly and honestly return
   ``blocked_by=["thinktank_coverage_not_in_leaderboard"]`` (a NO-CONTEST)
-  every week until it does. This is expected, not a bug in this module —
-  see the filed issue for the concrete unblock.
+  every week until it does — this is expected, not a bug in this module,
+  and is now fully independent of whether a champion producer is
+  registered (I2998 decoupled the two concerns). See the filed issue for
+  the concrete unblock.
 
 ``hac_significance`` (Newey-West/HAC overlap-aware significance) is
 RETAINED below, unchanged and still independently unit-tested — it is no
@@ -159,6 +187,28 @@ mtime alone cannot prove this engine is alive — a correctly-held
 (no-contest) week does not touch it. ``run_weekly_evaluation`` writes
 ``config/apply_audit/producer_champion/{date}.json`` (+ ``latest.json``)
 UNCONDITIONALLY, including on ``outcome="error"``.
+
+**Promotion-time feed-dependency liveness (alpha-engine-config-I3165,
+2026-07-23):** the config#3053 2026-07-20 no-trade-morning incident's root
+cause was that ``scanner_predictor_direct``'s live-trade feed chain
+(``research_free_backfill``) was never declared anywhere in the promotion
+record, and nothing at promotion time checked its producer was alive —
+config#1580 orphaned that chain's ultimate upstream one day after the
+2026-07-13 bootstrap, invisibly, for 10 days. ``ARM_FEED_DEPENDENCIES``
+below is the static arm -> feed source of truth this module previously
+lacked; ``check_feed_dependencies_live`` probes each declared dependency
+(reusing ``analysis/scanner_predictor_research_free_backfill.py::
+assert_champion_feed_fresh`` for ``research_free_backfill``) and, wired
+into ``evaluate_gates`` via ``run_weekly_evaluation``, degrades a would-be
+promotion onto a dead/orphaned feed to ``no_contest`` with
+``blocked_by=["feed_producer_dead"]`` — never crashes the run, never
+silently promotes through it, exactly the same validity-guard posture as
+``leaderboard_stale_gt_8d``. This is the PROMOTION-TIME complement to the
+config-I3086 ``critical_while_champion_arm`` ONGOING-monitoring mechanism
+(``alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml``), which
+catches a feed dying AFTER promotion; this gate catches it AT the moment
+of promotion. ``build_champion_audit`` records the promoted arm's
+declared dependencies as ``feed_dependencies`` on every outcome.
 """
 
 from __future__ import annotations
@@ -194,9 +244,12 @@ OUTCOMES = ("promoted", "no_contest", "unchanged_winner_already_champion", "erro
 # the pre-I2518 HAC/hysteresis/cooldown engine, and the pre-I2544
 # exact-date-only leaderboard read (superseded same-day by the
 # latest-available read below; no code path in this module writes either
-# retired group again).
+# retired group again). Slug vocabulary is unchanged by the I2998 direct
+# -lift rescoring — only the underlying score SOURCE field changed per arm,
+# not the failure-mode taxonomy.
 _BLOCKED_BY_SLUGS = (
-    # current (winner-take-all + latest-available leaderboard read, I2518/I2544)
+    # current (winner-take-all + latest-available leaderboard read + direct
+    # per-arm lift scoring, I2518/I2544/I2998)
     "no_valid_scanner_predictor_direct_selections",
     "no_valid_thinktank_coverage_selections",
     "scanner_predictor_direct_counterfactual_unavailable",
@@ -205,6 +258,7 @@ _BLOCKED_BY_SLUGS = (
     "leaderboard_unavailable",
     "leaderboard_stale_gt_8d",
     "arm_score_unavailable",
+    "feed_producer_dead",
     "frozen",
     "unclassified_error",
     # retired (pre-I2518 HAC/hysteresis/cooldown engine) — historical read-only
@@ -232,6 +286,105 @@ RESEARCH_PRODUCER_LEADERBOARD_PREFIX = "research/producer_leaderboard/"
 _RESEARCH_PRODUCER_LEADERBOARD_KEY_RE = re.compile(
     r"^research/producer_leaderboard/(\d{4}-\d{2}-\d{2})\.json$"
 )
+
+# ── Promotion-time feed-dependency liveness gate (alpha-engine-config-I3165,
+# 2026-07-23) ─────────────────────────────────────────────────────────────
+#
+# config#3053 root cause: scanner_predictor_direct was promoted 2026-07-13
+# with its live-trade feed chain (research_free_backfill, itself sourced
+# from scanner_evaluations) undeclared anywhere in the promotion record —
+# config#1580 orphaned that chain's ultimate upstream producer the very
+# next day, and nothing at promotion time (or afterward, until the
+# freshness monitor's config-I3086 critical_while_champion_arm mechanism)
+# checked it. That mechanism is ONGOING monitoring, wired to the ARTIFACT
+# _REGISTRY row's static severity being coerced dynamic while a listed arm
+# is champion; THIS gate is the complementary PROMOTION-TIME check, run
+# once per weekly evaluation, at the moment a challenger would newly become
+# champion.
+#
+# ARM_FEED_DEPENDENCIES is the small, static, source-of-truth mapping this
+# repo previously lacked entirely (no arm->feed mapping existed anywhere —
+# scanner_predictor_direct's chain was documented only in this module's own
+# sibling analysis/scanner_predictor_research_free_backfill.py docstring).
+# Each value is a list of ARTIFACT_REGISTRY.yaml artifact_ids (alpha-engine
+# -config/private-docs/ARTIFACT_REGISTRY.yaml) — deliberately the DIRECT
+# feed the arm's live trading reads, not its deeper transitive upstreams
+# (research_free_backfill's own upstream, scanner_evaluations, has no
+# ARTIFACT_REGISTRY row at all as of this writing — registering it is a
+# separate, out-of-scope gap). thinktank_coverage carries no entry (and
+# none is required): its evidence chain is the producer leaderboard, already
+# gated above by leaderboard_date_used/leaderboard_stale_gt_8d — it names no
+# live-trade feed artifact of its own.
+ARM_FEED_DEPENDENCIES: dict[str, list[str]] = {
+    "scanner_predictor_direct": ["research_free_backfill"],
+}
+
+# artifact_id -> liveness prober. Each prober takes (bucket, run_date,
+# s3_client) and RAISES on a dead/stale/missing/unreadable producer, returns
+# None (no exception) when live — the same shape
+# assert_champion_feed_fresh already uses. Deliberately reuses that
+# existing, already-tested producer-side check (config#3053) rather than
+# hand-rolling a second freshness reader for the same artifact: it already
+# encodes the correct content-derived staleness rule for
+# research_free_backfill (newest prediction_date vs run_date, not S3
+# LastModified, which a no-op rewrite would falsely refresh). New feed
+# dependencies added to ARM_FEED_DEPENDENCIES in the future need a prober
+# registered here (or, if a cheap presence/HEAD check suffices, a lighter
+# adapter) -- an arm whose feed has no registered prober here is simply not
+# checked (fails open on THIS gate; the config-I3086 ongoing monitor still
+# covers it once promoted) rather than crashing the run.
+def _check_research_free_backfill_live(bucket: str, run_date: str, s3_client) -> None:
+    from analysis.scanner_predictor_research_free_backfill import assert_champion_feed_fresh
+
+    assert_champion_feed_fresh(bucket, run_date=run_date, s3_client=s3_client)
+
+
+_FEED_LIVENESS_PROBES = {
+    "research_free_backfill": _check_research_free_backfill_live,
+}
+
+
+def check_feed_dependencies_live(
+    arm: str, *, bucket: str, run_date: str, s3_client=None,
+) -> str | None:
+    """Probe every feed artifact ``arm`` declares in
+    ``ARM_FEED_DEPENDENCIES`` for producer liveness. Returns
+    ``"feed_producer_dead"`` (the ``blocked_by`` slug) the first time a
+    declared dependency's registered prober raises anything at all;
+    returns ``None`` when ``arm`` declares no dependencies, every declared
+    dependency has no registered prober, or every registered prober passed.
+
+    Never raises — a probe failure (dead feed, unreadable artifact, an
+    unexpected exception in the prober itself) must degrade the gate to a
+    no-contest, exactly like every other validity guard in this module
+    (module docstring's binding config#2884 lesson: an error here must
+    never silently default to a promotion, and must never crash the weekly
+    evaluation either).
+    """
+    for feed_id in ARM_FEED_DEPENDENCIES.get(arm, []):
+        probe = _FEED_LIVENESS_PROBES.get(feed_id)
+        if probe is None:
+            logger.warning(
+                "champion_promotion: %r declares feed dependency %r with no "
+                "registered liveness prober — skipping (not checked by this "
+                "gate; add a _FEED_LIVENESS_PROBES entry to cover it)",
+                arm, feed_id,
+            )
+            continue
+        try:
+            probe(bucket, run_date, s3_client)
+        except Exception as e:  # noqa: BLE001 — a dead/unreadable feed (or any
+            # unexpected prober failure) degrades this promotion to
+            # no_contest; it must never crash the weekly evaluation and
+            # must never be silently swallowed into a promotion either.
+            logger.warning(
+                "champion_promotion: feed dependency %r for arm %r looks "
+                "dead/orphaned at promotion time (%s) — blocking this "
+                "promotion (feed_producer_dead)", feed_id, arm, e,
+            )
+            return "feed_producer_dead"
+    return None
+
 
 # HAC lag helper constants — still consulted by hac_significance() below,
 # which is retained as an independent, tested utility (see module docstring)
@@ -371,6 +524,7 @@ def evaluate_gates(
     champion_before: str,
     arm_scores: dict,
     freeze: bool,
+    feed_blocked_slug: str | None = None,
 ) -> dict:
     """Weekly winner-take-all decision (Brian's ruling, alpha-engine-config
     -I2518, 2026-07-14) — supersedes the HAC-significance / 2-week hysteresis
@@ -390,6 +544,18 @@ def evaluate_gates(
     run_date) — carried through into every outcome record (promoted,
     no_contest, and unchanged) so the audit trail always shows which
     week's evidence decided (or declined to decide) a flip.
+
+    ``feed_blocked_slug`` (alpha-engine-config-I3165, 2026-07-23) is the
+    precomputed result of ``check_feed_dependencies_live`` for the
+    CHALLENGER arm — the caller (``run_weekly_evaluation``) does that I/O
+    up front and passes only the verdict in, keeping this function pure.
+    When non-None (currently only ever ``"feed_producer_dead"``) AND the
+    challenger would otherwise win this week, the would-be promotion is
+    degraded to a no_contest instead — a challenger whose declared feed
+    producer looks dead/orphaned must never become champion, exactly
+    parallel to the ``leaderboard_stale_gt_8d`` validity guard. Checked
+    only on the win path (irrelevant to a no-contest or a defended
+    incumbency, since the pointer would not move either way).
 
     Decision: whichever arm has the strictly higher score this week wins.
     A tie (or either side missing) never flips the pointer — ties favor the
@@ -433,6 +599,21 @@ def evaluate_gates(
 
     if winner == champion_before:
         record["outcome"] = "unchanged_winner_already_champion"
+        return record
+
+    # Challenger wins this week on score alone — but a promotion-time feed
+    # -liveness guard (alpha-engine-config-I3165) can still veto it: the
+    # challenger's declared feed_dependencies must have a live producer
+    # before the pointer is allowed to move onto it. Checked before
+    # --freeze so the audit record always shows the TRUE reason a
+    # would-be promotion didn't happen (feed_producer_dead is a validity
+    # guard, not a suppression like frozen — the two are mutually
+    # exclusive outcomes of the same win, and the feed check is the more
+    # fundamental one: freeze only suppresses a promotion this gate has
+    # already decided is otherwise valid).
+    if feed_blocked_slug is not None:
+        record["outcome"] = "no_contest"
+        record["blocked_by"] = [feed_blocked_slug]
         return record
 
     # Challenger wins this week — a promotion, subject only to --freeze.
@@ -586,7 +767,17 @@ def build_champion_audit(
     available <= ``as_of``, or None when no leaderboard was available at
     all / evaluation aborted before scoring) — always present (nullable),
     on every outcome including ``error``, so the audit trail is never
-    silent about which week's evidence decided a flip."""
+    silent about which week's evidence decided a flip.
+
+    ``feed_dependencies`` (additive, alpha-engine-config-I3165, 2026-07-23)
+    is ``ARM_FEED_DEPENDENCIES.get(champion_after)`` — the live-trade feed
+    artifact_id(s) the record's ``champion_after`` arm declares, or ``None``
+    when ``champion_after`` declares none (``thinktank_coverage``) or is
+    itself ``None`` (``outcome="error"``, evaluation aborted before a
+    champion could be read). Always derived from ``champion_after``, never
+    ``champion_before`` — this field names what the LIVE pointer now
+    depends on, which is unchanged from before this run on every
+    non-promoted outcome and newly the challenger's feed on a promotion."""
     if error is not None or gate_result is None:
         return {
             "schema_version": AUDIT_SCHEMA_VERSION,
@@ -601,6 +792,7 @@ def build_champion_audit(
             "freeze": freeze,
             "detail": error or "gate evaluation did not run",
             "leaderboard_date_used": None,
+            "feed_dependencies": None,
         }
     return {
         "schema_version": AUDIT_SCHEMA_VERSION,
@@ -615,6 +807,7 @@ def build_champion_audit(
         "challenger": gate_result["challenger"],
         "freeze": freeze,
         "leaderboard_date_used": gate_result.get("leaderboard_date_used"),
+        "feed_dependencies": ARM_FEED_DEPENDENCIES.get(gate_result["champion_after"]) or None,
     }
 
 
@@ -638,14 +831,18 @@ def write_champion_audit(bucket: str, run_date: str, audit: dict, s3_client=None
 
 
 def _score_scanner_predictor_direct(e2e_lift: dict | None) -> tuple[float | None, str | None]:
-    """scanner_predictor_direct's weekly score: this run's backtester
-    -internal ``scanner_then_predictor_topN`` counterfactual lift vs the
-    shared agentic baseline (unchanged extraction from the pre-I2518
-    engine — see ``leaderboard_entry_from_e2e_lift``)."""
+    """scanner_predictor_direct's weekly score (alpha-engine-config-I2998):
+    this run's backtester-internal ``scanner_then_predictor_topN``
+    counterfactual's OWN realized sector-neutral 21d alpha —
+    ``sector_neutral_mean_alpha_21d`` — which is already benchmark-relative
+    at the source (realized log return minus the log SPY return over the
+    same window, see ``analysis/end_to_end.py::_scanner_then_predictor_topN``),
+    i.e. a direct lift vs the SPY zero-line, not vs any live comparator arm. See
+    ``leaderboard_entry_from_e2e_lift``."""
     entry = leaderboard_entry_from_e2e_lift(e2e_lift)
     if entry is None:
         return None, "scanner_predictor_direct_counterfactual_unavailable"
-    return entry["sn_lift_vs_agentic_cio"], None
+    return entry["sector_neutral_mean_alpha_21d"], None
 
 
 def _score_thinktank_coverage(
@@ -689,11 +886,21 @@ def _score_thinktank_coverage(
     if row is None:
         # Expected until crucible-research registers thinktank_coverage in
         # producers/registry.py::challenger_producers() — see module
-        # docstring "KNOWN, TRACKED GAP" / alpha-engine-config-I2519.
+        # docstring "KNOWN, TRACKED GAP" / alpha-engine-config-I2519. This
+        # condition is now fully independent of whether a champion producer
+        # is registered (alpha-engine-config-I2998 decoupled the two
+        # concerns — score_leaderboard writes this row champion-free).
         return None, "thinktank_coverage_not_in_leaderboard"
     if not row.get("n_dates_scored"):
         return None, "thinktank_coverage_no_resolved_outcomes"
-    alpha = row.get("topn_alpha_vs_champion")
+    # alpha-engine-config-I2998: direct lift vs the SPY benchmark, computed
+    # champion-free — the SAME kind of statistic as
+    # scanner_predictor_direct's score (mean top-N realized return lift vs
+    # SPY, date-clustered), replacing the retired topn_alpha_vs_champion
+    # (which required a live comparator producer and went permanently
+    # unavailable once config-I2993 retired agentic_sector_teams with no
+    # successor champion registered).
+    alpha = row.get("topn_alpha_vs_benchmark")
     if not isinstance(alpha, dict) or alpha.get("mean") is None:
         return None, "thinktank_coverage_no_resolved_outcomes"
     return float(alpha["mean"]), None
@@ -738,6 +945,48 @@ def build_weekly_arm_scores(
         "unavailable_reasons": reasons,
         "leaderboard_date_used": leaderboard_date_used,
     }
+
+
+def _publish_gate_error_alert(run_date: str, error: str) -> None:
+    """Best-effort active alert when ``run_weekly_evaluation`` catches an
+    exception during gate evaluation (config#2884). The weekly winner-take
+    -all gate is correctly fail-STATIC on an internal error -- the pointer
+    is never moved on a bad read -- but until now the ONLY liveness signal
+    was the ARTIFACT_REGISTRY's file-PRESENCE SLA on the audit JSON, which
+    a weekly ``outcome="error"`` write satisfies indefinitely. Without an
+    active alert, a persistent bug could freeze ``config/producer_champion
+    .json`` on a stale/losing arm for an unbounded number of weeks,
+    discoverable only by manually reading each week's audit record.
+    Mirrors the ``_publish_executor_opt_rejection_alert`` pattern in
+    ``evaluate.py``. Never raises -- alerting must not crash the run this
+    gate error already threatened to interrupt.
+    """
+    try:
+        from ops_alerts import publish_ops_alert
+    except ImportError as e:
+        logger.warning(
+            "[champion_promotion] gate-error alert skipped — ops_alerts "
+            "unavailable: %s", e,
+        )
+        return
+    message = (
+        f"champion_promotion gate evaluation raised on {run_date}: {error}. "
+        f"config/producer_champion.json was NOT re-evaluated this week "
+        f"(fail-static — pointer unchanged). See "
+        f"config/apply_audit/producer_champion/{run_date}.json (outcome=error)."
+    )
+    try:
+        publish_ops_alert(
+            message,
+            severity="error",
+            source="alpha-engine-backtester/optimizer/champion_promotion.py::run_weekly_evaluation",
+            dedup_key=f"champion_promotion_gate_error_{run_date}",
+            dedup_window_min=720,  # one alert per Saturday cycle, mirrors pit_parity.py
+        )
+    except Exception:  # noqa: BLE001 — alerting must never crash the run
+        logger.exception(
+            "[champion_promotion] gate-error alert publish failed (best-effort, swallowed)",
+        )
 
 
 def run_weekly_evaluation(
@@ -797,16 +1046,43 @@ def run_weekly_evaluation(
             e2e_lift, tt_leaderboard, run_date=run_date,
             leaderboard_date_used=tt_leaderboard_date_used,
         )
+        # alpha-engine-config-I3165: probe the CHALLENGER's declared feed
+        # dependencies for producer liveness before deciding the gate — a
+        # challenger that would otherwise win must not be promoted onto a
+        # dead/orphaned feed (config#3053). check_feed_dependencies_live
+        # never raises (any probe failure degrades to the
+        # "feed_producer_dead" slug), so this call cannot itself turn a
+        # normal week into an error outcome. Only probed when a promotion
+        # is even POSSIBLE this week (both scores present and the
+        # challenger's is strictly higher) — mirrors evaluate_gates' own
+        # win condition so a no-contest/defended-incumbent week never pays
+        # for an S3 read + parquet parse whose result couldn't change the
+        # outcome either way.
+        challenger = _other_champion(champion_before)
+        scores = arm_scores.get("scores", {})
+        challenger_would_win = (
+            scores.get(champion_before) is not None
+            and scores.get(challenger) is not None
+            and scores[challenger] > scores[champion_before]
+        )
+        feed_blocked_slug = (
+            check_feed_dependencies_live(
+                challenger, bucket=bucket, run_date=run_date, s3_client=s3_client,
+            )
+            if challenger_would_win else None
+        )
         gate_result = evaluate_gates(
             champion_before=champion_before,
             arm_scores=arm_scores,
             freeze=freeze,
+            feed_blocked_slug=feed_blocked_slug,
         )
     except Exception as e:  # noqa: BLE001 — gate evaluation must never
         # crash the weekly evaluate run; record as an error outcome
         # (still written, per the liveness posture) and move on.
         logger.exception("Champion-promotion gate evaluation raised")
         error = str(e)
+        _publish_gate_error_alert(run_date, error)
 
     audit = build_champion_audit(run_date, gate_result, freeze=freeze, error=error)
 
@@ -870,14 +1146,20 @@ RESEARCH_PRODUCER_LEADERBOARD_KEY_TMPL = "research/producer_leaderboard/{date}.j
 
 
 def leaderboard_entry_from_e2e_lift(e2e_lift: dict | None) -> dict | None:
-    """Extract this week's sector-neutral lift point (scanner_then_predictor
-    vs. agentic_cio_advance — i.e. scanner_predictor_direct vs. agentic) from
-    the e2e_lift diagnostic already computed earlier in the same evaluate
-    run. Returns None when the counterfactual is unavailable this week
+    """Extract this week's sector-neutral alpha point (scanner_then_predictor's
+    OWN realized 21d alpha, already SPY-relative) from the e2e_lift
+    diagnostic already computed earlier in the same evaluate run. Returns
+    None when the counterfactual is unavailable this week
     (skipped/insufficient_data/error/missing) — an honest "no new point this
-    week" rather than fabricating one. Unchanged from the pre-I2518 engine —
-    this extraction is also the current gate's scanner_predictor_direct
-    score source (see ``_score_scanner_predictor_direct``).
+    week" rather than fabricating one.
+
+    ``sector_neutral_mean_alpha_21d`` (alpha-engine-config-I2998) is the
+    current gate's scanner_predictor_direct score source (see
+    ``_score_scanner_predictor_direct``) — the arm's direct lift vs the SPY
+    zero-line, gated on THIS field's presence rather than the retired
+    ``sn_lift_vs_agentic_cio`` (still carried for observability, may be
+    None if the agentic-CIO comparator itself is unavailable that week —
+    that no longer blocks this entry from being usable).
     """
     if not isinstance(e2e_lift, dict):
         return None
@@ -888,11 +1170,13 @@ def leaderboard_entry_from_e2e_lift(e2e_lift: dict | None) -> dict | None:
     pred = methods.get("scanner_then_predictor_topN")
     if not isinstance(pred, dict):
         return None
-    sn_lift = pred.get("sn_lift_vs_agentic_cio")
-    if sn_lift is None:
+    sn_alpha = pred.get("sector_neutral_mean_alpha_21d")
+    if sn_alpha is None:
         return None
+    sn_lift = pred.get("sn_lift_vs_agentic_cio")
     return {
-        "sn_lift_vs_agentic_cio": float(sn_lift),
+        "sector_neutral_mean_alpha_21d": float(sn_alpha),
+        "sn_lift_vs_agentic_cio": float(sn_lift) if sn_lift is not None else None,
         "n_picks": pred.get("n_picks"),
         "n_cycles": cf.get("n_cycles"),
     }
@@ -900,8 +1184,9 @@ def leaderboard_entry_from_e2e_lift(e2e_lift: dict | None) -> dict | None:
 
 def build_leaderboard_artifact(run_date: str, history: list[dict], new_entry: dict | None) -> dict:
     """Append ``new_entry`` (if any) to ``history`` (oldest-first list of
-    ``{"date": ..., "sn_lift_vs_agentic_cio": ..., "n_picks": ..., "n_cycles": ...}``),
-    trim to the retention window, and return the full artifact to write to
+    ``{"date": ..., "sector_neutral_mean_alpha_21d": ..., "sn_lift_vs_agentic_cio": ...,
+    "n_picks": ..., "n_cycles": ...}``), trim to the retention window, and
+    return the full artifact to write to
     ``research/producer_leaderboard_champion_gate/{run_date}.json``.
     """
     points = list(history)

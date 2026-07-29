@@ -23,17 +23,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest
 
 from optimizer.champion_promotion import (
+    ARM_FEED_DEPENDENCIES,
     LEADERBOARD_STALENESS_DAYS,
     OUTCOMES,
     VALID_CHAMPIONS,
     build_champion_audit,
     build_leaderboard_artifact,
     build_weekly_arm_scores,
+    check_feed_dependencies_live,
     evaluate_gates,
     find_latest_research_producer_leaderboard_date,
     hac_significance,
@@ -89,6 +92,12 @@ class TestHacSignificance:
 
 
 def _e2e_lift_ok(sn_lift=0.02, n_cycles=6):
+    """alpha-engine-config-I2998: the gate's score source is
+    ``sector_neutral_mean_alpha_21d`` (this arm's own SPY-relative realized
+    alpha, NOT ``sn_lift_vs_agentic_cio``) -- the ``sn_lift`` param sets
+    that field directly (kept as ``sn_lift`` to minimize churn across the
+    many existing call sites); the retired ``sn_lift_vs_agentic_cio``
+    observability field is set to the same value for fixture realism."""
     return {
         "scanner_then_predictor_counterfactual": {
             "status": "ok",
@@ -96,7 +105,7 @@ def _e2e_lift_ok(sn_lift=0.02, n_cycles=6):
             "methods": {
                 "scanner_then_predictor_topN": {
                     "mean_alpha_21d": 0.03,
-                    "sector_neutral_mean_alpha_21d": 0.025,
+                    "sector_neutral_mean_alpha_21d": sn_lift,
                     "n_picks": 40,
                     "sn_lift_vs_agentic_cio": sn_lift,
                 },
@@ -114,11 +123,16 @@ def _tt_leaderboard_ok(run_date="2026-07-18", mean=0.015, n_dates_scored=5):
     """Mimics the REAL crucible-research schema
     (scoring/leaderboard_producers.py::build_producer_leaderboard /
     scoring/leaderboard_scoring.py::score_leaderboard) verified against the
-    crucible-research checkout 2026-07-14."""
+    crucible-research checkout 2026-07-20 (alpha-engine-config-I2998:
+    champion is optional, ``topn_alpha_vs_benchmark`` added -- the gate's
+    actual score source; ``topn_alpha_vs_champion`` kept for schema realism
+    but no longer read by ``_score_thinktank_coverage``). ``mean`` sets
+    ``topn_alpha_vs_benchmark.mean`` for the thinktank_coverage row."""
     return {
         "champion": "agentic_sector_teams",
         "horizon_days": 21,
         "top_n": 50,
+        "benchmark_ticker": "SPY",
         "n_dates": 12,
         "date": run_date,
         "leaderboard_id": "producer",
@@ -126,18 +140,22 @@ def _tt_leaderboard_ok(run_date="2026-07-18", mean=0.015, n_dates_scored=5):
             {
                 "name": "agentic_sector_teams", "kind": "champion",
                 "realized_rank_ic": {"mean": 0.05, "se": 0.02, "t_stat": 2.5, "n_dates": 12},
-                "topn_alpha_vs_champion": None, "n_dates_scored": 12,
+                "topn_alpha_vs_champion": None,
+                "topn_alpha_vs_benchmark": {"mean": 0.01, "se": 0.01, "t_stat": 1.0, "n_dates": 12},
+                "n_dates_scored": 12,
             },
             {
                 "name": "no_agent_quant", "kind": "challenger",
                 "realized_rank_ic": {"mean": 0.03, "se": 0.02, "t_stat": 1.5, "n_dates": 12},
                 "topn_alpha_vs_champion": {"mean": 0.008, "se": 0.01, "t_stat": 0.8, "n_dates": 12},
+                "topn_alpha_vs_benchmark": {"mean": 0.006, "se": 0.01, "t_stat": 0.6, "n_dates": 12},
                 "n_dates_scored": 12,
             },
             {
                 "name": "thinktank_coverage", "kind": "challenger",
                 "realized_rank_ic": {"mean": 0.04, "se": 0.02, "t_stat": 2.0, "n_dates": n_dates_scored},
                 "topn_alpha_vs_champion": {"mean": mean, "se": 0.01, "t_stat": 1.5, "n_dates": n_dates_scored},
+                "topn_alpha_vs_benchmark": {"mean": mean, "se": 0.01, "t_stat": 1.5, "n_dates": n_dates_scored},
                 "n_dates_scored": n_dates_scored,
             },
         ],
@@ -247,6 +265,24 @@ class TestBuildWeeklyArmScores:
         )
         assert result["scores"]["thinktank_coverage"] is None
         assert result["unavailable_reasons"]["thinktank_coverage"] == "leaderboard_unavailable"
+
+    def test_thinktank_coverage_scored_when_no_champion_registered(self):
+        """alpha-engine-config-I2998: config-I2993 retired agentic_sector_teams
+        with no successor champion registered -- crucible-research's
+        score_leaderboard now writes champion=None and scores every
+        challenger champion-free. This arm's score must still resolve from
+        topn_alpha_vs_benchmark, independent of the champion field."""
+        lb = _tt_leaderboard_ok(mean=0.021)
+        lb["champion"] = None
+        for spec in lb["specs"]:
+            if spec["name"] == "agentic_sector_teams":
+                spec["kind"] = "retired"
+            spec["topn_alpha_vs_champion"] = None
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["thinktank_coverage"] == pytest.approx(0.021)
+        assert "thinktank_coverage" not in result["unavailable_reasons"]
 
 
 # ── Gate engine (pure function, weekly winner-take-all) ────────────────────
@@ -473,11 +509,50 @@ class _FakeS3:
         return {"Contents": contents}
 
 
+def _put_research_free_backfill_parquet(s3: _FakeS3, bucket: str, *, newest_prediction_date: str) -> None:
+    """Write a synthetic ``research_free_backfill`` parquet artifact into
+    ``s3.store`` at the real key
+    (``analysis.scanner_predictor_research_free_backfill.ARTIFACT_KEY``) with
+    a single row dated ``newest_prediction_date`` — exactly the shape
+    ``assert_champion_feed_fresh`` reads (see
+    ``tests/test_scanner_predictor_research_free_backfill.py``'s identical
+    fixture pattern). Used to synthesize both a live/fresh feed and a
+    dead/stale-orphaned one for the alpha-engine-config-I3165 promotion-time
+    feed-liveness gate tests below."""
+    import io as _io
+
+    import pandas as _pd
+
+    from analysis.scanner_predictor_research_free_backfill import ARTIFACT_KEY
+
+    df = _pd.DataFrame(
+        [("AAPL", newest_prediction_date, 0.01, 0)],
+        columns=["ticker", "prediction_date", "predicted_alpha", "n_research_features_missing"],
+    )
+    buf = _io.BytesIO()
+    df.to_parquet(buf, index=False)
+    s3.store[f"{bucket}/{ARTIFACT_KEY}"] = buf.getvalue()
+
+
 class TestLeaderboardObservability:
     def test_entry_extraction_from_e2e_lift(self):
         entry = leaderboard_entry_from_e2e_lift(_e2e_lift_ok(sn_lift=0.017))
+        assert entry["sector_neutral_mean_alpha_21d"] == 0.017
         assert entry["sn_lift_vs_agentic_cio"] == 0.017
         assert entry["n_cycles"] == 6
+
+    def test_entry_extraction_gates_on_sector_neutral_alpha_not_agentic_lift(self):
+        """alpha-engine-config-I2998: the entry (and hence the gate score)
+        must remain usable even when the retired agentic-comparator field
+        is unavailable -- gating is on sector_neutral_mean_alpha_21d only."""
+        e2e = _e2e_lift_ok(sn_lift=0.019)
+        e2e["scanner_then_predictor_counterfactual"]["methods"][
+            "scanner_then_predictor_topN"
+        ]["sn_lift_vs_agentic_cio"] = None
+        entry = leaderboard_entry_from_e2e_lift(e2e)
+        assert entry is not None
+        assert entry["sector_neutral_mean_alpha_21d"] == 0.019
+        assert entry["sn_lift_vs_agentic_cio"] is None
 
     def test_entry_extraction_handles_missing_or_skipped(self):
         assert leaderboard_entry_from_e2e_lift(None) is None
@@ -852,7 +927,7 @@ class TestRunWeeklyEvaluation:
         assert result["outcome"] == "unchanged_winner_already_champion"
 
     def test_scoring_exception_is_error_outcome_but_still_audited(self):
-        """A malformed thinktank_coverage row (topn_alpha_vs_champion.mean
+        """A malformed thinktank_coverage row (topn_alpha_vs_benchmark.mean
         is non-numeric) raises inside _score_thinktank_coverage's float()
         call -- run_weekly_evaluation's own try/except must catch it,
         record outcome='error', and STILL write the audit record (the
@@ -861,7 +936,7 @@ class TestRunWeeklyEvaluation:
         lb = _tt_leaderboard_ok(run_date="2026-07-18")
         for spec in lb["specs"]:
             if spec["name"] == "thinktank_coverage":
-                spec["topn_alpha_vs_champion"] = {"mean": "not-a-number"}
+                spec["topn_alpha_vs_benchmark"] = {"mean": "not-a-number"}
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
             e2e_lift=_e2e_lift_ok(sn_lift=0.03),
@@ -875,6 +950,55 @@ class TestRunWeeklyEvaluation:
         assert result["leaderboard_date_used"] is None
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
         assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
+
+    def test_scoring_exception_publishes_active_alert(self):
+        """config#2884: an outcome='error' week must fire an active alert,
+        not just the passive audit-JSON write -- the only prior liveness
+        signal (ARTIFACT_REGISTRY file-presence SLA) is satisfied by a
+        routine error write, so a persistently-erroring gate could freeze
+        the champion pointer for an unbounded number of weeks with nobody
+        paged. Same malformed-leaderboard trigger as the test above."""
+        s3 = _FakeS3()
+        lb = _tt_leaderboard_ok(run_date="2026-07-18")
+        for spec in lb["specs"]:
+            if spec["name"] == "thinktank_coverage":
+                spec["topn_alpha_vs_benchmark"] = {"mean": "not-a-number"}
+        with mock.patch("ops_alerts.publish_ops_alert") as mock_publish:
+            result = run_weekly_evaluation(
+                bucket=self.BUCKET, run_date="2026-07-18",
+                e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+                tt_leaderboard=lb,
+                tt_leaderboard_date_used="2026-07-18",
+                freeze=False, upload=True, s3_client=s3,
+            )
+        assert result["outcome"] == "error"
+        mock_publish.assert_called_once()
+        _, kwargs = mock_publish.call_args
+        assert kwargs["severity"] == "error"
+        assert kwargs["dedup_key"] == "champion_promotion_gate_error_2026-07-18"
+        assert "champion_promotion.py::run_weekly_evaluation" in kwargs["source"]
+
+    def test_alert_publish_failure_does_not_propagate(self):
+        """The alert channel itself failing (e.g. SNS unreachable) must not
+        crash the already-erroring evaluate run -- best-effort, swallowed,
+        same posture as the audit-JSON write's own failure handling."""
+        s3 = _FakeS3()
+        lb = _tt_leaderboard_ok(run_date="2026-07-18")
+        for spec in lb["specs"]:
+            if spec["name"] == "thinktank_coverage":
+                spec["topn_alpha_vs_benchmark"] = {"mean": "not-a-number"}
+        with mock.patch(
+            "ops_alerts.publish_ops_alert", side_effect=RuntimeError("sns down"),
+        ):
+            result = run_weekly_evaluation(
+                bucket=self.BUCKET, run_date="2026-07-18",
+                e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+                tt_leaderboard=lb,
+                tt_leaderboard_date_used="2026-07-18",
+                freeze=False, upload=True, s3_client=s3,
+            )
+        assert result["outcome"] == "error"
+        assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
 
 
 # ── Frozen-schema conformance ────────────────────────────────────────────────
@@ -1010,3 +1134,332 @@ class TestSchemaConformance:
         schema = json.loads(AUDIT_SCHEMA_PATH.read_text())
         slugs = set(schema["properties"]["blocked_by"]["oneOf"][1]["items"]["enum"])
         assert "leaderboard_stale_gt_8d" in slugs
+
+    def test_feed_producer_dead_slug_in_schema_enum(self):
+        schema = json.loads(AUDIT_SCHEMA_PATH.read_text())
+        slugs = set(schema["properties"]["blocked_by"]["oneOf"][1]["items"]["enum"])
+        assert "feed_producer_dead" in slugs
+
+    def test_feed_dependencies_field_declared_in_schema(self):
+        schema = json.loads(AUDIT_SCHEMA_PATH.read_text())
+        assert "feed_dependencies" in schema["properties"]
+        assert "feed_dependencies" not in schema["required"]  # additive, optional
+
+    def test_promoted_audit_with_feed_dependencies_conforms(self):
+        audit = build_champion_audit(
+            "2026-07-18",
+            evaluate_gates(
+                champion_before="thinktank_coverage",
+                arm_scores={
+                    "scores": {"scanner_predictor_direct": 0.03, "thinktank_coverage": 0.01},
+                    "unavailable_reasons": {},
+                },
+                freeze=False,
+            ),
+            freeze=False,
+        )
+        assert audit["outcome"] == "promoted"
+        assert audit["champion_after"] == "scanner_predictor_direct"
+        assert audit["feed_dependencies"] == ["research_free_backfill"]
+        self._validate(AUDIT_SCHEMA_PATH, audit)
+
+
+# ── Promotion-time feed-dependency liveness gate (alpha-engine-config-I3165)
+# ────────────────────────────────────────────────────────────────────────────
+#
+# config#3053's root cause, restated as this gate's closes-when bar: a
+# promotion record must NAME the promoted arm's upstream feed dependency
+# (ARM_FEED_DEPENDENCIES / build_champion_audit's feed_dependencies field,
+# covered by TestSchemaConformance above and TestArmFeedDependencies below),
+# and a synthetic test must demonstrate the gate BLOCKING a promotion whose
+# declared feed has no live producer (TestCheckFeedDependenciesLive /
+# TestEvaluateGatesFeedLiveness / TestRunWeeklyEvaluationFeedLiveness below)
+# -- as well as the mirror-image case, a promotion proceeding normally when
+# the declared feed IS live, so the new gate cannot be mistaken for an
+# always-block regression.
+
+
+class TestArmFeedDependencies:
+    def test_scanner_predictor_direct_declares_research_free_backfill(self):
+        assert ARM_FEED_DEPENDENCIES["scanner_predictor_direct"] == ["research_free_backfill"]
+
+    def test_thinktank_coverage_declares_no_feed_dependency(self):
+        """thinktank_coverage's evidence chain is the producer leaderboard,
+        already gated by leaderboard_date_used/leaderboard_stale_gt_8d -- it
+        names no live-trade feed artifact of its own."""
+        assert ARM_FEED_DEPENDENCIES.get("thinktank_coverage") in (None, [])
+
+
+class TestCheckFeedDependenciesLive:
+    BUCKET = "test-bucket"
+
+    def test_no_declared_dependency_is_always_live(self):
+        """An arm with no ARM_FEED_DEPENDENCIES entry (thinktank_coverage)
+        is trivially never blocked by this gate -- it has nothing to
+        probe."""
+        s3 = _FakeS3()
+        assert check_feed_dependencies_live(
+            "thinktank_coverage", bucket=self.BUCKET, run_date="2026-07-20", s3_client=s3,
+        ) is None
+
+    def test_live_fresh_feed_passes(self):
+        """(a) The declared feed's producer IS live/fresh -- the gate
+        returns None (not blocked)."""
+        s3 = _FakeS3()
+        _put_research_free_backfill_parquet(s3, self.BUCKET, newest_prediction_date="2026-07-17")
+        assert check_feed_dependencies_live(
+            "scanner_predictor_direct", bucket=self.BUCKET, run_date="2026-07-20", s3_client=s3,
+        ) is None
+
+    def test_stale_feed_is_blocked(self):
+        """(b) The declared feed's newest prediction_date is stale beyond
+        the freshness window (config#3053's exact incident shape: the
+        producer silently stopped refreshing) -- blocked with the new
+        slug."""
+        s3 = _FakeS3()
+        _put_research_free_backfill_parquet(s3, self.BUCKET, newest_prediction_date="2026-07-01")
+        assert check_feed_dependencies_live(
+            "scanner_predictor_direct", bucket=self.BUCKET, run_date="2026-07-20", s3_client=s3,
+        ) == "feed_producer_dead"
+
+    def test_missing_feed_artifact_is_blocked(self):
+        """The declared feed artifact does not exist at all (orphaned
+        producer, never wrote anything) -- blocked, not a crash."""
+        s3 = _FakeS3()  # nothing uploaded
+        assert check_feed_dependencies_live(
+            "scanner_predictor_direct", bucket=self.BUCKET, run_date="2026-07-20", s3_client=s3,
+        ) == "feed_producer_dead"
+
+    def test_probe_exception_is_blocked_not_raised(self):
+        """Belt-and-braces: even an UNEXPECTED exception from the
+        registered prober (not just the StaleChampionFeedError it's
+        designed to raise) must degrade to feed_producer_dead, never
+        propagate -- the module's binding config#2884 lesson applies to
+        this gate exactly as much as to the rest of evaluate_gates."""
+        s3 = _FakeS3()
+
+        class _ExplodingS3:
+            def get_object(self, Bucket, Key):
+                raise RuntimeError("boom - unexpected probe failure")
+
+        assert check_feed_dependencies_live(
+            "scanner_predictor_direct", bucket=self.BUCKET, run_date="2026-07-20",
+            s3_client=_ExplodingS3(),
+        ) == "feed_producer_dead"
+
+    def test_unregistered_feed_dependency_fails_open_without_crashing(self):
+        """An arm declaring a feed id with no registered prober in
+        _FEED_LIVENESS_PROBES must not crash this gate -- it's simply not
+        checked (logged), never a silent block or a crash. Verified via a
+        monkeypatched ARM_FEED_DEPENDENCIES entry rather than mutating the
+        real one."""
+        import optimizer.champion_promotion as cp
+
+        original = dict(cp.ARM_FEED_DEPENDENCIES)
+        cp.ARM_FEED_DEPENDENCIES["thinktank_coverage"] = ["some_unregistered_feed"]
+        try:
+            s3 = _FakeS3()
+            result = check_feed_dependencies_live(
+                "thinktank_coverage", bucket=self.BUCKET, run_date="2026-07-20", s3_client=s3,
+            )
+            assert result is None
+        finally:
+            cp.ARM_FEED_DEPENDENCIES.clear()
+            cp.ARM_FEED_DEPENDENCIES.update(original)
+
+
+class TestEvaluateGatesFeedLiveness:
+    def test_feed_blocked_slug_degrades_would_be_promotion_to_no_contest(self):
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "unavailable_reasons": {},
+        }
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+            feed_blocked_slug=None,
+        )
+        assert result["outcome"] == "promoted"  # sanity: unblocked path still promotes
+
+        blocked = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+            feed_blocked_slug="feed_producer_dead",
+        )
+        assert blocked["outcome"] == "no_contest"
+        assert blocked["blocked_by"] == ["feed_producer_dead"]
+        assert blocked["champion_after"] == "scanner_predictor_direct"  # pointer never moves
+
+    def test_feed_blocked_slug_irrelevant_when_challenger_does_not_win(self):
+        """The feed check only matters on the WIN path -- an incumbent that
+        defends its title, or a no-contest week, must not be affected by
+        the challenger's feed liveness (nothing would move regardless)."""
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": 0.03, "thinktank_coverage": 0.01},
+            "unavailable_reasons": {},
+        }
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+            feed_blocked_slug="feed_producer_dead",
+        )
+        assert result["outcome"] == "unchanged_winner_already_champion"
+
+    def test_feed_blocked_slug_takes_priority_over_freeze(self):
+        """A dead feed must degrade to no_contest even under --freeze --
+        the audit trail should show the TRUE validity-guard reason, not a
+        suppression that implies the promotion was otherwise valid."""
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "unavailable_reasons": {},
+        }
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=True,
+            feed_blocked_slug="feed_producer_dead",
+        )
+        assert result["outcome"] == "no_contest"
+        assert result["blocked_by"] == ["feed_producer_dead"]
+
+
+class TestRunWeeklyEvaluationFeedLiveness:
+    """End-to-end via run_weekly_evaluation -- the actual wiring evaluate.py
+    calls. Demonstrates both halves of the issue's closes-when bar: (a) a
+    promotion proceeds normally when the declared feed's producer is
+    live/fresh, and (b) the gate blocks (degrades to no_contest) when the
+    declared feed's producer looks dead/orphaned."""
+
+    BUCKET = "test-bucket"
+    RUN_DATE = "2026-07-20"  # the real config#3053 incident date
+
+    def test_promotion_proceeds_when_challenger_feed_is_live(self):
+        """(a) THE mirror-image synthetic test: same exact setup as
+        ``test_promotion_onto_dead_feed_degrades_to_no_contest`` below
+        (thinktank_coverage is champion_before, scanner_predictor_direct is
+        the challenger and wins this week on score) except its declared
+        feed (research_free_backfill) IS live/fresh -- the promotion must
+        proceed normally and the pointer must move, exactly as it would
+        have before this gate existed. Demonstrates the new gate is not an
+        always-block regression."""
+        s3 = _FakeS3()
+        s3.put_object(
+            Bucket=self.BUCKET, Key="config/producer_champion.json",
+            Body=json.dumps({
+                "schema_version": 1, "champion": "thinktank_coverage",
+                "promoted_at": "2026-07-13T00:00:00Z",
+                "promotion_source": "gate_engine",
+            }).encode(),
+        )
+        _put_research_free_backfill_parquet(s3, self.BUCKET, newest_prediction_date="2026-07-17")
+        result = run_weekly_evaluation(
+            bucket=self.BUCKET, run_date=self.RUN_DATE,
+            e2e_lift=_e2e_lift_ok(sn_lift=0.05),          # scanner_predictor_direct's score
+            tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=0.01),  # thinktank_coverage's score
+            tt_leaderboard_date_used=self.RUN_DATE,
+            freeze=False, upload=True, s3_client=s3,
+        )
+        assert result["outcome"] == "promoted"
+        assert result["champion_before"] == "thinktank_coverage"
+        assert result["champion_after"] == "scanner_predictor_direct"
+        assert result["blocked_by"] is None
+        pointer_key = f"{self.BUCKET}/config/producer_champion.json"
+        assert json.loads(s3.store[pointer_key])["champion"] == "scanner_predictor_direct"
+        audit = json.loads(s3.store[f"{self.BUCKET}/config/apply_audit/producer_champion/{self.RUN_DATE}.json"])
+        assert audit["outcome"] == "promoted"
+        assert audit["blocked_by"] is None
+        assert audit["feed_dependencies"] == ["research_free_backfill"]
+
+    def test_promotion_onto_dead_feed_degrades_to_no_contest(self):
+        """(b) THE synthetic test the issue's closes-when bar asks for:
+        scanner_predictor_direct would win this week on score alone
+        (thinktank_coverage incumbent, scanner_predictor_direct challenger,
+        higher score) but its declared feed_dependencies
+        (research_free_backfill) has no live producer -- the champion
+        pointer must NOT move, and the audit record must show
+        blocked_by=['feed_producer_dead'], not a fabricated
+        unchanged/promoted outcome and not a crash."""
+        s3 = _FakeS3()
+        # Seed the pointer so thinktank_coverage is champion_before and
+        # scanner_predictor_direct is genuinely the winning CHALLENGER.
+        s3.put_object(
+            Bucket=self.BUCKET, Key="config/producer_champion.json",
+            Body=json.dumps({
+                "schema_version": 1, "champion": "thinktank_coverage",
+                "promoted_at": "2026-07-13T00:00:00Z",
+                "promotion_source": "gate_engine",
+            }).encode(),
+        )
+        # Deliberately do NOT write a research_free_backfill parquet at all
+        # -- the config#3053 shape: the producer's ultimate upstream was
+        # orphaned and nothing was ever written this cycle.
+        result = run_weekly_evaluation(
+            bucket=self.BUCKET, run_date=self.RUN_DATE,
+            e2e_lift=_e2e_lift_ok(sn_lift=0.05),          # scanner_predictor_direct's score
+            tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=0.01),  # thinktank_coverage's score
+            tt_leaderboard_date_used=self.RUN_DATE,
+            freeze=False, upload=True, s3_client=s3,
+        )
+        assert result["outcome"] == "no_contest"
+        assert result["blocked_by"] == ["feed_producer_dead"]
+        assert result["champion_before"] == "thinktank_coverage"
+        assert result["champion_after"] == "thinktank_coverage"  # pointer never moved
+        pointer_key = f"{self.BUCKET}/config/producer_champion.json"
+        # Pointer object is untouched -- still the seeded thinktank_coverage
+        # pointer, never overwritten with scanner_predictor_direct.
+        assert json.loads(s3.store[pointer_key])["champion"] == "thinktank_coverage"
+        audit = json.loads(s3.store[f"{self.BUCKET}/config/apply_audit/producer_champion/{self.RUN_DATE}.json"])
+        assert audit["outcome"] == "no_contest"
+        assert audit["blocked_by"] == ["feed_producer_dead"]
+        # feed_dependencies still names what champion_after (unchanged)
+        # would need if it had a declared dependency -- thinktank_coverage
+        # has none, so this is None, not a stale scanner_predictor_direct
+        # value left over from the blocked would-be promotion.
+        assert audit["feed_dependencies"] is None
+
+    def test_stale_feed_also_blocks_promotion(self):
+        """Same closes-when scenario, but the feed artifact EXISTS and is
+        readable -- just stale (the producer stopped refreshing rather
+        than never having run at all). Must block identically."""
+        s3 = _FakeS3()
+        s3.put_object(
+            Bucket=self.BUCKET, Key="config/producer_champion.json",
+            Body=json.dumps({
+                "schema_version": 1, "champion": "thinktank_coverage",
+                "promoted_at": "2026-07-13T00:00:00Z",
+                "promotion_source": "gate_engine",
+            }).encode(),
+        )
+        _put_research_free_backfill_parquet(s3, self.BUCKET, newest_prediction_date="2026-07-01")
+        result = run_weekly_evaluation(
+            bucket=self.BUCKET, run_date=self.RUN_DATE,
+            e2e_lift=_e2e_lift_ok(sn_lift=0.05),
+            tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=0.01),
+            tt_leaderboard_date_used=self.RUN_DATE,
+            freeze=False, upload=True, s3_client=s3,
+        )
+        assert result["outcome"] == "no_contest"
+        assert result["blocked_by"] == ["feed_producer_dead"]
+        pointer_key = f"{self.BUCKET}/config/producer_champion.json"
+        assert json.loads(s3.store[pointer_key])["champion"] == "thinktank_coverage"
+
+    def test_champion_defending_own_seat_is_unaffected_by_challenger_feed_liveness(self):
+        """A no-op week (incumbent defends, or the challenger loses on
+        score) must not be perturbed by this gate at all -- feed liveness
+        of a NON-winning challenger is irrelevant since the pointer would
+        not move either way. No research_free_backfill artifact is written
+        (feed looks dead) but scanner_predictor_direct challenges and LOSES
+        on score, so the outcome must be the ordinary unchanged path, not
+        a feed-liveness no_contest."""
+        s3 = _FakeS3()
+        result = run_weekly_evaluation(
+            bucket=self.BUCKET, run_date=self.RUN_DATE,
+            e2e_lift=_e2e_lift_ok(sn_lift=0.01),           # scanner_predictor_direct loses
+            tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=0.05),  # thinktank_coverage's score N/A (it's champion_before here... )
+            tt_leaderboard_date_used=self.RUN_DATE,
+            freeze=False, upload=True, s3_client=s3,
+        )
+        # champion_before defaults to scanner_predictor_direct (pre
+        # -bootstrap base case) since no pointer was seeded; challenger is
+        # thinktank_coverage, which wins here (0.05 > 0.01) -- a genuine
+        # promotion onto thinktank_coverage, which declares NO feed
+        # dependency, so the missing research_free_backfill artifact must
+        # not block it.
+        assert result["outcome"] == "promoted"
+        assert result["champion_after"] == "thinktank_coverage"
+        assert result["blocked_by"] is None

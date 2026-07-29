@@ -82,6 +82,11 @@ import boto3
 import pandas as pd
 import yaml
 
+# krepis.heartbeat — §116 rule 5 heartbeat cadence convention.
+# TIME_BASED_HEARTBEAT tracks monotonic time for emit_heartbeat_if_elapsed
+# alongside the legacy iteration-based _HEARTBEAT_EVERY (line 1449).
+from krepis.heartbeat import HEARTBEAT_INTERVAL_S, emit_heartbeat_if_elapsed
+
 from analysis import param_sweep
 from optimizer import executor_optimizer
 from optimizer.config_archive import read_params_pit_or_current
@@ -1477,6 +1482,7 @@ def _run_simulation_loop(
 
     t0 = _time.monotonic()
     _budget_warned = False
+    _last_heartbeat_ts = 0.0  # §116 rule 5 time-based heartbeat tracker
 
     for idx in range(start_idx, n_dates):
         signal_date = sim_dates[idx]
@@ -1566,6 +1572,14 @@ def _run_simulation_loop(
                 "Simulation loop: %d/%d dates processed (%.1fs elapsed, last=%s)",
                 idx + 1, n_dates, elapsed, signal_date,
             )
+
+        # S116 rule 5: time-based heartbeat at fleet cadence alongside the
+        # legacy iteration-based one above, via the krepis.heartbeat chokepoint.
+        _last_heartbeat_ts = emit_heartbeat_if_elapsed(
+            "simulate",
+            interval_s=HEARTBEAT_INTERVAL_S,
+            last_heartbeat_at=_last_heartbeat_ts,
+        )
 
     # L2: the sim completed all dates — clear the checkpoint so a fresh run for
     # this date recomputes (within-run resume is for FAILED runs only; cross-run
@@ -2820,10 +2834,12 @@ def run_cov_estimator_sweep_stage(
     )
 
     bucket = config.get("signals_bucket", "alpha-engine-research")
+    n_trials = len(sweep_report.get("cells") or {})
     key = f"backtest/{run_date}/cov_sweep.json"
     payload = {
         "run_date": run_date,
         "status": "ok",
+        "n_trials": n_trials,
         **sweep_report,
     }
     body = json.dumps(payload, default=str, indent=2).encode("utf-8")
@@ -2839,6 +2855,22 @@ def run_cov_estimator_sweep_stage(
         # recording surface for a missed write. Fail-soft here is intentional.
         logger.warning(
             "cov_estimator_sweep: S3 persist failed (non-fatal): %s", exc,
+        )
+
+    # config#2454: this cycle ran a real sweep (we're past the earlier
+    # "skipped" early-return above), so its n_trials cells count into the
+    # cumulative multiple-testing trial total DSR reads. Best-effort — the
+    # sweep artifact above is already valid regardless of whether the
+    # accumulator increment lands.
+    try:
+        from nousergon_lib.quant.stats.trial_accumulator import increment_trial_count
+        increment_trial_count(
+            "cov_estimator_sweep", n_trials, run_date, bucket=bucket, s3_client=s3,
+        )
+    except Exception as exc:
+        logger.warning(
+            "cov_estimator_sweep: cumulative trial-count increment failed "
+            "(non-fatal): %s", exc,
         )
 
     logger.info(
@@ -2878,9 +2910,13 @@ def _load_alpha_uncertainty_from_predictions_archive(
             doc = json.loads(obj["Body"].read())
         except Exception:
             continue
+        predictions = doc.get("predictions")
+        if not isinstance(predictions, dict):
+            # List form (or absent/malformed) — skip silently.
+            continue
         per_ticker = {
             ticker: float(entry["predicted_alpha_std"])
-            for ticker, entry in (doc.get("predictions") or {}).items()
+            for ticker, entry in predictions.items()
             if isinstance(entry, dict)
             and entry.get("predicted_alpha_std") is not None
         }
@@ -2986,12 +3022,14 @@ def run_gamma_sweep_stage(
         alpha_uncertainty_by_date=alpha_uncertainty_by_date,
     )
 
+    n_trials = len(sweep_report.get("cells") or {})
     key = f"backtest/{run_date}/gamma_sweep.json"
     payload = {
         "run_date": run_date,
         "status": "ok",
         "n_dates_with_uncertainty": len(alpha_uncertainty_by_date),
         "n_target_dates": len(target_dates),
+        "n_trials": n_trials,
         **sweep_report,
     }
     body = json.dumps(payload, default=str, indent=2).encode("utf-8")
@@ -3007,6 +3045,20 @@ def run_gamma_sweep_stage(
         # recording surface for a missed write. Fail-soft here is intentional.
         logger.warning(
             "gamma_sweep: S3 persist failed (non-fatal): %s", exc,
+        )
+
+    # config#2454: only reached on a real (non-skipped) sweep — the two
+    # earlier early-returns above cover the "insufficient coverage" and
+    # "predictor backtest failed" skip paths. Count this cycle's cells into
+    # the cumulative multiple-testing trial total DSR reads.
+    try:
+        from nousergon_lib.quant.stats.trial_accumulator import increment_trial_count
+        increment_trial_count(
+            "gamma_sweep", n_trials, run_date, bucket=bucket, s3_client=s3,
+        )
+    except Exception as exc:
+        logger.warning(
+            "gamma_sweep: cumulative trial-count increment failed (non-fatal): %s", exc,
         )
 
     logger.info(
@@ -3097,6 +3149,7 @@ def run_optimizer_param_sweep_stage(
         recommendation = {"status": "error", "reason": str(exc)}
         apply_result = {"applied": False, "reason": str(exc)}
 
+    n_trials = len(sweep_report.get("cells") or {})
     key = f"backtest/{run_date}/optimizer_param_sweep.json"
     payload = {
         "run_date": run_date,
@@ -3105,6 +3158,7 @@ def run_optimizer_param_sweep_stage(
         "n_production_dates": inputs.get("n_production_dates"),
         "recommendation": recommendation,
         "apply_result": apply_result,
+        "n_trials": n_trials,
         **sweep_report,
     }
     body = json.dumps(payload, default=str, indent=2).encode("utf-8")
@@ -3119,6 +3173,20 @@ def run_optimizer_param_sweep_stage(
         # ARTIFACT_REGISTRY.yaml, so the ENFORCE freshness-monitor is the
         # recording surface for a missed write. Fail-soft here is intentional.
         logger.warning("optimizer_param_sweep: S3 persist failed (non-fatal): %s", exc)
+
+    # config#2454: this cycle ran a real sweep (the "production inputs not
+    # ready" skip path above already returned early otherwise) — count its
+    # cells into the cumulative multiple-testing trial total DSR reads.
+    try:
+        from nousergon_lib.quant.stats.trial_accumulator import increment_trial_count
+        increment_trial_count(
+            "optimizer_param_sweep", n_trials, run_date, bucket=bucket, s3_client=s3,
+        )
+    except Exception as exc:
+        logger.warning(
+            "optimizer_param_sweep: cumulative trial-count increment failed "
+            "(non-fatal): %s", exc,
+        )
 
     logger.info(
         "optimizer_param_sweep: baseline=%s winner=%s ranking_top=%s",
@@ -3399,6 +3467,94 @@ def run_predictor_backtest(config: dict) -> dict:
         # OBSERVE stage gates nothing; a failure must never abort the backtest
         # run. Fail-soft is intentional (see registry note on the PUT above).
         logger.warning("double_sort stage failed (OBSERVE, non-fatal): %s", exc)
+
+    # ── config#3081 (OBSERVE): S-slot sizing shootout ────────────────────────
+    # Compares the incumbent conviction-weighted sizer against a risk-parity
+    # (inverse-realized-vol) sizer and a fractional-Kelly sizer on the SAME
+    # signal stream already in-memory for THIS run (signals_by_date /
+    # price_matrix / ohlcv_by_ticker / sector_map, all produced above by
+    # synthetic.predictor_backtest.run) — no S3 panel load needed (unlike
+    # double_sort, which pulls a separate predictor horizon panel), since the
+    # vectorized sweep's own inputs are already sitting in `result`. Safe by
+    # construction: synthetic.vectorized_sweep.run_sizing_shootout /
+    # analysis.sizing_shootout.compute_sizing_shootout are pure/read-only over
+    # in-memory data, and gate nothing (ARCHITECTURE.md §14(e)).
+    try:
+        ss_cfg = config.get("sizing_shootout", {}) or {}
+        if ss_cfg.get("enabled", True) and result.get("price_matrix") is not None:
+            from executor.feature_lookup import FeatureLookup
+
+            from analysis.sizing_shootout import compute_sizing_shootout
+            from synthetic.vectorized_sweep import run_sizing_shootout
+
+            ss_signal_lookups = _precompute_signal_lookups(signals_by_date)
+            ss_feature_lookup = FeatureLookup.from_ohlcv_by_ticker(ohlcv_by_ticker)
+            ss_sector_map = result.get("sector_map", {})
+
+            ss_market_regime = "neutral"
+            for sl in (ss_signal_lookups or {}).values():
+                regime_str = (
+                    sl.signals_raw_filtered.get("market_regime")
+                    if hasattr(sl, "signals_raw_filtered") else None
+                )
+                if regime_str:
+                    ss_market_regime = regime_str
+                    break
+
+            ss_init_cash = float(config.get("init_cash", 1_000_000.0))
+            # Same config key + default the vectorized param-sweep path reads
+            # (backtest.py `_run_vectorized_param_sweep`) — every arm gets
+            # this SAME fee_rate (see run_sizing_shootout docstring), so a
+            # cost-free Kelly "win" cannot occur by construction.
+            ss_fee_rate = float(config.get("simulation_fees", 0.001))
+            ss_base_combo = dict(ss_cfg.get("base_combo_config", {}))
+
+            shootout_results = run_sizing_shootout(
+                combo_configs=[ss_base_combo],
+                price_matrix=result["price_matrix"],
+                ohlcv_by_ticker=ohlcv_by_ticker or {},
+                signal_lookups=ss_signal_lookups or {},
+                feature_lookup=ss_feature_lookup,
+                spy_prices=result.get("spy_prices"),
+                sector_map=ss_sector_map,
+                init_cash=ss_init_cash,
+                market_regime=ss_market_regime,
+                fee_rate=ss_fee_rate,
+            )
+
+            ss = compute_sizing_shootout(
+                shootout_results,
+                run_date=config.get("_run_date"),
+                init_cash=ss_init_cash,
+                spy_prices=result.get("spy_prices"),
+                dates=result["price_matrix"].index,
+                combo_configs=[ss_base_combo],
+                fee_rate=ss_fee_rate,
+            )
+            stats["sizing_shootout"] = ss
+            _run_date = config.get("_run_date")
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            if _run_date:
+                import boto3
+                s3 = boto3.client("s3")
+                key = f"backtest/{_run_date}/sizing_shootout.json"
+                body = json.dumps({"run_date": _run_date, **ss}, default=str, indent=2).encode("utf-8")
+                try:
+                    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+                    logger.info("sizing_shootout: persisted s3://%s/%s", bucket, key)
+                except Exception as exc:
+                    # config#1234 rationale: sizing_shootout.json is OBSERVE-only
+                    # / non-load-bearing (config#3081) and is registered/
+                    # grandfathered in ARTIFACT_REGISTRY.yaml, so the ENFORCE
+                    # freshness-monitor is the recording surface for a missed
+                    # write. Fail-soft is intentional.
+                    logger.warning("sizing_shootout S3 persist failed (non-fatal): %s", exc)
+    except Exception as exc:
+        # config#1234 rationale (outer of dual-layer swallow): the whole
+        # config#3081 OBSERVE stage gates nothing; a failure must never abort
+        # the backtest run. Fail-soft is intentional (see registry note on
+        # the PUT above).
+        logger.warning("sizing_shootout stage failed (OBSERVE, non-fatal): %s", exc)
 
     return stats
 
@@ -4039,6 +4195,31 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                         bucket, registry.date, "predictor_param_sweep",
                         "sweep_df", sweep_df, preserve_index=False, s3_client=s3,
                     ))
+
+                # config#2454: only reached when ps_ctx.skipped is False —
+                # a real sweep ran this cycle (as opposed to the ``if
+                # ps_ctx.skipped`` branch above, which reuses a prior
+                # marker's sweep_df and generated ZERO new trials). Each row
+                # of sweep_df is one evaluated combo, so len(sweep_df) is
+                # this cycle's trial count. Gating the increment on this
+                # branch is the load-bearing bit — incrementing on a
+                # skipped/reused cycle would overstate the true trial count
+                # (the same combos would be double-counted every time the
+                # phase auto-skips and reuses the marker).
+                n_trials = 0 if sweep_df is None else len(sweep_df)
+                try:
+                    from nousergon_lib.quant.stats.trial_accumulator import (
+                        increment_trial_count,
+                    )
+                    increment_trial_count(
+                        "predictor_param_sweep", n_trials, registry.date,
+                        bucket=bucket, s3_client=s3,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "predictor_param_sweep: cumulative trial-count "
+                        "increment failed (non-fatal): %s", exc,
+                    )
 
     return single_stats, sweep_df
 
@@ -4771,6 +4952,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--force-phases", default="",
                         help="Comma-separated list of phase names to force-rerun (overrides markers "
                              "for those phases only). More surgical than --force.")
+    parser.add_argument("--force-skip-errored", action="store_true",
+                        help="Allow --skip-phases to skip phases whose prior marker has "
+                             "status=error. The end-of-run critical-deliverable check "
+                             "(check_critical_deliverables) still fires regardless of this "
+                             "flag — a phase producing critical artifacts with status=error "
+                             "always fails the stage.")
     # Tier 4 vectorized predictor_param_sweep — default ON since
     # 2026-04-28 v18 validated stats parity (post fee-rate alignment)
     # + cap retighten 5400→1800. Two flags retained for explicit control:
@@ -5592,6 +5779,7 @@ def _main_impl() -> None:
         force=args.force,
         force_phases=force_phases,
         hard_caps=hard_caps,
+        force_skip_errored=getattr(args, "force_skip_errored", False),
     )
     config["_phase_registry"] = registry
 
@@ -5740,7 +5928,7 @@ def _main_impl() -> None:
     # the contamination report and returns. Never raises into the SF — the
     # spot stage that invokes it is best-effort and non-blocking.
     if args.pit_parity:
-        from analysis.pit_parity import run_pit_parity, write_failure_artifact
+        from analysis.pit_parity import handle_pit_parity_failure, run_pit_parity
         try:
             report = run_pit_parity(config)
             print(json.dumps(
@@ -5761,37 +5949,13 @@ def _main_impl() -> None:
             # alert via ``nousergon_lib.alerts.publish`` (sev=warning,
             # dedup-keyed on run_date so a swept-cycle retry collapses to
             # one alert). The 2026-05-17→2026-05-24 incident swallowed
-            # 4 silent failures with only an spot-stdout log line —
-            # the operator's gate was unreachable for 11 days.
-            logger.error(
-                "[pit_parity] run failed (observational, non-fatal): %s",
-                e, exc_info=True,
-            )
-            try:
-                write_failure_artifact(config, e)
-            except Exception as artifact_err:
-                logger.error(
-                    "[pit_parity] failure-artifact write also failed: %s",
-                    artifact_err,
-                )
-            try:
-                from nousergon_lib.alerts import publish as _alerts_publish
-                run_date = config.get("_run_date") or "unknown"
-                _alerts_publish(
-                    f"pit_parity failed on {run_date}: "
-                    f"{type(e).__name__}: {str(e)[:200]} — "
-                    f"see s3://{config.get('signals_bucket', 'alpha-engine-research')}/"
-                    f"backtest/{run_date}/pit_parity.json",
-                    severity="warning",
-                    source="alpha-engine-backtester/pit_parity",
-                    dedup_key=f"pit_parity_failed_{run_date}",
-                    dedup_window_min=720,  # 12h — one alert per Saturday cycle
-                )
-            except Exception as alert_err:
-                logger.error(
-                    "[pit_parity] operator alert publish also failed: %s",
-                    alert_err,
-                )
+            # 4 silent failures with only an spot-stdout log line — the
+            # operator's gate was unreachable for 11 days. config#3120:
+            # the artifact-write+alert pairing is extracted into
+            # ``handle_pit_parity_failure`` (analysis/pit_parity.py) so it
+            # is directly unit-testable with a mocked alert sender, not
+            # just reachable via a full spot run.
+            handle_pit_parity_failure(config, e)
         return
 
     _init_pipeline(args, config)
@@ -6058,6 +6222,13 @@ def _main_impl() -> None:
                 _export_simulation_artifacts(config, args.date, sweep_df=sweep_df, predictor_sweep_df=predictor_sweep_df, portfolio_stats=portfolio_stats, predictor_stats=predictor_stats)
         except Exception as e:
             logger.warning("Simulation artifact export failed (non-fatal): %s", e)
+
+        # I3281: end-of-run critical-deliverable check. Fails the stage if any
+        # critical phase has a status=error marker — even if the phase was
+        # explicitly skipped via --skip-phases or --force-skip-errored. This is
+        # the hard backstop against the silent-green-run pattern where an errored
+        # phase's degraded artifact is invisible to the stage driver.
+        registry.check_critical_deliverables()
 
         # Outcome taxonomy guard (L4523 — encodes ARCHITECTURE.md §22). The
         # Evaluator treats portfolio_stats.json + sweep_df.parquet as CRITICAL.

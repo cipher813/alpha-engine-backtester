@@ -384,7 +384,7 @@ echo "════════════════════════�
 
 # ── Phase-aware instance-type floor (L4485) ──────────────────────────────────
 # Modes that run predictor_pipeline (10y GBM inference over ~900 tickers;
-# peak RSS ~2.8 GB measured 2026-06-01) need ≥8 GB RAM. The 4 GB c5.large —
+# peak RSS ~2.8 GB measured 2026-06-01) need ≥16 GB RAM. The 4 GB c5.large —
 # FIRST in the default rotation — OOM-killed predictor_pipeline on the
 # 2026-06-01 off-cycle run. CRITICAL: the Saturday SF's PredictorBacktest +
 # PortfolioOptimizerBacktest states invoke this script with NO --instance-type,
@@ -395,18 +395,17 @@ echo "════════════════════════�
 # param-sweep / simulate / signal-quality don't load the predictor tensor and
 # stay on the cheap 4 GB-first rotation. Skipped when the operator passes an
 # explicit --instance-type (their choice wins, incl. deliberate small debug).
-_PREDICTOR_RAM_FLOOR_TYPES="m5.large,m6i.large,m5a.large,c5.xlarge,c6i.xlarge"
-# L4487 (2026-06-05): the ≥16 GB pit_parity floor (L4486d) is REVERTED to ≥8 GB.
-# pit_parity now runs its two passes in separate subprocesses
-# (analysis/pit_parity.py::_run_predictor_pass_isolated → backtest.py
-# --pit-parity-pass), so the OS reclaims each pass's RSS between passes — the
-# Parity spot's footprint is bounded to ONE pass (~2.8 GB), which fits the 8 GB
-# floor with margin. No PIT_PARITY_ENABLED special-case: all predictor-bearing
-# modes (incl. the Parity state's --mode=all) share the cheap 8 GB floor again.
+_PREDICTOR_RAM_FLOOR_TYPES="m5.xlarge,m6i.xlarge,m5a.xlarge,c5.2xlarge,c6i.2xlarge"
+# I3280 (2026-07-23): the universal predictor floor was bumped from 8 GB to 16 GB
+# instances — the RAM headroom guard requires ≥6.0 GB available MemAvailable, but
+# 8 GB instances can dip to ~6 GB under OS overhead + ArcticDB caches, leaving
+# zero margin against the requirement. 16 GB instances (~13-14 GB available)
+# provide comfortable margin. pit_parity shares this same universal floor
+# (subprocess isolation already bounded its per-pass footprint to ~2.8 GB).
 case "$BACKTEST_MODE" in
     all|predictor-backtest|portfolio-optimizer-backtest)
         if [ -z "$INSTANCE_TYPE" ]; then
-            echo "  Mode '$BACKTEST_MODE' runs predictor_pipeline → applying ≥8 GB instance floor"
+            echo "  Mode '$BACKTEST_MODE' runs predictor_pipeline → applying ≥16 GB instance floor"
             INSTANCE_TYPES="$_PREDICTOR_RAM_FLOOR_TYPES"
         fi
         ;;
@@ -437,7 +436,14 @@ echo "  Spot attempt  : $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS  (#883 — relaunch on 
 echo ""
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
-if [ ! -f "$REPO_ROOT/config.yaml" ]; then
+# Preflight-only runs only backtest.py --mode=smoke (reads-only, zero
+# writes, zero external API calls) and exits BEFORE the full-backtest
+# path — it does not need config.yaml. The unconditional check here
+# broke the Friday shell_run dry path on fresh spot instances that
+# hadn't yet provisioned config.yaml (the check ran before the
+# PREFLIGHT_ONLY short-circuit at ~line 1147). Guard the check so
+# preflight-only is exempt.
+if [ "$PREFLIGHT_ONLY" != "1" ] && [ ! -f "$REPO_ROOT/config.yaml" ]; then
     echo "ERROR: config.yaml not found — copy from config.yaml.example"
     exit 1
 fi
@@ -976,19 +982,30 @@ PYBIN="\${PIP% -m pip}"
 # numpy 1.24-1.26) -> the backtester runtime_smoke's GBMScorer.load crashed at
 # 'import scipy.sparse' with "module 'numpy' has no attribute 'long'". The
 # downgrade is REMOVED (complete the migration; never re-extend a deprecated
-# shim). This guard asserts the exact import chain that broke (numpy>=2 +
-# scipy.sparse + lightgbm) AFTER all installs, so any future co-installed pin
-# that downgrades numpy breaks LOUD here at deps time (seconds) instead of ~40
-# min into the run. Per feedback_no_silent_fails.
+# shim). This guard asserts the exact import chains that broke AFTER all
+# installs, so any future co-installed pin that downgrades numpy breaks LOUD
+# here at deps time (seconds) instead of ~40 min into the run. Two chains:
+#   numpy>=2 + scipy.sparse + lightgbm — the 2026-07-18 runtime_smoke crash
+#     (np.long removed) after the stale downgrade left numpy at 1.26; and
+#   numba + vectorbt — the same weekend's simulate-phase crash (config-I3279):
+#     numpy 2.5.1 resolved above numba 0.66's numpy<2.5 ceiling, so
+#     'import vectorbt' raised "Numba needs NumPy 2.4 or less" ~18h into the
+#     run and portfolio_stats.json/optimizer_gate degraded to an error stub.
+#     The pip-check gate below catches that instance at the METADATA level
+#     (numba declares its ceiling); this import smoke also catches ABI-level
+#     numba/numpy breaks that ship with self-consistent metadata. vectorbt
+#     backs vectorbt_bridge.py -> portfolio_stats + the optimizer-gate arc,
+#     so it is load-bearing for the Saturday SF's promotion artifacts.
+# Per feedback_no_silent_fails.
 # (NB: no backticks in this heredoc body -- they would command-substitute.)
-\$PYBIN -c "import numpy, scipy.sparse, lightgbm; assert int(numpy.__version__.split('.')[0]) >= 2, 'numpy '+numpy.__version__+' < 2.0 is inconsistent with the numpy-2-built scipy/cvxpy stack (config#2815)'; print('numpy-2 guard OK: numpy='+numpy.__version__+' scipy='+scipy.__version__+' lightgbm='+lightgbm.__version__)" || {
-    echo "FATAL: numpy-2 environment consistency check failed — a co-installed pin or stale downgrade left numpy below 2.0, breaking the numpy-2-built scipy/lightgbm stack (config#2815). See traceback above." >&2
+\$PYBIN -c "import numpy, scipy.sparse, lightgbm, numba, vectorbt; assert int(numpy.__version__.split('.')[0]) >= 2, 'numpy '+numpy.__version__+' < 2.0 is inconsistent with the numpy-2-built scipy/cvxpy stack (config#2815)'; print('numpy-2 guard OK: numpy='+numpy.__version__+' scipy='+scipy.__version__+' lightgbm='+lightgbm.__version__+' numba='+numba.__version__+' vectorbt='+vectorbt.__version__)" || {
+    echo "FATAL: import-chain consistency check failed — a co-installed pin, stale downgrade, or numba/numpy ABI mismatch broke the scipy/lightgbm or numba/vectorbt import chain (config#2815, config-I3279). See traceback above." >&2
     exit 1
 }
 
-# Fail-loud pip-check dependency-consistency gate (config#2973). The numpy-2
-# guard above only covers the ONE import chain (numpy + scipy.sparse +
-# lightgbm) that has actually broken a run so far. \`pip install\` reports ANY
+# Fail-loud pip-check dependency-consistency gate (config#2973). The import
+# guard above only covers the TWO chains (numpy + scipy.sparse + lightgbm;
+# numba + vectorbt) that have actually broken runs so far. \`pip install\` reports ANY
 # OTHER co-install/transitive-dependency conflict as a post-hoc "does not
 # take into account all installed packages" warning and still exits 0, so an
 # internally-inconsistent env ships silently and only surfaces as an import
@@ -1368,6 +1385,10 @@ echo "════════════════════════�
 echo ""
 
 run_ssm "backtest" "$MAX_RUNTIME_SECONDS" <<BACKTEST
+# MUST precede set -euo pipefail — any code path (including sourced files
+# from ${ENV_SOURCE}) that references this variable before its main init at
+# line ~1423 will trigger an unbound-variable fatal exit under set -u.
+export _BACKTEST_WAS_SKIPPED=false
 set -eo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
@@ -1402,6 +1423,11 @@ _stage_skipped() {
     esac
 }
 
+# Track whether backtest was skipped so the evaluator invocation below knows
+# to pass --skip-backtester and distinguish intentional absence from unexpected
+# failure (config#2887).
+_BACKTEST_WAS_SKIPPED=false
+
 # ── Stage: backtest ─────────────────────────────────────────────────────────
 # If backtest.py fails we exit non-zero so parity + evaluator never run
 # against stale or missing artifacts — the evaluator would otherwise
@@ -1411,6 +1437,7 @@ _stage_skipped() {
 # evaluator run against invalid sweep results and was the root cause of
 # multiple undetected param oscillations.
 if _stage_skipped backtest; then
+    _BACKTEST_WAS_SKIPPED=true
     echo "⊘ stage=backtest SKIPPED (--skip-stages=\${SKIP_STAGES})"
 else
     echo "▶ stage=backtest START at \$(date -u +%H:%M:%S)"
@@ -1563,6 +1590,10 @@ else
     if [ "${FREEZE_EVALUATOR}" = "true" ]; then
         _EVAL_FREEZE="--freeze"
     fi
+    _EVAL_SKIP_BT=""
+    if [ "$_BACKTEST_WAS_SKIPPED" = "true" ]; then
+        _EVAL_SKIP_BT="--skip-backtester"
+    fi
     # --date "\${RUN_DATE}" pins evaluate.py to the SF-stamped run date. The
     # backtest stage's comment above claimed the evaluator "already threads"
     # RUN_DATE — it never did; evaluate.py silently defaulted to its own
@@ -1571,7 +1602,7 @@ else
     # a WEEKDAY recovery rerun (watch-rerun-2026-07-18-12, 2026-07-20)
     # resolved today() to Monday, looked in backtest/2026-07-20/, and
     # correctly hard-failed on missing artifacts (config#3133).
-    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE --log-level INFO 2>&1; then
+    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE \$_EVAL_SKIP_BT --log-level INFO 2>&1; then
         echo "ERROR: evaluate.py failed. Spot run marked FAILED." >&2
         exit 1
     fi
