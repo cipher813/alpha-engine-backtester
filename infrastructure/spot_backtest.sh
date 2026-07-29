@@ -436,7 +436,14 @@ echo "  Spot attempt  : $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS  (#883 — relaunch on 
 echo ""
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
-if [ ! -f "$REPO_ROOT/config.yaml" ]; then
+# Preflight-only runs only backtest.py --mode=smoke (reads-only, zero
+# writes, zero external API calls) and exits BEFORE the full-backtest
+# path — it does not need config.yaml. The unconditional check here
+# broke the Friday shell_run dry path on fresh spot instances that
+# hadn't yet provisioned config.yaml (the check ran before the
+# PREFLIGHT_ONLY short-circuit at ~line 1147). Guard the check so
+# preflight-only is exempt.
+if [ "$PREFLIGHT_ONLY" != "1" ] && [ ! -f "$REPO_ROOT/config.yaml" ]; then
     echo "ERROR: config.yaml not found — copy from config.yaml.example"
     exit 1
 fi
@@ -1378,6 +1385,10 @@ echo "════════════════════════�
 echo ""
 
 run_ssm "backtest" "$MAX_RUNTIME_SECONDS" <<BACKTEST
+# MUST precede set -euo pipefail — any code path (including sourced files
+# from ${ENV_SOURCE}) that references this variable before its main init at
+# line ~1423 will trigger an unbound-variable fatal exit under set -u.
+export _BACKTEST_WAS_SKIPPED=false
 set -eo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
@@ -1412,6 +1423,11 @@ _stage_skipped() {
     esac
 }
 
+# Track whether backtest was skipped so the evaluator invocation below knows
+# to pass --skip-backtester and distinguish intentional absence from unexpected
+# failure (config#2887).
+_BACKTEST_WAS_SKIPPED=false
+
 # ── Stage: backtest ─────────────────────────────────────────────────────────
 # If backtest.py fails we exit non-zero so parity + evaluator never run
 # against stale or missing artifacts — the evaluator would otherwise
@@ -1421,6 +1437,7 @@ _stage_skipped() {
 # evaluator run against invalid sweep results and was the root cause of
 # multiple undetected param oscillations.
 if _stage_skipped backtest; then
+    _BACKTEST_WAS_SKIPPED=true
     echo "⊘ stage=backtest SKIPPED (--skip-stages=\${SKIP_STAGES})"
 else
     echo "▶ stage=backtest START at \$(date -u +%H:%M:%S)"
@@ -1573,6 +1590,10 @@ else
     if [ "${FREEZE_EVALUATOR}" = "true" ]; then
         _EVAL_FREEZE="--freeze"
     fi
+    _EVAL_SKIP_BT=""
+    if [ "$_BACKTEST_WAS_SKIPPED" = "true" ]; then
+        _EVAL_SKIP_BT="--skip-backtester"
+    fi
     # --date "\${RUN_DATE}" pins evaluate.py to the SF-stamped run date. The
     # backtest stage's comment above claimed the evaluator "already threads"
     # RUN_DATE — it never did; evaluate.py silently defaulted to its own
@@ -1581,7 +1602,7 @@ else
     # a WEEKDAY recovery rerun (watch-rerun-2026-07-18-12, 2026-07-20)
     # resolved today() to Monday, looked in backtest/2026-07-20/, and
     # correctly hard-failed on missing artifacts (config#3133).
-    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE --log-level INFO 2>&1; then
+    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE \$_EVAL_SKIP_BT --log-level INFO 2>&1; then
         echo "ERROR: evaluate.py failed. Spot run marked FAILED." >&2
         exit 1
     fi
