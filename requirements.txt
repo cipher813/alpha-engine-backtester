@@ -108,7 +108,7 @@ nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.c
 # spot box is code-only, and these floors mirror predictor's own (all
 # numpy-2.4-compatible). Guard: tests/test_spot_backtest_no_sibling_requirements.py.
 scipy>=1.18.0
-lightgbm>=4.6.0
+lightgbm>=4.7.0
 catboost>=1.2.10
 hmmlearn>=0.3.3
 tqdm>=4.70.0
