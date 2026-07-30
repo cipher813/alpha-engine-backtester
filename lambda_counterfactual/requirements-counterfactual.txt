@@ -6,5 +6,5 @@ pyyaml>=6.0.3
 # replay.counterfactual fits DecisionTreeClassifier(max_depth=3) on
 # rows extracted from decision_artifacts/ via DictVectorizer + emits
 # tree structure via export_text.
-scikit-learn~=1.4
+scikit-learn~=1.9
 numpy<3
