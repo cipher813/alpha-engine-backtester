@@ -32,8 +32,8 @@ Two-stage activation (ROADMAP L2553 auto-apply cutover):
      shadow archives. This prevents a single noisy week from flipping
      sector weights live.
 
-Reads ``team_candidates`` joined to ``universe_returns`` for rows where
-the 5 sub-score columns are non-NULL (populated only after PR-B's v15
+Reads ``scanner_evaluations`` joined to ``universe_returns`` for rows where
+the 5 sub-score columns are non-NULL (populated only after PR-B's v24
 migration is in production). Produces ``insufficient_data`` until at
 least ``_MIN_WEEKS`` weeks of sub-score data accumulate.
 
@@ -275,20 +275,20 @@ def _team_ablation(
     best-config recommendation."""
     rows = conn.execute(
         """
-        SELECT tc.eval_date, tc.rsi_sub_score, tc.macd_sub_score,
-               tc.ma50_sub_score, tc.ma200_sub_score, tc.momentum_sub_score,
+        SELECT se.eval_date, se.rsi_sub_score, se.macd_sub_score,
+               se.ma50_sub_score, se.ma200_sub_score, se.momentum_sub_score,
                ur.return_5d
-        FROM team_candidates tc
+        FROM scanner_evaluations se
         INNER JOIN universe_returns ur
-          ON tc.ticker = ur.ticker AND tc.eval_date = ur.eval_date
-        WHERE tc.team_id = ?
-          AND tc.eval_date BETWEEN ? AND ?
+          ON se.ticker = ur.ticker AND se.eval_date = ur.eval_date
+        WHERE se.sector = ?
+          AND se.eval_date BETWEEN ? AND ?
           AND ur.return_5d IS NOT NULL
-          AND tc.rsi_sub_score IS NOT NULL
-          AND tc.macd_sub_score IS NOT NULL
-          AND tc.ma50_sub_score IS NOT NULL
-          AND tc.ma200_sub_score IS NOT NULL
-          AND tc.momentum_sub_score IS NOT NULL
+          AND se.rsi_sub_score IS NOT NULL
+          AND se.macd_sub_score IS NOT NULL
+          AND se.ma50_sub_score IS NOT NULL
+          AND se.ma200_sub_score IS NOT NULL
+          AND se.momentum_sub_score IS NOT NULL
         """,
         (team_id, start_date, end_date),
     ).fetchall()
@@ -406,15 +406,15 @@ def compute_tech_weight_ablation(
         own_conn = True
 
     try:
-        # Schema check: team_candidates must have the v15 sub-score columns.
+        # Schema check: scanner_evaluations must have the v24 sub-score columns.
         try:
             cols = {
-                r[1] for r in conn.execute("PRAGMA table_info(team_candidates)")
+                r[1] for r in conn.execute("PRAGMA table_info(scanner_evaluations)")
             }
         except sqlite3.OperationalError:
             return {
                 "status": "no_data", "run_date": run_date,
-                "reason": "team_candidates table missing",
+                "reason": "scanner_evaluations table missing",
             }
         required = {
             "rsi_sub_score", "macd_sub_score", "ma50_sub_score",
@@ -425,8 +425,8 @@ def compute_tech_weight_ablation(
             return {
                 "status": "no_data", "run_date": run_date,
                 "reason": (
-                    f"team_candidates schema missing sub-score columns "
-                    f"(needs v15 migration); missing: {missing}"
+                    f"scanner_evaluations schema missing sub-score columns "
+                    f"(needs v24 migration); missing: {missing}"
                 ),
             }
 
@@ -460,7 +460,7 @@ def compute_tech_weight_ablation(
                 "reason": (
                     f"no team has ≥{_MIN_ROWS_PER_TEAM} rows with "
                     f"sub-scores populated in window {start_iso}..{end_iso} "
-                    f"— PR-B v15 migration may not have accumulated data yet"
+                    f"— PR-B v24 migration may not have accumulated data yet"
                 ),
             }
 
