@@ -156,7 +156,7 @@ def _load_secrets_from_ssm() -> None:
         value = get_secret(name, required=False, default=None)
         if value is not None:
             os.environ[name] = value
-            logger.debug("Loaded secret %s from SSM", name)
+            logger.debug("Loaded secret from SSM")
 
 
 _init_done = False
