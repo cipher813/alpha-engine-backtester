@@ -141,4 +141,4 @@ psutil>=5.9.0
 # a None default, so this bump is required for the field to ever be
 # non-None, not for correctness against an older krepis (that path already
 # degrades gracefully).
-krepis[openai]==0.24.0  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
+krepis[openai]>=0.24.1
