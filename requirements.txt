@@ -30,7 +30,7 @@ vectorbt~=0.28.5
 numpy>=2.0,<2.5
 plotly<6
 pandas~=2.2
-boto3~=1.34
+boto3~=1.43
 pyyaml~=6.0
 yfinance~=0.2.54
 pyarrow~=25.0
@@ -55,7 +55,7 @@ setuptools>=83.0.0
 # metadata (numpy-2 support landed at 1.4.2); a naive reading of `~=1.4`
 # as "1.4.x only" would wrongly assume this pin needs bumping for
 # numpy-2 compat. Verified via `pip install --dry-run`, config#2815.
-scikit-learn~=1.4
+scikit-learn~=1.9
 # cvxpy added 2026-05-11 for analysis/portfolio_optimizer_backtest.py — replays
 # the constrained MVO optimizer (alpha-engine PR #157) over historical synthetic
 # predictions. Bumped to >=1.9.2,<1.10 for numpy 2 compat (config#2815) — same
@@ -108,10 +108,10 @@ nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.c
 # spot box is code-only, and these floors mirror predictor's own (all
 # numpy-2.4-compatible). Guard: tests/test_spot_backtest_no_sibling_requirements.py.
 scipy>=1.18.0
-lightgbm>=4.6.0
+lightgbm>=4.7.0
 catboost>=1.2.10
 hmmlearn>=0.3.3
-tqdm>=4.69.0
+tqdm>=4.70.0
 optuna>=4.9.0
 psutil>=5.9.0
 
@@ -141,11 +141,11 @@ psutil>=5.9.0
 # a None default, so this bump is required for the field to ever be
 # non-None, not for correctness against an older krepis (that path already
 # degrades gracefully).
-#
-# Bumped to >=0.23.0 (alpha-engine-config-I5227, 2026-07-29): krepis 0.23.0
-# added callsite_id as a REQUIRED keyword-only argument to LLMClient.__init__
-# (a breaking change with no default) — replay/runner.py's
-# _invoke_target_with_schema now passes callsite_id="crucible-backtester/
-# replay-runner". krepis <0.23.0 raises TypeError on that keyword, so the
-# floor must match the actual parameter the code passes.
-krepis[openai]>=0.23.0
+krepis[openai]>=0.24.1
+# Bumped to >=0.24.1 on main (2026-07-29). krepis 0.23.0 added callsite_id
+# as a REQUIRED keyword-only argument to LLMClient.__init__ (a breaking change
+# with no default) — replay/runner.py's _invoke_target_with_schema passes
+# callsite_id="replay-concordance" (the row this callsite owns in
+# alpha-engine-config's LLM_CALLSITE_REGISTRY.yaml). krepis <0.23.0 raises
+# TypeError on that keyword, so the floor must match the actual parameter
+# the code passes.

@@ -346,14 +346,14 @@ def _invoke_target_with_schema(
             reasoning={"exclude": True},
         )
         # krepis >=0.23.0 requires callsite_id as a keyword-only argument
-        # (added as a breaking change — the param has no default). The
-        # replay runner has no canonical "which agent" context since it
-        # replays arbitrary past runs; use a static identifier scoped to
-        # this module, distinct from the live agent callsite_id values
-        # the fleet's executors pass.
+        # (added as a breaking change — the param has no default). This id
+        # is the row this call site already owns in alpha-engine-config's
+        # LLM_CALLSITE_REGISTRY.yaml (`replay-concordance`), so spend lands
+        # under the callsite the registry says produces it — inventing a
+        # new string here would attribute it to nothing.
         client = LLMClient(
             spec,
-            callsite_id="crucible-backtester/replay-runner",
+            callsite_id="replay-concordance",
             api_key=resolved_key,
             client_factory=client_factory,
         )
