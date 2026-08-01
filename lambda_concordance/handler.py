@@ -14,6 +14,15 @@ per-target summary JSON to S3.
 ``target_models`` is now a list of OpenRouter model ids, not Anthropic
 model names.
 
+**alpha-engine-config#3003 (2026-07-30):** migrated remaining plaintext
+Lambda env-vars to SSM resolution via ``nousergon_lib.secrets.get_secret()``
+at cold-start init. Secrets are loaded once and set in ``os.environ`` so
+library consumers (krepis, flow-doctor, langchain) find them through
+standard env-var paths. OPENROUTER_API_KEY was already migrated to SSM by
+I2997 (see ``replay/runner.py:_resolve_openrouter_api_key``).
+ANTHROPIC_API_KEY is deliberately excluded — this Lambda no longer calls
+Anthropic directly after the OpenRouter migration.
+
 Per ROADMAP P0 "Replay harness + agent-justification gate" (Model-
 Agnostic Capability Upgrade deliverable #7 — agent-justification gate
 signal #3, cheap-model concordance).
@@ -45,15 +54,17 @@ Haiku baseline. The ``max_artifacts`` cap is also a runtime cap — at
 ~3-5 sec / replay call, 150 artifacts fits comfortably under the 900s
 Lambda timeout.
 
-Environment variables:
+Secrets (loaded from SSM ``/alpha-engine/<NAME>`` by _ensure_init at
+cold-start unless already present — see ``_SECRET_NAMES``):
+  All secrets previously set as plaintext Lambda env vars are now loaded
+  from AWS SSM Parameter Store via ``nousergon_lib.secrets.get_secret()``.
+  Non-secret env vars (S3_BUCKET, EMAIL_SENDER, EMAIL_RECIPIENTS) remain
+  as configured on the Lambda.
+
+Environment variables (set on the Lambda):
   S3_BUCKET             — default: alpha-engine-research
-  OPENROUTER_API_KEY    — pulled from SSM by nousergon_lib.secrets.get_secret()
-                           (/alpha-engine/OPENROUTER_API_KEY — this Lambda's
-                           existing alpha-engine-ssm-read instance-role
-                           policy already covers it, no new IAM)
   EMAIL_SENDER          — flow-doctor wiring
   EMAIL_RECIPIENTS      — flow-doctor wiring
-  GMAIL_APP_PASSWORD    — flow-doctor wiring
 """
 
 from __future__ import annotations
@@ -92,6 +103,62 @@ setup_logging(
 logger = logging.getLogger(__name__)
 
 
+# ── Secrets migrated from plaintext Lambda env vars to SSM (config#3003) ────
+# OPENROUTER_API_KEY was already migrated by I2997 (see replay/runner.py).
+# ANTHROPIC_API_KEY is intentionally excluded — this Lambda no longer calls
+# Anthropic directly after the OpenRouter migration. Non-secret config
+# (S3_BUCKET, EMAIL_SENDER, EMAIL_RECIPIENTS) stays as Lambda env vars.
+_SECRET_NAMES: tuple[str, ...] = (
+    "GITHUB_TOKEN",
+    "LANGCHAIN_API_KEY",
+    "GMAIL_APP_PASSWORD",
+    "VOYAGE_API_KEY",
+    "FMP_API_KEY",
+    "POLYGON_API_KEY",
+    "FRED_API_KEY",
+    "RAG_DATABASE_URL",
+)
+
+
+def _load_secrets_from_ssm() -> None:
+    """Load secrets from SSM into ``os.environ`` at cold-start init.
+
+    Each secret name ``X`` maps to the SSM parameter
+    ``/alpha-engine/<X>`` (the fleet standard prefix, matching the
+    existing OPENROUTER_API_KEY pattern in ``replay/runner.py``). Loaded
+    only when NOT already present in the environment (during the
+    transition period where the Lambda env vars are still configured;
+    after the plaintext vars are removed from the Lambda configuration,
+    the SSM values fill the same env var names so library consumers
+    find them unchanged).
+
+    ``get_secret(..., required=False, default=None)`` makes every secret
+    optional: a parameter not yet created just logs a debug note and
+    does not fail the invocation. This is the correct failure mode
+    during the transition — missing SSM parameters are a provisioning
+    gap, and a loud-env-var-error on the next run is the signal. The
+    ``test_no_secret_environ_reads`` CI guard does NOT catch the
+    ``os.environ.__setitem__`` calls below (it checks for
+    ``os.environ.get`` / ``os.getenv`` calls in source — assignment
+    from SSM is the intended path).
+    """
+    try:
+        from nousergon_lib.secrets import get_secret  # noqa: PLC0415 — lazy import; Lambda runtime has it
+    except ImportError:
+        return  # Not in a Lambda / dev environment — skip gracefully
+
+    for name in _SECRET_NAMES:
+        if name in os.environ:
+            # Already set (still configured on the Lambda during
+            # transition; after the plaintext env vars are removed
+            # this branch becomes dead and the SSM path below runs).
+            continue
+        value = get_secret(name, required=False, default=None)
+        if value is not None:
+            os.environ[name] = value
+            logger.debug("Loaded secret from SSM")
+
+
 _init_done = False
 
 
@@ -100,12 +167,15 @@ def _ensure_init() -> None:
 
     Post-L2998-PR-9c (2026-05-14): secrets load via
     nousergon_lib.secrets.get_secret() at use-site (per-process
-    cached). No bulk SSM fetch on cold-start. Retained for the
-    XDG_CACHE_HOME default needed for Lambda's read-only /var/task."""
+    cached). Retained for the XDG_CACHE_HOME default needed for
+    Lambda's read-only /var/task. config#3003 added the SSM bulk
+    load above (``_SECRET_NAMES``) so library consumers find their
+    secrets in ``os.environ`` without plaintext Lambda env vars."""
     global _init_done
     if _init_done:
         return
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+    _load_secrets_from_ssm()
     _init_done = True
 
 
