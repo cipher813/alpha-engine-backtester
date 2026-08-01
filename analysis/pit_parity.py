@@ -86,9 +86,35 @@ def _run_predictor_pass_isolated(safe_config: dict, which: str, run_date: str) -
         # the traceback is preserved even when the SSM-relayed stream drops it.
         # A crashed pass must surface loud (caught by run_pit_parity's
         # observational handler) — never silently yield empty stats.
-        proc = subprocess.run(
-            cmd, cwd=str(repo_root), stderr=subprocess.PIPE, text=True,
-        )
+        # config#5975 (2026-08-01): add a 45-min timeout per pass (backed by
+        # the 2026-06-05 L4487 spot instance sizing — each pass peaks ~3 GB RSS
+        # on a 16 GB box and completes in ~25 min under normal conditions; 45
+        # min provides ~80% headroom). Without this timeout, a hung subprocess
+        # (e.g. resource exhaustion from running the predictor pipeline twice
+        # in subprocess isolation after the main process already consumed ~8 GB)
+        # blocks the parent indefinitely, causing the SSM command to exhaust
+        # its 120-min execution timeout and the SF to fail with RC 137. On
+        # TimeoutExpired the child's partial stderr is logged and the exception
+        # propagates through run_pit_parity → handle_pit_parity_failure (writes
+        # status=failed artifact + pages the operator) — pit_parity stays
+        # observational/non-blocking; the SF proceeds to the parity stage.
+        _PIT_PARITY_PASS_TIMEOUT = 2700  # 45 min per pass
+        try:
+            proc = subprocess.run(
+                cmd, cwd=str(repo_root), stderr=subprocess.PIPE, text=True,
+                timeout=_PIT_PARITY_PASS_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as te:
+            tail = (te.stderr or b"").decode("utf-8", errors="replace").strip()[-2000:] if te.stderr else "(child produced no stderr before timeout)"
+            logger.error(
+                "[pit_parity] %s pass subprocess timed out after %.0fs; "
+                "child stderr tail:\n%s",
+                which, _PIT_PARITY_PASS_TIMEOUT, tail,
+            )
+            raise RuntimeError(
+                f"pit_parity {which} pass timed out after "
+                f"{_PIT_PARITY_PASS_TIMEOUT}s: {tail[-500:]}"
+            ) from te
         if proc.returncode != 0:
             tail = (proc.stderr or "").strip()[-2000:]
             logger.error(
