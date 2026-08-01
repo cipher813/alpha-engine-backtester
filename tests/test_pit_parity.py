@@ -520,10 +520,74 @@ def test_backtest_main_pit_parity_branch_uses_handle_pit_parity_failure():
     import backtest as bt
 
     src = inspect.getsource(bt)
-    idx = src.index("if args.pit_parity:")
-    branch_src = src[idx:idx + 2500]
+    lines = src.splitlines(keepends=True)
+    start = next(
+        i for i, ln in enumerate(lines) if ln.strip() == "if args.pit_parity:"
+    )
+    # Bound the branch by INDENTATION, not by a fixed character count. The
+    # previous form sliced a magic 2500-char window, so any legitimate
+    # addition inside this branch (config#3121 added the smoke-phase budget
+    # block) silently pushed the asserted lines out of the window and failed
+    # a test whose subject had not changed. Scan to the first subsequent
+    # non-blank, non-comment line indented at or below `if args.pit_parity:`
+    # — that is the real end of the block, whatever its length.
+    base_indent = len(lines[start]) - len(lines[start].lstrip())
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if len(lines[i]) - len(lines[i].lstrip()) <= base_indent:
+            end = i
+            break
+    branch_src = "".join(lines[start:end])
     assert "handle_pit_parity_failure(config, e)" in branch_src
     assert "from analysis.pit_parity import handle_pit_parity_failure" in branch_src
+
+
+def test_smoke_pit_parity_forced_import_error_fails_named_and_non_fatal(monkeypatch):
+    """config#3121 acceptance: a deliberately broken pit-parity import (or
+    any other _run_predictor_pass_isolated failure) must fail with a
+    NAMED error and must NOT raise out of run_pit_parity — this is what
+    lets smoke-pit-parity fail loud in seconds instead of silently
+    hanging or false-passing. Drives the fixture-applied tiny config
+    through run_pit_parity exactly as backtest.py's `if args.pit_parity:`
+    branch would, with the isolation seam forced to raise the class of
+    error a numba/numpy ImportError would surface as."""
+    import backtest as bt
+    import argparse
+
+    args = argparse.Namespace(
+        mode="smoke-pit-parity", only_phases="", skip_phases="",
+        force=False, freeze=False, date="2026-07-21", upload=True,
+        pit_parity=False,
+    )
+    config: dict = {"_run_date": "2026-07-21", "signals_bucket": "b"}
+    bt._apply_smoke_fixture("smoke-pit-parity", args, config)
+
+    assert args.pit_parity is True
+    assert config["_run_date"] == ".smoke/2026-07-21"  # namespaced, not the real key
+
+    def _boom_pass(safe_config, which, run_date):
+        raise RuntimeError(
+            "ImportError: No module named 'numba' (simulated smoke failure)"
+        )
+
+    monkeypatch.setattr(pp, "_run_predictor_pass_isolated", _boom_pass)
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: types.SimpleNamespace(
+        put_object=lambda **kw: None,
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    # run_pit_parity itself must propagate the raw exception (the CALLER —
+    # backtest.py::main's try/except around `if args.pit_parity:` — is what
+    # converts it into the named, non-fatal artifact+alert pair; that
+    # outer contract is covered by test_write_failure_artifact_uploads_
+    # status_failed / the backtest.py source pins elsewhere in this file).
+    with pytest.raises(RuntimeError, match="numba"):
+        pp.run_pit_parity(config)
 
 
 def test_passes_run_via_subprocess_run_not_multiprocessing():
