@@ -1713,7 +1713,7 @@ else
         _EVAL_FREEZE="--freeze"
     fi
     _EVAL_SKIP_BT=""
-    if [ "$_BACKTEST_WAS_SKIPPED" = "true" ]; then
+    if [ "\$_BACKTEST_WAS_SKIPPED" = "true" ]; then
         _EVAL_SKIP_BT="--skip-backtester"
     fi
     # --date "\${RUN_DATE}" pins evaluate.py to the SF-stamped run date. The
