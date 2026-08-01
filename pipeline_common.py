@@ -1166,7 +1166,19 @@ def push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
         return
 
     try:
-        cutoff = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+        # Load the forward horizon from predictor.yaml — the single source
+        # of truth for both the grading window and the rolling-analytics
+        # lookback. Previously this was a hardcoded timedelta(days=30) that
+        # structurally returned 0 graded rows because no prediction within
+        # that window could have had its forward horizon close yet.
+        forward_days = _load_active_horizon_days()
+        # The newest gradeable prediction had its forward horizon close
+        # roughly forward_days trading days ago (~1.4 calendar days per
+        # trading day). Subtract that grade-window plus a 30-calendar-day
+        # rolling history to admit graded rows into the window.
+        grade_window_calendar = int(forward_days * 7 / 5) + 1
+        total_lookback = grade_window_calendar + 30
+        cutoff = (datetime.utcnow() - timedelta(days=total_lookback)).strftime("%Y-%m-%d")
         conn = _sqlite3.connect(db_path)
         df = pd.read_sql_query(
             "SELECT *, "
@@ -1184,7 +1196,9 @@ def push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
         return
 
     if len(df) < 5:
-        logger.info("push_predictor_rolling_metrics: < 5 resolved outcomes, skipping S3 update")
+        logger.info("push_predictor_rolling_metrics: < 5 resolved outcomes, "
+                     "skipping S3 update (lookback=%dd, forward_days=%d)",
+                     total_lookback, forward_days)
         return
 
     hit_rate = float(pd.to_numeric(df["canonical_correct"], errors="coerce").mean())
@@ -1239,6 +1253,20 @@ def push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
     existing["ic_ir_30d"] = ic_ir_30d
     existing["rolling_metrics_updated_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     existing["rolling_n"] = len(df)
+    existing["forward_days"] = forward_days
+    existing["lookback_days"] = total_lookback
+    # Machine-readable reason when ic is null — lets consumers distinguish
+    # "not enough graded data yet" from "producer never ran" from "producer
+    # crashed" (config#5194 silent-failure class).
+    if ic_30d is None:
+        existing["ic_null_reason"] = (
+            f"insufficient_graded_rows: {len(valid)} valid IC samples "
+            f"< {_MIN_IC_SAMPLES} minimum"
+            if len(valid) < _MIN_IC_SAMPLES
+            else "computation_failure"
+        )
+    else:
+        existing.pop("ic_null_reason", None)
 
     try:
         s3.put_object(
