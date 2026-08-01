@@ -47,14 +47,24 @@ def conn():
     """Build an in-memory DB with the v15 schema (sub-score columns)."""
     c = sqlite3.connect(":memory:")
     c.executescript("""
-        CREATE TABLE team_candidates (
+        CREATE TABLE IF NOT EXISTS scanner_evaluations (
             id INTEGER PRIMARY KEY,
-            ticker TEXT, eval_date TEXT, team_id TEXT,
-            quant_rank INTEGER, quant_score REAL, qual_score REAL,
-            team_recommended INTEGER DEFAULT 0,
-            rsi_sub_score REAL, macd_sub_score REAL,
-            ma50_sub_score REAL, ma200_sub_score REAL,
-            momentum_sub_score REAL
+            ticker TEXT NOT NULL,
+            eval_date TEXT NOT NULL,
+            sector TEXT,
+            tech_score REAL,
+            scan_path TEXT,
+            quant_filter_pass INTEGER NOT NULL DEFAULT 0,
+            liquidity_pass INTEGER NOT NULL DEFAULT 1,
+            volatility_pass INTEGER NOT NULL DEFAULT 1,
+            balance_sheet_pass INTEGER NOT NULL DEFAULT 1,
+            filter_fail_reason TEXT,
+            rsi_sub_score REAL,
+            macd_sub_score REAL,
+            ma50_sub_score REAL,
+            ma200_sub_score REAL,
+            momentum_sub_score REAL,
+            UNIQUE(ticker, eval_date)
         );
         CREATE TABLE universe_returns (
             id INTEGER PRIMARY KEY,
@@ -67,14 +77,14 @@ def conn():
 
 def _seed(conn, team_id: str, eval_date: str, picks: list[tuple]):
     """Insert (ticker, rsi, macd, ma50, ma200, momentum, return_5d) rows."""
-    for i, (ticker, rsi, macd, ma50, ma200, mom, ret) in enumerate(picks, 1):
+    for ticker, rsi, macd, ma50, ma200, mom, ret in picks:
         conn.execute(
-            "INSERT INTO team_candidates "
-            "(ticker, eval_date, team_id, quant_rank, quant_score, "
+            "INSERT INTO scanner_evaluations "
+            "(ticker, eval_date, sector, "
             "rsi_sub_score, macd_sub_score, ma50_sub_score, "
             "ma200_sub_score, momentum_sub_score) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (ticker, eval_date, team_id, i, 0.0,
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (ticker, eval_date, team_id,
              rsi, macd, ma50, ma200, mom),
         )
         conn.execute(
@@ -176,24 +186,24 @@ class TestComputeTechWeightAblation:
         )
         assert result["status"] == "error"
 
-    def test_missing_team_candidates_table(self):
+    def test_missing_scanner_evaluations_table(self):
         c = sqlite3.connect(":memory:")
         result = compute_tech_weight_ablation(
             db_conn=c, run_date="2026-05-09",
         )
         assert result["status"] == "no_data"
-        assert "team_candidates" in result["reason"]
+        assert "scanner_evaluations" in result["reason"]
         c.close()
 
     def test_missing_sub_score_columns(self):
-        """Pre-v15 schema (just quant_rank/quant_score) must surface
+        """Pre-v24 schema (just sector/tech_score) must surface
         clearly so operator knows the producer-side migration hasn't
         rolled out yet, not crash."""
         c = sqlite3.connect(":memory:")
         c.executescript("""
-            CREATE TABLE team_candidates (
+            CREATE TABLE scanner_evaluations (
                 id INTEGER PRIMARY KEY, ticker TEXT, eval_date TEXT,
-                team_id TEXT, quant_rank INTEGER, quant_score REAL
+                sector TEXT, tech_score REAL
             );
             CREATE TABLE universe_returns (
                 id INTEGER PRIMARY KEY, ticker TEXT, eval_date TEXT,
@@ -240,7 +250,7 @@ class TestComputeTechWeightAblation:
                 (f"T{i}", score, score, score, score, score, ret),
             ])
         # Need ≥2 rows per date for ranking — re-seed with 4 per date
-        conn.execute("DELETE FROM team_candidates")
+        conn.execute("DELETE FROM scanner_evaluations")
         conn.execute("DELETE FROM universe_returns")
         for d in range(8):
             date = f"2026-04-{d+1:02d}"

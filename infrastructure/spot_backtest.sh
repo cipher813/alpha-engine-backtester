@@ -1740,13 +1740,38 @@ echo "════════════════════════�
 echo "  Backtest complete. Instance will be terminated."
 echo "═══════════════════════════════════════════════════════════════"
 
-# Per-stage CloudWatch heartbeats. Each stage gets its own heartbeat so
-# the Saturday SF can split backtest+parity (Backtester state) from
-# evaluator (Evaluator state) across two SF states without conflating
-# their alarms. Backtester heartbeat fires only when both backtest and
-# parity ran (parity is observability for backtest output — they form
-# one semantic unit). Evaluator heartbeat fires only when evaluator ran.
-# Stages listed in --skip-stages are excluded from heartbeat emission.
+# Per-stage CloudWatch heartbeats. Each stage gets its own heartbeat so the
+# Saturday SF can split stages across separate SF states without conflating
+# their alarms. Stages listed in --skip-stages are excluded from emission.
+#
+# ── Why the backtester gate is `backtest` alone (config-I5786) ───────────────
+# This block used to require that BOTH backtest and parity ran, on the
+# reasoning that "parity is observability for backtest output — they form one
+# semantic unit." That was true while they were ONE SF state. On 2026-05-16
+# (nousergon-data#250, the preflight task split) they became TWO, and every
+# caller since passes a --skip-stages set that excludes one or the other:
+#
+#   Backtester state              --skip-stages=parity,evaluator
+#   Parity state                  --skip-stages=backtest,evaluator
+#   Evaluator state               --skip-stages=backtest,parity
+#   PredictorBacktest state       --skip-stages=parity,evaluator
+#   PortfolioOptimizerBacktest    --skip-stages=parity,evaluator
+#
+# So the old conjunction became UNSATISFIABLE BY EVERY CALLER. The last
+# `Process=backtester` heartbeat in CloudWatch is 2026-05-13 — the final
+# Saturday run before that split — and `alpha-engine-backtester-no-heartbeat`
+# has been correctly in ALARM ever since, reporting a signal no code path
+# could emit. Nothing was wrong with the backtester.
+#
+# The gate is now `backtest` alone: the heartbeat answers "did the backtest
+# stage complete", which is what its alarm is named for. Parity is its own SF
+# state now and needs its own heartbeat and alarm — tracked separately, NOT
+# folded in here, because a heartbeat with no alarm is a metric with no
+# subscriber (observability-policy.md §5).
+#
+# Enforced by tests/test_spot_backtest_heartbeat_emission.py, which executes
+# this block's real gating logic against every --skip-stages combination the
+# SF actually passes.
 _emit_heartbeat() {
     local _process="$1"
     aws cloudwatch put-metric-data \
@@ -1766,7 +1791,7 @@ _stage_in_skip() {
     esac
 }
 
-if ! _stage_in_skip backtest && ! _stage_in_skip parity; then
+if ! _stage_in_skip backtest; then
     _emit_heartbeat backtester
 fi
 if ! _stage_in_skip evaluator; then
