@@ -3264,6 +3264,58 @@ def run_predictor_backtest(config: dict) -> dict:
     # failure leaves pbo=null (honest-N/A), never fabricated.
     if config.get("pit_parity_sweep"):
         try:
+            # Precomputed feature maps — built ONCE, shared by every combo of
+            # the CSCV sweep AND by _build_pit_parity_cscv_matrix's per-block
+            # re-sims below. This is the SAME hoist _run_simulation_pipeline
+            # already performs (see the "Precomputed feature maps" block near
+            # the param-sweep setup), reproduced here because the config#816
+            # sweep was added later, in a different function, and re-created
+            # the defect that hoist exists to prevent:
+            #
+            #   "every sim_fn closure below lazily derives the maps inside
+            #    _run_simulation_loop, and the param-sweep path pays 60x the
+            #    ~900-ticker ArcticDB bulk read (2026-04-22 13:00 PT re-run
+            #    timed out for exactly this reason — py-spy confirmed every
+            #    combo was re-entering load_precomputed_feature_maps)."
+            #
+            # It timed out again for exactly that reason on 2026-08-01
+            # (watch-rerun-2026-08-01-4): 272.5s per combo x 60 combos, with
+            # "feature_maps: bulk-reading atr_14_pct + VWAP for 904 ticker(s)"
+            # opening each one. _run_simulation_loop re-reads whenever any of
+            # the three maps is None, so passing them is what suppresses it.
+            #
+            # Safe to share: the swept grid is min_score / max_position_pct /
+            # drawdown_circuit_breaker / atr_multiplier / time_decay_*, none of
+            # which changes the underlying series. atr_multiplier SCALES ATR
+            # downstream; it does not change what ATR is.
+            _pit_atr = _pit_vwap = _pit_cov = None
+            try:
+                from store.feature_maps import load_precomputed_feature_maps
+                _pit_bucket = config.get("signals_bucket", "alpha-engine-research")
+                _pit_smoke = config.get("smoke_tickers")
+                _pit_allow = set(_pit_smoke) if _pit_smoke else None
+                _pit_t0 = _time.monotonic()
+                _pit_atr, _pit_vwap, _pit_cov = load_precomputed_feature_maps(
+                    _pit_bucket, tickers_allowlist=_pit_allow,
+                )
+                logger.info(
+                    "[pit_parity] CSCV sweep feature-map precompute: %d atr / "
+                    "%d vwap / %d coverage in %.1fs — shared across all combos",
+                    len(_pit_atr or {}), len(_pit_vwap or {}), len(_pit_cov or {}),
+                    _time.monotonic() - _pit_t0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Fall through to per-call derivation rather than abort — the
+                # sweep is observational and must not take the pass down. Logged
+                # LOUD because the run reverts to the timing that caused the
+                # 2026-08-01 timeout, so the regression must be visible.
+                logger.warning(
+                    "[pit_parity] feature-map precompute failed (%s) — each combo "
+                    "will re-read ArcticDB inside _run_simulation_loop. Expect the "
+                    "pre-fix per-combo cost that timed the stage out on 2026-08-01.",
+                    exc,
+                )
+
             def _pit_sim_fn(combo_config: dict) -> dict:
                 return _run_simulation_loop(
                     executor_run, SimulatedIBKRClient,
@@ -3273,6 +3325,9 @@ def run_predictor_backtest(config: dict) -> dict:
                     ohlcv_by_ticker=ohlcv_by_ticker,
                     signals_by_date=signals_by_date,
                     spy_prices=spy_prices,
+                    atr_by_ticker=_pit_atr,
+                    vwap_series_by_ticker=_pit_vwap,
+                    coverage_by_ticker=_pit_cov,
                 )
 
             from analysis import param_sweep as _param_sweep
