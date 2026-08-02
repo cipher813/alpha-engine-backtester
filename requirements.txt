@@ -113,7 +113,7 @@ catboost>=1.2.10
 hmmlearn>=0.3.3
 tqdm>=4.70.0
 optuna>=4.9.0
-psutil>=5.9.0
+psutil>=7.2.2
 
 # krepis[openai] (MIT foundation) — direct dep for krepis.dates.resolve_trading_day
 # (pipeline_common re-exports it) and, as of config#1300, krepis.console.console_url
