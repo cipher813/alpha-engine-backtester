@@ -142,3 +142,10 @@ psutil>=7.2.2
 # non-None, not for correctness against an older krepis (that path already
 # degrades gracefully).
 krepis[openai]>=0.24.1
+# Bumped to >=0.24.1 on main (2026-07-29). krepis 0.23.0 added callsite_id
+# as a REQUIRED keyword-only argument to LLMClient.__init__ (a breaking change
+# with no default) — replay/runner.py's _invoke_target_with_schema passes
+# callsite_id="replay-concordance" (the row this callsite owns in
+# alpha-engine-config's LLM_CALLSITE_REGISTRY.yaml). krepis <0.23.0 raises
+# TypeError on that keyword, so the floor must match the actual parameter
+# the code passes.
