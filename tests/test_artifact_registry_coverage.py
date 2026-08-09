@@ -66,6 +66,11 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "store/sim_checkpoint.py": 1,
     "analysis/grade_history.py": 1,
     "analysis/pit_parity.py": 1,
+    # alpha-engine-config#6030: per-pass pit_stats artifacts
+    # (parity/{run_date}/pit_stats_{pass}.json) + the compare's
+    # pit_parity.json write — one strict _put_json chokepoint. Registry
+    # entries for the new parity/ prefix: alpha-engine-config-I6724.
+    "analysis/pit_stats_artifact.py": 1,
     "analysis/production_health.py": 1,
     "analysis/regime_stratified_sortino_runner.py": 2,
     "analysis/retrain_alert.py": 2,
