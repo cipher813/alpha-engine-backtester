@@ -5125,6 +5125,29 @@ def _parse_args() -> argparse.Namespace:
              "manual use.",
     )
     parser.add_argument(
+        "--pit-parity-pass-publish", choices=["lookahead", "walkforward"],
+        default=None,
+        help="Stage entry for the split weekly-SF pit_parity states "
+             "(alpha-engine-config#6030): run exactly ONE pit_parity predictor "
+             "pass (in the same L4487 isolated subprocess) and publish its "
+             "stats to s3://{bucket}/parity/{run_date}/pit_stats_<pass>.json "
+             "per contracts/pit_stats_pass.schema.json. Exits non-zero when "
+             "the pass or the upload fails, so the invoking SF branch records "
+             "DEGRADED and the compare stage emits verdict UNKNOWN.",
+    )
+    parser.add_argument(
+        "--pit-parity-compare", action="store_true",
+        help="Stage entry for the split weekly-SF PitParityCompare state "
+             "(alpha-engine-config#6030): read BOTH pass artifacts "
+             "(parity/{run_date}/pit_stats_{lookahead,walkforward}.json), "
+             "compute delta_pit_minus_current + PBO + materiality + "
+             "parity_alarms, and write backtest/{run_date}/pit_parity.json. "
+             "A missing/unparseable/non-ok pass artifact does NOT abort the "
+             "compare: the report is still written with status/verdict "
+             "UNKNOWN (sf-pipeline-policy §2.3a — absence of a verdict is "
+             "never a pass).",
+    )
+    parser.add_argument(
         "--config-json", default=None,
         help="INTERNAL (L4487): path to the JSON-serialized config the "
              "--pit-parity-pass child should run with.",
@@ -6046,6 +6069,45 @@ def _main_impl() -> None:
                 )
             except Exception as _alert_err:  # best-effort; log line is the primary surface
                 logger.warning("[pit_parity] RSS-budget alert publish failed: %s", _alert_err)
+        return
+
+    # --pit-parity-pass-publish: stage entry for the split SF pass states
+    # (alpha-engine-config#6030). Runs BEFORE _init_pipeline so it can never
+    # write a config. init_research_db mirrors the --pit-parity branch below
+    # (config-I3069): the isolated pass subprocess is the only production
+    # call site of model_version_net_alpha and needs config["research_db"].
+    # FAIL-LOUD (SystemExit 1) on pass/upload failure — unlike the bundled
+    # --pit-parity posture, the pass artifact IS this stage's product; the
+    # SF branch absorbs the failure fail-open (branch-degraded marker) and
+    # the compare stage emits verdict UNKNOWN.
+    if args.pit_parity_pass_publish:
+        from analysis.pit_stats_artifact import publish_pass_artifact
+        init_research_db(args.db, config)
+        ok = publish_pass_artifact(config, args.pit_parity_pass_publish)
+        if not ok:
+            raise SystemExit(1)
+        return
+
+    # --pit-parity-compare: stage entry for the split SF PitParityCompare
+    # state (alpha-engine-config#6030). Reads both pass artifacts, computes
+    # the delta report + parity_alarms, writes backtest/{date}/pit_parity.json.
+    # Exits 0 even when the verdict is UNKNOWN — emitting the honest UNKNOWN
+    # verdict IS this stage succeeding (§2.3a separates "withhold the
+    # guarantee" from "fail the pipeline"); the degradation is already
+    # flagged by the failed branch's own SF marker. A crash here (S3
+    # unreachable, report upload failure) propagates non-zero so the SF
+    # degrades the compare stage itself.
+    if args.pit_parity_compare:
+        from analysis.pit_stats_artifact import run_compare_and_publish
+        report = run_compare_and_publish(config)
+        print(json.dumps(
+            {k: report[k] for k in (
+                "schema", "run_date", "status", "verdict", "pass_availability",
+                "delta_pit_minus_current", "headline_log_alpha_delta",
+                "materiality", "pbo", "_s3_key",
+            ) if k in report},
+            indent=2, default=str,
+        ))
         return
 
     # --pit-parity: dedicated observational run (plan §D4). Runs BEFORE

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible-backtester/contracts/pit_stats_pass.schema.json",
+  "title": "pit_stats per-pass artifact (v1)",
+  "description": "Versioned cross-stage contract for s3://{research-bucket}/parity/{run_date}/pit_stats_{pass}.json — the per-pass skilled-risk-basket stats each pit_parity predictor pass (lookahead | walkforward) publishes when the pass runs as its own Step Functions stage (alpha-engine-config#6030, splitting the bundled Parity SF state per sf-pipeline-policy §2.1). Written by crucible-backtester analysis/pit_stats_artifact.py::publish_pass_artifact (invoked via `backtest.py --pit-parity-pass-publish <pass>` on the pass's own spot instance). Consumed by analysis/pit_stats_artifact.py::run_compare_and_publish (the PitParityCompare SF stage), which reads BOTH pass artifacts, computes delta_pit_minus_current (ΔSortino/ΔPSR/ΔCVaR/Δmax-DD/PBO) and writes backtest/{run_date}/pit_parity.json. The `stats` block lifts the EXACT field subset the in-process implementation (analysis/pit_parity.py::run_pit_parity + build_contamination_report) consumed from the pickled per-pass stats dicts — no invented fields; the full in-memory stats dict is deliberately NOT serialized. Pickle is not an acceptable cross-boundary format (M0 contract rule): all values are JSON with numpy/pandas coerced explicitly — non-finite floats become null. Additive-only evolution: new optional fields may be added under the same major version; renames/removals/type changes require a major `schema` bump coordinated with the compare consumer AND the nousergon-data SF-level consumer contract (nousergon-data contracts/pit_stats_pass.consumer.json).",
+  "type": "object",
+  "required": ["schema", "run_date", "pass", "status"],
+  "properties": {
+    "schema": { "const": "pit_stats_pass-1.0.0" },
+    "run_date": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "The SF-stamped weekly run_date (NYSE trading day) — the same date key every backtest/{date}/ artifact of the run shares."
+    },
+    "pass": {
+      "enum": ["lookahead", "walkforward"],
+      "description": "Which pit_parity pass produced this artifact. 'lookahead' = the legacy single-pass (look-ahead-contaminated) comparator; 'walkforward' = the point-in-time PIT pass."
+    },
+    "status": {
+      "type": "string",
+      "description": "'ok' iff the pass completed and `stats` is trustworthy. Any other value ('failed', 'error', 'insufficient_data', ...) means the compare stage must treat this pass as unavailable and emit its parity verdict as UNKNOWN — never as a pass (sf-pipeline-policy §2.3a)."
+    },
+    "error_class": {
+      "type": "string",
+      "description": "Exception class name when status != 'ok' via the failure path."
+    },
+    "error_msg": {
+      "type": "string",
+      "description": "Truncated exception message when status != 'ok' via the failure path."
+    },
+    "wall_clock_seconds": {
+      "type": ["number", "null"],
+      "description": "Measured wall-clock of the isolated pass subprocess (alpha-engine-config-I6026 deliverable 2 — the series per-stage timeout calibration is seeded from)."
+    },
+    "stats": {
+      "type": "object",
+      "description": "The exact per-pass stats subset the in-process compare consumed. Keys mirror the in-memory dict verbatim, including the private _cscv_* names, so the compare-side reconstruction is an identity mapping.",
+      "properties": {
+        "sortino_ratio": { "type": ["number", "null"] },
+        "psr": { "type": ["number", "null"] },
+        "cvar_95": { "type": ["number", "null"] },
+        "max_drawdown": { "type": ["number", "null"] },
+        "total_return": { "type": ["number", "null"] },
+        "total_alpha": { "type": ["number", "null"] },
+        "daily_log_returns": {
+          "type": ["array", "null"],
+          "items": { "type": ["number", "null"] },
+          "description": "Per-date portfolio log returns (plan invariant 5). Non-finite entries are serialized as null; the consumer coerces null -> NaN and filters via np.isfinite, matching the in-process behavior."
+        },
+        "predictor_metadata": {
+          "type": ["object", "null"],
+          "description": "The pass's predictor metadata dict. The compare consumes predictor_metadata.walk_forward (fold count, cold-start exclusions) from the walkforward pass only."
+        },
+        "_cscv_block_matrix": {
+          "type": ["array", "null"],
+          "items": { "type": "array", "items": { "type": ["number", "null"] } },
+          "description": "(n_blocks, n_combos) Sortino CSCV block matrix — present only on a walkforward pass that ran the opt-in pit_parity_sweep (config#816 decision B). null => pbo reported null by the compare, never fabricated."
+        },
+        "_cscv_spec_ids": {
+          "type": ["array", "null"],
+          "items": {},
+          "description": "Column identifiers for _cscv_block_matrix."
+        },
+        "_cscv_n_trials": {
+          "type": ["integer", "null"],
+          "description": "Number of swept combos, for the DSR multiple-testing deflation."
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
