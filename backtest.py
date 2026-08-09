@@ -5196,13 +5196,16 @@ def _parse_args() -> argparse.Namespace:
         "--predictor-stats-key", default=None,
         help="INTERNAL (config#6032): S3 key of the PredictorBacktest phase's "
              "predictor_stats.json artifact (backtest/{date}/predictor_stats.json). "
-             "With --pit-parity, the walk-forward (PIT) pass reuses the phase's "
-             "already-computed stats instead of re-running the full predictor "
-             "pipeline in a subprocess (~25 min saved per Saturday). Only used "
-             "when the artifact validates as walk-forward-mode with the CSCV "
-             "block matrix present (the phase runs the same walk-forward "
-             "inference over the same config earlier in the SF); any mismatch "
-             "falls back to the subprocess. Not for manual use.",
+             "The walk-forward (PIT) pass reuses the phase's already-computed "
+             "stats instead of re-running the full predictor pipeline in a "
+             "subprocess (~25 min saved per Saturday) — with --pit-parity (the "
+             "bundled launcher, kept as the pre-split rollback path) AND with "
+             "--pit-parity-pass-publish walkforward (the split-SF stage entry). "
+             "Only used when the artifact validates as walk-forward-mode with "
+             "the CSCV block matrix present (the phase runs the same "
+             "walk-forward inference over the same config earlier in the SF); "
+             "any mismatch falls back to the subprocess. Ignored for the "
+             "lookahead pass. Not for manual use.",
     )
     # --walk-forward / --no-walk-forward : mirrors the --use-vectorized-sweep
     # / --use-scalar-sweep opt-out pattern above. DEFAULT ON since
@@ -6153,7 +6156,35 @@ def _main_impl() -> None:
     if args.pit_parity_pass_publish:
         from analysis.pit_stats_artifact import publish_pass_artifact
         init_research_db(args.db, config)
-        ok = publish_pass_artifact(config, args.pit_parity_pass_publish)
+        # config#6032: for the walkforward pass only, reuse the
+        # PredictorBacktest phase's predictor_stats.json (loaded below) —
+        # same load-and-fall-back-on-any-error posture as the --pit-parity
+        # branch below (a missing/unreadable artifact must NOT fail the
+        # stage; publish_pass_artifact falls back to the pass subprocess).
+        predictor_stats = None
+        if args.pit_parity_pass_publish == "walkforward" and args.predictor_stats_key:
+            try:
+                import boto3
+                _pb_bucket = config.get("signals_bucket", "alpha-engine-research")
+                _pb_obj = boto3.client("s3").get_object(
+                    Bucket=_pb_bucket, Key=args.predictor_stats_key,
+                )
+                predictor_stats = json.loads(_pb_obj["Body"].read())
+                logger.info(
+                    "[pit_stats] loaded PredictorBacktest artifact "
+                    "s3://%s/%s for walkforward pass reuse",
+                    _pb_bucket, args.predictor_stats_key,
+                )
+            except Exception as e:
+                logger.error(
+                    "[pit_stats] predictor_stats artifact s3://%s/%s could not "
+                    "be loaded (%s) — falling back to the pass subprocess",
+                    config.get("signals_bucket", "alpha-engine-research"),
+                    args.predictor_stats_key, e,
+                )
+        ok = publish_pass_artifact(
+            config, args.pit_parity_pass_publish, predictor_stats=predictor_stats,
+        )
         if not ok:
             raise SystemExit(1)
         return

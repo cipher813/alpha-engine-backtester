@@ -580,7 +580,11 @@ def test_backtest_pit_parity_branch_inits_research_db_before_run_pit_parity():
     branch_src = "".join(lines[start:end])
 
     init_db_idx = branch_src.index("init_research_db(args.db, config)")
-    run_pp_idx = branch_src.index("run_pit_parity(config)")
+    # config#6032 anchored the call on the signature prefix (no closing
+    # paren): run_pit_parity gained a `predictor_stats=` kwarg in the
+    # artifact-reuse change, and the ordering guarantee under test is
+    # about the call site, not its argument list.
+    run_pp_idx = branch_src.index("run_pit_parity(config")
     assert init_db_idx < run_pp_idx, (
         "init_research_db must run before run_pit_parity in the --pit-parity branch"
     )

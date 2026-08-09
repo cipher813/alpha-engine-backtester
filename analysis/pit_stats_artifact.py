@@ -25,6 +25,16 @@ and emits ``backtest/{run_date}/pit_parity.json`` with ``status: "unknown"``
 ``pipeline_health.pit_parity_status``) reads the same ``status`` key it
 already reads for ``"failed"`` / ``"incomplete"`` reports, so UNKNOWN
 propagates to the machine without a shape change.
+
+config#6032: the walkforward pass may REUSE the PredictorBacktest phase's
+already-computed ``predictor_stats.json`` (same walk-forward inference, same
+config, earlier in the same SF) instead of re-running the full predictor
+pipeline in its own isolated subprocess — see ``publish_pass_artifact``'s
+``predictor_stats`` parameter. This is the split-SF relocation of the reuse
+optimization that previously targeted the bundled ``run_pit_parity`` launcher
+(``analysis/pit_parity.py``); that launcher's own reuse hook is retained
+unchanged as the rollback path (alpha-engine-config-I6725 tracks its
+retirement).
 """
 
 from __future__ import annotations
@@ -40,6 +50,7 @@ from analysis.pit_parity import (
     SCHEMA as PIT_PARITY_SCHEMA,
     _config_without_runtime_handles,
     _run_predictor_pass_isolated,
+    _validate_reusable_predictor_stats,
     build_contamination_report,
     read_prior_delta,
 )
@@ -222,40 +233,92 @@ def _alert(message: str, *, dedup_key: str) -> None:
         logger.error("[pit_stats] alert publish failed: %s", alert_err)
 
 
-def publish_pass_artifact(config: dict, which: str) -> bool:
-    """Run ONE pit_parity pass in an isolated subprocess and publish its
-    stats artifact. Returns True iff the pass completed ``ok`` AND the
-    artifact uploaded — the CLI exits non-zero otherwise so the SF branch
-    records DEGRADED (fail-open at the SF layer, fail-loud at this one).
+def publish_pass_artifact(
+    config: dict, which: str, predictor_stats: dict | None = None,
+) -> bool:
+    """Run ONE pit_parity pass and publish its stats artifact. Returns True
+    iff the pass completed ``ok`` AND the artifact uploaded — the CLI exits
+    non-zero otherwise so the SF branch records DEGRADED (fail-open at the
+    SF layer, fail-loud at this one).
+
+    config#6032: when ``which == "walkforward"`` and ``predictor_stats`` —
+    the PredictorBacktest phase's already-computed ``predictor_stats.json``
+    — validates as a substitute (see
+    ``analysis.pit_parity._validate_reusable_predictor_stats``: walk-forward
+    mode + CSCV block matrix present), this REUSES it instead of running the
+    isolated pass subprocess, saving ~25 min of redundant predictor-pipeline
+    runtime per Saturday. Any rejection (no artifact supplied, wrong
+    inference mode, missing matrix) falls back to the subprocess exactly as
+    before — a degraded measurement is never an acceptable price for a
+    runtime saving. The lookahead pass is NEVER a reuse candidate: it forces
+    the legacy single-pass (``walk_forward=False``) mode no phase artifact
+    reproduces. The published artifact's ``reuse`` block records whether
+    reuse was attempted/used and why not, so a fast stage is verifiable
+    rather than silently different behavior; ``wall_clock_seconds`` stays
+    ``null`` on a reused pass — it measures subprocess runtime (the I6026
+    timeout-calibration series) and a reused pass has none to report.
     """
     bucket = config.get("signals_bucket", "alpha-engine-research")
     run_date = config.get("_run_date") or _dt.date.today().isoformat()
     key = pass_artifact_key(run_date, which)
     safe_config = _config_without_runtime_handles(config)
 
+    reuse_reason = None
+    reused = False
+    if which == "walkforward" and predictor_stats is not None:
+        reuse_reason = _validate_reusable_predictor_stats(predictor_stats)
+        if reuse_reason is None:
+            reused = True
+            logger.info(
+                "[pit_stats] walkforward pass REUSED from the "
+                "PredictorBacktest phase's predictor_stats.json (no "
+                "subprocess; ~25 min saved). The phase ran the same "
+                "walk-forward inference over the same config earlier in "
+                "this SF."
+            )
+        else:
+            logger.error(
+                "[pit_stats] predictor_stats.json NOT reusable for the "
+                "walkforward pass (%s) — falling back to the pass "
+                "subprocess.", reuse_reason,
+            )
+    reuse_block = {
+        "attempted": which == "walkforward" and predictor_stats is not None,
+        "used": reused,
+        "rejection_reason": reuse_reason,
+    }
+
     started = time.monotonic()
-    try:
-        stats = _run_predictor_pass_isolated(safe_config, which, run_date)
-    except Exception as exc:  # noqa: BLE001 — converted to failed artifact + alert
-        elapsed = time.monotonic() - started
-        logger.error("[pit_stats] %s pass failed after %.0fs: %s", which, elapsed, exc)
-        artifact = build_failure_pass_artifact(which, run_date, exc)
-        artifact["wall_clock_seconds"] = round(elapsed, 3)
+    if reused:
+        stats = predictor_stats
+    else:
         try:
-            validate_pass_artifact(artifact)
-            _put_json(bucket, key, artifact)
-        except Exception as put_err:  # noqa: BLE001 — artifact absence => compare UNKNOWN
-            logger.error("[pit_stats] failure-artifact write also failed: %s", put_err)
-        _alert(
-            f"pit_parity {which} pass failed on {run_date}: "
-            f"{type(exc).__name__}: {str(exc)[:200]} — the PitParityCompare "
-            f"stage will emit verdict UNKNOWN (see s3://{bucket}/{key})",
-            dedup_key=f"pit_stats_{which}_failed_{run_date}",
-        )
-        return False
+            stats = _run_predictor_pass_isolated(safe_config, which, run_date)
+        except Exception as exc:  # noqa: BLE001 — converted to failed artifact + alert
+            elapsed = time.monotonic() - started
+            logger.error("[pit_stats] %s pass failed after %.0fs: %s", which, elapsed, exc)
+            artifact = build_failure_pass_artifact(which, run_date, exc)
+            artifact["wall_clock_seconds"] = round(elapsed, 3)
+            artifact["reuse"] = reuse_block
+            try:
+                validate_pass_artifact(artifact)
+                _put_json(bucket, key, artifact)
+            except Exception as put_err:  # noqa: BLE001 — artifact absence => compare UNKNOWN
+                logger.error("[pit_stats] failure-artifact write also failed: %s", put_err)
+            _alert(
+                f"pit_parity {which} pass failed on {run_date}: "
+                f"{type(exc).__name__}: {str(exc)[:200]} — the PitParityCompare "
+                f"stage will emit verdict UNKNOWN (see s3://{bucket}/{key})",
+                dedup_key=f"pit_stats_{which}_failed_{run_date}",
+            )
+            return False
 
     elapsed = time.monotonic() - started
-    artifact = build_pass_artifact(stats, which, run_date, wall_clock_seconds=elapsed)
+    artifact = build_pass_artifact(
+        stats, which, run_date,
+        wall_clock_seconds=(None if reused else elapsed),
+    )
+    artifact["reuse"] = reuse_block
     validate_pass_artifact(artifact)
     _put_json(bucket, key, artifact)
     if artifact["status"] != "ok":
@@ -267,8 +330,8 @@ def publish_pass_artifact(config: dict, which: str) -> bool:
         )
         return False
     logger.info(
-        "[pit_stats] %s pass ok in %.0fs — published s3://%s/%s",
-        which, elapsed, bucket, key,
+        "[pit_stats] %s pass ok in %.0fs (reused=%s) — published s3://%s/%s",
+        which, elapsed, reused, bucket, key,
     )
     return True
 
