@@ -159,7 +159,19 @@ echo "▶ stage=pit_${PIT_PASS} START at \$(date -u +%H:%M:%S)"
 # records DEGRADED and the compare emits verdict UNKNOWN. The always-emit
 # contract inside publish_pass_artifact still writes a status=failed
 # artifact + pages a warning before exiting non-zero.
+#
+# config#6032: the PredictorBacktest phase (earlier in this SF, same
+# RUN_DATE, its own stage/box) already ran the SAME walk-forward (PIT)
+# inference over the same config and wrote
+# backtest/{RUN_DATE}/predictor_stats.json — bake that key in so
+# publish_pass_artifact can reuse it and skip this pass's own
+# full-predictor-pipeline subprocess (~25 min saved). No-op for the
+# lookahead sibling script (predictor-stats-key is ignored there — the
+# lookahead pass forces legacy single-pass mode no phase artifact
+# reproduces). Best-effort: a missing/unreadable artifact falls back to
+# the subprocess inside publish_pass_artifact (never fails this stage).
 $REMOTE_PYTHON -u backtest.py --pit-parity-pass-publish ${PIT_PASS} \\
+    --predictor-stats-key "backtest/\${RUN_DATE}/predictor_stats.json" \\
     --date "\${RUN_DATE}" --log-level INFO 2>&1
 echo "▶ stage=pit_${PIT_PASS} END at \$(date -u +%H:%M:%S)"
 

@@ -30,7 +30,26 @@
     },
     "wall_clock_seconds": {
       "type": ["number", "null"],
-      "description": "Measured wall-clock of the isolated pass subprocess (alpha-engine-config-I6026 deliverable 2 — the series per-stage timeout calibration is seeded from)."
+      "description": "Measured wall-clock of the isolated pass subprocess (alpha-engine-config-I6026 deliverable 2 — the series per-stage timeout calibration is seeded from). null when the pass was reused (see `reuse`) — a reused pass has no subprocess runtime to report and must not pollute the calibration series."
+    },
+    "reuse": {
+      "type": "object",
+      "description": "config#6032: PredictorBacktest-phase predictor_stats.json reuse status for the walkforward pass — the phase runs the same walk-forward inference over the same config earlier in the SF, so its artifact can substitute for this pass's own subprocess (~25 min saved). Always attempted=false for the lookahead pass, which forces the legacy single-pass mode no phase artifact reproduces.",
+      "properties": {
+        "attempted": {
+          "type": "boolean",
+          "description": "True iff a predictor_stats.json artifact was supplied to publish_pass_artifact for this (walkforward) pass."
+        },
+        "used": {
+          "type": "boolean",
+          "description": "True iff the supplied artifact validated and the pass subprocess was skipped."
+        },
+        "rejection_reason": {
+          "type": ["string", "null"],
+          "description": "Why an attempted reuse was rejected (wrong inference mode, missing CSCV matrix, non-ok status, ...); null when used=true or attempted=false."
+        }
+      },
+      "additionalProperties": false
     },
     "stats": {
       "type": "object",

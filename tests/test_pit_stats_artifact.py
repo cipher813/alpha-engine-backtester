@@ -335,6 +335,104 @@ def test_publish_pass_artifact_ok(monkeypatch, fake_s3):
     _validate(written)
     assert written["status"] == "ok"
     assert written["wall_clock_seconds"] is not None
+    assert written["reuse"] == {
+        "attempted": False, "used": False, "rejection_reason": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# publish_pass_artifact — config#6032 walkforward reuse of the
+# PredictorBacktest phase's predictor_stats.json (split-SF relocation of the
+# reuse optimization previously targeting the bundled run_pit_parity
+# launcher — see analysis/pit_parity.py::_validate_reusable_predictor_stats).
+# ---------------------------------------------------------------------------
+
+
+def _phase_artifact(sortino=0.6, status="ok", *, with_matrix=True,
+                     with_wf_meta=True):
+    s = _stats(sortino, 0.8, -0.05, -0.25, [0.005, 0.0, -0.001], 0.01)
+    s["status"] = status
+    if with_wf_meta:
+        s["predictor_metadata"] = {"walk_forward": {"n_folds": 12}}
+    if with_matrix:
+        s["_cscv_block_matrix"] = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8]]
+        s["_cscv_spec_ids"] = [0, 1]
+        s["_cscv_n_trials"] = 2
+    return s
+
+
+def test_publish_pass_artifact_reuses_valid_predictor_stats_for_walkforward(
+        monkeypatch, fake_s3):
+    """A valid phase artifact substitutes for the walkforward pass subprocess
+    entirely — the subprocess must never run."""
+    def _boom(cfg, which, run_date):
+        raise AssertionError("subprocess must not run when reuse is valid")
+
+    monkeypatch.setattr(psa, "_run_predictor_pass_isolated", _boom)
+    ok = psa.publish_pass_artifact(
+        _cfg(), "walkforward", predictor_stats=_phase_artifact(),
+    )
+    assert ok is True
+    key = "parity/2026-08-08/pit_stats_walkforward.json"
+    written = json.loads(fake_s3.objects[key])
+    _validate(written)
+    assert written["status"] == "ok"
+    assert written["wall_clock_seconds"] is None  # no subprocess ran
+    assert written["reuse"] == {
+        "attempted": True, "used": True, "rejection_reason": None,
+    }
+    assert written["stats"]["sortino_ratio"] == pytest.approx(0.6)
+    assert written["stats"]["_cscv_block_matrix"] is not None
+
+
+def test_publish_pass_artifact_falls_back_when_reuse_invalid(
+        monkeypatch, fake_s3):
+    """A matrix-less phase artifact must NOT be reused — PBO (config#816
+    decision B) would degrade to null. Falls back to the subprocess."""
+    seen: list[str] = []
+
+    def fake_pass(cfg, which, run_date):
+        seen.append(which)
+        return _stats(0.5, 0.85, -0.04, -0.2, [0.002], 0.015)
+
+    monkeypatch.setattr(psa, "_run_predictor_pass_isolated", fake_pass)
+    ok = psa.publish_pass_artifact(
+        _cfg(), "walkforward",
+        predictor_stats=_phase_artifact(with_matrix=False),
+    )
+    assert ok is True
+    assert seen == ["walkforward"]  # subprocess DID run
+    key = "parity/2026-08-08/pit_stats_walkforward.json"
+    written = json.loads(fake_s3.objects[key])
+    _validate(written)
+    assert written["wall_clock_seconds"] is not None  # real subprocess time
+    reuse = written["reuse"]
+    assert reuse["attempted"] is True
+    assert reuse["used"] is False
+    assert "cscv_block_matrix" in reuse["rejection_reason"]
+
+
+def test_publish_pass_artifact_reuse_never_attempted_for_lookahead(
+        monkeypatch, fake_s3):
+    """The lookahead pass forces the legacy single-pass (walk_forward=False)
+    mode no phase artifact reproduces — reuse must never even be attempted,
+    regardless of what predictor_stats is supplied."""
+    seen: list[str] = []
+
+    def fake_pass(cfg, which, run_date):
+        seen.append(which)
+        return _stats(1.0, 0.9, -0.03, -0.15, [0.01], 0.02)
+
+    monkeypatch.setattr(psa, "_run_predictor_pass_isolated", fake_pass)
+    ok = psa.publish_pass_artifact(
+        _cfg(), "lookahead", predictor_stats=_phase_artifact(),
+    )
+    assert ok is True
+    assert seen == ["lookahead"]
+    written = json.loads(fake_s3.objects["parity/2026-08-08/pit_stats_lookahead.json"])
+    assert written["reuse"] == {
+        "attempted": False, "used": False, "rejection_reason": None,
+    }
 
 
 def test_publish_pass_artifact_crash_writes_failed_artifact_and_returns_false(
