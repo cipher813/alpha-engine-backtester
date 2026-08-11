@@ -21,6 +21,7 @@ import json
 import os
 import sqlite3
 import sys
+from datetime import date, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -107,6 +108,20 @@ class _Body:
         return self._data
 
 
+# Fixture dates are RELATIVE, not literal (config#6920 sweep finding).
+#
+# This module used hardcoded 2026-04-12 / 2026-04-20 while `_pending_universe`
+# filters on `lookback_days=120` counted from *today*. On 2026-08-11 the older
+# date turned 121 days old and silently fell out of the window: three tests
+# started failing on main with `assert 3 == 6`, with nothing having changed in
+# the code. A fixed date inside a relative window is a time bomb with a
+# knowable fuse — these are anchored to now so the fuse cannot be lit.
+_LOOKBACK_DAYS = 120  # mirrors _pending_universe's default; see the guard test
+_D_OLDEST = (date.today() - timedelta(days=110)).isoformat()
+_D_OLD = (date.today() - timedelta(days=100)).isoformat()
+_D_RECENT = (date.today() - timedelta(days=90)).isoformat()
+
+
 def _candidates_artifact(run_date: str, eval_log: list[dict]) -> dict:
     return {"run_date": run_date, "scanner_eval_log": eval_log}
 
@@ -119,7 +134,7 @@ def _eval_rows(passing: list[str], failing: list[str]) -> list[dict]:
     ]
 
 
-def _seeded_s3(tmp_path, *, dates=("2026-04-12", "2026-04-20")) -> _FakeS3:
+def _seeded_s3(tmp_path, *, dates=(_D_OLD, _D_RECENT)) -> _FakeS3:
     """A fake S3 carrying candidates.json for each of ``dates`` with 3
     passing (T0/T1/T2) + 2 failing (T3/T4) tickers — the S3 analog of the
     old ``_scanner_db`` sqlite fixture this module used before config#3053."""
@@ -182,22 +197,22 @@ def test_pending_universe_returns_all_passing_rows_when_nothing_cached(tmp_path)
     # 3 passing tickers x 2 dates = 6 rows, none cached yet
     assert len(pending) == 6, pending
     assert set(pending["ticker"]) == {"T0", "T1", "T2"}
-    assert set(pending["eval_date"]) == {"2026-04-12", "2026-04-20"}
+    assert set(pending["eval_date"]) == {_D_OLD, _D_RECENT}
 
 
 def test_pending_universe_excludes_already_cached_rows(tmp_path):
     conn = sqlite3.connect(str(tmp_path / "r.db"))
     _ensure_table(conn)
-    _prefill(conn, [("T0", "2026-04-12", 0.01), ("T1", "2026-04-12", -0.02)])
+    _prefill(conn, [("T0", _D_OLD, 0.01), ("T1", _D_OLD, -0.02)])
     s3 = _seeded_s3(tmp_path)
     pending = _pending_universe(conn, bucket="any-bucket", s3_client=s3)
     # 6 total - 2 cached = 4 remaining
     assert len(pending) == 4, pending
     pairs = set(zip(pending["ticker"], pending["eval_date"]))
-    assert ("T0", "2026-04-12") not in pairs
-    assert ("T1", "2026-04-12") not in pairs
-    assert ("T2", "2026-04-12") in pairs
-    assert ("T0", "2026-04-20") in pairs
+    assert ("T0", _D_OLD) not in pairs
+    assert ("T1", _D_OLD) not in pairs
+    assert ("T2", _D_OLD) in pairs
+    assert ("T0", _D_RECENT) in pairs
 
 
 def test_pending_universe_empty_when_fully_cached(tmp_path):
@@ -205,7 +220,7 @@ def test_pending_universe_empty_when_fully_cached(tmp_path):
     _ensure_table(conn)
     _prefill(conn, [
         (f"T{i}", d, 0.0)
-        for d in ("2026-04-12", "2026-04-20")
+        for d in (_D_OLD, _D_RECENT)
         for i in range(3)
     ])
     s3 = _seeded_s3(tmp_path)
@@ -232,12 +247,12 @@ def test_pending_universe_skips_week_with_empty_eval_log_but_uses_others(tmp_pat
     conn = sqlite3.connect(str(tmp_path / "r.db"))
     _ensure_table(conn)
     s3 = _FakeS3(tmp_path)
-    s3.put_candidates("2026-04-12", _candidates_artifact("2026-04-12", []))
-    s3.put_candidates("2026-04-20", _candidates_artifact(
-        "2026-04-20", _eval_rows(["T0"], ["T1"]),
+    s3.put_candidates(_D_OLD, _candidates_artifact(_D_OLD, []))
+    s3.put_candidates(_D_RECENT, _candidates_artifact(
+        _D_RECENT, _eval_rows(["T0"], ["T1"]),
     ))
     pending = _pending_universe(conn, bucket="any-bucket", s3_client=s3)
-    assert set(zip(pending["ticker"], pending["eval_date"])) == {("T0", "2026-04-20")}
+    assert set(zip(pending["ticker"], pending["eval_date"])) == {("T0", _D_RECENT)}
 
 
 def test_pending_universe_respects_lookback_window(tmp_path):
@@ -257,9 +272,9 @@ def test_pending_universe_respects_lookback_window(tmp_path):
 
 def test_existing_keys_reads_ticker_prediction_date_pairs(tmp_path):
     conn = sqlite3.connect(str(tmp_path / "r.db"))
-    _prefill(conn, [("T0", "2026-04-12", 0.01)])
+    _prefill(conn, [("T0", _D_OLD, 0.01)])
     keys = _existing_keys(conn)
-    assert keys == {("T0", "2026-04-12")}
+    assert keys == {("T0", _D_OLD)}
 
 
 def test_existing_keys_empty_when_table_absent(tmp_path):
@@ -271,9 +286,9 @@ def test_existing_keys_empty_when_table_absent(tmp_path):
 
 
 def test_list_recent_candidate_dates_sorted_and_filtered(tmp_path):
-    s3 = _seeded_s3(tmp_path, dates=("2026-04-12", "2026-04-20", "2026-04-06"))
+    s3 = _seeded_s3(tmp_path, dates=(_D_OLD, _D_RECENT, _D_OLDEST))
     dates = _list_recent_candidate_dates("any-bucket", s3_client=s3, lookback_days=365)
-    assert dates == ["2026-04-06", "2026-04-12", "2026-04-20"]
+    assert dates == [_D_OLDEST, _D_OLD, _D_RECENT]
 
 
 def test_list_recent_candidate_dates_empty_when_no_objects(tmp_path):
@@ -427,11 +442,11 @@ def test_insert_or_replace_on_primary_key_is_idempotent(tmp_path):
     _ensure_table(conn)
     conn.execute(
         f"INSERT OR REPLACE INTO {TABLE_NAME} VALUES (?,?,?,?)",
-        ("T0", "2026-04-12", 0.01, 4),
+        ("T0", _D_OLD, 0.01, 4),
     )
     conn.execute(
         f"INSERT OR REPLACE INTO {TABLE_NAME} VALUES (?,?,?,?)",
-        ("T0", "2026-04-12", 0.05, 4),  # re-run with a different value
+        ("T0", _D_OLD, 0.05, 4),  # re-run with a different value
     )
     conn.commit()
     rows = conn.execute(f"SELECT * FROM {TABLE_NAME}").fetchall()
@@ -471,7 +486,7 @@ def test_export_then_materialize_roundtrip(tmp_path):
     s3 = _FakeS3(tmp_path)
     producer = sqlite3.connect(str(tmp_path / "producer.db"))
     _ensure_table(producer)
-    rows = [("T0", "2026-04-12", 0.013, 4), ("T1", "2026-04-20", -0.021, 4)]
+    rows = [("T0", _D_OLD, 0.013, 4), ("T1", _D_RECENT, -0.021, 4)]
     producer.executemany(f"INSERT INTO {TABLE_NAME} VALUES (?,?,?,?)", rows)
     producer.commit()
 
@@ -505,7 +520,7 @@ def test_materialize_seeds_pending_universe_idempotency(tmp_path):
     _ensure_table(prior)
     prior.executemany(
         f"INSERT INTO {TABLE_NAME} VALUES (?,?,?,?)",
-        [("T0", "2026-04-12", 0.01, 4), ("T1", "2026-04-12", 0.02, 4)],
+        [("T0", _D_OLD, 0.01, 4), ("T1", _D_OLD, 0.02, 4)],
     )
     prior.commit()
     _export_artifact(prior, "any-bucket", s3_client=s3)
@@ -514,8 +529,8 @@ def test_materialize_seeds_pending_universe_idempotency(tmp_path):
     materialize_from_s3(fresh, "any-bucket", s3_client=s3)
     pending = _pending_universe(fresh, bucket="any-bucket", s3_client=s3)
     pairs = set(zip(pending["ticker"], pending["eval_date"]))
-    assert ("T0", "2026-04-12") not in pairs
-    assert ("T1", "2026-04-12") not in pairs
+    assert ("T0", _D_OLD) not in pairs
+    assert ("T1", _D_OLD) not in pairs
     assert len(pending) == 4  # 6 passing - 2 seeded
 
 
@@ -536,3 +551,28 @@ def test_materialize_raises_on_non_404_download_error(tmp_path):
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         assert "AccessDenied" in str(e)
+
+
+def test_fixture_dates_are_inside_the_lookback_window():
+    """The window is relative; the fixtures must stay inside it forever.
+
+    Directly pins the 2026-08-11 breakage: a fixture date that ages past
+    `_pending_universe(lookback_days=...)` makes unrelated assertions fail with
+    a row-count mismatch that looks like a logic bug and is not one.
+    """
+    import inspect
+
+    from analysis import scanner_predictor_research_free_backfill as M
+
+    default = inspect.signature(M._pending_universe).parameters["lookback_days"].default
+    assert default == _LOOKBACK_DAYS, (
+        f"_pending_universe's lookback default moved to {default}d; update "
+        f"_LOOKBACK_DAYS and re-check every fixture date against it"
+    )
+    today = date.today()
+    for label, value in (("_D_OLDEST", _D_OLDEST), ("_D_OLD", _D_OLD), ("_D_RECENT", _D_RECENT)):
+        age = (today - date.fromisoformat(value)).days
+        assert 0 < age < _LOOKBACK_DAYS, (
+            f"{label} is {age}d old, outside the {_LOOKBACK_DAYS}d window "
+            f"_pending_universe filters on"
+        )
