@@ -92,6 +92,36 @@ exists to bound cost on accidental wide-window runs (e.g. if the
 caller passes ``window_days=365`` by mistake)."""
 
 MIN_OBSERVATIONS_FOR_CONCORDANCE = 3
+
+# Time held back from the replay loop for the aggregate, the CloudWatch emits
+# and the summary PUT (config#6920). Without a reserve the loop can consume the
+# whole budget and the run ends with nothing persisted — which is what made a
+# 15-minute paid run indistinguishable from one that never happened.
+CONCORDANCE_WRITE_RESERVE_S = 45.0
+
+# Floor for the "can another item fit?" estimate before any item has completed.
+# Measured per-item latencies on 2026-08-11 ranged 6s-137s; the handler's cap
+# was sized on an assumed 3-5s, which is why it could never bind.
+CONCORDANCE_MIN_ITEM_ESTIMATE_S = 30.0
+
+
+def _next_item_affordable(remaining_s, latencies_ms: list[int]) -> tuple[bool, float]:
+    """Can another replay finish before the deadline?
+
+    Estimates from the observed p90 of this run's own item latencies — the
+    workload measures itself rather than trusting a literal. Returns
+    (affordable, needed_seconds); always affordable when there is no deadline.
+    """
+    if remaining_s is None:
+        return True, 0.0
+    if latencies_ms:
+        ordered = sorted(latencies_ms)
+        p90 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.9))] / 1000.0
+        estimate = max(CONCORDANCE_MIN_ITEM_ESTIMATE_S, p90)
+    else:
+        estimate = CONCORDANCE_MIN_ITEM_ESTIMATE_S
+    needed = estimate + CONCORDANCE_WRITE_RESERVE_S
+    return remaining_s() >= needed, needed
 """Below this count, the per-group mean is statistically meaningless —
 emit metric as None (skip) rather than report a noisy value. Mirrors
 the rationale-clustering thin-sample threshold."""
@@ -319,6 +349,7 @@ def compute_and_emit_concordance(
     emit_metrics: bool = True,
     persist_per_replay: bool = False,
     dry_run: bool = False,
+    remaining_s=None,
 ) -> dict[str, Any]:
     """Replay the trailing-window corpus under each target_model,
     aggregate concordance per (agent_id_base, target_model), emit
@@ -348,6 +379,12 @@ def compute_and_emit_concordance(
         dry_run: when True, lists candidate artifacts + skips replay
             calls + persists nothing. Returns a summary with
             ``would_replay`` rather than ``per_agent``.
+        remaining_s: zero-arg callable returning the seconds left before the
+            caller's own deadline (in Lambda, ``context.get_remaining_time_in
+            _millis() / 1000``). When supplied, the replay loop stops early
+            rather than being killed mid-run, and the summary carries
+            ``complete=False`` plus the skipped count (config#6920). ``None``
+            (a spot run, a CLI run) means no deadline and no early stop.
 
     Returns:
         Summary dict with per-target-model concordance + per-agent
@@ -425,7 +462,27 @@ def compute_and_emit_concordance(
         replay_skips: list[dict[str, str]] = []
         n_replayed = 0
 
-        for key in keys:
+        item_latencies_ms: list[int] = []
+        budget_stopped = False
+        n_skipped_for_budget = 0
+
+        for index, key in enumerate(keys):
+            # config#6920: check BEFORE starting an item. Being killed
+            # mid-replay discards the whole run's aggregate — nothing is
+            # persisted until the loop finishes — so stopping early with a
+            # partial, honestly-labelled result strictly dominates.
+            affordable, needed = _next_item_affordable(remaining_s, item_latencies_ms)
+            if not affordable:
+                budget_stopped = True
+                n_skipped_for_budget = len(keys) - index
+                logger.warning(
+                    "[batch_replay] stopping early on budget: %d of %d artifacts "
+                    "not replayed for target=%s (needed ~%.0fs, %.0fs left). The "
+                    "summary is persisted and marked incomplete.",
+                    n_skipped_for_budget, len(keys), target_model, needed,
+                    remaining_s(),
+                )
+                break
             try:
                 replay = replay_artifact(
                     artifact_key=key,
@@ -448,6 +505,8 @@ def compute_and_emit_concordance(
                 continue
 
             n_replayed += 1
+            if isinstance(replay.replay_latency_ms, (int, float)):
+                item_latencies_ms.append(int(replay.replay_latency_ms))
 
             # Roll up token cost (best-effort).
             for k in ("input_tokens", "output_tokens"):
@@ -533,6 +592,13 @@ def compute_and_emit_concordance(
 
         target_summary = {
             "target_model": target_model,
+            # config#6920: a consumer must be able to tell a full sweep from a
+            # truncated one. `complete` is False whenever the loop stopped on
+            # budget, so a partial concordance can never be read as a full one.
+            "complete": not budget_stopped,
+            "budget_stopped": budget_stopped,
+            "n_artifacts_candidate": len(keys),
+            "n_artifacts_skipped_for_budget": n_skipped_for_budget,
             "n_artifacts_replayed": n_replayed,
             "agents_analyzed": len(per_agent),
             "per_agent": per_agent,

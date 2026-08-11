@@ -180,6 +180,19 @@ def _ensure_init() -> None:
 
 
 @monitor_handler
+def _remaining_seconds(context):
+    """Zero-arg callable giving the seconds left in this invocation.
+
+    ``None`` when there is no Lambda context (local runs, tests), which the
+    batch module treats as "no deadline" — identical behaviour to before
+    config#6920.
+    """
+    getter = getattr(context, "get_remaining_time_in_millis", None)
+    if not callable(getter):
+        return None
+    return lambda: getter() / 1000.0
+
+
 def handler(event: dict, context) -> dict:
     """Compute + emit per-(agent_id, target_model) cheap-model concordance.
 
@@ -232,11 +245,16 @@ def handler(event: dict, context) -> dict:
     agent_filter = event.get("agents") or None
     if isinstance(agent_filter, str):
         agent_filter = [a.strip() for a in agent_filter.split(",") if a.strip()]
-    # Default cap chosen to fit comfortably within the 900s Lambda
-    # timeout: 150 artifacts × ~3-5 sec/replay ≈ 450-750 sec. The
-    # batch module's documented DEFAULT_MAX_ARTIFACTS (500) is
-    # appropriate for spot-instance runs without a hard deadline; for
-    # Lambda we tighten it. Override via event if the corpus is sparse.
+    # Cap sized against the 900s Lambda timeout. The original rationale
+    # here read "150 artifacts × ~3-5 sec/replay ≈ 450-750 sec"; measured
+    # per-item latencies on 2026-08-11 were 6s-137s (p90 well above 20s),
+    # so that estimate was wrong by 2-30× and the cap could never bind —
+    # ReplayConcordance hit the wall at Status: timeout with the whole run's
+    # aggregate discarded (config#6920). The cap stays as a COST guard; the
+    # deadline below is what now bounds the time, measured from this run's
+    # own item latencies rather than an assumed constant. The batch module's
+    # DEFAULT_MAX_ARTIFACTS (500) remains right for spot runs with no
+    # deadline. Override via event if the corpus is sparse.
     max_artifacts = int(event.get("max_artifacts", min(150, DEFAULT_MAX_ARTIFACTS)))
     dry_run = bool(event.get("dry_run", False))
 
@@ -257,6 +275,7 @@ def handler(event: dict, context) -> dict:
             max_artifacts=max_artifacts,
             emit_metrics=not dry_run,
             dry_run=dry_run,
+            remaining_s=_remaining_seconds(context),
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("[lambda_concordance] computation failed hard")
@@ -273,12 +292,24 @@ def handler(event: dict, context) -> dict:
     # error, persist error) surface but the run completed. Eval is
     # observability — partial signal is preferable to abort.
     has_failures = False
+    incomplete = False
     if not dry_run:
         for target_summary in summary.get("per_target_model", []):
             if target_summary.get("replay_failures"):
                 has_failures = True
-                break
-    status = "PARTIAL" if has_failures else "OK"
+            # config#6920: a run that stopped on budget covered less of the
+            # corpus than it was asked to. That is partial signal, and saying
+            # OK would make a truncated sweep read as a full one.
+            if target_summary.get("budget_stopped"):
+                incomplete = True
+                logger.warning(
+                    "[lambda_concordance] target=%s stopped on budget: %s of %s "
+                    "artifacts not replayed",
+                    target_summary.get("target_model"),
+                    target_summary.get("n_artifacts_skipped_for_budget"),
+                    target_summary.get("n_artifacts_candidate"),
+                )
+    status = "PARTIAL" if (has_failures or incomplete) else "OK"
 
     logger.info(
         "[lambda_concordance] done status=%s duration=%.1fs "
