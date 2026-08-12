@@ -452,6 +452,33 @@ def _cio_layer_attribution(merged: pd.DataFrame) -> dict | None:
     return out
 
 
+def _prefilter_universe_returns(ur: pd.DataFrame) -> pd.DataFrame:
+    """The universe-returns row admission rule: 5d returns must be populated.
+
+    Extracted from ``compute_lift_metrics`` (config-I6975) so the runtime
+    classification-count attestation drives the SAME admission rule the live
+    producer applies, rather than a copy of it that would agree with any
+    behaviour this function ever adopts.
+    """
+    return ur[ur["return_5d"].notna()]
+
+
+def load_universe_returns_frame(
+    conn, date_filter: str = "", params: list | None = None, *, prefilter: bool = True,
+) -> pd.DataFrame:
+    """Load ``universe_returns`` exactly as the live e2e producer does.
+
+    ``prefilter`` applies ``_prefilter_universe_returns``; ``compute_lift_metrics``
+    passes False so it can distinguish "no rows for this date" from "no rows with
+    return_5d" in its status. Every other caller wants the admitted frame.
+    """
+    ur = pd.read_sql_query(
+        f"SELECT * FROM universe_returns{date_filter} ORDER BY eval_date, ticker",
+        conn, params=list(params or []),
+    )
+    return _prefilter_universe_returns(ur) if prefilter else ur
+
+
 def compute_lift_metrics(
     research_db_path: str,
     trades_db_path: str | None = None,
@@ -508,18 +535,15 @@ def compute_lift_metrics(
 
     try:
         # Load universe_returns as base
-        ur = pd.read_sql_query(
-            f"SELECT * FROM universe_returns{date_filter} ORDER BY eval_date, ticker",
-            conn, params=params,
-        )
+        ur_all = load_universe_returns_frame(conn, date_filter, params, prefilter=False)
 
-        n_dates = ur["eval_date"].nunique()
+        n_dates = ur_all["eval_date"].nunique()
         if n_dates == 0:
             conn.close()
             return {"status": "insufficient_data", "error": "no data for specified date"}
 
         # Only use rows with 5d returns populated
-        ur = ur[ur["return_5d"].notna()]
+        ur = _prefilter_universe_returns(ur_all)
         if ur.empty:
             conn.close()
             return {"status": "insufficient_data", "error": "no rows with return_5d populated"}
