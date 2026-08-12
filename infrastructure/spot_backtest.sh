@@ -727,15 +727,21 @@ cleanup() {
         # alert to warning when we will relaunch, so a recovered run does not
         # page as an error.
         if [ -n "${INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
-            local _decide_out _decide_rc
+            # `|| _decide_rc=$?` is LOAD-BEARING — see the identical guard in
+            # `_spot_common.sh` for the full account. In short: this script runs
+            # under `set -e`, `relaunch-decision` answers "hold" with exit 75 for
+            # every non-reclaim failure, and an unguarded `VAR="$(cmd)"` let
+            # errexit destroy the shell inside the EXIT trap — silently, because
+            # `set -e` does not re-enter a trap it is already running — skipping
+            # `terminate-instances` and leaking the spot instance.
+            local _decide_out="" _decide_rc=0
             _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
                 --instance-id "$INSTANCE_ID" \
                 --region "$AWS_REGION" \
                 --attempt "$SPOT_ATTEMPT" \
                 --max-attempts "$MAX_SPOT_ATTEMPTS" \
                 ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
-                2>/dev/null)"
-            _decide_rc=$?
+                2>/dev/null)" || _decide_rc=$?
             echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}"
             if [ "$_decide_rc" -eq 0 ]; then
                 _will_relaunch=1
