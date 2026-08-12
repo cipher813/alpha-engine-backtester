@@ -37,7 +37,35 @@ a systematic bug rides on:
 ``drawdown_peak_to_trough``  running-peak drawdown definition
 ``alpha_over_active_window`` benchmark window alignment (the 2026-05-24 bug)
 ``oracle_nav_agreement``     whole NAV path vs a from-scratch accountant
+``classification_counts_*``  the tp/fp/fn/tn the Report Card's precision is
+                             built from (config-I6975; see below)
 ===========================  ==============================================
+
+WHAT THE COUNT CHECKS ADD (config-I6975)
+----------------------------------------
+Everything above attests **arithmetic**. The ``classification_counts_*`` family
+attests **what is being counted**, one layer up — the same distinction as the
+``avg_volume_20d`` incident, where the arithmetic was right and the quantity was
+not.
+
+``crucible-evaluator grading/tiles/research.py::_precision_metric`` derives
+precision, edge-over-base-rate and a Wilson CI from the ``tp``/``fp``/``fn``/``tn``
+this repo aggregated into ``backtest/{date}/e2e_lift.json``. The statistical layer
+on top is now attested on the evaluator side; the **counts themselves** were not.
+A mislabelled selection, an off-by-one in the outcome join, or an unresolved
+21-day outcome silently counted as a negative all produce internally consistent,
+plausible, entirely wrong precision on Tile 1 — and every other check in this
+module would still say PASS, because none of them touch the counting.
+
+So the battery drives the PRODUCTION classification path
+(``analysis/end_to_end.py``'s universe-returns admission rule + ``_scanner_lift``
+→ ``_classification_for`` → ``compute_binary_metrics``) over a frozen
+signal/outcome pair whose confusion matrix is derived **on paper**, and compares.
+The frozen pair deliberately contains four rows that must be EXCLUDED — an
+unresolved 21-day outcome, a universe row with no scanner evaluation, a scanner
+evaluation with no universe row, and a row whose eval_date matches on one side
+only — because "counted something it should not have" is the failure this exists
+to catch, and no all-inclusive fixture can catch it.
 
 The literals are reproduced from ``tests/test_closed_form_scenarios.py``'s
 hand-computed layer, which documents the arithmetic for each. They are duplicated
@@ -251,6 +279,216 @@ def _oracle_nav_agreement() -> float:
     return float(np.max(np.abs(prod_nav - ref_nav)) / _INIT_CASH)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Classification-count layer (config-I6975)
+# ════════════════════════════════════════════════════════════════════════════
+
+#: The frozen eval-date grid. Two RESOLVED cohort dates and one date deliberately
+#: inside the canonical horizon window as of ``_FROZEN_ASOF`` — see
+#: ``_assert_frozen_grid_resolves``.
+_FROZEN_D0 = "2024-01-02"
+_FROZEN_D1 = "2024-01-03"
+_FROZEN_D_UNRESOLVED = "2024-02-20"
+_FROZEN_ASOF = "2024-03-01"
+
+#: ``(ticker, eval_date, return_5d, beat_spy_21d, beat_spy_5d)``.
+#: ``beat_spy_5d`` is the exact INVERSE of ``beat_spy_21d`` on every resolved row,
+#: so a wiring bug that graded the 21d block off the 5d column lands on
+#: (2, 2, 3, 2) rather than the expected (2, 2, 2, 3) and FAILs. A fixture where
+#: the two horizons agree could not tell them apart.
+_FROZEN_UNIVERSE: tuple[tuple, ...] = (
+    # ── counted ──────────────────────────────────────────────────────────────
+    ("AAA", _FROZEN_D0, 0.01, 1, 0),    # selected, beat   → TP
+    ("BBB", _FROZEN_D0, 0.02, 1, 0),    # selected, beat   → TP
+    ("CCC", _FROZEN_D0, -0.01, 0, 1),   # selected, missed → FP
+    ("DDD", _FROZEN_D0, 0.03, 1, 0),    # rejected, beat   → FN
+    ("EEE", _FROZEN_D0, -0.02, 0, 1),   # rejected, missed → TN
+    ("FFF", _FROZEN_D0, 0.00, 0, 1),    # rejected, missed → TN
+    ("GGG", _FROZEN_D0, 0.01, 0, 1),    # rejected, missed → TN
+    ("HHH", _FROZEN_D1, -0.03, 0, 1),   # selected, missed → FP
+    ("III", _FROZEN_D1, 0.04, 1, 0),    # rejected, beat   → FN
+    # ── must be EXCLUDED; each one is a distinct miscounting bug ─────────────
+    # 21d outcome has NOT resolved yet. Counting it as "did not beat" would
+    # inflate fp and depress precision on every recent cohort — the exact shape
+    # the config-I6975 gotcha names.
+    ("JJJ", _FROZEN_D_UNRESOLVED, 0.02, None, None),
+    # in universe_returns, never scanner-evaluated: the join is INNER, so this
+    # is not a missed winner. Counting it would inflate fn and the base rate.
+    ("KKK", _FROZEN_D0, 0.01, 1, 0),
+    # return_5d absent → rejected by the producer's own admission rule before
+    # any classification happens. Counting it would inflate tp.
+    ("MMM", _FROZEN_D0, None, 1, 0),
+    # scanner-evaluated on a DIFFERENT date. A join on ticker alone (or an
+    # off-by-one on eval_date) pairs this row with the wrong cohort → tp 3.
+    ("NNN", _FROZEN_D0, 0.05, 1, 0),
+)
+
+#: ``(ticker, eval_date, quant_filter_pass)``.
+_FROZEN_SCANNER: tuple[tuple, ...] = (
+    ("AAA", _FROZEN_D0, 1), ("BBB", _FROZEN_D0, 1), ("CCC", _FROZEN_D0, 1),
+    ("DDD", _FROZEN_D0, 0), ("EEE", _FROZEN_D0, 0), ("FFF", _FROZEN_D0, 0),
+    ("GGG", _FROZEN_D0, 0),
+    ("HHH", _FROZEN_D1, 1), ("III", _FROZEN_D1, 0),
+    ("JJJ", _FROZEN_D_UNRESOLVED, 1),
+    ("MMM", _FROZEN_D0, 1),
+    ("NNN", _FROZEN_D1, 1),   # date mismatch vs NNN's universe row at D0
+    ("LLL", _FROZEN_D0, 1),   # scanner-only ticker: no universe row to join to
+)
+
+#: Hand-derived from the table above, by reading it — NOT by running the
+#: producer. An expectation produced by running the same code would agree with
+#: any counting behaviour the code ever adopts, which is the defect this closes.
+#:
+#:   admitted    = 13 universe rows − MMM (no return_5d)                  = 12
+#:   inner join  = 12 − KKK (no scanner row) − NNN (date mismatch)        = 10
+#:   resolved    = 10 − JJJ (beat_spy_21d NULL)                           =  9
+#:   selected    = AAA BBB CCC HHH                    (JJJ excluded above)
+#:   positive    = AAA BBB DDD III
+_EXPECTED_COUNTS: dict[str, int] = {"tp": 2, "fp": 2, "fn": 2, "tn": 3}
+
+
+def _assert_frozen_grid_resolves() -> str:
+    """Bind the frozen grid to ``DEFAULT_POLICY`` and RAISE if it stops holding.
+
+    Two things must be true for the fixture to certify anything, and both are
+    properties of the fleet horizon policy rather than of this file:
+
+    1. the outcome column the producer classifies on is the one the fixture
+       populates (a policy rename must not leave us attesting a dead column);
+    2. the resolved eval dates really are ≥ ``primary_horizon`` trading days
+       before the frozen as-of date, and the unresolved one really is inside the
+       window. If a policy change to the primary horizon broke that, every row
+       would fall into one bucket and the check would certify nothing while
+       still reporting PASS.
+
+    Raising here surfaces as an ERRORED check → verdict ``UNKNOWN``. Absence of
+    evidence, never a pass.
+    """
+    import pandas as pd
+
+    from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
+    horizon = int(DEFAULT_POLICY.primary_horizon)
+    beat_col = DEFAULT_POLICY.outcome_columns(horizon).beat_spy
+    if beat_col != "beat_spy_21d":
+        raise ValueError(
+            f"horizon policy primary outcome column is {beat_col!r}, but the frozen "
+            "classification fixture populates 'beat_spy_21d' — re-derive the fixture "
+            "against the new policy rather than attesting a column nobody reads."
+        )
+
+    def _elapsed(start: str) -> int:
+        # Trading-day distance, exclusive of the start date.
+        return max(0, len(pd.bdate_range(start, _FROZEN_ASOF)) - 1)
+
+    for resolved in (_FROZEN_D0, _FROZEN_D1):
+        if _elapsed(resolved) < horizon:
+            raise ValueError(
+                f"frozen grid: {resolved} is only {_elapsed(resolved)} trading days "
+                f"before {_FROZEN_ASOF}, inside the {horizon}d horizon — the rows it "
+                "carries could not have resolved, so the fixture certifies nothing."
+            )
+    if _elapsed(_FROZEN_D_UNRESOLVED) >= horizon:
+        raise ValueError(
+            f"frozen grid: {_FROZEN_D_UNRESOLVED} is {_elapsed(_FROZEN_D_UNRESOLVED)} "
+            f"trading days before {_FROZEN_ASOF}, OUTSIDE the {horizon}d horizon — the "
+            "unresolved-outcome case is no longer exercised."
+        )
+    return beat_col
+
+
+def _frozen_research_db():
+    """An in-memory research.db carrying only the two tables the path reads.
+
+    In-memory on purpose: the attestation runs inside the live backtest process
+    and must touch neither the network nor the filesystem.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE universe_returns ("
+        "ticker TEXT, eval_date TEXT, return_5d REAL, "
+        "beat_spy_21d INTEGER, beat_spy_5d INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO universe_returns VALUES (?, ?, ?, ?, ?)", _FROZEN_UNIVERSE,
+    )
+    conn.execute(
+        "CREATE TABLE scanner_evaluations ("
+        "ticker TEXT, eval_date TEXT, quant_filter_pass INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO scanner_evaluations VALUES (?, ?, ?)", _FROZEN_SCANNER,
+    )
+    conn.commit()
+    return conn
+
+
+_OBSERVED_COUNTS_CACHE: dict | None = None
+
+
+def _observed_counts() -> dict:
+    """Drive the production classification path over the frozen pair.
+
+    Cached for the life of the process so the four count scenarios pay for one
+    run, not four. The input is frozen and the path is pure, so the cache cannot
+    mask a change: a redeploy is a new process.
+    """
+    global _OBSERVED_COUNTS_CACHE
+    if _OBSERVED_COUNTS_CACHE is not None:
+        return _OBSERVED_COUNTS_CACHE
+
+    from analysis.end_to_end import _scanner_lift, load_universe_returns_frame
+
+    _assert_frozen_grid_resolves()
+    conn = _frozen_research_db()
+    try:
+        ur = load_universe_returns_frame(conn)
+        block = _scanner_lift(conn, ur, "", [])
+    finally:
+        conn.close()
+
+    clf = block.get("classification_21d")
+    if not clf:
+        raise ValueError(
+            "the production path emitted no classification_21d block for the frozen "
+            f"pair (scanner_lift status={block.get('status')!r}) — the counts the "
+            "Report Card's precision is built from were not produced at all."
+        )
+    _OBSERVED_COUNTS_CACHE = clf
+    return clf
+
+
+def _count_scenarios() -> list[Scenario]:
+    """One scenario per confusion-matrix cell.
+
+    Four scenarios rather than one composite check, deliberately: the emitted
+    artifact's ``expected``/``observed`` fields are scalars (see
+    ``contracts/backtest_attestation.schema.json``), and splitting keeps each
+    divergence diagnosable from the artifact alone — "fn 2 → 3" names the bug,
+    "counts disagreed" does not. They share the ``classification_counts_``
+    prefix so they read as one family on the tile and in the Director digest,
+    and they flow through the existing verdict/propagation with no new wiring.
+    """
+    return [
+        Scenario(
+            name=f"classification_counts_{cell}",
+            description=(
+                f"scanner_lift.classification_21d.{cell} over the frozen "
+                f"signal/outcome pair (hand-derived {expected})"
+            ),
+            expected=float(expected),
+            # Bind `cell` per iteration — a late-bound closure would make all
+            # four scenarios read the same key and three of them vacuous.
+            compute=(lambda c=cell: float(_observed_counts()[c])),
+            rtol=0.0,
+            atol=0.0,   # integer counts: exact agreement or nothing
+        )
+        for cell, expected in _EXPECTED_COUNTS.items()
+    ]
+
+
 def _SCENARIOS() -> list[Scenario]:
     """The battery. A callable (not a module constant) so a test can substitute
     it, and so no engine import happens at import time of this module."""
@@ -286,6 +524,8 @@ def _SCENARIOS() -> list[Scenario]:
             compute=_oracle_nav_agreement,
             atol=1e-9,
         ),
+        # config-I6975 — the counting layer, one level above the arithmetic.
+        *_count_scenarios(),
     ]
 
 

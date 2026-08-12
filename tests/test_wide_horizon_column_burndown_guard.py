@@ -76,6 +76,16 @@ _UNIVERSE_RETURNS_EXEMPT = frozenset({
     # its universe_returns column names now resolve from HorizonPolicy
     # (OutcomeColumns attribute access), so no wide-column literal remains.
     "analysis/end_to_end.py",              # universe_returns joins + locally-computed alpha
+    # config-I6975 — the runtime classification-count attestation builds a FROZEN
+    # in-memory `universe_returns` table and drives `analysis/end_to_end.py`'s own
+    # classification path over it. The fixture's columns must be exactly the ones
+    # that (exempt) producer reads, so deriving them from HorizonPolicy would make
+    # the fixture disagree with the producer the moment the policy moved and the
+    # producer had not been migrated — precisely the divergence this attestation
+    # exists to catch. Instead `_assert_frozen_grid_resolves()` RAISES (→ verdict
+    # UNKNOWN) when the policy and the fixture stop agreeing, which is the honest
+    # version of what a burn-down would have enforced silently.
+    "analysis/attestation.py",             # frozen universe_returns fixture (config-I6975)
     "reporter.py",                         # renders universe_returns-sourced artifact keys
     "evaluate.py",                         # reads u.log_return_21d FROM universe_returns
 })
