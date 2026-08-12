@@ -545,16 +545,30 @@ def _engine_versions() -> dict:
     return versions
 
 
-def run_attestation(run_date: str | None = None) -> dict:
-    """Run the known-answer battery on the deployed engine and return the verdict.
+def run_attestation(
+    run_date: str | None = None,
+    *,
+    scenario_provider: "Callable[[], list[Scenario]] | None" = None,
+    component: str = "backtester",
+    schema: str = SCHEMA,
+) -> dict:
+    """Run a known-answer battery on the deployed engine and return the verdict.
 
     Never raises — see the module docstring's CONTRACT section. Returns a dict
-    conforming to ``SCHEMA``.
+    conforming to ``schema``.
+
+    ``scenario_provider`` / ``component`` / ``schema`` exist so a second stage in
+    this repo can emit its own §2.3a verdict through **this** machinery rather
+    than growing a parallel one: the outcome taxonomy (disagreed ⇒ FAIL, could
+    not run ⇒ UNKNOWN) is the part that must not be reimplemented per stage —
+    that is exactly where "could not measure" gets collapsed into "found a
+    defect". Defaults reproduce the backtester battery byte-for-byte.
     """
     started = time.monotonic()
     checks: list[dict] = []
+    provider = scenario_provider or _SCENARIOS
     try:
-        scenarios = _SCENARIOS()
+        scenarios = provider()
     except Exception as exc:  # noqa: BLE001 — see CONTRACT: this becomes UNKNOWN
         logger.error(
             "attestation: battery could not be constructed (%s: %s) — verdict UNKNOWN. "
@@ -562,7 +576,8 @@ def run_attestation(run_date: str | None = None) -> dict:
             type(exc).__name__, exc, exc_info=True,
         )
         return {
-            "schema": SCHEMA,
+            "schema": schema,
+            "component": component,
             "run_date": run_date,
             "status": "error",
             "verdict": UNKNOWN,
@@ -621,7 +636,8 @@ def run_attestation(run_date: str | None = None) -> dict:
     else:
         verdict = PASS
     result = {
-        "schema": SCHEMA,
+        "schema": schema,
+        "component": component,
         "run_date": run_date,
         "status": "ok",
         "verdict": verdict,
@@ -652,3 +668,121 @@ def run_attestation(run_date: str | None = None) -> dict:
             n_failed, len(checks),
         )
     return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fail-closed consumer
+# ════════════════════════════════════════════════════════════════════════════
+
+def attestation_key(run_date: str) -> str:
+    """S3 key of the backtest engine's verdict for ``run_date``."""
+    return f"backtest/{run_date}/attestation.json"
+
+
+def read_attestation(
+    bucket: str,
+    run_date: str,
+    key: str | None = None,
+    s3_client=None,
+) -> dict:
+    """Read a §2.3a verdict artifact, resolving EVERY failure path to UNKNOWN.
+
+    Returns ``{"verdict": PASS|FAIL|UNKNOWN, "reason": str, "as_of": str|None,
+    "key": str, "body": dict|None}``.
+
+    The whole point of this function is that there is no code path through it on
+    which an absent, unreadable, mis-stamped or unrecognised verdict comes back
+    as a pass. In particular:
+
+    * **absent object** → UNKNOWN. "Older artifact, proceed" is the precise
+      blindness §2.3a exists to remove, so absence is a first-class not-verified
+      state, never a skip.
+    * **unparseable body** → UNKNOWN.
+    * **body stamped with a different ``run_date``** → UNKNOWN. A verdict from
+      another cycle is never inherited (§2.3a rule 1) — last week's PASS says
+      nothing about this week's numbers, and S3 will happily serve it.
+    * **any verdict string other than the literal ``"PASS"``** → passed through
+      if it is a recognised state, UNKNOWN otherwise. A producer that starts
+      writing ``"ok"`` degrades loudly instead of silently granting the
+      guarantee.
+
+    Never raises: a consumer that crashes reading the verdict would take down the
+    stage the verdict was meant to merely *qualify*. The swallowed failure mode is
+    "the verdict could not be read"; the primary deliverable (the evaluation) is
+    untouched; the recording surface is the returned ``reason`` — which is
+    written into this stage's own emitted artifact — plus an ERROR log line.
+    """
+    resolved_key = key or attestation_key(run_date)
+    out = {"verdict": UNKNOWN, "reason": "", "as_of": None,
+           "key": resolved_key, "body": None}
+    try:
+        import json
+
+        import boto3
+
+        client = s3_client or boto3.client("s3")
+        obj = client.get_object(Bucket=bucket, Key=resolved_key)
+        raw = obj["Body"].read()
+        last_modified = obj.get("LastModified")
+        out["as_of"] = (
+            last_modified.strftime("%Y-%m-%dT%H:%M:%SZ")
+            if last_modified is not None else None
+        )
+        body = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001 — see docstring: every path is UNKNOWN
+        out["reason"] = (
+            f"could not read s3://{bucket}/{resolved_key} "
+            f"({type(exc).__name__}: {str(exc)[:200]})"
+        )
+        logger.error(
+            "attestation consumer: %s — verdict UNKNOWN, correctness guarantee WITHHELD.",
+            out["reason"],
+        )
+        return out
+
+    if not isinstance(body, dict):
+        out["reason"] = f"{resolved_key} is not a JSON object"
+        logger.error("attestation consumer: %s — verdict UNKNOWN.", out["reason"])
+        return out
+
+    out["body"] = body
+    stamped = body.get("run_date")
+    if stamped != run_date:
+        out["reason"] = (
+            f"{resolved_key} is stamped run_date={stamped!r}, expected {run_date!r} — "
+            "a verdict from another cycle is never inherited"
+        )
+        logger.error("attestation consumer: %s — verdict UNKNOWN.", out["reason"])
+        return out
+
+    raw_verdict = body.get("verdict")
+    if raw_verdict not in (PASS, FAIL, UNKNOWN):
+        out["reason"] = (
+            f"{resolved_key} carries unrecognised verdict {raw_verdict!r} — "
+            f"only the literal {PASS!r} is a pass"
+        )
+        logger.error("attestation consumer: %s — verdict UNKNOWN.", out["reason"])
+        return out
+
+    out["verdict"] = raw_verdict
+    out["reason"] = (
+        "verdict read" if raw_verdict == PASS
+        else f"producer reported {raw_verdict}"
+    )
+    return out
+
+
+def worst(*verdicts: str | None) -> str:
+    """Combine verdicts: any FAIL ⇒ FAIL, else any non-PASS ⇒ UNKNOWN, else PASS.
+
+    ``None`` and unrecognised values are non-PASS, so a combine can never be
+    talked into a pass by an absent input.
+    """
+    values = list(verdicts)
+    if not values:
+        return UNKNOWN
+    if any(v == FAIL for v in values):
+        return FAIL
+    if all(v == PASS for v in values):
+        return PASS
+    return UNKNOWN
