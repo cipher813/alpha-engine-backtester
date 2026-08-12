@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible-backtester/contracts/backtest_attestation.schema.json",
+  "title": "backtest runtime numeric attestation (v1)",
+  "description": "Versioned cross-repo contract for s3://{research-bucket}/backtest/{run_date}/attestation.json — the backtester's RUNTIME correctness verdict per sf-pipeline-policy.md §2.3a. Written by crucible-backtester analysis/attestation.py::run_attestation, persisted unconditionally (ALWAYS-EMIT) by reporter.py::save so that ABSENCE of the object unambiguously means 'the producer never ran' rather than 'ran, nothing to say'. Consumed by crucible-evaluator grading/attestation.py::read_backtester_attestation, which surfaces it as the Backtester tile's `numeric_attestation` CRITICAL component and as report_card['attestation'].backtester. The verdict answers a question no data artifact answers: not 'did the backtest run' but 'is the arithmetic that produced its numbers still right on the wheels this spot instance actually resolved'. Additive-only evolution: new optional fields may be added under the same major version; renames/removals/type changes require a major `schema` bump coordinated with the evaluator consumer.",
+  "type": "object",
+  "required": ["schema", "run_date", "status", "verdict"],
+  "properties": {
+    "schema": { "const": "backtest_attestation-1.0.0" },
+    "run_date": {
+      "type": ["string", "null"],
+      "description": "The SF-stamped weekly run_date (NYSE trading day) — the same date key every backtest/{date}/ artifact of the run shares. The consumer REJECTS a body whose run_date does not match the cycle it is grading and emits UNKNOWN: §2.3a rule 1, a verdict from another cycle says nothing about this cycle's numbers and is never inherited."
+    },
+    "status": {
+      "enum": ["ok", "error"],
+      "description": "'ok' iff the battery was constructed and every check was attempted. 'error' means the battery itself could not be built (import failure, engine unavailable) — always paired with verdict=UNKNOWN."
+    },
+    "verdict": {
+      "enum": ["PASS", "FAIL", "UNKNOWN"],
+      "description": "PASS iff every known-answer check agreed with its hand-derived expectation. FAIL iff at least one check DISAGREED — evidence the arithmetic moved; this cycle's backtest numbers, and any executor config the optimizer derived from them, are not trustworthy. UNKNOWN iff no check disagreed but at least one could not RUN (absence of evidence). Consumers must test equality against 'PASS' — never truthiness — so an unrecognised future value degrades to UNKNOWN rather than reading as a pass (§2.3a rule 2)."
+    },
+    "n_checks": { "type": "integer", "minimum": 0 },
+    "n_failed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Checks that ran and DISAGREED. Drives FAIL."
+    },
+    "n_errored": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Checks that could not run. Drives UNKNOWN when n_failed is 0. Kept separate from n_failed so an environment problem is never reported as a correctness regression."
+    },
+    "checks": {
+      "type": "array",
+      "description": "Per-check record. Carries BOTH the expected and observed number so a divergence is diagnosable from the artifact alone, without rerunning anything.",
+      "items": {
+        "type": "object",
+        "required": ["name", "passed"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "expected": { "type": ["number", "null"] },
+          "observed": { "type": ["number", "null"] },
+          "abs_error": { "type": ["number", "null"] },
+          "rtol": { "type": "number" },
+          "atol": { "type": "number" },
+          "passed": { "type": "boolean" },
+          "errored": { "type": "boolean" },
+          "error_class": { "type": "string" },
+          "error_msg": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "engine": {
+      "type": "object",
+      "description": "The build that was attested. A verdict that does not identify the engine cannot explain a later divergence — this is the field that turns 'the numbers moved' into 'the numbers moved when vectorbt went 0.28.5 → 0.28.9'.",
+      "properties": {
+        "python": { "type": "string" },
+        "vectorbt": { "type": "string" },
+        "numpy": { "type": "string" },
+        "pandas": { "type": "string" },
+        "numba": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "error_class": { "type": "string" },
+    "error_msg": { "type": "string" },
+    "wall_clock_seconds": { "type": ["number", "null"] }
+  },
+  "additionalProperties": true
+}
