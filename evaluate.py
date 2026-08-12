@@ -1922,6 +1922,39 @@ def _main_impl() -> None:
         mode="evaluate",
     ).run()
 
+    # ── Correctness verdict + promotion gate (sf-pipeline-policy.md §2.3a) ──
+    # This stage promotes config/executor_params.json and
+    # config/producer_champion.json — the two artifacts the live executor reads.
+    # It may only do so on numbers something asserted are trustworthy:
+    #   (a) its OWN ranking metrics (IC / hit rate / calibration), attested here
+    #       against hand-derived answers on the wheels this box actually resolved;
+    #   (b) the simulation ENGINE's verdict at backtest/{date}/attestation.json,
+    #       which this stage consumes for the first time here — before, it graded
+    #       and promoted off those numbers without ever reading the check that
+    #       says they are sound (the §2.3a rule-1 test, failing).
+    # Absent, unreadable, stale-dated or FAIL all resolve to a non-PASS combined
+    # verdict, which forces --freeze: every diagnostic still runs and every
+    # artifact still lands, but nothing is promoted. §2.3a — withholding the
+    # guarantee is not the same as failing the pipeline, and absence is never a
+    # pass.
+    from analysis import evaluator_attestation as _attest
+    _attest_bucket = config.get("signals_bucket", "alpha-engine-research")
+    _attestation = _attest.build_stage_attestation(_attest_bucket, args.date)
+    _withheld = _attest.apply_promotion_gate(_attestation, args)
+    logger.info(
+        "Correctness verdict: %s (own=%s, upstream=%s) — promotion %s",
+        _attestation["verdict"],
+        _attestation["own"]["verdict"],
+        _attestation["upstream"]["verdict"],
+        "WITHHELD" if _withheld else "permitted",
+    )
+    if bool(getattr(args, "upload", False)):
+        # Unconditional on an uploading run — including (especially) when the
+        # verdict is UNKNOWN. A cycle that emitted no verdict artifact is
+        # indistinguishable from one that was never graded, which is the exact
+        # blindness this closes.
+        _attest.write_attestation(_attest_bucket, args.date, _attestation)
+
     # config#3121: --smoke exits here, BEFORE _init_data_sources (which
     # would raise if a real backtest/{date}/ prefix has no critical
     # artifacts — not a condition a smoke run should depend on) and before

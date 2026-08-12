@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible-backtester/contracts/evaluator_attestation.schema.json",
+  "title": "evaluator_attestation correctness verdict (v1)",
+  "description": "Cross-repo contract for s3://alpha-engine-research/backtest/{run_date}/evaluator_attestation.json — the sf-pipeline-policy.md §2.3a correctness verdict of the Evaluator stage (SF states EvaluatorDiagnostics + EvaluatorOptimize, crucible-backtester evaluate.py). Produced by crucible-backtester analysis/evaluator_attestation.py::build_stage_attestation on every uploading run; consumed by crucible-evaluator grading/attestation.py, which folds it into report_card['attestation'] and the Backtester/Research tiles. The verdict is the WORST of this stage's own ranking-metric battery (IC / hit rate / calibration, known-answer, run through the production functions on the wheels the spot box resolved) and the simulation engine's verdict at backtest/{run_date}/attestation.json. ABSENCE OF THIS OBJECT IS NOT A PASS: a consumer that cannot read it must resolve to UNKNOWN and withhold the correctness guarantee — that is the whole point of the artifact, and reading a missing verdict as 'older artifact, proceed' reproduces exactly the blindness §2.3a exists to remove. A body stamped with a run_date other than the one requested is likewise UNKNOWN — a verdict from another cycle is never inherited. Additive-only evolution: new fields and new check names may be added; existing fields are never renamed or removed without a schema bump coordinated with the crucible-evaluator consumer.",
+  "type": "object",
+  "required": ["schema", "component", "run_date", "verdict", "promotion_withheld", "own", "upstream"],
+  "properties": {
+    "schema": {
+      "const": "evaluator_attestation-1.0.0",
+      "description": "Frozen schema identifier. A consumer that does not recognise this string must resolve to UNKNOWN rather than best-effort parsing an artifact whose meaning it cannot establish."
+    },
+    "component": {
+      "const": "evaluator",
+      "description": "The stage this verdict is about. Distinguishes this artifact from the sibling backtest/{run_date}/attestation.json, whose component is 'backtester'."
+    },
+    "run_date": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "The NYSE trading day this cycle graded, matching the prefix the object is written under. A consumer MUST compare this against the run_date it asked for and resolve to UNKNOWN on a mismatch."
+    },
+    "verdict": {
+      "enum": ["PASS", "FAIL", "UNKNOWN"],
+      "description": "The combined §2.3a verdict: worst of `own.verdict` and `upstream.verdict`. Any FAIL wins; otherwise any non-PASS yields UNKNOWN; only both PASS yields PASS. FAIL means a known-answer check DISAGREED with its hand-derived expectation — evidence the numbers are wrong. UNKNOWN means a check, or the upstream read, could not RUN — absence of evidence. Both withhold the guarantee, but only FAIL accuses the arithmetic; collapsing them would make a broken venv read as a correctness regression. ONLY the literal 'PASS' grants the guarantee."
+    },
+    "promotion_withheld": {
+      "type": "boolean",
+      "description": "True whenever `verdict` is not PASS. When true the Evaluator stage ran under a forced --freeze: every diagnostic and artifact still landed, but config/executor_params.json, the other auto-apply configs and config/producer_champion.json were NOT promoted. This is the fail-closed action, recorded so a week with no promotion is distinguishable from a week with nothing to promote."
+    },
+    "own": {
+      "type": "object",
+      "description": "This stage's own known-answer battery over the ranking metrics it grades on: Spearman information coefficient, hit-rate/accuracy including the unresolved-outcome exclusion, and ECE/Brier calibration. Each check drives the production function and compares against a value derived from the metric's definition on paper.",
+      "required": ["schema", "component", "verdict", "checks", "n_checks", "n_failed"],
+      "properties": {
+        "schema": { "const": "evaluator_attestation-1.0.0" },
+        "component": { "const": "evaluator" },
+        "status": { "enum": ["ok", "error"] },
+        "verdict": { "enum": ["PASS", "FAIL", "UNKNOWN"] },
+        "n_checks": { "type": "integer", "minimum": 0 },
+        "n_failed": { "type": "integer", "minimum": 0 },
+        "n_errored": { "type": "integer", "minimum": 0 },
+        "engine": {
+          "type": "object",
+          "description": "Versions of the interpreter and numeric stack that were attested. A verdict that does not identify the build it graded cannot explain a later divergence."
+        },
+        "wall_clock_seconds": { "type": "number" },
+        "error_class": { "type": "string" },
+        "error_msg": { "type": "string" },
+        "checks": {
+          "type": "array",
+          "description": "One record per known-answer check. `expected` and `observed` are both carried — rather than a bare boolean — so a divergence is diagnosable from the artifact alone, without rerunning anything.",
+          "items": {
+            "type": "object",
+            "required": ["name", "description", "expected", "observed", "passed"],
+            "properties": {
+              "name": { "type": "string" },
+              "description": { "type": "string" },
+              "expected": { "type": ["number", "null"] },
+              "observed": { "type": ["number", "null"] },
+              "abs_error": { "type": ["number", "null"] },
+              "rtol": { "type": "number" },
+              "atol": { "type": "number" },
+              "passed": { "type": "boolean" },
+              "errored": { "type": "boolean" },
+              "error_class": { "type": "string" },
+              "error_msg": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "upstream": {
+      "type": "object",
+      "description": "The simulation engine's verdict as this stage read it. Present with verdict=UNKNOWN and a populated `reason` when the object was absent, unreadable, stamped with another run_date, or carried an unrecognised verdict string.",
+      "required": ["component", "verdict", "reason", "key"],
+      "properties": {
+        "component": { "const": "backtester" },
+        "verdict": { "enum": ["PASS", "FAIL", "UNKNOWN"] },
+        "reason": {
+          "type": "string",
+          "description": "Why the verdict is what it is. On UNKNOWN this names which failure path was taken — absent object, unparseable body, run_date mismatch, unrecognised verdict string — so 'could not measure' is never confused with 'found a defect'."
+        },
+        "as_of": {
+          "type": ["string", "null"],
+          "description": "S3 LastModified of the upstream verdict object, UTC ISO-8601. Null when the object could not be read. Surfaces on the console beside the state so a stale verdict reads stale rather than green."
+        },
+        "key": { "type": "string" }
+      }
+    }
+  }
+}

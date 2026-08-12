@@ -185,6 +185,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "replay/counterfactual.py": 2,
     "replay/runner.py": 2,
     "reporter.py": 1,
+    # alpha-engine-config-I7039: the Evaluator stage's §2.3a correctness verdict
+    # at backtest/{date}/evaluator_attestation.json — one put_object in
+    # `write_attestation`. Registered in ARTIFACT_REGISTRY.yaml with a real
+    # freshness SLA (cadence eod_sf, severity critical), NOT grandfathered: its
+    # absence is exactly the condition the verdict exists to make visible, and a
+    # missing verdict is never a benign gap. Sibling of the engine's
+    # backtest/{date}/attestation.json row (config-I6973).
+    "analysis/evaluator_attestation.py": 1,
 }
 
 
