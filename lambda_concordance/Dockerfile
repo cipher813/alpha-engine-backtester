@@ -33,7 +33,7 @@ RUN microdnf install -y git && microdnf clean all
 # earliest tag carrying krepis.llm's OpenRouter unresolved/leaked-tool-call
 # safety fix.
 COPY lambda_concordance/requirements-concordance.txt requirements-concordance.txt
-RUN pip install --no-cache-dir "nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.5" "krepis[openai]>=0.12.2" && \
+RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.5" "krepis[openai]>=0.12.2" && \
     pip install --no-cache-dir -r requirements-concordance.txt && \
     rm -rf /root/.cache/pip
 

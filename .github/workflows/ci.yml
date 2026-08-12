@@ -169,3 +169,25 @@ jobs:
           name: mutmut-cache
           path: .mutmut-cache
           retention-days: 14
+
+  # Rejects any dependency extra written with an underscore. pip <23.3 does not
+  # normalise `_` to `-` in a REQUESTED extra while setuptools always normalises
+  # the DECLARED one, so `pkg[flow_doctor]` matches nothing against
+  # `Provides-Extra: flow-doctor` — and pip reports that as a WARNING on a
+  # SUCCESSFUL exit. Measured 2026-08-12: pip 23.2.1 resolves 18 packages with
+  # flow-doctor absent, 23.3.2/24.0/25.0 resolve 30 with it present. Amazon
+  # Linux 2023 ships pip 23.2.1, which is how it reached production
+  # (alpha-engine-config-I6963).
+  #
+  # This is a STATIC check on purpose. Every resolve job in this fleet upgrades
+  # pip before resolving, so CI runs on a pip that normalises correctly and can
+  # never reproduce the production resolver. A green resolve is not evidence.
+  lint-extras:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: "3.12"
+      - name: Lint dependency extras (no underscores)
+        run: python3 scripts/lint_extras.py .
