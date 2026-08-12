@@ -22,6 +22,7 @@ from botocore.exceptions import ClientError
 
 from nousergon_lib.quant.horizons import DEFAULT_POLICY
 
+from analysis.attestation import run_attestation as _run_attestation
 from analysis.lookahead_disclosure import build_disclosure as _build_lookahead
 from analysis.lookahead_disclosure import render_section as _render_lookahead
 from analysis.outcome_store import primary_beat_counts
@@ -1699,6 +1700,13 @@ def save(
     # data gap from a missing diagnostic — both read as absence.
     # See feedback_observational_stages_always_emit_artifact and the
     # artifact-completion monitoring design (alpha-engine-config private-docs).
+    #
+    # Runtime numeric attestation (sf-pipeline-policy §2.3a). Runs the
+    # known-answer battery through the production simulation path IN THIS
+    # PROCESS — so the verdict describes the engine that produced this cycle's
+    # numbers, not the one CI resolved. Sub-second; `run_attestation` never
+    # raises (a failure resolves to verdict=UNKNOWN with the cause recorded).
+    attestation = _run_attestation(run_date=run_date)
     for filename, data in [
         ("decision_capture_coverage.json", decision_capture_coverage),
         ("executor_decision_capture_coverage.json", executor_decision_capture_coverage),
@@ -1789,6 +1797,15 @@ def save(
         # Absence now unambiguously means "producer never ran" (an infra
         # failure) rather than "ran, no data" — same rationale as the
         # freshness-monitored artifacts above.
+        # RUNTIME numeric correctness verdict (sf-pipeline-policy §2.3a). Computed
+        # HERE rather than accepted as a kwarg: a verdict a caller can forget to
+        # pass is a verdict that silently degrades to UNKNOWN forever, and the
+        # whole point is that it is produced in the same process, on the same
+        # wheels, that produced this cycle's numbers. Always-emit, like every
+        # freshness-monitored artifact above — absence must unambiguously mean
+        # "the producer never ran", and the evaluator's Backtester tile grades
+        # a missing artifact as N/A (never GREEN), never as a pass.
+        ("attestation.json", attestation),
         ("grading.json", grading),
         ("trigger_scorecard.json", trigger_scorecard),
         ("shadow_book.json", shadow_book),
