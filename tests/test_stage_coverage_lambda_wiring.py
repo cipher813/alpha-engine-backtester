@@ -4,14 +4,16 @@ Counterfactual, the only crucible-backtester stages that are Lambda
 handlers rather than spot launchers (see
 test_stage_coverage_assertion_wiring.py for the shell-launcher coverage).
 
-Both handlers call the ONE shared `nousergon_lib.stage_coverage` module
-landed by a separate nousergon-lib PR. nousergon-lib is pinned by git tag
-in requirements.txt and does NOT carry that module yet — these tests
-verify BOTH sides of that gap: (1) the handler degrades loudly-but-
-harmlessly (ImportError caught, logged, handler outcome unchanged) against
-today's pin, matching this environment's actually-installed nousergon_lib
-(confirmed absent: `python -c "import nousergon_lib.stage_coverage"` fails
-here exactly as it will in CI), and (2) once the module IS importable
+Both handlers call the ONE shared `krepis.stage_coverage` module landed by
+a separate krepis PR. krepis is PyPI-published (this repo's
+`requirements.txt` already floors it at `krepis[openai]>=0.55.0` — a
+future release adding the module needs no pin-bump PR here), and does NOT
+carry that module at any released version yet — these tests verify BOTH
+sides of that gap: (1) the handler degrades loudly-but-harmlessly
+(ImportError caught, logged, handler outcome unchanged) against today's
+installed krepis, matching this environment's actually-installed version
+(confirmed absent: `python -c "import krepis.stage_coverage"` fails here
+exactly as it will in CI), and (2) once the module IS importable
 (simulated via a fake module injected into sys.modules), its verdict lands
 under the `stage_coverage` key in the returned payload.
 """
@@ -84,8 +86,8 @@ def _ok_summary(handler_name: str) -> dict:
     }
 
 
-# ── Real environment: nousergon_lib.stage_coverage is NOT importable ────────
-# (Confirmed absent from the installed nousergon_lib at the current pin —
+# ── Real environment: krepis.stage_coverage is NOT importable ────────
+# (Confirmed absent from the installed krepis at the current pin —
 # this is not a mock, it's this handler's genuine import path.)
 
 
@@ -107,7 +109,7 @@ class TestModuleAbsentDegradesLoudlyNotSilently:
              patch.object(mod.logger, "error") as mock_error:
             mod.handler({}, context=None)
         assert mock_error.called, (
-            f"{name}: ImportError for nousergon_lib.stage_coverage must be "
+            f"{name}: ImportError for krepis.stage_coverage must be "
             f"logged (logger.error), not silently passed"
         )
         logged_msg = mock_error.call_args[0][0]
@@ -126,8 +128,8 @@ class TestModuleAbsentDegradesLoudlyNotSilently:
 
 @pytest.fixture
 def fake_stage_coverage_module():
-    """Inject a fake nousergon_lib.stage_coverage into sys.modules so the
-    handler's `from nousergon_lib.stage_coverage import assert_stage_coverage`
+    """Inject a fake krepis.stage_coverage into sys.modules so the
+    handler's `from krepis.stage_coverage import assert_stage_coverage`
     succeeds — simulating the state after the nousergon-lib pin bump lands
     (a separate wave, per the PR body's merge order). Restores prior state
     on teardown so this fixture cannot leak into other tests."""
@@ -137,21 +139,21 @@ def fake_stage_coverage_module():
         calls.append({"stage": stage, "run_date": run_date, "window_start": window_start})
         return {"stage": stage, "run_date": run_date, "status": "COVERED"}
 
-    fake_mod = types.ModuleType("nousergon_lib.stage_coverage")
+    fake_mod = types.ModuleType("krepis.stage_coverage")
     fake_mod.assert_stage_coverage = _assert_stage_coverage
 
-    had_parent = "nousergon_lib" in sys.modules
-    parent = sys.modules.get("nousergon_lib")
+    had_parent = "krepis" in sys.modules
+    parent = sys.modules.get("krepis")
     had_submodule_attr = had_parent and hasattr(parent, "stage_coverage")
 
     if not had_parent:
-        import nousergon_lib as parent  # noqa: PLC0415 — real import, establishes sys.modules entry
-    sys.modules["nousergon_lib.stage_coverage"] = fake_mod
+        import krepis as parent  # noqa: PLC0415 — real import, establishes sys.modules entry
+    sys.modules["krepis.stage_coverage"] = fake_mod
     setattr(parent, "stage_coverage", fake_mod)
 
     yield calls
 
-    del sys.modules["nousergon_lib.stage_coverage"]
+    del sys.modules["krepis.stage_coverage"]
     if had_submodule_attr:
         pass  # was already there before us (unlikely) — leave as-is
     else:

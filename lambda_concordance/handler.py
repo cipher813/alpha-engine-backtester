@@ -342,7 +342,7 @@ def handler(event: dict, context) -> dict:
     # back to "now" for a bare invocation with no end_time_iso.
     _coverage_run_date = (end_time or _started).date().isoformat()
     try:
-        from nousergon_lib.stage_coverage import assert_stage_coverage
+        from krepis.stage_coverage import assert_stage_coverage
         result["stage_coverage"] = assert_stage_coverage(
             "ReplayConcordance", run_date=_coverage_run_date, window_start=_started,
         )

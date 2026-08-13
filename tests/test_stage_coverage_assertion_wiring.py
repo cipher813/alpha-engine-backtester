@@ -4,7 +4,19 @@ Brian's rescope ruling on I7214: the end-of-run `StageCoverageAssert` SF
 state was NON-SOTA (a new state/Lambda/IAM surface). The assertion belongs
 in each stage's OWN launcher script, asserting its declared output
 immediately before the script exits, via the ONE shared implementation
-landed as `nousergon_lib.stage_coverage` (a separate nousergon-lib PR).
+landed as `krepis.stage_coverage` (a separate krepis PR). krepis, not
+nousergon_lib, is the sanctioned `python -m` entrypoint namespace for
+launcher-side dispatch: on nousergon-lib >=0.81.0, `python -m
+nousergon_lib.<mod>` is a guard-less re-export shim that exits 0 SILENTLY
+under runpy without executing the inner dispatch (nousergon-data#1646/
+#1649 — see nousergon-data/tests/test_spot_data_weekly_ssm_transport.py::
+test_uses_lib_ssm_dispatcher_chokepoint, which pins the same rule for
+spot_data_weekly.sh). Every existing `-m` invocation in this repo's
+launchers already targets krepis (`krepis.ec2_spot`, `krepis.
+ssm_dispatcher`, `krepis.ssm_log_capture`) — zero `nousergon_lib -m`
+precedent exists here. krepis is PyPI-published (not git-tag pinned), so
+this repo's `krepis[openai]>=0.55.0` floor in requirements.txt already
+covers a future release that adds the module — no pin bump needed.
 This repo's launchers only ever CALL that module through the documented
 CLI front door — they never reimplement its stage list or read
 ARTIFACT_REGISTRY.yaml directly (policy-shared-code: no per-repo fork of
@@ -16,10 +28,11 @@ must never fail the stage — the `|| echo ... >&2` fallback (never `|| true`,
 which would make an absent module indistinguishable from a covered stage)
 is asserted structurally.
 
-nousergon-lib is pinned by git tag in requirements.txt and will NOT carry
-`nousergon_lib.stage_coverage` until a separate pin-bump PR lands — these
-are static-analysis guards only; the SSM/EC2 runtime path (like the rest
-of the test_spot_backtest_*.py / test_spot_stage_scripts_*.py suite) is
+krepis.stage_coverage does not exist at any published krepis release yet
+(confirmed absent from the krepis 0.54.0 installed in this environment) —
+these are static-analysis guards only; the SSM/EC2 runtime path (like the
+rest of the test_spot_backtest_*.py / test_spot_stage_scripts_*.py suite)
+is
 not exercised in CI.
 """
 
@@ -85,7 +98,7 @@ NOT_SF_WIRED = {
     ),
 }
 
-ASSERT_MODULE_INVOCATION = "-m nousergon_lib.stage_coverage assert"
+ASSERT_MODULE_INVOCATION = "-m krepis.stage_coverage assert"
 
 
 def _text(name: str) -> str:
@@ -189,9 +202,10 @@ def test_single_stage_launcher_assertion_is_on_the_success_path(script, stage):
 
 @pytest.mark.parametrize("script", sorted(SF_WIRED_SINGLE_STAGE) + [SF_WIRED_MULTI_STAGE_SCRIPT])
 def test_launcher_assertion_never_bare_true_swallowed(script):
-    """A bare `|| true` would make an absent module (expected until the
-    nousergon-lib pin bump lands) indistinguishable from a genuinely
-    covered stage — the exact silence this mechanism exists to remove.
+    """A bare `|| true` would make an absent module (expected until a
+    krepis release carrying stage_coverage publishes) indistinguishable
+    from a genuinely covered stage — the exact silence this mechanism
+    exists to remove.
     The fallback must be a visible, stage-named WARNING on stderr."""
     text = _text(script)
     assert_idx = text.index(ASSERT_MODULE_INVOCATION)
