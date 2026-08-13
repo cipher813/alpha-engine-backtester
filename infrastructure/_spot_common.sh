@@ -451,51 +451,27 @@ spot_common_install_cleanup_trap() {
                 echo "    spot state-reason-code: $reason_code"
                 echo "    spot state-transition-reason: $state_reason"
             fi
-            # #883 — mid-run spot-reclaim relaunch DECISION, via the lib
-            # chokepoint `python -m krepis.ec2_spot relaunch-decision`. Only a
-            # CONFIRMED reclaim relaunches; a genuine crash/OOM/timeout
-            # classifies as other/unknown and fails loud (no blind retry
-            # that could mask a real bug).
+            # See alpha-engine-config-I7009 — migrated off the exit-code contract to --json.
             if [ -n "${INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
-                # `|| _decide_rc=$?` is LOAD-BEARING, not defensive noise.
-                #
-                # These launchers run under `set -e`, and `relaunch-decision`
-                # signals "hold" by EXIT CODE (NO_RELAUNCH_EXIT_CODE = 75).
-                # Hold is the DESIGNED answer for every failure that is not an
-                # AWS spot reclaim — i.e. nearly all of them. An unguarded
-                # `VAR="$(cmd)"` is a simple command whose status IS the
-                # substitution's, so on that ordinary answer errexit fired and
-                # tore the shell down INSIDE the EXIT trap: `_decide_rc=$?` was
-                # unreachable, and so was everything below it — the
-                # `terminate-instances` call, the S3 staging teardown, and the
-                # `exit "$exit_code"` that re-raises the workload's real status.
-                # Because `set -e` does not re-enter a trap it is already
-                # running, the abort emitted NOTHING: the log simply stops after
-                # the diagnostic above.
-                #
-                # Consequence: every non-reclaim failure of every stage leaked
-                # its spot instance, which then ran on until its own systemd
-                # watchdog stopped it, and the launcher exited 75 instead of the
-                # workload's status. Confirmed in crucible-predictor on
-                # ne-weekly-freshness-pipeline/watch-rerun-2026-08-10-9
-                # (2026-08-11): CloudTrail records no TerminateInstances for
-                # i-092854cbb6e62b753 in the window while three unrelated
-                # instances were terminated normally. Fixed there in
-                # crucible-predictor-PR467; this is the same defect in this
-                # repo's copy, reached by all ten per-stage launchers that
-                # source this file.
-                local _decide_out="" _decide_rc=0
-                _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
+                local _decide_json="" _decide_rc=0
+                _decide_json="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
                     --instance-id "$INSTANCE_ID" \
                     --region "$AWS_REGION" \
                     --attempt "$SPOT_ATTEMPT" \
                     --max-attempts "$MAX_SPOT_ATTEMPTS" \
                     ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
+                    --json \
                     2>/dev/null)" || _decide_rc=$?
-                echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}"
-                if [ "$_decide_rc" -eq 0 ]; then
-                    _will_relaunch=1
-                    _alert_sev="warning"
+                if [ "$_decide_rc" -ne 0 ]; then
+                    echo "    spot relaunch-decision: CLI failed to answer (rc=$_decide_rc) — treating as hold" >&2
+                else
+                    local _relaunch=""
+                    _relaunch="$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; print("1" if json.load(sys.stdin).get("relaunch") else "0")')"
+                    echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): $_decide_json"
+                    if [ "$_relaunch" = "1" ]; then
+                        _will_relaunch=1
+                        _alert_sev="warning"
+                    fi
                 fi
             fi
             # Independent-channel surveillance (SNS + flow-doctor forum
