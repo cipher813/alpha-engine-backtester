@@ -226,6 +226,38 @@ spot_common_compute_phase_flags() {
 # tensor does not make a stage cheap, and every launcher that reads the full
 # universe needs this whether or not `predictor_pipeline` appears anywhere in
 # it. The name now says the condition an author must actually check.
+#
+# ── THIS FLOOR IS A GUESS, AND HERE IS WHAT WILL REPLACE IT ──────────────────
+#
+# `floor_types` below is NOT derived from any measurement. It is the value at
+# which the OOM kills stopped, reached by raising the previous cap — and a cap
+# derived from another cap is not a budget. That was unavoidable: an OOM-killed
+# process reports no peak RSS, so only a SURVIVING run can state the real
+# requirement, and until 2026-08-13 no stage recorded it on success either.
+#
+# It is now recorded. `krepis.rss_budget`, applied at the
+# `krepis.ssm_dispatcher` chokepoint every stage in this repo runs its remote
+# work through (krepis-PR149, alpha-engine-config-I7260), measures the peak
+# resident set of each stage's whole process subtree on every SUCCESSFUL run and
+# publishes headroom to `ops/checks/ae-rss-<stage>/latest.json`, which renders
+# on the console. Read one stage's row with:
+#
+#   aws s3 cp s3://alpha-engine-research/ops/checks/ae-rss-evaluator/latest.json -
+#
+# WHAT REPLACES THIS FLOOR, AND WHEN. Once each stage on the floor has at least
+# 4 readings in its row's `history` (≈4 weekly runs, i.e. from ~2026-09-10),
+# re-derive `floor_types` from the measured peak: pick the smallest instance
+# class whose RAM leaves the declared warn margin above the MAXIMUM observed
+# peak, not the median, and record the derivation and the readings it used in
+# the commit that changes this line. Right-sizing DOWN is real money — this
+# rotation is 16 GB where several stages may need far less — and it is the
+# right-sizing that is currently unjustifiable in either direction.
+#
+# Until then this comment, not the value, is the honest statement of what the
+# floor is: a bound that has stopped the kills, with the measurement that will
+# falsify it now running. Do NOT lower it on intuition; do not raise it either
+# without saying which reading forced the raise. (alpha-engine-config-I7260,
+# which also tracks re-deriving the two headroom thresholds themselves.)
 spot_common_apply_large_universe_ram_floor() {
     local floor_types="m5.xlarge,m6i.xlarge,m5a.xlarge,c5.2xlarge,c6i.2xlarge"
     if [ -z "$INSTANCE_TYPE" ]; then
