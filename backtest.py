@@ -5922,6 +5922,70 @@ def _load_predictor_artifacts(config: dict, run_date: str):
     return predictor_stats, predictor_sweep_df
 
 
+def assert_predictor_backtest_deliverable(
+    predictor_stats: dict | None, run_date: str
+) -> None:
+    """Fail the ``--mode predictor-backtest`` stage when its own critical
+    deliverable is an error record (config-I7259).
+
+    ``classify_simulation_outcome`` guards ``portfolio_stats`` + ``sweep_df``
+    for the simulate/param-sweep/all modes and exempts predictor-backtest,
+    which produces neither — but that left predictor-backtest with NO
+    deliverable guard at all, and its own product is ``predictor_stats.json``.
+
+    On 2026-08-13 (and identically 2026-06-26) ``_run_predictor_pipeline``
+    caught a ``ValueError: cannot convert float NaN to integer``, stored
+    ``{"status": "error", ...}``, and the stage printed *"Predictor-backtest
+    complete"*, exited 0 and terminated its spot instance. Everything
+    downstream then treated a stage that produced nothing as one that had
+    succeeded:
+
+    - the SF marked ``PredictorBacktest`` Success, so
+      ``nousergon-data/scripts/weekly_sf_rerun.py`` recorded it as cleanly
+      completed and emitted ``skip_predictor_backtest`` — every recovery rerun
+      reused the error artifact instead of regenerating it;
+    - pit_parity's walk-forward reuse (config#6032) refused the
+      ``status != ok`` artifact and fell back to re-running the full predictor
+      pipeline, which blew its 2700s per-pass ceiling. That week's
+      contamination verdict came out UNKNOWN as a result.
+
+    Called AFTER ``_export_simulation_artifacts`` so the artifact — now
+    carrying ``error_class`` + ``traceback`` — is still uploaded as evidence.
+    The failure must be loud AND diagnosable, not one or the other.
+
+    The weekly SF has no degraded route for this state, so raising halts the
+    pipeline. That is correct: ``PredictorBacktest`` writes the live entry feed
+    consumed while ``scanner_predictor_direct`` is champion
+    (alpha-engine-config-I7216 — a frozen entry cohort traded silently for days
+    behind exactly this class of invisible stage failure).
+
+    Scope is ``status == "error"`` ONLY. That value is written at exactly one
+    place, ``_run_predictor_pipeline``'s except arm, and means an exception was
+    swallowed. The other non-ok statuses (``no_orders``, low-``coverage``) are
+    degeneracies of a run that COMPLETED — the same shape as the EMPTY-sweep
+    no-op, which is deliberately loud-but-not-fatal. Widening this to
+    ``!= "ok"`` would crash the stage on a legitimate no-admissible-entry week
+    (alpha-engine-config#7252).
+    """
+    status = (predictor_stats or {}).get("status")
+    if status == "error":
+        raise RuntimeError(
+            "predictor-backtest produced no usable predictor_stats: "
+            f"error_class={(predictor_stats or {}).get('error_class')!r} "
+            f"error={(predictor_stats or {}).get('error')!r}. "
+            f"The artifact (backtest/{run_date}/predictor_stats.json) was "
+            "uploaded with its traceback for diagnosis; the stage fails "
+            "because an error record is not a product."
+        )
+    if status not in (None, "ok"):
+        logger.warning(
+            "[outcome] predictor-backtest completed with a degenerate "
+            "status=%r — the artifact is written and the stage passes, but "
+            "pit_parity's walk-forward reuse will refuse it and re-run the "
+            "full pipeline (config#6032).", status,
+        )
+
+
 def classify_simulation_outcome(
     mode: str,
     portfolio_stats: dict | None,
@@ -6739,6 +6803,45 @@ def _main_impl() -> None:
                     )
                 except Exception:  # noqa: BLE001 — alert is best-effort observability
                     pass
+
+        # predictor-backtest is exempt from the guard above because it produces
+        # neither portfolio_stats nor sweep_df — but it was left with NO
+        # deliverable guard at all, and its own critical product is
+        # predictor_stats.json. On 2026-08-13 (and identically on 2026-06-26)
+        # `_run_predictor_pipeline` caught a `ValueError: cannot convert float
+        # NaN to integer`, stored `{"status": "error", ...}`, and the stage
+        # printed "Predictor-backtest complete", exited 0 and terminated its
+        # spot instance. Everything downstream then treated a stage that
+        # produced nothing as a stage that had succeeded:
+        #
+        #   - the SF marked PredictorBacktest Success, so
+        #     `scripts/weekly_sf_rerun.py` recorded it as cleanly completed and
+        #     emitted `skip_predictor_backtest` — every recovery rerun reused
+        #     the error artifact instead of regenerating it;
+        #   - pit_parity's walk-forward reuse (config#6032) refused the
+        #     `status != ok` artifact and fell back to re-running the full
+        #     predictor pipeline, which then blew its 2700s per-pass ceiling.
+        #     The week's contamination verdict was UNKNOWN as a result.
+        #
+        # A producer that writes an error record has not succeeded. Raise AFTER
+        # `_export_simulation_artifacts` so the artifact (now carrying
+        # `error_class` + `traceback`, config-I7259) is still uploaded as
+        # evidence — the failure must be loud AND diagnosable, not one or the
+        # other. There is no degraded route for this state in the weekly SF, so
+        # this halts the pipeline: correct, because PredictorBacktest writes the
+        # live entry feed consumed while `scanner_predictor_direct` is champion
+        # (alpha-engine-config-I7216 — a frozen entry cohort traded silently for
+        # days behind exactly this class of invisible stage failure).
+        # Scope: `status == "error"` ONLY. That value is written at exactly one
+        # place — `_run_predictor_pipeline`'s except arm — and means an
+        # exception was swallowed. The other non-ok statuses
+        # (`no_orders`, low-`coverage`) are degeneracies of a run that
+        # COMPLETED, and are the same shape as the EMPTY-sweep no-op handled
+        # above: loud, tracked (alpha-engine-config#7252), not a stage failure.
+        # Widening this to `!= "ok"` would crash the stage on a legitimate
+        # no-admissible-entry week.
+        if args.mode == "predictor-backtest":
+            assert_predictor_backtest_deliverable(predictor_stats, args.date)
 
     # ── Report, upload, email, and instance stop ──────────────────────────
     # Wrapped in try/finally so --stop-instance ALWAYS runs.
