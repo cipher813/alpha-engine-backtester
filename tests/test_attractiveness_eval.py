@@ -34,6 +34,7 @@ from analysis.attractiveness_eval import (
     MIN_EVAL_DATES_T,
     SCHEMA_VERSION,
     SHRINKAGE_FULL_DATES,
+    _counterfactual,
     _sector_balanced_top_n,
     compute_attractiveness_eval,
     suggest_pillar_weights,
@@ -320,6 +321,25 @@ class TestCounterfactual:
         assert top60["n_cycles"] == len(WEEKLY_DATES)
         assert top60["capture_rate"] > 0.85
         assert top60["mean_alpha"] > lg["mean_alpha"]
+        # config#7213: basket vs population is populated on every variant,
+        # aligned attractiveness → top basket beats the full-universe mean
+        assert top60["population_mean_alpha"] is not None
+        assert top60["excess_vs_population"] > 0
+        # holding_rule is counterfactual-level (one rule for every
+        # N/sector_balanced variant), not duplicated onto each row.
+        assert cf["holding_rule"] == (
+            "weekly rebalance, 21d hold, equal-weight, no intra-period turnover"
+        )
+        assert "holding_rule" not in top60
+        top20_true = variants[(20, True)]
+        top20_false = variants[(20, False)]
+        assert top20_true["n_cycles"] == len(WEEKLY_DATES)
+        assert top20_true["excess_vs_population"] is not None
+        assert top20_true["excess_vs_population"] > 0
+        assert top20_false["n_cycles"] == len(WEEKLY_DATES)
+        assert top20_false["excess_vs_population"] is not None
+        assert isinstance(top20_true["excess_ci95"], list)
+        assert len(top20_true["excess_ci95"]) == 2
         # universe of 100 scored names can't fill a top-120/200 variant —
         # skipped honestly (no truncated pseudo-variant), nulls in the entry
         for n in (120, 200):
@@ -327,6 +347,11 @@ class TestCounterfactual:
                 assert variants[(n, b)]["n_cycles"] == 0
                 assert variants[(n, b)]["capture_rate"] is None
                 assert variants[(n, b)]["mean_alpha"] is None
+                assert variants[(n, b)]["population_mean_alpha"] is None
+                assert variants[(n, b)]["excess_vs_population"] is None
+                assert variants[(n, b)]["excess_t"] is None
+                assert variants[(n, b)]["excess_p"] is None
+                assert variants[(n, b)]["excess_ci95"] is None
 
     def test_sector_balanced_allocation_is_proportional(self):
         g = pd.DataFrame({
@@ -358,6 +383,151 @@ class TestCounterfactual:
         # the composite IC is still measured — counterfactual absence must
         # not blank the rest of the artifact
         assert art["composite_ic"]["date_ic_mean"] is not None
+
+
+# ── Basket vs population (config#7213) ───────────────────────────────────────
+
+
+def _make_conn_with_scanner_evals(tmp_path, records: list[tuple[str, str, int]]):
+    """Minimal research.db with only scanner_evaluations, for direct
+    ``_counterfactual`` calls that don't need the full compute_attractiveness_eval
+    plumbing. ``records``: (ticker, eval_date, quant_filter_pass)."""
+    db = tmp_path / "research.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE scanner_evaluations (ticker TEXT, eval_date TEXT, "
+        "quant_filter_pass INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO scanner_evaluations VALUES (?,?,?)", records
+    )
+    conn.commit()
+    return conn
+
+
+class TestScannerBasketReturn:
+    """config#7213 — the top-N basket vs full-cycle-population excess: the
+    number Brian asked for directly. Exercises ``_counterfactual`` at the
+    ``(conn, merged, ur)`` layer so cycle SIZE can differ across dates (the
+    fixture helpers above always emit an equal-sized universe per date,
+    which cannot distinguish per-cycle-averaging from pooling-across-names
+    — see test_excess_is_date_clustered_not_pooled)."""
+
+    def test_excess_is_date_clustered_not_pooled(self, tmp_path):
+        # Date A: 100-name universe, alpha strictly descending by rank
+        # (i=0 best); attractiveness score ranks identically → top-20 picks
+        # i=0..19. mean(top-20) - mean(all 100) = 0.4 exactly (closed form).
+        a_tickers = _tickers(100)
+        a_alpha = {t: 1.0 - i * 0.01 for i, t in enumerate(a_tickers)}
+        a_score = {t: 100 - i for i, t in enumerate(a_tickers)}
+        # Date B: a SMALL 20-name universe where the basket IS the entire
+        # population (top-20 of 20) → excess is exactly 0 for that cycle.
+        b_tickers = _tickers(20)
+        b_alpha = {t: 2.0 - i * 0.05 for i, t in enumerate(b_tickers)}
+        b_score = {t: 20 - i for i, t in enumerate(b_tickers)}
+
+        records = [(t, "2026-07-02", 1 if i == 0 else 0)
+                   for i, t in enumerate(a_tickers)]
+        records += [(t, "2026-07-09", 1 if i == 0 else 0)
+                    for i, t in enumerate(b_tickers)]
+        conn = _make_conn_with_scanner_evals(tmp_path, records)
+
+        ur_rows = (
+            [{"eval_date": "2026-07-02", "ticker": t, "alpha": a_alpha[t],
+              "sector": "Tech"} for t in a_tickers]
+            + [{"eval_date": "2026-07-09", "ticker": t, "alpha": b_alpha[t],
+                "sector": "Tech"} for t in b_tickers]
+        )
+        ur = pd.DataFrame(ur_rows)
+        merged_rows = (
+            [{"eval_date": "2026-07-02", "ticker": t,
+              "attractiveness_score": a_score[t]} for t in a_tickers]
+            + [{"eval_date": "2026-07-09", "ticker": t,
+                "attractiveness_score": b_score[t]} for t in b_tickers]
+        )
+        merged = pd.DataFrame(merged_rows)
+
+        result = _counterfactual(conn, merged, ur)
+        conn.close()
+        top20 = {(e["n"], e["sector_balanced"]): e for e in result["top_n"]}[(20, False)]
+        assert top20["n_cycles"] == 2
+
+        expected_a_basket = float(np.mean([1.0 - i * 0.01 for i in range(20)]))
+        expected_a_pop = float(np.mean([1.0 - i * 0.01 for i in range(100)]))
+        expected_a_excess = expected_a_basket - expected_a_pop
+        expected_b_excess = 0.0  # basket == population on date B
+        # per-cycle-then-averaged: unweighted mean of the two dates' excess,
+        # NOT a pooled/count-weighted combination (100 rows vs 20 rows).
+        expected_excess = (expected_a_excess + expected_b_excess) / 2
+        assert top20["excess_vs_population"] == pytest.approx(expected_excess, abs=1e-4)
+
+        # A pooled-across-names (count-weighted) computation would give a
+        # DIFFERENT number — pin it explicitly so a regression to pooling
+        # (rather than per-cycle averaging) fails this test.
+        b_basket_alpha = [b_alpha[t] for t in b_tickers]  # all 20 = the basket
+        a_basket_alpha = [a_alpha[t] for i, t in enumerate(a_tickers) if i < 20]
+        pooled_basket = float(np.mean(a_basket_alpha + b_basket_alpha))
+        pooled_population = float(np.mean(list(a_alpha.values()) + list(b_alpha.values())))
+        pooled_excess = pooled_basket - pooled_population
+        assert top20["excess_vs_population"] != pytest.approx(pooled_excess, abs=1e-4)
+
+    def test_population_uses_full_cycle_universe_not_scored_subset(self, tmp_path):
+        """Only the first 60 of 100 cycle names are attractiveness-scored
+        (the higher-alpha half, by construction) — population_mean_alpha
+        must still be the mean over all 100, never the scored-60 subset,
+        or a partially-scored cycle would silently inflate its own
+        comparator (non-inferable gotcha #3, PIT universe)."""
+        tickers = _tickers(100)
+        alpha = {t: 0.30 - i * 0.005 for i, t in enumerate(tickers)}
+        records = [(t, "2026-07-02", 1 if i == 0 else 0)
+                   for i, t in enumerate(tickers)]
+        conn = _make_conn_with_scanner_evals(tmp_path, records)
+        ur = pd.DataFrame([
+            {"eval_date": "2026-07-02", "ticker": t, "alpha": alpha[t],
+             "sector": "Tech"} for t in tickers
+        ])
+        # Only ranks 0..59 (the higher-alpha half) are scored.
+        scored_tickers = tickers[:60]
+        merged = pd.DataFrame([
+            {"eval_date": "2026-07-02", "ticker": t,
+             "attractiveness_score": 60 - i}
+            for i, t in enumerate(scored_tickers)
+        ])
+
+        result = _counterfactual(conn, merged, ur)
+        conn.close()
+        top20 = {(e["n"], e["sector_balanced"]): e for e in result["top_n"]}[(20, False)]
+        expected_population = float(np.mean(list(alpha.values())))  # all 100
+        wrong_population_from_scored_only = float(
+            np.mean([alpha[t] for t in scored_tickers]))  # the bug this guards
+        assert top20["population_mean_alpha"] == pytest.approx(expected_population, abs=1e-6)
+        assert top20["population_mean_alpha"] != pytest.approx(
+            wrong_population_from_scored_only, abs=1e-6)
+
+    def test_cycle_with_fewer_than_n_scored_names_is_skipped_not_truncated(self, tmp_path):
+        """A cycle with only 15 scored names must not produce a truncated
+        'top-20' — the whole cycle is excluded from the n=20 variant."""
+        tickers = _tickers(15)
+        records = [(t, "2026-07-02", 1 if i == 0 else 0)
+                   for i, t in enumerate(tickers)]
+        conn = _make_conn_with_scanner_evals(tmp_path, records)
+        ur = pd.DataFrame([
+            {"eval_date": "2026-07-02", "ticker": t, "alpha": 0.1 - i * 0.001,
+             "sector": "Tech"} for i, t in enumerate(tickers)
+        ])
+        merged = pd.DataFrame([
+            {"eval_date": "2026-07-02", "ticker": t, "attractiveness_score": 15 - i}
+            for i, t in enumerate(tickers)
+        ])
+        result = _counterfactual(conn, merged, ur)
+        conn.close()
+        # 15 scored < MIN_NAMES_PER_DATE (10)? no — 15 >= 10, so the cycle
+        # itself counts, but it can never fill a 20-name basket.
+        top20 = {(e["n"], e["sector_balanced"]): e for e in result["top_n"]}[(20, False)]
+        assert top20["n_cycles"] == 0
+        assert top20["mean_alpha"] is None
+        assert top20["population_mean_alpha"] is None
+        assert top20["excess_vs_population"] is None
 
 
 # ── Degraded-input paths ─────────────────────────────────────────────────────

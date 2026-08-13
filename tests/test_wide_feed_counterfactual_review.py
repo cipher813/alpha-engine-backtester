@@ -12,6 +12,7 @@ import sqlite3
 import pandas as pd
 import pytest
 
+from analysis.attractiveness_eval import COUNTERFACTUAL_TOP_NS
 from analysis.wide_feed_counterfactual_review import (
     build_review,
     cohort_sizes,
@@ -164,25 +165,30 @@ def test_build_review_annotates_top_n_with_null_capture(tmp_path, monkeypatch):
 
 def test_build_review_null_capture_none_when_history_thinner_than_every_variant(tmp_path, monkeypatch):
     # attractiveness_eval._counterfactual always emits one row per
-    # COUNTERFACTUAL_TOP_NS variant (6 rows), but with capture_rate/mean_alpha
-    # None when no cycle ever had len(scored) >= n — here n_scored=40 is below
-    # every variant (60/120/200), so every row is the empty shape and our
+    # COUNTERFACTUAL_TOP_NS variant, but with capture_rate/mean_alpha None
+    # when no cycle ever had len(scored) >= n — here n_scored=15 is below
+    # every variant (config#7213 added 20/40, so the floor must sit below
+    # the smallest one), so every row is the empty shape and our
     # null-capture annotation must not fabricate a number against it either.
     db = _make_research_db(tmp_path, WEEKLY_DATES, n_names=100, n_pass=10)
-    history = _make_history(WEEKLY_DATES, n_names=100, n_scored=40)
+    history = _make_history(WEEKLY_DATES, n_names=100, n_scored=15)
     monkeypatch.setattr(
         "analysis.wide_feed_counterfactual_review.load_attractiveness_history",
         lambda bucket, s3_client=None: history,
     )
     review = build_review(db, bucket="unused-in-test", as_of="2026-06-10")
     top_n = review["artifact"]["counterfactual"]["top_n"]
-    assert len(top_n) == 6
+    assert len(top_n) == len(COUNTERFACTUAL_TOP_NS) * 2
     for row in top_n:
         assert row["capture_rate"] is None
         assert row["n_cycles"] == 0
+        # config#7213 fields must stay honest-null alongside the pre-existing
+        # ones on an empty-shape row.
+        assert row["population_mean_alpha"] is None
+        assert row["excess_vs_population"] is None
         # cohort n_universe_avg is real (100): null_capture_rate is still
-        # computable for N=60 (<= 100), but None for N=120/200 (> universe,
-        # same truncation guard null_capture_rate applies elsewhere).
+        # computable for N <= 100, but None above universe size (same
+        # truncation guard null_capture_rate applies elsewhere).
         # capture_rate_vs_null needs a real capture_rate, so it's None either way.
         if row["n"] <= 100:
             assert row["null_capture_rate"] == pytest.approx(row["n"] / 100.0)
