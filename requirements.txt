@@ -149,3 +149,26 @@ krepis[openai]>=0.55.0
 # alpha-engine-config's LLM_CALLSITE_REGISTRY.yaml). krepis <0.23.0 raises
 # TypeError on that keyword, so the floor must match the actual parameter
 # the code passes.
+
+# alpha-engine-config#7199 — pytest is a RUNTIME dependency of this repo, not
+# only a dev one. The backtester-to-executor replay parity artifact
+# (`backtest/{run_date}/parity_report.json`, the proof that the simulation's
+# fills resemble what the live executor would actually do) is produced by
+# `python -m pytest tests/test_parity_replay.py -m parity`, invoked from
+# infrastructure/spot_parity_replay.sh, spot_parity.sh and spot_backtest.sh on
+# the spot instance.
+#
+# It used to arrive transitively: `spot_common_install_deps` co-installed the
+# PREDICTOR repo's requirements, which carry `pytest>=9.1.1`. PR #550
+# (2026-07-20, config#3031) stopped doing that — correctly, it was co-resolving
+# a conflicting numpy floor — and took pytest with it, unnoticed. From the
+# 2026-07-24 run onward the parity stage printed `No module named pytest`,
+# exited in one second, and the SF routed to the SUCCESS path: 4+ weeks with no
+# real parity_report.json (last: 2026-07-18, for run_date 2026-07-17) while the
+# sibling report.md in the same S3 prefix kept updating weekly and masked it.
+#
+# SOTA note: the correct end state is a real CLI entry point
+# (`python -m replay.parity_report`) so that a TEST RUNNER is not a production
+# dependency. That is a larger change than restoring the artifact, and is
+# tracked separately; this pin restores the producer now.
+pytest>=9.1.1
