@@ -709,43 +709,27 @@ cleanup() {
             echo "    spot state-reason-code: $reason_code"
             echo "    spot state-transition-reason: $state_reason"
         fi
-        # #883 — mid-run spot-reclaim relaunch DECISION (lib chokepoint).
-        # Originally (L4485-b, #283/#289) this classified the reclaim INLINE
-        # (grepping StateReason.Code / StateTransitionReason directly) — a
-        # divergent copy of the identical logic duplicated across the data
-        # (#349), backtester, and (missing) predictor launchers. Per #883
-        # that classify→decide DECISION now lives in the lib:
-        # `python -m krepis.ec2_spot relaunch-decision` (lib v0.65.0+),
-        # invoked directly via krepis (config#1649 — the nousergon_lib
-        # re-export shim is guard-less on lib >=0.81.0, same as this
-        # launcher's other lib CLI callsites). The lib's classify_termination
-        # (describe-instances) MUST run while the instance still exists, so
-        # decide HERE, BEFORE terminate-instances. exit 0 = relaunch;
-        # NO_RELAUNCH_EXIT_CODE (75) / any other = hold (fail loud) — a
-        # genuine crash/OOM/timeout still exits at once, no blind retry that
-        # could mask a real bug (feedback_no_silent_fails). Downgrade the
-        # alert to warning when we will relaunch, so a recovered run does not
-        # page as an error.
+        # See alpha-engine-config-I7009 — migrated off the exit-code contract to --json.
         if [ -n "${INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
-            # `|| _decide_rc=$?` is LOAD-BEARING — see the identical guard in
-            # `_spot_common.sh` for the full account. In short: this script runs
-            # under `set -e`, `relaunch-decision` answers "hold" with exit 75 for
-            # every non-reclaim failure, and an unguarded `VAR="$(cmd)"` let
-            # errexit destroy the shell inside the EXIT trap — silently, because
-            # `set -e` does not re-enter a trap it is already running — skipping
-            # `terminate-instances` and leaking the spot instance.
-            local _decide_out="" _decide_rc=0
-            _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
+            local _decide_json="" _decide_rc=0
+            _decide_json="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
                 --instance-id "$INSTANCE_ID" \
                 --region "$AWS_REGION" \
                 --attempt "$SPOT_ATTEMPT" \
                 --max-attempts "$MAX_SPOT_ATTEMPTS" \
                 ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
+                --json \
                 2>/dev/null)" || _decide_rc=$?
-            echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}"
-            if [ "$_decide_rc" -eq 0 ]; then
-                _will_relaunch=1
-                _alert_sev="warning"
+            if [ "$_decide_rc" -ne 0 ]; then
+                echo "    spot relaunch-decision: CLI failed to answer (rc=$_decide_rc) — treating as hold" >&2
+            else
+                local _relaunch=""
+                _relaunch="$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; print("1" if json.load(sys.stdin).get("relaunch") else "0")')"
+                echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): $_decide_json"
+                if [ "$_relaunch" = "1" ]; then
+                    _will_relaunch=1
+                    _alert_sev="warning"
+                fi
             fi
         fi
         # Independent-channel surveillance: fan out via ops_alerts
