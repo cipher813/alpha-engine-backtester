@@ -39,6 +39,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     exit 1
 fi
 
+# Stage-coverage window (config-I7214): the instant this launcher started.
+# An artifact older than this is a leftover from a previous cycle, not this
+# run's output — an existence-only probe cannot tell those apart.
+_STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+
 # ── Unconditional global defaults ────────────────────────────────────────────
 # Every var a downstream function reads is initialized HERE, unconditionally,
 # regardless of which flags the caller later parses or which code path runs.

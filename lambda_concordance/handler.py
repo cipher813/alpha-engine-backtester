@@ -73,7 +73,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Project root on sys.path so ``from replay.batch import ...`` resolves
 # in the Lambda task layout. Mirrors lambda_health/handler.py pattern.
@@ -213,6 +213,11 @@ def handler(event: dict, context) -> dict:
     """
     _ensure_init()
 
+    # Captured at handler entry (config-I7214) — the window the per-stage
+    # coverage assertion below uses to distinguish this run's artifact from
+    # a leftover of a previous cycle.
+    _started = datetime.now(timezone.utc)
+
     # Imports deferred until after _ensure_init so SSM-loaded secrets
     # are available for any module-level init that consults them.
     from replay import is_shell_run_dry, shell_run_dry_response
@@ -325,8 +330,25 @@ def handler(event: dict, context) -> dict:
         len(summary.get("per_target_model", [])),
     )
 
-    return {
+    result = {
         "status": status,
         "duration_seconds": round(elapsed, 1),
         "summary": summary,
     }
+
+    # Per-stage output assertion (config-I7214, sf-pipeline-policy.md §2.1).
+    # OBSERVE MODE — never changes this handler's own outcome. run_date is
+    # this Lambda's end_time (the SF's $$.Execution.StartTime), falling
+    # back to "now" for a bare invocation with no end_time_iso.
+    _coverage_run_date = (end_time or _started).date().isoformat()
+    try:
+        from nousergon_lib.stage_coverage import assert_stage_coverage
+        result["stage_coverage"] = assert_stage_coverage(
+            "ReplayConcordance", run_date=_coverage_run_date, window_start=_started,
+        )
+    except ImportError as exc:
+        # Loud, not silent: the lib pin predates the module. Observe mode —
+        # the handler's own outcome is unchanged (config-I7214).
+        logger.error("stage-coverage assertion unavailable: %s", exc)
+
+    return result

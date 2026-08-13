@@ -32,6 +32,9 @@ export HOME="${HOME:-/home/ec2-user}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SPOT_STAGE_NAME="backtester"
+# SF state name this script asserts against (config-I7214) — this script IS
+# the Backtester SF state, hardcoded 1:1, no flag-derived mapping needed.
+_COVERAGE_STAGE="Backtester"
 
 # shellcheck source=./_spot_common.sh
 source "$SCRIPT_DIR/_spot_common.sh"
@@ -203,3 +206,8 @@ echo "  Backtester complete. Instance will be terminated."
 echo "═══════════════════════════════════════════════════════════════"
 
 spot_common_emit_heartbeat backtester
+
+# Per-stage output assertion (config-I7214, sf-pipeline-policy.md §2.1):
+# assert THIS stage wrote what it declared, at the boundary where the fact
+# becomes knowable. OBSERVE MODE — it can never fail the stage.
+"$LIB_PYTHON" -m nousergon_lib.stage_coverage assert --stage "$_COVERAGE_STAGE" --window-start "$_STAGE_WINDOW_START" || echo "WARNING: stage-coverage assertion did not run for $_COVERAGE_STAGE (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
