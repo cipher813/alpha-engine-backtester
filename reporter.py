@@ -25,6 +25,7 @@ from nousergon_lib.quant.horizons import DEFAULT_POLICY
 from analysis.attestation import run_attestation as _run_attestation
 from analysis.lookahead_disclosure import build_disclosure as _build_lookahead
 from analysis.lookahead_disclosure import render_section as _render_lookahead
+from analysis.self_test import run_self_test as _run_self_test
 from analysis.outcome_store import primary_beat_counts
 
 logger = logging.getLogger(__name__)
@@ -1617,6 +1618,7 @@ def save(
     walk_forward_stability: dict | None = None,
     significance_observe: dict | None = None,
     all_orders: list[dict] | None = None,
+    self_test: dict | None = None,
     *,
     upload_bucket: str | None = None,
     upload_prefix: str = "backtest",
@@ -1740,6 +1742,20 @@ def save(
     # numbers, not the one CI resolved. Sub-second; `run_attestation` never
     # raises (a failure resolves to verdict=UNKNOWN with the cause recorded).
     attestation = _run_attestation(run_date=run_date)
+    # Published known-answer SELF-TEST (Brian, 2026-08-13: "confirm they are even
+    # computing correctly and include outputs of this test"). Same substrate
+    # argument as the attestation above — it runs IN THIS PROCESS, on the wheels
+    # this cycle resolved — but it publishes the full evidence: every case's
+    # inputs, hand-derived expectation, observed value, error and tolerance, plus
+    # a header naming the `importlib.metadata` version of every quant library
+    # actually loaded and the code SHA. `run_self_test` never raises; a non-PASS
+    # verdict raises the run's degraded flag rather than failing the run
+    # (sf-pipeline-policy.md §2.3a — withholding a guarantee beats failing).
+    # The caller (`evaluate.py`) runs it early so its verdict can reach the
+    # completeness tracker's degraded flag, and passes the body here. Falling
+    # back to running it means a caller that forgets cannot silently drop the
+    # artifact — absence of self_test.json must always mean "it never ran".
+    self_test = self_test if self_test is not None else _run_self_test(run_date=run_date)
     for filename, data in [
         ("decision_capture_coverage.json", decision_capture_coverage),
         ("executor_decision_capture_coverage.json", executor_decision_capture_coverage),
@@ -1839,6 +1855,9 @@ def save(
         # "the producer never ran", and the evaluator's Backtester tile grades
         # a missing artifact as N/A (never GREEN), never as a pass.
         ("attestation.json", attestation),
+        # Always-emit, same contract: absence must unambiguously mean "the
+        # self-test never ran", never "it ran and found nothing to say".
+        ("self_test.json", self_test),
         ("grading.json", grading),
         ("trigger_scorecard.json", trigger_scorecard),
         ("shadow_book.json", shadow_book),

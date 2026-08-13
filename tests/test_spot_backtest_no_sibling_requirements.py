@@ -72,7 +72,22 @@ def test_numpy_cap_still_present():
     """The numba/vectorbt ceiling must survive future edits — it is the pin
     the co-install used to silently violate."""
     req = REQS.read_text()
-    assert "numpy>=2.0,<2.5" in req, (
-        "requirements.txt lost the numpy>=2.0,<2.5 cap (numba 0.66 hard-caps "
-        "at numpy<2.5; vectorbt imports break without it — config#2975/#2976)"
+    assert "numpy>=2.0,<2.6" in req, (
+        "requirements.txt lost the numpy>=2.0,<2.6 cap (numba hard-caps numpy; "
+        "vectorbt imports break above the ceiling — config#2975/#2976)"
+    )
+
+
+def test_numba_floor_declared_with_the_numpy_cap():
+    """The numpy cap exists because of numba's ceiling, so numba must be
+    DECLARED here — otherwise pip is free to resolve an older numba whose
+    ceiling is lower than the cap, and the cap silently stops protecting
+    anything. numba 0.67 is the release that raised numpy to <2.6; 0.66
+    capped at <2.5 (alpha-engine-config-I7200 sweep, 2026-08-13)."""
+    req = REQS.read_text()
+    assert "numba>=0.67" in req, (
+        "requirements.txt declares a numpy<2.6 cap but no numba floor — the "
+        "cap's whole justification is numba's ceiling, and numba<0.67 caps at "
+        "numpy<2.5, so an older resolution breaks `import vectorbt` while this "
+        "file still looks correct"
     )

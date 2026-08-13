@@ -98,7 +98,9 @@ from optimizer.config_archive import read_params_pit_or_current
 from emailer import send_digest_email
 from reporter import build_digest, build_report, save, upload_to_s3
 from evaluate_handoff import load_snapshot, write_snapshot
-from completeness import CompletenessTracker
+from analysis.self_test import run_self_test as _run_self_test
+from analysis.self_test import verdict_is_pass as _self_test_is_pass
+from completeness import CompletenessTracker, ModuleResult
 from pipeline_common import (
     load_config,
     pull_research_db,
@@ -1996,6 +1998,37 @@ def _main_impl() -> None:
 
     tracker = CompletenessTracker()
 
+    # ── Published known-answer SELF-TEST (Brian, 2026-08-13) ────────────────
+    # `analysis/self_test.py` drives the PRODUCTION simulation path over a
+    # battery of hand-derivable scenarios plus three metamorphic relations, in
+    # THIS process on THIS box's resolved wheels, and publishes every case's
+    # inputs / expectation / observation / error / tolerance to
+    # backtest/{date}/self_test.json (written by `reporter.save`, alongside
+    # attestation.json).
+    #
+    # Recorded on the completeness tracker so a non-PASS verdict raises the
+    # stage's EXISTING degraded flag — the completeness manifest, the digest
+    # email's "Degraded modules" line, and the report header — rather than
+    # introducing a new hard-fail path. sf-pipeline-policy.md §2.3a:
+    # withholding a guarantee beats failing the run.
+    _self_test = _run_self_test(run_date=args.date)
+    tracker.record(ModuleResult(
+        name="self_test",
+        status="ok" if _self_test_is_pass(_self_test.get("verdict")) else "degraded",
+        inputs_available={"deployed_quant_libraries": True},
+        degradation_reason=(
+            None if _self_test_is_pass(_self_test.get("verdict"))
+            else (
+                f"known-answer self-test verdict={_self_test.get('verdict')} "
+                f"({_self_test.get('n_failed', 0)} disagreed, "
+                f"{_self_test.get('n_errored', 0)} could not run) on "
+                f"{_self_test.get('libraries')} — this cycle's numbers are not attested"
+            )
+        ),
+        result=_self_test,
+        duration_seconds=float(_self_test.get("wall_clock_seconds") or 0.0),
+    ))
+
     # Phase markers (alpha-engine-config-I3112 step 1): the Evaluator SF
     # state runs this whole file as one ~2h opaque block — a mid-run kill
     # (e.g. the 2026-07-20 SIGKILL, watch-rerun-2026-07-18-10/-11) left no
@@ -2661,6 +2694,7 @@ def _main_impl() -> None:
         # Save
         out_dir = save(
             report_md=report_md,
+            self_test=_self_test,
             signal_quality=sq_result,
             score_analysis=score_rows,
             sweep_df=config.get("_sweep_df"),

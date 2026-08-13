@@ -89,10 +89,18 @@ S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 BRANCH="${BRANCH:-main}"
 # Capacity-resilient instance-type fallback set (2026-05-22 incident:
 # THIS LAUNCHER's Evaluator invocation hit InsufficientInstanceCapacity
-# for c5.large in subnet-e07166ec / us-east-1f). All 2 vCPU / 4-8 GB
-# RAM — equivalent for the backtester (memory-bound; the 2026-04-23
-# predictor_data_prep OOM is being fixed structurally via the
-# ohlcv_by_ticker → DataFrame refactor — P2 in SYSTEM_STATE).
+# for c5.large in subnet-e07166ec / us-east-1f).
+#
+# CORRECTED 2026-08-13 (alpha-engine-config-I7216): this set is 4 GB, 8 GB,
+# 4 GB, 4 GB, and this comment used to call those types "equivalent for the
+# backtester (memory-bound)". A memory-bound job's instance types are not
+# equivalent across a 2x RAM spread — that pairing made the launcher's memory
+# budget depend on which spot capacity pool answered, so an OOM presented as
+# intermittent flakiness. Every mode that actually needs memory now sets its
+# own floor below (see the two _*_RAM_FLOOR_TYPES blocks); this rotation is
+# the capacity-resilient default for modes with no floor, and must not be
+# read as a statement that its members are interchangeable under memory
+# pressure.
 INSTANCE_TYPES="${INSTANCE_TYPES:-c5.large,m5.large,c6i.large,c5a.large}"
 INSTANCE_TYPE=""  # backward-compat: --instance-type X collapses INSTANCE_TYPES to single value
 AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
@@ -430,11 +438,63 @@ _PREDICTOR_RAM_FLOOR_TYPES="m5.xlarge,m6i.xlarge,m5a.xlarge,c5.2xlarge,c6i.2xlar
 # zero margin against the requirement. 16 GB instances (~13-14 GB available)
 # provide comfortable margin. pit_parity shares this same universal floor
 # (subprocess isolation already bounded its per-pass footprint to ~2.8 GB).
+# alpha-engine-config-I7216 (2026-08-13): param-sweep needs a floor too.
+#
+# The block above carved param-sweep OUT of the predictor floor on the stated
+# assumption that it "doesn't load the predictor tensor and stays on the cheap
+# 4 GB-first rotation". That assumption is now false, and it failed silently
+# for days:
+#
+#   bash: line 16: 26748 Killed  python -u backtest.py --mode param-sweep ...
+#
+# A kernel OOM kill on a 4 GB c5.large, 2026-08-13 (execution
+# rehearsal-2026-08-13-2, instance i-0eba8344f3a124b3c). The blast radius was
+# not "one backtest run": Backtester precedes PredictorBacktest, which writes
+# predictor/research_free_backfill/predictor_outcomes_research_free.parquet —
+# the LIVE ENTRY FEED while scanner_predictor_direct is champion. With
+# Backtester dying, that cohort froze at prediction_date 2026-08-07 and every
+# trading day since drew its entry candidates from the same stale pool.
+# Distinct names newly entered fell from ~20/month to 3.
+#
+# It also failed INTERMITTENTLY rather than always, which is why it read as
+# flakiness: the default rotation `c5.large,m5.large,c6i.large,c5a.large` is
+# 4 GB, 8 GB, 4 GB, 4 GB. Whether the job survived depended on which capacity
+# pool answered — a coin flip on memory, described in this file's own comment
+# as "All 2 vCPU / 4-8 GB RAM — equivalent for the backtester (memory-bound...)".
+# For a memory-bound job those types are not equivalent, and that is the sentence
+# the defect lived inside.
+#
+# SIZING — deliberately over-provisioned, and deliberately not a guess dressed
+# as a measurement. The only fact in hand is that it died at 4 GB: an OOM-killed
+# process reports no peak, so the true requirement is UNKNOWN.
+#
+# Reusing the 16 GB predictor tier rather than stepping to 8 GB is an asymmetry
+# call, not a capacity estimate. The block above records that predictor_pipeline
+# peaks at ~2.8 GB RSS and is STILL given 16 GB, because 8 GB instances "dip to
+# ~6 GB available under OS overhead + ArcticDB caches" (config-I3280). This job
+# reads the same ArcticDB feature store. Against that, the cost of guessing low
+# is another failed nightly run — and because Backtester gates PredictorBacktest,
+# a failed run is another day of trading on a frozen entry cohort. The cost of
+# guessing high is a few cents of spot per run.
+#
+# This is therefore a CEILING to trade under until the number is known, not a
+# budget. Right-sizing DOWN from a measured peak RSS on a surviving run is the
+# follow-up on alpha-engine-config-I7216 — a cap derived from another cap is not
+# a budget, and this comment exists so the next reader does not treat 16 GB as
+# evidence of anything.
+_PARAM_SWEEP_RAM_FLOOR_TYPES="$_PREDICTOR_RAM_FLOOR_TYPES"
+
 case "$BACKTEST_MODE" in
     all|predictor-backtest|portfolio-optimizer-backtest)
         if [ -z "$INSTANCE_TYPE" ]; then
             echo "  Mode '$BACKTEST_MODE' runs predictor_pipeline → applying ≥16 GB instance floor"
             INSTANCE_TYPES="$_PREDICTOR_RAM_FLOOR_TYPES"
+        fi
+        ;;
+    param-sweep|simulate|signal-quality)
+        if [ -z "$INSTANCE_TYPE" ]; then
+            echo "  Mode '$BACKTEST_MODE' → applying ≥8 GB instance floor (config-I7216: OOM-killed on 4 GB c5.large 2026-08-13)"
+            INSTANCE_TYPES="$_PARAM_SWEEP_RAM_FLOOR_TYPES"
         fi
         ;;
 esac
@@ -951,12 +1011,12 @@ command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m p
 # requirements.txt is deliberately NOT installed here. Co-installing two
 # repos' requirements files into one resolver namespace let predictor's
 # numpy>=2.5.1 floor (installed second) silently override the backtester's
-# numpy<2.5 cap (numba/vectorbt hard ceiling) — the 2026-07-20 weekly deps
+# numpy cap (numba/vectorbt hard ceiling) — the 2026-07-20 weekly deps
 # failures — and the same class had already bitten via nousergon-lib
 # (L4513) and pyarrow. Every library the in-process predictor replay
 # (synthetic/predictor_backtest.py, research-free backfill) needs at
 # runtime is declared in the backtester's OWN requirements.txt with
-# numpy<2.5-compatible bounds. The import guards below prove the predictor
+# bounds compatible with that cap. The import guards below prove the predictor
 # code chain resolves against this single environment.
 cd /home/ec2-user/alpha-engine-predictor
 if [ ! -d "/home/ec2-user/alpha-engine-predictor/model" ]; then
