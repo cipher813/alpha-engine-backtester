@@ -37,6 +37,13 @@ RUN microdnf install -y git && microdnf clean all
 # ImportError-guarded and observe-mode, so an older krepis in the image would
 # make the assertion silently emit nothing rather than fail the build
 # (config-I7334) — the floor is what keeps it measurable.
+#
+# It also carries the >=0.57.0 requirement of alpha-engine-config-I7179
+# (krepis-PR140): LLMClient resolves a default cost_sink from
+# KREPIS_COST_SINK_BUCKET / KREPIS_COST_SINK_PREFIX (wired by
+# deploy_concordance.sh's merge-lambda-env step) when the caller passes
+# none — this callsite never has, so every DeepSeek call this Lambda makes
+# was previously landing on no cost record.
 COPY lambda_concordance/requirements-concordance.txt requirements-concordance.txt
 RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.57" "krepis[openai]>=0.59.4" && \
     pip install --no-cache-dir -r requirements-concordance.txt && \

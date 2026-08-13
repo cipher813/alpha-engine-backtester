@@ -180,6 +180,14 @@ krepis[openai]>=0.59.6
 # alpha-engine-config's LLM_CALLSITE_REGISTRY.yaml). krepis <0.23.0 raises
 # TypeError on that keyword, so the floor must match the actual parameter
 # the code passes.
+#
+# Bumped to >=0.57.0 (alpha-engine-config-I7179, krepis-PR140): LLMClient
+# now resolves a default cost_sink from KREPIS_COST_SINK_BUCKET/
+# KREPIS_COST_SINK_PREFIX when the caller does not pass one explicitly —
+# replay/runner.py's _invoke_target_model never has, so every DeepSeek call
+# this module makes was landing on no cost record. The env wiring lives in
+# infrastructure/deploy_concordance.sh (merge-lambda-env), not here; this
+# floor just ensures the installed krepis is new enough to read it.
 
 # alpha-engine-config#7199 — pytest is a RUNTIME dependency of this repo, not
 # only a dev one. The backtester-to-executor replay parity artifact
