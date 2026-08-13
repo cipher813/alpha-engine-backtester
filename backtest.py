@@ -3072,6 +3072,51 @@ def run_gamma_sweep_stage(
     return payload
 
 
+def _persist_sizing_ab(
+    bucket: str,
+    run_date: str,
+    result: dict,
+    *,
+    s3_client=None,
+) -> str:
+    """Persist the sizing A/B comparison to ``backtest/{run_date}/sizing_ab.json``.
+
+    ALWAYS-EMIT (config#7209, config#7214). The body carries its own
+    ``status`` — ``ok`` / ``insufficient_data`` / ``error`` / ``not_run`` — so
+    the artifact's PRESENCE means the stage ran and its ABSENCE means it did
+    not. That distinction is the whole reason this key exists: before this,
+    `run_sizing_ab` had tests and no artifact, and there was no observation
+    that could tell "we chose not to compute it" from "the producer died".
+
+    The key layout matches ``reporter._artifact_key`` — the public
+    ``backtest/{date}/`` namespace the evaluator and the freshness monitor
+    read, NOT ``phase_artifacts``' internal ``.phases/`` resume namespace.
+
+    Fail-soft on the S3 call only: a persist failure is logged loud and the
+    registered freshness row is the recording surface for the missed write.
+    The COMPUTE above is not in this try — a producer failure is already
+    captured as ``status: error`` in the body written here.
+    """
+    key = f"backtest/{run_date}/sizing_ab.json"
+    payload = {"run_date": run_date, **result}
+    body = json.dumps(payload, default=str, indent=2).encode("utf-8")
+    s3 = s3_client or boto3.client("s3")
+    try:
+        s3.put_object(
+            Bucket=bucket, Key=key, Body=body, ContentType="application/json",
+        )
+        logger.info(
+            "sizing_ab: persisted s3://%s/%s (status=%s)",
+            bucket, key, payload.get("status"),
+        )
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        logger.error(
+            "sizing_ab: S3 persist failed for s3://%s/%s: %s",
+            bucket, key, exc, exc_info=True,
+        )
+    return key
+
+
 def run_optimizer_param_sweep_stage(
     config: dict,
     run_date: str,
@@ -5489,6 +5534,62 @@ def _run_simulation_pipeline(
                 fd.report(e, severity="error", context={
                     "site": "param_sweep", "mode": args.mode})
             sweep_df = None
+
+        # ── Sizing A/B (config#7209, config#7214) ────────────────────────────
+        # `analysis/sizing_ab.py::run_sizing_ab` has existed, with tests, since
+        # before this file's simulation phases were split — and its output had
+        # NEVER been persisted for any date. `evaluate.py` passes
+        # `sizing_ab=None,  # simulation-only`, which is a true statement about
+        # evaluate.py (it holds no simulator) and was read as a decision not to
+        # produce the artifact at all. This is the wiring that makes it exist:
+        # the simulator lives HERE, and the A/B is two extra sims against the
+        # already-built setup — no new data read.
+        #
+        # ALWAYS-EMIT and fail-soft, in that order of importance. The artifact
+        # is written on every path, carrying its own status, because absence
+        # must mean "the stage never ran"; and a sizing-comparison failure must
+        # not abort a backtest whose primary deliverables are already computed
+        # (sf-pipeline-policy §3: this output feeds no order, no promotion and
+        # no NAV). Cost: 2 simulations, against the 60-combo sweep above.
+        _sizing_ab_result: dict = {
+            "status": "not_run",
+            "reason": "sizing A/B stage did not execute",
+        }
+        try:
+            with registry.phase("sizing_ab", mode=args.mode):
+                if _sim_setup is None:
+                    _sizing_ab_result = {
+                        "status": "insufficient_data",
+                        "reason": "simulation setup unavailable",
+                    }
+                else:
+                    executor_run, SimulatedIBKRClient, dates, price_matrix, _, ohlcv = _sim_setup
+                    if price_matrix is None:
+                        _sizing_ab_result = {
+                            "status": "insufficient_data",
+                            "reason": f"only {len(dates)} signal dates available",
+                        }
+                    else:
+                        def _sizing_sim_fn(combo_config: dict) -> dict:
+                            return _run_simulation_loop(
+                                executor_run, SimulatedIBKRClient, dates,
+                                price_matrix, combo_config,
+                                ohlcv_by_ticker=ohlcv,
+                                atr_by_ticker=atr_by_ticker,
+                                vwap_series_by_ticker=vwap_series_by_ticker,
+                                coverage_by_ticker=coverage_by_ticker,
+                            )
+                        from analysis.sizing_ab import run_sizing_ab
+                        logger.info("sizing_ab: running current-sizing vs equal-weight A/B")
+                        _sizing_ab_result = run_sizing_ab(_sizing_sim_fn, config)
+        except Exception as e:
+            logger.error("sizing_ab failed: %s", e, exc_info=True)
+            _sizing_ab_result = {"status": "error", "error": str(e)}
+            if fd:
+                fd.report(e, severity="warning", context={
+                    "site": "sizing_ab", "mode": args.mode})
+
+        _persist_sizing_ab(bucket, args.date, _sizing_ab_result, s3_client=s3)
 
         # Executor parameter optimization from sweep results
         if sweep_df is not None and not sweep_df.empty:
