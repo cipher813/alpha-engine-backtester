@@ -114,7 +114,7 @@ spot_common_pre_launch_preflight \
     "$REPO_ROOT/synthetic/predictor_backtest.py"
 
 # The pass runs predictor_pipeline — universal >=16 GB floor (I3280).
-spot_common_apply_predictor_ram_floor
+spot_common_apply_large_universe_ram_floor
 echo "  Instance types: $INSTANCE_TYPES"
 
 spot_common_launch_instance

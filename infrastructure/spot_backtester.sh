@@ -140,7 +140,7 @@ spot_common_pre_launch_preflight \
 # costs a few cents of spot. Right-sizing DOWN from a measured peak RSS on a
 # surviving run is tracked on alpha-engine-config-I7216 — a cap derived from
 # another cap is not a budget.
-spot_common_apply_predictor_ram_floor
+spot_common_apply_large_universe_ram_floor
 spot_common_collapse_instance_type
 echo "  Instance types: $INSTANCE_TYPES"
 

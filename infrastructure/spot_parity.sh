@@ -117,7 +117,7 @@ spot_common_pre_launch_preflight \
 # subprocess isolation bounds its per-pass footprint to ~2.8 GB, same
 # guard as the other predictor-bearing stages) unless the operator passed
 # an explicit --instance-type.
-spot_common_apply_predictor_ram_floor
+spot_common_apply_large_universe_ram_floor
 echo "  Instance types: $INSTANCE_TYPES"
 
 spot_common_launch_instance

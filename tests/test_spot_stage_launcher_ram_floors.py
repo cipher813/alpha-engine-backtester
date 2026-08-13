@@ -35,12 +35,13 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INFRA = REPO_ROOT / "infrastructure"
 
-FLOOR_CALL = "spot_common_apply_predictor_ram_floor"
+FLOOR_CALL = "spot_common_apply_large_universe_ram_floor"
 
 # Launchers whose workload is known to need >4 GB. `param-sweep` is here
 # because production proved it, not because it loads the predictor tensor.
 _REQUIRES_FLOOR = {
     "spot_backtester.sh",                     # backtest.py --mode param-sweep (OOM 2026-08-13)
+    "spot_evaluator.sh",                      # evaluate.py universe read (OOM 2026-08-13)
     "spot_predictor_backtest.sh",             # predictor_pipeline
     "spot_portfolio_optimizer_backtest.sh",   # predictor_pipeline
     "spot_parity.sh",
@@ -51,8 +52,17 @@ _REQUIRES_FLOOR = {
 # Launchers deliberately left on the default rotation. Listed explicitly so the
 # choice is recorded and reviewable; moving one here is a decision someone made,
 # not a line nobody wrote. If any of these is ever OOM-killed, it moves up.
+#
+# That last sentence has now fired twice in one day, both times on the same
+# reasoning ("does not run predictor_pipeline, so the cheap rotation is fine"):
+# spot_backtester.sh moved up in PR657, spot_evaluator.sh moves up here. The
+# shared premise was wrong — the cost driver is the ~900-ticker ArcticDB read,
+# not the GBM tensor — which is why the floor helper was renamed from
+# `spot_common_apply_predictor_ram_floor` to
+# `spot_common_apply_large_universe_ram_floor` in the same change. Anything
+# still listed below should be re-examined against that question, not against
+# whether it mentions predictor_pipeline.
 _DELIBERATELY_NO_FLOOR = {
-    "spot_evaluator.sh",
     "spot_parity_compare.sh",
     "spot_parity_replay.sh",
     "spot_backtest_and_evaluate.sh",
