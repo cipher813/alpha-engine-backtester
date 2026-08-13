@@ -211,6 +211,34 @@ if [ -f "\$PARITY_REPORT_DIR/parity_report.json" ]; then
         "s3://\${BUCKET}/backtest/\${RUN_DATE}/parity_report.json" --quiet \\
         && echo "Uploaded parity_report.json to s3://\${BUCKET}/backtest/\${RUN_DATE}/" \\
         || echo "WARNING: failed to upload parity_report.json (non-fatal)"
+else
+    # alpha-engine-config#7199 — THE ABSENCE IS THE DEFECT. Until now a missing
+    # parity_report.json was indistinguishable from a skipped upload: the guard
+    # had no else-branch, the non-zero pytest exit degraded to a WARNING on
+    # stderr, and the stage returned 0. That is how parity_report.json went
+    # unwritten from 2026-07-24 to 2026-08-13 while the sibling report.md in the
+    # same prefix kept updating weekly and nothing noticed. (Root cause: PR #550
+    # stopped co-installing the predictor requirements, which is where pytest
+    # came from; "No module named pytest", exit in 1 second, SF success path.)
+    #
+    # An absent artifact now becomes a PRESENT artifact that says it is absent,
+    # so every downstream reader renders FAILED rather than a silently stale
+    # ABSENT row. sf-pipeline-policy 2.3a rule 2: a missing verdict is never a
+    # pass.
+    echo "ERROR: the parity replay produced NO parity_report.json (producer exit=\$PARITY_EXIT)." >&2
+    echo "       The backtester-to-executor fill-parity claim is UNPROVEN for \${RUN_DATE}." >&2
+    printf '{"schema":"parity_report-0.0.0","run_date":"%s","status":"failed","verdict":"FAIL","verdict_reason":"the parity replay produced no report this run (producer exit=%s) - the backtester-to-executor fill-parity claim is unproven","producer_exit":%s}\\n' \\
+        "\${RUN_DATE}" "\$PARITY_EXIT" "\$PARITY_EXIT" > /tmp/parity_report_missing.json
+    aws s3 cp /tmp/parity_report_missing.json \\
+        "s3://\${BUCKET}/backtest/\${RUN_DATE}/parity_report.json" --quiet \\
+        && echo "       Recorded the absence at s3://\${BUCKET}/backtest/\${RUN_DATE}/parity_report.json" \\
+        || echo "       WARNING: could not record the absence marker either." >&2
+    # Deliberately NOT exiting non-zero here: this launcher still runs co-tenant
+    # stages behind one script, and killing stages that do not consume the
+    # parity artifact would trade one blindness for an outage
+    # (sf-pipeline-policy 2.1). The recorded absence above is the surface; the
+    # split ParityReplay branch (spot_parity_replay.sh) is where this fails the
+    # stage, because there it costs only that branch.
 fi
 
 if [ "\$PARITY_EXIT" != "0" ]; then
