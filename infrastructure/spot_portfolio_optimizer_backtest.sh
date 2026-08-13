@@ -110,7 +110,7 @@ spot_common_pre_launch_preflight \
 
 # This mode re-runs predictor_pipeline internally — apply the >=16 GB
 # instance floor (I3280) unless the operator passed an explicit --instance-type.
-spot_common_apply_predictor_ram_floor
+spot_common_apply_large_universe_ram_floor
 echo "  Instance types: $INSTANCE_TYPES"
 
 spot_common_launch_instance

@@ -206,16 +206,30 @@ spot_common_compute_phase_flags() {
     fi
 }
 
-# Modes that run predictor_pipeline (10y GBM inference over ~900 tickers;
-# peak RSS ~2.8 GB) need >=16 GB RAM (I3280: 8 GB instances can dip to ~6 GB
-# available under OS overhead, leaving zero margin above the 6.0 GB headroom
-# guard). Only spot_predictor_backtest.sh and
-# spot_portfolio_optimizer_backtest.sh call this. Skipped when the operator
-# passes an explicit --instance-type.
-spot_common_apply_predictor_ram_floor() {
+# Stages that materialise the ~900-ticker universe need >=16 GB RAM (I3280:
+# 8 GB instances can dip to ~6 GB available under OS overhead, leaving zero
+# margin above the 6.0 GB headroom guard). Skipped when the operator passes an
+# explicit --instance-type.
+#
+# RENAMED 2026-08-13 from `spot_common_apply_predictor_ram_floor`. The old name
+# named the wrong thing, and the misnomer had already cost two production OOMs:
+#
+#   * spot_backtester.sh was left off the floor on the reasoning "param-sweep
+#     does not run predictor_pipeline -> stays on the cheap default rotation".
+#     OOM-killed 2026-08-13 (config-I7216, PR653/PR657).
+#   * spot_evaluator.sh carried the SAME sentence and was OOM-killed the SAME
+#     DAY on a 4 GB c5.large, immediately after
+#     `Load complete: 921 price tickers, 903 feature tickers`
+#     (execution watch-rerun-2026-08-13-2, instance i-077d2a5479affe1d3).
+#
+# The driver is the ArcticDB universe read, not the GBM tensor. Not loading the
+# tensor does not make a stage cheap, and every launcher that reads the full
+# universe needs this whether or not `predictor_pipeline` appears anywhere in
+# it. The name now says the condition an author must actually check.
+spot_common_apply_large_universe_ram_floor() {
     local floor_types="m5.xlarge,m6i.xlarge,m5a.xlarge,c5.2xlarge,c6i.2xlarge"
     if [ -z "$INSTANCE_TYPE" ]; then
-        echo "  Stage runs predictor_pipeline -> applying >=16 GB instance floor"
+        echo "  Stage reads the full ~900-ticker universe -> applying >=16 GB instance floor"
         INSTANCE_TYPES="$floor_types"
     fi
     if [ -n "$INSTANCE_TYPE" ]; then

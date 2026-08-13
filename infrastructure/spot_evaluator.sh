@@ -112,8 +112,14 @@ spot_common_pre_launch_preflight \
     "$REPO_ROOT/preflight.py" \
     "$REPO_ROOT/pipeline_common.py"
 
-# The evaluator does not run predictor_pipeline — stays on the cheap
-# default rotation (no RAM floor needed).
+# evaluate.py materialises the full ArcticDB universe before the diagnostics
+# phase, so it needs the floor. The premise this comment used to carry — "does
+# not run predictor_pipeline, so the cheap rotation is fine" — was falsified in
+# production on 2026-08-13: the evaluator-diagnostics stage was OOM-killed
+# (SIGKILL, `26756 Killed`) on a 4 GB c5.large immediately after logging
+# `Load complete in 163.0s: 921 price tickers, 903 feature tickers`.
+# It is the universe read that costs the memory, not the GBM tensor.
+spot_common_apply_large_universe_ram_floor
 spot_common_collapse_instance_type
 echo "  Instance types: $INSTANCE_TYPES"
 

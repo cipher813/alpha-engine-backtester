@@ -98,26 +98,36 @@ def test_evaluator_runs_only_evaluate_py_with_skip_backtester():
         ("spot_predictor_backtest.sh", True),
         ("spot_portfolio_optimizer_backtest.sh", True),
         ("spot_parity.sh", True),
-        ("spot_evaluator.sh", False),
+        # Flipped False -> True on the SAME DAY and for the SAME reason as
+        # spot_backtester.sh above: evaluate.py materialises the full ArcticDB
+        # universe before its diagnostics phase and was OOM-killed (SIGKILL,
+        # `26756 Killed`) on a 4 GB c5.large, immediately after logging
+        # `Load complete in 163.0s: 921 price tickers, 903 feature tickers`
+        # (execution watch-rerun-2026-08-13-2).
+        ("spot_evaluator.sh", True),
     ],
 )
 def test_predictor_ram_floor_matches_monolith_case_statement(script, floor_expected):
     """The monolith applies the >=16GB floor for
     `all|predictor-backtest|portfolio-optimizer-backtest` modes (I3280).
-    pit_parity (which the Parity script runs) shares the same universal
-    floor. The Evaluator does not run predictor_pipeline and stays on the
-    cheap default rotation.
+    pit_parity (which the Parity script runs) shares the same universal floor.
 
-    param-sweep (Backtester) USED to be in that second group and no longer is
-    (alpha-engine-config-I7216): "does not run predictor_pipeline" was taken to
-    mean "is not memory-bound", which production falsified with a kernel OOM
-    kill on a 4 GB c5.large. Its floor is not evidence of a measured
-    requirement — an OOM-killed process reports no peak — it is a ceiling to
-    trade under until one exists."""
+    param-sweep (Backtester) and the Evaluator BOTH used to be carved out of
+    that group, on the same sentence — "does not run predictor_pipeline" taken
+    to mean "is not memory-bound". Production falsified it twice on 2026-08-13,
+    with a kernel OOM kill each time on a 4 GB c5.large. The cost driver is the
+    ~900-ticker ArcticDB read that all of them perform; the GBM tensor was never
+    what made the difference, which is why the helper is now named
+    `spot_common_apply_large_universe_ram_floor`.
+
+    Neither floor is evidence of a measured requirement — an OOM-killed process
+    reports no peak — they are ceilings to trade under until one exists.
+    Right-sizing down from a measured peak RSS on a surviving run is tracked on
+    alpha-engine-config-I7216; a cap derived from another cap is not a budget."""
     text = (_INFRA / script).read_text()
-    has_floor_call = "spot_common_apply_predictor_ram_floor" in text
+    has_floor_call = "spot_common_apply_large_universe_ram_floor" in text
     assert has_floor_call == floor_expected, (
-        f"{script}: expected spot_common_apply_predictor_ram_floor() present={floor_expected}"
+        f"{script}: expected spot_common_apply_large_universe_ram_floor() present={floor_expected}"
     )
 
 
