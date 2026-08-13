@@ -59,10 +59,26 @@ def _launcher_text() -> str:
 
 
 def _floor_vars() -> dict[str, list[str]]:
-    """Extract every `_*_RAM_FLOOR_TYPES="a,b,c"` assignment."""
-    out = {}
+    """Extract every `_*_RAM_FLOOR_TYPES=...` assignment, resolved to types.
+
+    One level of variable indirection is resolved, because a floor that
+    deliberately reuses another tier (`_A="$_B"`) is a legitimate and clearer
+    way to say "the same tier", and the assertions below must see the real
+    instance types rather than the reference.
+    """
+    raw: dict[str, str] = {}
     for m in re.finditer(r'(_[A-Z_]*RAM_FLOOR_TYPES)="([^"]+)"', _launcher_text()):
-        out[m.group(1)] = [t.strip() for t in m.group(2).split(",") if t.strip()]
+        raw[m.group(1)] = m.group(2)
+
+    out: dict[str, list[str]] = {}
+    for name, value in raw.items():
+        ref = re.fullmatch(r"\$\{?(_[A-Z_]*RAM_FLOOR_TYPES)\}?", value.strip())
+        if ref:
+            assert ref.group(1) in raw, (
+                f"{name} references {ref.group(1)}, which is not defined in the launcher"
+            )
+            value = raw[ref.group(1)]
+        out[name] = [t.strip() for t in value.split(",") if t.strip()]
     return out
 
 

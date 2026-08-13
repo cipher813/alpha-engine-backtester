@@ -464,12 +464,25 @@ _PREDICTOR_RAM_FLOOR_TYPES="m5.xlarge,m6i.xlarge,m5a.xlarge,c5.2xlarge,c6i.2xlar
 # For a memory-bound job those types are not equivalent, and that is the sentence
 # the defect lived inside.
 #
-# 8 GB is a floor set from the ONE fact in hand — it died at 4 GB — not from a
-# measured peak, because an OOM-killed process reports no peak. Four 2-vCPU/8 GB
-# pools keep the capacity resilience the rotation exists for. Right-sizing needs
-# peak RSS from a surviving run; tracked on alpha-engine-config-I7216 rather
-# than guessed at here (a cap derived from another cap is not a budget).
-_PARAM_SWEEP_RAM_FLOOR_TYPES="m5.large,m6i.large,m5a.large,m6a.large"
+# SIZING — deliberately over-provisioned, and deliberately not a guess dressed
+# as a measurement. The only fact in hand is that it died at 4 GB: an OOM-killed
+# process reports no peak, so the true requirement is UNKNOWN.
+#
+# Reusing the 16 GB predictor tier rather than stepping to 8 GB is an asymmetry
+# call, not a capacity estimate. The block above records that predictor_pipeline
+# peaks at ~2.8 GB RSS and is STILL given 16 GB, because 8 GB instances "dip to
+# ~6 GB available under OS overhead + ArcticDB caches" (config-I3280). This job
+# reads the same ArcticDB feature store. Against that, the cost of guessing low
+# is another failed nightly run — and because Backtester gates PredictorBacktest,
+# a failed run is another day of trading on a frozen entry cohort. The cost of
+# guessing high is a few cents of spot per run.
+#
+# This is therefore a CEILING to trade under until the number is known, not a
+# budget. Right-sizing DOWN from a measured peak RSS on a surviving run is the
+# follow-up on alpha-engine-config-I7216 — a cap derived from another cap is not
+# a budget, and this comment exists so the next reader does not treat 16 GB as
+# evidence of anything.
+_PARAM_SWEEP_RAM_FLOOR_TYPES="$_PREDICTOR_RAM_FLOOR_TYPES"
 
 case "$BACKTEST_MODE" in
     all|predictor-backtest|portfolio-optimizer-backtest)
