@@ -951,12 +951,12 @@ command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m p
 # requirements.txt is deliberately NOT installed here. Co-installing two
 # repos' requirements files into one resolver namespace let predictor's
 # numpy>=2.5.1 floor (installed second) silently override the backtester's
-# numpy<2.5 cap (numba/vectorbt hard ceiling) — the 2026-07-20 weekly deps
+# numpy cap (numba/vectorbt hard ceiling) — the 2026-07-20 weekly deps
 # failures — and the same class had already bitten via nousergon-lib
 # (L4513) and pyarrow. Every library the in-process predictor replay
 # (synthetic/predictor_backtest.py, research-free backfill) needs at
 # runtime is declared in the backtester's OWN requirements.txt with
-# numpy<2.5-compatible bounds. The import guards below prove the predictor
+# bounds compatible with that cap. The import guards below prove the predictor
 # code chain resolves against this single environment.
 cd /home/ec2-user/alpha-engine-predictor
 if [ ! -d "/home/ec2-user/alpha-engine-predictor/model" ]; then
