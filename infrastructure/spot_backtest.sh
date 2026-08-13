@@ -89,10 +89,18 @@ S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 BRANCH="${BRANCH:-main}"
 # Capacity-resilient instance-type fallback set (2026-05-22 incident:
 # THIS LAUNCHER's Evaluator invocation hit InsufficientInstanceCapacity
-# for c5.large in subnet-e07166ec / us-east-1f). All 2 vCPU / 4-8 GB
-# RAM — equivalent for the backtester (memory-bound; the 2026-04-23
-# predictor_data_prep OOM is being fixed structurally via the
-# ohlcv_by_ticker → DataFrame refactor — P2 in SYSTEM_STATE).
+# for c5.large in subnet-e07166ec / us-east-1f).
+#
+# CORRECTED 2026-08-13 (alpha-engine-config-I7216): this set is 4 GB, 8 GB,
+# 4 GB, 4 GB, and this comment used to call those types "equivalent for the
+# backtester (memory-bound)". A memory-bound job's instance types are not
+# equivalent across a 2x RAM spread — that pairing made the launcher's memory
+# budget depend on which spot capacity pool answered, so an OOM presented as
+# intermittent flakiness. Every mode that actually needs memory now sets its
+# own floor below (see the two _*_RAM_FLOOR_TYPES blocks); this rotation is
+# the capacity-resilient default for modes with no floor, and must not be
+# read as a statement that its members are interchangeable under memory
+# pressure.
 INSTANCE_TYPES="${INSTANCE_TYPES:-c5.large,m5.large,c6i.large,c5a.large}"
 INSTANCE_TYPE=""  # backward-compat: --instance-type X collapses INSTANCE_TYPES to single value
 AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
@@ -430,11 +438,50 @@ _PREDICTOR_RAM_FLOOR_TYPES="m5.xlarge,m6i.xlarge,m5a.xlarge,c5.2xlarge,c6i.2xlar
 # zero margin against the requirement. 16 GB instances (~13-14 GB available)
 # provide comfortable margin. pit_parity shares this same universal floor
 # (subprocess isolation already bounded its per-pass footprint to ~2.8 GB).
+# alpha-engine-config-I7216 (2026-08-13): param-sweep needs a floor too.
+#
+# The block above carved param-sweep OUT of the predictor floor on the stated
+# assumption that it "doesn't load the predictor tensor and stays on the cheap
+# 4 GB-first rotation". That assumption is now false, and it failed silently
+# for days:
+#
+#   bash: line 16: 26748 Killed  python -u backtest.py --mode param-sweep ...
+#
+# A kernel OOM kill on a 4 GB c5.large, 2026-08-13 (execution
+# rehearsal-2026-08-13-2, instance i-0eba8344f3a124b3c). The blast radius was
+# not "one backtest run": Backtester precedes PredictorBacktest, which writes
+# predictor/research_free_backfill/predictor_outcomes_research_free.parquet —
+# the LIVE ENTRY FEED while scanner_predictor_direct is champion. With
+# Backtester dying, that cohort froze at prediction_date 2026-08-07 and every
+# trading day since drew its entry candidates from the same stale pool.
+# Distinct names newly entered fell from ~20/month to 3.
+#
+# It also failed INTERMITTENTLY rather than always, which is why it read as
+# flakiness: the default rotation `c5.large,m5.large,c6i.large,c5a.large` is
+# 4 GB, 8 GB, 4 GB, 4 GB. Whether the job survived depended on which capacity
+# pool answered — a coin flip on memory, described in this file's own comment
+# as "All 2 vCPU / 4-8 GB RAM — equivalent for the backtester (memory-bound...)".
+# For a memory-bound job those types are not equivalent, and that is the sentence
+# the defect lived inside.
+#
+# 8 GB is a floor set from the ONE fact in hand — it died at 4 GB — not from a
+# measured peak, because an OOM-killed process reports no peak. Four 2-vCPU/8 GB
+# pools keep the capacity resilience the rotation exists for. Right-sizing needs
+# peak RSS from a surviving run; tracked on alpha-engine-config-I7216 rather
+# than guessed at here (a cap derived from another cap is not a budget).
+_PARAM_SWEEP_RAM_FLOOR_TYPES="m5.large,m6i.large,m5a.large,m6a.large"
+
 case "$BACKTEST_MODE" in
     all|predictor-backtest|portfolio-optimizer-backtest)
         if [ -z "$INSTANCE_TYPE" ]; then
             echo "  Mode '$BACKTEST_MODE' runs predictor_pipeline → applying ≥16 GB instance floor"
             INSTANCE_TYPES="$_PREDICTOR_RAM_FLOOR_TYPES"
+        fi
+        ;;
+    param-sweep|simulate|signal-quality)
+        if [ -z "$INSTANCE_TYPE" ]; then
+            echo "  Mode '$BACKTEST_MODE' → applying ≥8 GB instance floor (config-I7216: OOM-killed on 4 GB c5.large 2026-08-13)"
+            INSTANCE_TYPES="$_PARAM_SWEEP_RAM_FLOOR_TYPES"
         fi
         ;;
 esac
