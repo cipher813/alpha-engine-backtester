@@ -1016,8 +1016,84 @@ def format_lift_report(metrics: dict) -> list[str]:
 
 # ── Internal lift computations ───────────────────────────────────────────────
 
+def _scanner_lift_classification(merged: pd.DataFrame) -> dict | None:
+    """Shared classification-metrics helper for _scanner_lift's 5d diagnostic."""
+    if "beat_spy_5d" not in merged.columns:
+        return None
+    has_outcome = merged["beat_spy_5d"].notna()
+    if not has_outcome.any():
+        return None
+    m = merged[has_outcome]
+    selected = (m["quant_filter_pass"] == 1).tolist()
+    positive = (m["beat_spy_5d"] == 1).tolist()
+    return compute_binary_metrics(
+        tp=sum(s and p for s, p in zip(selected, positive)),
+        fp=sum(s and not p for s, p in zip(selected, positive)),
+        fn=sum(not s and p for s, p in zip(selected, positive)),
+        tn=sum(not s and not p for s, p in zip(selected, positive)),
+    )
+
+
+def _scanner_lift_block(merged: pd.DataFrame) -> dict:
+    """Compute the universe_avg/passing_avg/lift/classification block shared by
+    the windowed and unfiltered readouts of _scanner_lift."""
+    passing = merged[merged["quant_filter_pass"] == 1]
+
+    universe_avg = float(merged["return_5d"].mean())
+    passing_avg = float(passing["return_5d"].mean()) if not passing.empty else None
+    lift = (passing_avg - universe_avg) if passing_avg is not None else None
+
+    clf = _scanner_lift_classification(merged)
+
+    # Canonical 21d horizon (L4551): classification on beat_spy_21d + the
+    # log-domain alpha lift, additive alongside the 5d diagnostic above.
+    sel_mask = merged["quant_filter_pass"] == 1
+    clf_21d = _classification_for(merged, sel_mask, "beat_spy_21d")
+    lift_21d = _alpha_21d_log_lift(merged, sel_mask)
+
+    return {
+        "universe_avg": round(universe_avg, 4),
+        "passing_avg": round(passing_avg, 4) if passing_avg is not None else None,
+        "lift": round(lift, 4) if lift is not None else None,
+        "n_universe": len(merged),
+        "n_passing": len(passing),
+        "classification": clf,
+        "classification_21d": clf_21d,
+        "lift_21d_log": lift_21d,
+    }
+
+
 def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
-    """Scanner filter lift: passing stocks vs. full universe."""
+    """Scanner filter lift: passing stocks vs. full universe.
+
+    alpha-engine-config-I1458: between crucible-research PR#344 (merged
+    2026-06-30) and PR#383 (merged 2026-07-05, commit 1b54bd9),
+    ``graph/research_graph.py`` read ``run_quant_filter._last_eval_log`` — a
+    process-local stash that was ALWAYS EMPTY in that process — and wrote
+    ``quant_filter_pass=0`` for 100% of rows on every eval_date in that
+    window (comment at crucible-research graph/research_graph.py:4016-4025;
+    pre-history before the scanner_evaluations gate detail existed carries
+    the same all-zero shape). Grading those dates alongside dates where the
+    gate genuinely ran manufactures ~6.3k false negatives out of a filter
+    that simply never recorded a verdict that day, collapsing measured
+    recall from a real-but-poor number to a fabricated 4.4%.
+
+    Window rule chosen: exclude any eval_date whose scanner_evaluations rows
+    sum to ZERO passes ("recorded_zero_pass_dates_excluded") — a
+    self-describing test of "did the gate actually record a verdict this
+    date", evaluated directly off the data being graded. REJECTED
+    alternative: floor the window at a hard-coded 2026-07-05 (the PR#383
+    landing date). That date is precise for the known empty-stash bug, but
+    the pre-existing-gate-detail history before it shows the identical
+    all-zero shape for a different reason, so a single hard floor would
+    still admit some zero-pass dates into the grade and would need a second
+    tracked date if another regression reintroduces the pattern later. The
+    recorded-zero rule catches every era with the same shape and needs no
+    maintenance if the bug recurs.
+
+    The pre-restriction (unfiltered) figures are retained verbatim under the
+    ``unfiltered`` key rather than discarded, so the change is auditable.
+    """
     try:
         se_filter = date_filter.replace("eval_date", "se.eval_date") if date_filter else ""
         se = pd.read_sql_query(
@@ -1028,44 +1104,39 @@ def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dic
             return {"status": "skipped", "reason": "scanner_evaluations empty"}
 
         merged = ur.merge(se, on=["ticker", "eval_date"], how="inner")
-        passing = merged[merged["quant_filter_pass"] == 1]
 
-        universe_avg = float(merged["return_5d"].mean())
-        passing_avg = float(passing["return_5d"].mean()) if not passing.empty else None
-        lift = (passing_avg - universe_avg) if passing_avg is not None else None
+        # Window restriction: per-eval_date sum of quant_filter_pass over the
+        # RAW scanner_evaluations rows (se), not the post-merge frame — a date
+        # can carry rows with no realized-return match yet still have
+        # genuinely recorded a pass, and we want the gate's own record, not
+        # what happened to join.
+        per_date_passes = se.groupby("eval_date")["quant_filter_pass"].sum()
+        all_eval_dates = sorted(per_date_passes.index)
+        dates_with_passes = sorted(per_date_passes[per_date_passes > 0].index)
+        n_dates_total = len(all_eval_dates)
+        n_dates_with_passes = len(dates_with_passes)
 
-        # Classification metrics: selected=passed filter, positive=beat SPY
-        clf = None
-        if "beat_spy_5d" in merged.columns:
-            has_outcome = merged["beat_spy_5d"].notna()
-            if has_outcome.any():
-                m = merged[has_outcome]
-                selected = (m["quant_filter_pass"] == 1).tolist()
-                positive = (m["beat_spy_5d"] == 1).tolist()
-                clf = compute_binary_metrics(
-                    tp=sum(s and p for s, p in zip(selected, positive)),
-                    fp=sum(s and not p for s, p in zip(selected, positive)),
-                    fn=sum(not s and p for s, p in zip(selected, positive)),
-                    tn=sum(not s and not p for s, p in zip(selected, positive)),
-                )
+        windowed_merged = merged[merged["eval_date"].isin(dates_with_passes)]
 
-        # Canonical 21d horizon (L4551): classification on beat_spy_21d + the
-        # log-domain alpha lift, additive alongside the 5d diagnostic above.
-        sel_mask = merged["quant_filter_pass"] == 1
-        clf_21d = _classification_for(merged, sel_mask, "beat_spy_21d")
-        lift_21d = _alpha_21d_log_lift(merged, sel_mask)
+        result = _scanner_lift_block(windowed_merged)
+        result["n_dates"] = n_dates_with_passes
+        result["n_dates_with_passes"] = n_dates_with_passes
+        result["n_dates_excluded_zero_pass"] = n_dates_total - n_dates_with_passes
+        result["first_eval_date"] = dates_with_passes[0] if dates_with_passes else None
+        result["last_eval_date"] = dates_with_passes[-1] if dates_with_passes else None
+        result["window_rule"] = "recorded_zero_pass_dates_excluded"
+        result["arm"] = SCANNER_METRIC_ARM
 
-        return {
-            "universe_avg": round(universe_avg, 4),
-            "passing_avg": round(passing_avg, 4) if passing_avg is not None else None,
-            "lift": round(lift, 4) if lift is not None else None,
-            "n_universe": len(merged),
-            "n_passing": len(passing),
-            "classification": clf,
-            "classification_21d": clf_21d,
-            "lift_21d_log": lift_21d,
-            "arm": SCANNER_METRIC_ARM,
-        }
+        # Additive-only: pre-restriction figures, retained for audit rather
+        # than discarded (S3 contract discipline — never rename/remove an
+        # existing key; this whole sub-block is new).
+        unfiltered = _scanner_lift_block(merged)
+        unfiltered["n_dates"] = n_dates_total
+        unfiltered["first_eval_date"] = all_eval_dates[0] if all_eval_dates else None
+        unfiltered["last_eval_date"] = all_eval_dates[-1] if all_eval_dates else None
+        result["unfiltered"] = unfiltered
+
+        return result
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "scanner_evaluations table not found"}
 
