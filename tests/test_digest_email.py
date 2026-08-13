@@ -42,7 +42,7 @@ def test_analysis_report_url_and_slug():
     assert emailer.ANALYSIS_SLUG == "analysis"
     assert (
         emailer.analysis_report_url("2026-06-26")
-        == "https://console.nousergon.ai/analysis?date=2026-06-26"
+        == "https://dashboard.nousergon.ai/analysis?date=2026-06-26"
     )
     # Override is honored (tests / non-prod consoles).
     assert emailer.analysis_report_url(
@@ -96,7 +96,7 @@ def test_send_digest_email_backtester_is_thin_with_console_and_report_link(monke
         status="ok", s3_bucket="alpha-engine-research",
     )
     assert "Alpha Engine Backtester | 2026-06-26 | results ready" in captured["subject"]
-    url = "https://console.nousergon.ai/analysis?date=2026-06-26"
+    url = "https://dashboard.nousergon.ai/analysis?date=2026-06-26"
     assert url in captured["plain"]
     assert f'href="{url}"' in captured["html"]
     # Links to ITS OWN report.md only (not the evaluator's) — the two are separate.
