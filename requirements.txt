@@ -27,7 +27,18 @@ vectorbt~=0.28.5
 # capping here reproduces that known-good resolution instead of floating
 # onto whatever numpy 2.5+ PyPI resolves next. alpha-engine-config#2975,
 # #2976.
-numpy>=2.0,<2.5
+#
+# 2026-08-13: the ceiling moved. numba 0.67.0 declares `numpy<2.6,>=1.22`
+# (numba 0.66 was the `<2.5` one this cap was written against), so the cap
+# steps to <2.6 — and numba is DECLARED here rather than left transitive,
+# because the ceiling this cap tracks belongs to numba and a cap whose
+# reason lives in an undeclared package drifts silently the moment pip
+# resolves an older numba. Verified in a clean 3.12 venv before the edit,
+# not inferred from metadata: numpy 2.5.2 + numba 0.67.0 + vectorbt 0.28.5
+# import cleanly AND `vbt.Portfolio.from_signals(...)` returns the correct
+# total_return, i.e. the numba-compiled path actually executes.
+numba>=0.67
+numpy>=2.0,<2.6
 plotly<6
 pandas~=2.2
 boto3~=1.43
@@ -102,11 +113,11 @@ nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.c
 # repo declares the libraries that code needs at runtime. The spot deps step
 # previously co-installed crucible-predictor's whole requirements.txt into the
 # same environment, which let predictor's numpy>=2.5.1 floor silently override
-# the numpy<2.5 cap above (numba/vectorbt hard ceiling) — every incompatible
+# the numpy cap above (numba/vectorbt hard ceiling) — every incompatible
 # pin pair between the two files was a latent deps-step failure. The two
 # requirements files are now NEVER co-resolved: predictor's checkout on the
 # spot box is code-only, and these floors mirror predictor's own (all
-# numpy-2.4-compatible). Guard: tests/test_spot_backtest_no_sibling_requirements.py.
+# compatible with the numpy cap above). Guard: tests/test_spot_backtest_no_sibling_requirements.py.
 scipy>=1.18.0
 lightgbm>=4.7.0
 catboost>=1.2.10
