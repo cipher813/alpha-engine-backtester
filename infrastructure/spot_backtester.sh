@@ -108,8 +108,39 @@ spot_common_pre_launch_preflight \
     "$REPO_ROOT/preflight.py" \
     "$REPO_ROOT/pipeline_common.py"
 
-# param-sweep does not run predictor_pipeline — stays on the cheap default
-# rotation (no RAM floor needed).
+# alpha-engine-config-I7216 (2026-08-13): param-sweep DOES need a RAM floor.
+#
+# This comment used to argue that because param-sweep does not run
+# predictor_pipeline, it could stay on the cheap default rotation and skip the
+# floor. The premise is about the predictor tensor and is true; the conclusion
+# does not follow, and was falsified in production:
+#
+#   bash: line 16: 26748 Killed  python -u backtest.py --mode param-sweep ...
+#
+# A kernel OOM kill on a 4 GB c5.large (2026-08-13, instance
+# i-0eba8344f3a124b3c). param-sweep reads the same ArcticDB feature store over
+# ~900 tickers; not loading the GBM tensor does not make it cheap.
+#
+# The blast radius is not one backtest. THIS stage gates PredictorBacktest,
+# which writes predictor/research_free_backfill/predictor_outcomes_research_free
+# .parquet — the LIVE ENTRY FEED while scanner_predictor_direct is champion.
+# With this stage dying the cohort froze at prediction_date 2026-08-07 and every
+# trading day drew its entry candidates from that stale pool; distinct names
+# newly entered fell from ~20/month to 3.
+#
+# It also failed INTERMITTENTLY, which is why it read as flakiness: the default
+# rotation (_spot_common.sh) is c5.large,m5.large,c6i.large,c5a.large — 4 GB,
+# 8 GB, 4 GB, 4 GB. For a memory-bound job the effective budget became a
+# function of which spot capacity pool answered.
+#
+# Reusing the predictor floor rather than inventing a smaller one is an
+# asymmetry call, not a capacity estimate: an OOM-killed process reports no
+# peak, so the true requirement is UNKNOWN. Guessing low costs another failed
+# nightly run and another day of trading on a frozen cohort; guessing high
+# costs a few cents of spot. Right-sizing DOWN from a measured peak RSS on a
+# surviving run is tracked on alpha-engine-config-I7216 — a cap derived from
+# another cap is not a budget.
+spot_common_apply_predictor_ram_floor
 spot_common_collapse_instance_type
 echo "  Instance types: $INSTANCE_TYPES"
 

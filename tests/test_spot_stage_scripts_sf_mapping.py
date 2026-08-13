@@ -89,7 +89,12 @@ def test_evaluator_runs_only_evaluate_py_with_skip_backtester():
 @pytest.mark.parametrize(
     "script,floor_expected",
     [
-        ("spot_backtester.sh", False),
+        # alpha-engine-config-I7216: flipped False -> True. param-sweep was
+        # carved out of the floor because it does not run predictor_pipeline —
+        # true, and irrelevant: it reads the same ArcticDB feature store over
+        # ~900 tickers and was OOM-killed on a 4 GB c5.large on 2026-08-13,
+        # freezing the live entry feed for days.
+        ("spot_backtester.sh", True),
         ("spot_predictor_backtest.sh", True),
         ("spot_portfolio_optimizer_backtest.sh", True),
         ("spot_parity.sh", True),
@@ -100,8 +105,15 @@ def test_predictor_ram_floor_matches_monolith_case_statement(script, floor_expec
     """The monolith applies the >=16GB floor for
     `all|predictor-backtest|portfolio-optimizer-backtest` modes (I3280).
     pit_parity (which the Parity script runs) shares the same universal
-    floor. param-sweep (Backtester) and the Evaluator don't run
-    predictor_pipeline and stay on the cheap default rotation."""
+    floor. The Evaluator does not run predictor_pipeline and stays on the
+    cheap default rotation.
+
+    param-sweep (Backtester) USED to be in that second group and no longer is
+    (alpha-engine-config-I7216): "does not run predictor_pipeline" was taken to
+    mean "is not memory-bound", which production falsified with a kernel OOM
+    kill on a 4 GB c5.large. Its floor is not evidence of a measured
+    requirement — an OOM-killed process reports no peak — it is a ceiling to
+    trade under until one exists."""
     text = (_INFRA / script).read_text()
     has_floor_call = "spot_common_apply_predictor_ram_floor" in text
     assert has_floor_call == floor_expected, (
