@@ -35,15 +35,25 @@ What it computes
    injected via ``end_to_end.load_historical_trajectory_scores``) vs
    realized forward alpha.
 5. **Counterfactual** (config#1398) — top-N-by-attractiveness selections
-   (N = 60/120/200, sector-balanced + unbalanced) vs the live ``tech_score``
-   survivor set (``scanner_evaluations.quant_filter_pass == 1``, the same
-   live-gate identification ``end_to_end._scanner_factor_counterfactual``
-   uses). Per selection: ex-post winner **capture rate** (per cycle, the
-   fraction of the cycle's top-K realized-alpha names — K = selection size,
-   winners drawn from the full scanner-evaluated cycle universe — that the
-   selection captured, averaged equally across cycles) and **mean realized
-   forward alpha** (per-cycle selection means, averaged equally across
-   cycles, i.e. date-clustered).
+   (N = 20/40/60/120/200, sector-balanced + unbalanced) vs the live
+   ``tech_score`` survivor set (``scanner_evaluations.quant_filter_pass ==
+   1``, the same live-gate identification
+   ``end_to_end._scanner_factor_counterfactual`` uses). Per selection:
+   ex-post winner **capture rate** (per cycle, the fraction of the cycle's
+   top-K realized-alpha names — K = selection size, winners drawn from the
+   full scanner-evaluated cycle universe — that the selection captured,
+   averaged equally across cycles) and **mean realized forward alpha**
+   (per-cycle selection means, averaged equally across cycles, i.e.
+   date-clustered). **Basket vs population** (config#7213) — each
+   selection's mean alpha compared against the mean alpha of the FULL
+   scanner-evaluated cycle universe (not just the scored subset), as a
+   per-cycle-then-averaged **excess** with a t-test/CI on the per-cycle diff
+   series (never pooled across names) — the number Brian asked for directly:
+   "how does the scanner's top-N basket do against the population it was
+   drawn from". ``counterfactual.holding_rule`` is an explicit string
+   (one per artifact, not per row — the same rule applies to every N /
+   sector_balanced variant) so the number is never read as a
+   continuously-traded return.
 
 Units + horizon
 ---------------
@@ -115,8 +125,19 @@ MIN_EVAL_DATES_T = 3
 # the 1/N prior (lambda = 1). Above it, lambda = SHRINKAGE_FULL_DATES / n.
 SHRINKAGE_FULL_DATES = 8
 
-# Counterfactual top-N variants (config#1398).
-COUNTERFACTUAL_TOP_NS = (60, 120, 200)
+# Counterfactual top-N variants (config#1398). 20/40 added (config#7213) —
+# the top-20 basket-vs-population grade Brian asked for directly; the
+# excess-vs-population block below is computed uniformly for every cohort
+# here, not only 20/40/60, since it is a strict, harmless generalization of
+# the deliverable and keeps one code path (no N-conditional branching).
+COUNTERFACTUAL_TOP_NS = (20, 40, 60, 120, 200)
+
+# Holding rule assumed by every counterfactual basket (config#7213): the
+# scanner/attractiveness cadence is weekly, so a basket is rebalanced weekly,
+# held the full forward horizon with no intra-period turnover modeled, and
+# equal-weighted. Stated explicitly in the artifact so basket_mean_alpha /
+# excess_vs_population are never read as a live, continuously-traded return.
+HOLDING_RULE = "weekly rebalance, 21d hold, equal-weight, no intra-period turnover"
 
 # Trajectory signals measured (schema authority: crucible-research
 # scoring/attractiveness_trajectory.build_trajectory stocks[] records).
@@ -327,6 +348,56 @@ def _capture_rate(cycle: pd.DataFrame, selection: pd.DataFrame) -> float | None:
     return len(winners & set(selection["ticker"])) / float(k)
 
 
+def _excess_stats(basket: list[float], population: list[float]) -> dict:
+    """``basket`` vs ``population`` per-cycle PAIRED excess (config#7213) —
+    same cycles contribute both legs (population is appended for a cycle
+    only when that cohort's basket was, so the two lists stay index-aligned).
+    The excess mean is the mean of the per-cycle DIFFS, never the difference
+    of two independently-pooled means (linear-equal here, but computed this
+    way so significance is tested on the correct — per-cycle — series, one
+    observation per eval_date, mirroring ``_clustered_ic_block``). Honest
+    small-N: t/p/ci95 are None below ``MIN_EVAL_DATES_T`` paired cycles."""
+    n = len(basket)
+    population_mean_alpha = round(float(np.mean(population)), 5) if population else None
+    out = {
+        "population_mean_alpha": population_mean_alpha,
+        "excess_vs_population": None,
+        "excess_t": None,
+        "excess_p": None,
+        "excess_ci95": None,
+    }
+    if n == 0:
+        return out
+
+    diffs = np.asarray(basket, dtype=float) - np.asarray(population, dtype=float)
+    excess_mean = float(np.mean(diffs))
+    out["excess_vs_population"] = round(excess_mean, 5)
+
+    if n >= MIN_EVAL_DATES_T:
+        from scipy.stats import sem, ttest_1samp
+        from scipy.stats import t as t_dist
+
+        t_stat, p_val = ttest_1samp(diffs, 0.0)
+        # np.isfinite: a zero-variance diff series yields t=inf/nan, invalid
+        # strict JSON — report None rather than corrupt the artifact (mirrors
+        # _clustered_ic_block's same guard).
+        if np.isfinite(t_stat):
+            out["excess_t"] = round(float(t_stat), 4)
+        if np.isfinite(p_val):
+            out["excess_p"] = round(float(p_val), 4)
+
+        se = float(sem(diffs))
+        if np.isfinite(se) and se > 0:
+            t_crit = float(t_dist.ppf(0.975, df=n - 1))
+            out["excess_ci95"] = [round(excess_mean - t_crit * se, 5),
+                                   round(excess_mean + t_crit * se, 5)]
+        else:
+            # zero-variance diff series — the mean is exact, CI collapses to
+            # a point rather than being fabricated as None.
+            out["excess_ci95"] = [round(excess_mean, 5), round(excess_mean, 5)]
+    return out
+
+
 def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
     """Top-N-by-attractiveness vs the live tech_score survivor gate
     (config#1398). The live survivor set is ``scanner_evaluations`` rows with
@@ -340,7 +411,7 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
     empty = {"top_n": [], "live_gate": {"capture_rate": None,
                                         "mean_alpha": None,
                                         "n_survivors": 0},
-             "n_cycles": 0}
+             "n_cycles": 0, "holding_rule": HOLDING_RULE}
     if "scanner_evaluations" not in tabs:
         empty["reason"] = "scanner_evaluations table absent"
         return empty
@@ -365,7 +436,8 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
     base = base.merge(attr, on=["eval_date", "ticker"], how="left")
 
     variants = [(n, sb) for n in COUNTERFACTUAL_TOP_NS for sb in (False, True)]
-    per_variant: dict = {v: {"capture": [], "alpha": []} for v in variants}
+    per_variant: dict = {v: {"capture": [], "alpha": [], "population": []}
+                         for v in variants}
     live = {"capture": [], "alpha": [], "n_survivors": 0}
     n_cycles = 0
 
@@ -381,6 +453,12 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
         live["alpha"].append(float(survivors["alpha"].mean()))
         live["n_survivors"] += int(len(survivors))
 
+        # Population leg (config#7213): the FULL scanner-evaluated cycle
+        # universe with realized alpha — ``g``, not ``scored`` — so a
+        # selector that only scores a subset of the cycle can't shrink its
+        # own population comparator (non-inferable gotcha #3, PIT universe).
+        cycle_population_alpha = float(g["alpha"].mean())
+
         for n, sector_balanced in variants:
             if len(scored) < n:
                 continue  # a truncated "top-N" wouldn't be the named variant
@@ -389,8 +467,10 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
             else:
                 sel = scored.sort_values(
                     "attractiveness_score", ascending=False).head(n)
-            per_variant[(n, sector_balanced)]["capture"].append(_capture_rate(g, sel))
-            per_variant[(n, sector_balanced)]["alpha"].append(float(sel["alpha"].mean()))
+            slot = per_variant[(n, sector_balanced)]
+            slot["capture"].append(_capture_rate(g, sel))
+            slot["alpha"].append(float(sel["alpha"].mean()))
+            slot["population"].append(cycle_population_alpha)
 
     def _mean(xs: list) -> float | None:
         vals = [x for x in xs if x is not None]
@@ -399,13 +479,15 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
     top_n = []
     for (n, sector_balanced) in variants:
         v = per_variant[(n, sector_balanced)]
-        top_n.append({
+        entry = {
             "n": n,
             "sector_balanced": sector_balanced,
             "capture_rate": _mean(v["capture"]),
             "mean_alpha": _mean(v["alpha"]),
             "n_cycles": len(v["alpha"]),
-        })
+        }
+        entry.update(_excess_stats(v["alpha"], v["population"]))
+        top_n.append(entry)
     return {
         "top_n": top_n,
         "live_gate": {
@@ -414,6 +496,10 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
             "n_survivors": int(live["n_survivors"]),
         },
         "n_cycles": n_cycles,
+        # config#7213: cohort definition for every basket row above — a
+        # counterfactual-level constant (not per-row: it's the same rule for
+        # every N/sector_balanced variant this producer emits).
+        "holding_rule": HOLDING_RULE,
     }
 
 
@@ -504,6 +590,7 @@ def compute_attractiveness_eval(
                 "live_gate": {"capture_rate": None, "mean_alpha": None,
                               "n_survivors": 0},
                 "n_cycles": 0,
+                "holding_rule": HOLDING_RULE,
             },
         }
         if reason:
