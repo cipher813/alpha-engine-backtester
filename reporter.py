@@ -419,6 +419,39 @@ def _section_pipeline_health(health: dict) -> list[str]:
     else:
         lines.append("- pit_parity: not run this week (stage disabled/skipped)")
 
+    # config#7199 — the contamination VERDICT line, rendered whenever the check
+    # produced a report at all. Separate from the status line above on purpose:
+    # "the stage ran" and "the numbers are uncontaminated" are two claims, and
+    # only the second is the one an external reader is asking about.
+    verdict = health.get("pit_parity_verdict")
+    if verdict is not None:
+        coverage = health.get("pit_parity_coverage_fraction")
+        coverage_txt = "" if coverage is None else f" (coverage {coverage:.1%})"
+        reason = health.get("pit_parity_verdict_reason") or ""
+        if verdict == "PASS":
+            lines.append(
+                "- Look-ahead contamination: **PASS** — the point-in-time vs "
+                "look-ahead delta is not distinguishable from zero over the "
+                "full window."
+            )
+        elif verdict == "PARTIAL":
+            lines.append(
+                f"- Look-ahead contamination: **PARTIAL**{coverage_txt} — clean "
+                f"over the window covered; the REMAINDER IS UNVERIFIED. "
+                f"{reason}"
+            )
+        elif verdict == "FAIL":
+            lines.append(
+                f"- Look-ahead contamination: **FAIL**{coverage_txt} — "
+                f"MATERIAL contamination detected. {reason}"
+            )
+        else:
+            lines.append(
+                f"- Look-ahead contamination: **UNKNOWN** — the check did not "
+                f"answer this week. These numbers carry NO contamination "
+                f"guarantee. {reason}"
+            )
+
     lines.append("")
     return lines
 

@@ -48,10 +48,14 @@ import numpy as np
 
 from analysis.pit_parity import (
     SCHEMA as PIT_PARITY_SCHEMA,
+    VERDICT_FAIL,
+    VERDICT_UNKNOWN,
+    is_timeout_failure,
     _config_without_runtime_handles,
     _run_predictor_pass_isolated,
     _validate_reusable_predictor_stats,
     build_contamination_report,
+    coverage_from_wf_meta,
     read_prior_delta,
 )
 
@@ -163,6 +167,20 @@ def build_pass_artifact(
     }
     if status == "ok":
         artifact["stats"] = extract_pass_stats(stats)
+        # config#7199: lift the walk-forward coverage block to the TOP LEVEL of
+        # the pass artifact. It is already inside stats.predictor_metadata, but
+        # the compare's verdict depends on it, and a field a verdict depends on
+        # does not live three levels down inside a free-form metadata blob where
+        # a shape change is invisible. Always emitted (null-filled for the
+        # lookahead pass, which is single-pass and has no fold coverage).
+        wf_meta = (stats.get("predictor_metadata") or {}).get("walk_forward")
+        artifact["coverage"] = (
+            coverage_from_wf_meta(wf_meta) if which == "walkforward"
+            else {"coverage_fraction": None, "budget_stopped": False,
+                  "complete": True, "measured": False,
+                  "note": "lookahead is a single pass over the full grid — "
+                          "no fold coverage to report"}
+        )
     else:
         # A pass that returned a non-ok status dict (insufficient data,
         # executor path missing, ...) still always emits an artifact so the
@@ -182,6 +200,11 @@ def build_failure_pass_artifact(which: str, run_date: str, exc: BaseException) -
         "run_date": run_date,
         "pass": which,
         "status": "failed",
+        # config#7199 / Brian ruling 2026-08-13: the compare turns a TIMED-OUT
+        # pass into verdict FAIL and any other crash into UNKNOWN, so the
+        # producer records which it was as a flag rather than leaving the
+        # consumer to string-match an exception message.
+        "timed_out": is_timeout_failure(type(exc).__name__, str(exc)),
         "error_class": type(exc).__name__,
         "error_msg": str(exc)[:1000],
     }
@@ -376,18 +399,71 @@ def _stats_from_artifact(artifact: dict) -> dict:
     return dict(artifact["stats"])
 
 
+def _timed_out_passes(artifacts: dict[str, dict | None] | None) -> list[str]:
+    """Names of the passes whose failure artifact records a wall-kill.
+
+    Reads the explicit ``timed_out`` flag; falls back to matching the recorded
+    error for artifacts written before that flag existed — including the exact
+    2026-08-07 body, ``"pit_parity walkforward pass timed out after 2700s"``.
+    """
+    out: list[str] = []
+    for which, artifact in (artifacts or {}).items():
+        if not isinstance(artifact, dict):
+            continue
+        if is_timeout_failure(
+            artifact.get("error_class"), artifact.get("error_msg"),
+            timed_out=artifact.get("timed_out"),
+        ):
+            out.append(which)
+    return sorted(out)
+
+
 def build_unknown_report(
-    run_date: str, availability: dict[str, str],
+    run_date: str,
+    availability: dict[str, str],
+    artifacts: dict[str, dict | None] | None = None,
 ) -> dict:
-    """The §2.3a verdict when either pass artifact is unavailable: UNKNOWN,
-    never pass. Shape extends the existing ``status``-keyed non-complete
-    reports ('failed', 'incomplete') that evaluate.py / the Report Card
-    already read — a new status VALUE, not a new shape."""
+    """The §2.3a verdict when either pass artifact is unusable.
+
+    Two distinct outcomes, and the distinction is Brian's 2026-08-13 ruling:
+
+    * a pass that **timed out** -> ``FAIL`` / ``status: "failed"``. It ran and
+      hit its wall. That is a failure of the check, not an absence of one, and
+      the report card must say FAILED where the dashboard already does.
+    * anything else — never written, skipped, unparseable -> ``UNKNOWN`` /
+      ``status: "unknown"``. Absence of evidence, and never a pass (§2.3a
+      rule 2).
+
+    Shape extends the existing ``status``-keyed non-complete reports
+    ('failed', 'incomplete') that evaluate.py / the Report Card / the
+    dashboard's ``results/view_model.py::integrity_rows`` already read — new
+    status VALUES, not a new shape.
+    """
+    timed_out = _timed_out_passes(artifacts)
+    if timed_out:
+        verdict, status = VERDICT_FAIL, "failed"
+        reason = (
+            "FAILED: the " + ", ".join(timed_out) + " pass timed out. A check "
+            "that ran and hit its wall is a failure, not an absence (Brian "
+            "ruling 2026-08-13). These numbers carry NO contamination "
+            "guarantee."
+        )
+    else:
+        verdict, status = VERDICT_UNKNOWN, "unknown"
+        reason = (
+            "The contamination check did not answer this cycle — pass "
+            "artifacts " + repr(dict(availability)) + ". Absence of a verdict "
+            "is never a pass (sf-pipeline-policy §2.3a rule 2)."
+        )
     return {
         "schema": PIT_PARITY_SCHEMA,
         "run_date": run_date,
-        "status": "unknown",
-        "verdict": "UNKNOWN",
+        "status": status,
+        "verdict": verdict,
+        "verdict_reason": reason,
+        "timed_out_passes": timed_out,
+        "coverage": {"coverage_fraction": None, "budget_stopped": False,
+                     "complete": None, "measured": False},
         "pass_availability": dict(availability),
         # Compatibility keys mirroring the legacy "incomplete" report so
         # existing readers of current_status/pit_status keep working.
@@ -427,14 +503,13 @@ def run_compare_and_publish(config: dict) -> dict:
             "[pit_stats] compare inputs unavailable (%s) — emitting verdict UNKNOWN",
             availability,
         )
-        report = build_unknown_report(run_date, availability)
+        report = build_unknown_report(run_date, availability, artifacts)
         _put_json(bucket, f"backtest/{run_date}/pit_parity.json", report)
         _alert(
-            f"pit_parity verdict UNKNOWN on {run_date}: pass artifacts "
-            f"{availability} — absence of a verdict must not be read as a "
-            f"clean pass (sf-pipeline-policy §2.3a). "
+            f"pit_parity verdict {report['verdict']} on {run_date}: pass "
+            f"artifacts {availability} — {report['verdict_reason']} "
             f"See s3://{bucket}/backtest/{run_date}/pit_parity.json",
-            dedup_key=f"pit_parity_unknown_{run_date}",
+            dedup_key=f"pit_parity_{report['verdict'].lower()}_{run_date}",
         )
         return report
 
@@ -452,7 +527,31 @@ def run_compare_and_publish(config: dict) -> dict:
     # Explicit ok status: a completed report previously carried NO status key
     # and readers default absent -> "ok" (evaluate.py:2296), so this is a
     # compatible, strictly-more-honest extension.
-    report["status"] = "ok"
+    #
+    # config#7199: `status` answers "did the compare stage produce a real
+    # comparison"; `verdict` (set by build_contamination_report) answers "is
+    # this run contamination-free". They are different questions and the second
+    # is the load-bearing one — a PARTIAL comparison is a successful STAGE and
+    # an incomplete CLAIM, and collapsing the two is exactly how the 2026-08-07
+    # card graded `status: ok` with no contamination verdict at all. A verdict
+    # of UNKNOWN downgrades the status too, matching build_unknown_report.
+    report["status"] = {
+        VERDICT_UNKNOWN: "unknown",
+        VERDICT_FAIL: "failed",
+    }.get(report.get("verdict"), "ok")
+    logger.info(
+        "[pit_stats] contamination verdict=%s coverage=%s — %s",
+        report.get("verdict"),
+        (report.get("coverage") or {}).get("coverage_fraction"),
+        report.get("verdict_reason"),
+    )
+    if report.get("verdict") != "PASS":
+        _alert(
+            f"pit_parity contamination verdict {report.get('verdict')} on "
+            f"{run_date}: {report.get('verdict_reason')} "
+            f"See s3://{bucket}/backtest/{run_date}/pit_parity.json",
+            dedup_key=f"pit_parity_verdict_{report.get('verdict')}_{run_date}",
+        )
     report["pass_artifacts"] = {
         which: pass_artifact_key(run_date, which) for which in PASSES
     }
