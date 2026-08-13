@@ -169,6 +169,7 @@ krepis[openai]>=0.55.0
 #
 # SOTA note: the correct end state is a real CLI entry point
 # (`python -m replay.parity_report`) so that a TEST RUNNER is not a production
-# dependency. That is a larger change than restoring the artifact, and is
-# tracked separately; this pin restores the producer now.
+# dependency. That is a larger change than restoring the artifact — tracked as
+# alpha-engine-config-I7212, which REMOVES this pin. This restores the producer
+# now, four weeks late.
 pytest>=9.1.1
