@@ -33,11 +33,13 @@ import datetime as _dt
 import gc
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import time
@@ -958,6 +960,108 @@ _WF_DEFAULTS = {
 }
 
 
+# ── config#7199: the self-deadlining walk-forward budget ────────────────────
+# Seconds held back from the deadline so that everything AFTER the fold loop —
+# signal generation, the simulation, stats assembly, the pickle/S3 write — still
+# has room to run. Being killed at the wall discards the whole pass and produces
+# no artifact at all; stopping early with a labelled PARTIAL keeps every fold
+# that DID complete. Sized against the measured healthy pass (~10-13 min total,
+# of which the post-inference simulation half is the larger part), deliberately
+# generous: over-reserving costs coverage, under-reserving costs the artifact.
+WF_BUDGET_RESERVE_S = float(os.environ.get("PIT_PARITY_WF_RESERVE_S", "420"))
+
+#: Assumed cost of the FIRST fold, before this run has measured anything. Only
+#: ever used for fold 0; from fold 1 the estimate is the observed p90.
+WF_FIRST_FOLD_ESTIMATE_S = float(
+    os.environ.get("PIT_PARITY_WF_FIRST_FOLD_ESTIMATE_S", "60")
+)
+
+
+#: Config key carrying this process's wall-clock deadline as a UNIX epoch
+#: second. Injected by ``analysis.pit_parity._run_predictor_pass_isolated``
+#: into the config JSON the isolated pass child reads, so the child inherits
+#: the parent's subprocess timeout instead of discovering it as a SIGKILL.
+#: Epoch (not a duration) so it survives the process boundary unambiguously.
+DEADLINE_EPOCH_CONFIG_KEY = "_pass_deadline_epoch"
+
+
+def _deadline_remaining_s(config: dict) -> "Callable[[], float] | None":
+    """Build the remaining-seconds callable from the config's deadline, or
+    ``None`` when no deadline was handed down (every caller that is not an
+    isolated pit_parity pass — the CLI, the phase, tests — behaves exactly as
+    before)."""
+    deadline = config.get(DEADLINE_EPOCH_CONFIG_KEY)
+    if deadline is None:
+        return None
+    try:
+        deadline = float(deadline)
+    except (TypeError, ValueError):
+        logger.error(
+            "[walk_forward] %s=%r is not a number — ignoring the deadline "
+            "rather than truncating on a value nobody can read.",
+            DEADLINE_EPOCH_CONFIG_KEY, deadline,
+        )
+        return None
+    logger.info(
+        "[walk_forward] fold loop is self-deadlining: %.0fs of budget remain "
+        "(reserve %.0fs held back for simulation + artifact write).",
+        deadline - time.time(), WF_BUDGET_RESERVE_S,
+    )
+    return lambda: deadline - time.time()
+
+
+def _safe_remaining(remaining_s) -> float:
+    """Evaluate a remaining-seconds callable without ever raising.
+
+    A budget probe that throws must not take the pass down with it — an
+    unreadable clock means "unbounded", which degrades to today's behaviour
+    (run every fold) rather than to a silent truncation nobody asked for.
+    """
+    try:
+        return float(remaining_s())
+    except Exception as exc:  # noqa: BLE001 — see docstring; the log IS the surface
+        logger.error(
+            "[walk_forward] remaining-budget probe failed (%s: %s) — treating the "
+            "budget as unbounded for this fold.", type(exc).__name__, exc,
+        )
+        return float("inf")
+
+
+def _p90(samples: list[float]) -> float:
+    """p90 of the observed per-fold durations.
+
+    p90 and not p50 deliberately: the concordance incident (crucible-backtester
+    #633) sized a budget on a mean and the slow tail ran 30x it, so the cap could
+    never bind. The budget must be sized on the fold that might come next, not on
+    the typical one.
+    """
+    ordered = sorted(samples)
+    if not ordered:
+        return WF_FIRST_FOLD_ESTIMATE_S
+    # Rounds UP rather than nearest-rank, so with few samples the estimate walks
+    # toward the observed MAX. That is the safe direction for a deadline: an
+    # over-estimate costs one fold of coverage, an under-estimate costs the
+    # whole artifact. Nearest-rank on ten samples returns the 9th of nine fast
+    # folds and ignores the one 100x outlier entirely — the concordance mistake.
+    idx = min(len(ordered) - 1, int(math.ceil(0.9 * len(ordered))))
+    return ordered[idx]
+
+
+def _next_fold_affordable(
+    remaining_s, fold_seconds: list[float], *, reserve_s: float,
+) -> bool:
+    """True iff another fold plausibly fits before the deadline.
+
+    ``remaining - reserve >= p90(observed folds)``. Before any fold has been
+    measured the estimate is :data:`WF_FIRST_FOLD_ESTIMATE_S` — so a pass handed
+    a budget it has ALREADY blown (the deadline arrived during feature
+    computation) scores zero folds and returns coverage 0 rather than starting
+    work it cannot finish. Coverage 0 is UNKNOWN downstream, not PARTIAL and
+    never a pass.
+    """
+    return (_safe_remaining(remaining_s) - reserve_s) >= _p90(fold_seconds)
+
+
 # Canonical Layer-1A momentum feature set — the raw inputs the deterministic
 # momentum baseline consumes by name. Mirrors
 # ``crucible-predictor/model/momentum_scorer.py::predict_array``
@@ -999,6 +1103,8 @@ def run_walk_forward_inference(
     region: str = "us-east-1",
     wf_params: dict | None = None,
     s3_client=None,
+    remaining_s: "Callable[[], float] | None" = None,
+    budget_reserve_s: float = WF_BUDGET_RESERVE_S,
 ) -> tuple[dict[str, dict[str, float]], dict]:
     """Point-in-time-honest replacement for the single-pass ``run_inference``.
 
@@ -1085,16 +1191,56 @@ def run_walk_forward_inference(
     predictions_by_date: dict[str, dict[str, float]] = {}
     n_test_dates_scored = 0
 
-    for fold in folds:
+    # config#7199 — self-deadlining fold loop, mirroring the shape landed for
+    # the concordance sweep in crucible-backtester#633. The loop asks, before
+    # each fold, whether another fold still fits in the budget it was handed,
+    # estimating from the p90 of THIS run's own observed per-fold latencies
+    # (the workload measures itself — a cap derived from an assumed constant
+    # does not track the workload; that is exactly how the 2700s pit_parity
+    # ceiling could be blown through with no artifact at all on 2026-08-07).
+    # On a no it breaks, and wf_stats records the truncation so a partial
+    # walk-forward pass can never be read as a full one.
+    #
+    # A contamination check reporting "clean over the 62% of the window I
+    # covered" is worth enormously more than a timeout; sf-pipeline-policy
+    # §2.3a is why the partial must be LABELLED partial and must never render
+    # as a pass.
+    n_test_dates_planned = sum(
+        fold.test_end_idx - fold.test_start_idx + 1 for fold in folds
+    )
+    fold_seconds: list[float] = []
+    n_folds_stopped_for_budget = 0
+    budget_stopped = False
+    covered_through: str | None = None
+
+    for i, fold in enumerate(folds):
+        if remaining_s is not None and not _next_fold_affordable(
+            remaining_s, fold_seconds, reserve_s=budget_reserve_s,
+        ):
+            budget_stopped = True
+            n_folds_stopped_for_budget = len(folds) - i
+            logger.error(
+                "[walk_forward] stopping early on budget: %d of %d fold(s) not "
+                "scored (remaining=%.0fs, reserve=%.0fs, p90 fold=%.0fs). The "
+                "pass will publish a PARTIAL walk-forward result covering "
+                "%d of %d test dates — never a clean pass.",
+                n_folds_stopped_for_budget, len(folds), _safe_remaining(remaining_s),
+                budget_reserve_s, _p90(fold_seconds) if fold_seconds else float("nan"),
+                n_test_dates_scored, n_test_dates_planned,
+            )
+            break
+
         decision_date = fold.test_start_date
         fold_test_dates = trading_dates[
             fold.test_start_idx : fold.test_end_idx + 1
         ]
+        _fold_started = time.monotonic()
         fold_preds = _predict_from_tensor(
             tensor, tickers, date_to_idx, fold_test_dates,
             scorer=scorer, heartbeat_every=50,
             log_label=f"WF[{decision_date.isoformat()}]",
         )
+        fold_seconds.append(time.monotonic() - _fold_started)
         for d, row in fold_preds.items():
             if d in predictions_by_date:
                 # Non-overlapping test windows is a fold-splitter
@@ -1105,7 +1251,19 @@ def run_walk_forward_inference(
                 )
             predictions_by_date[d] = row
         n_test_dates_scored += len(fold_preds)
+        if fold_test_dates:
+            covered_through = fold_test_dates[-1]
 
+    n_folds_scored = len(folds) - n_folds_stopped_for_budget
+    # Coverage is measured on TEST DATES, not folds: the contamination delta is
+    # a per-date return-stream comparison, so the date axis is the axis the
+    # compare stage truncates both passes onto. Folds are chronological and
+    # non-overlapping, so an early stop drops the TAIL — both streams stay
+    # aligned from index 0, which is what makes the truncated comparison valid.
+    coverage_fraction = (
+        (n_test_dates_scored / n_test_dates_planned)
+        if n_test_dates_planned else None
+    )
     wf_stats = {
         "enabled": True,
         # Momentum leg is the deterministic baseline (model/momentum_scorer.py),
@@ -1114,16 +1272,26 @@ def run_walk_forward_inference(
         # 0 / [] so any consumer reading the old shape degrades gracefully.
         "momentum_source": "deterministic_baseline",
         "n_folds": len(folds),
-        "n_folds_scored": len(folds),
+        "n_folds_scored": n_folds_scored,
         "n_cold_start_excluded": 0,
         "cold_start_test_starts": [],
         "n_test_dates_scored": n_test_dates_scored,
         "params": p,
+        # config#7199 coverage block — read by analysis/pit_stats_artifact.py
+        # into the pass artifact and by the compare stage into the verdict.
+        "complete": not budget_stopped,
+        "budget_stopped": budget_stopped,
+        "n_folds_planned": len(folds),
+        "n_folds_skipped_for_budget": n_folds_stopped_for_budget,
+        "n_test_dates_planned": n_test_dates_planned,
+        "coverage_fraction": coverage_fraction,
+        "covered_through": covered_through,
     }
     logger.info(
-        "[walk_forward] complete: %d fold(s) scored (deterministic momentum), "
-        "%d test dates with predictions",
-        len(folds), n_test_dates_scored,
+        "[walk_forward] complete: %d of %d fold(s) scored (deterministic "
+        "momentum), %d of %d test dates with predictions (coverage=%s)",
+        n_folds_scored, len(folds), n_test_dates_scored, n_test_dates_planned,
+        "n/a" if coverage_fraction is None else f"{coverage_fraction:.1%}",
     )
     if folds and n_test_dates_scored == 0:
         # Folds exist but no test-window date produced a prediction → every
@@ -1342,6 +1510,7 @@ def run(
         predictions_by_date, wf_stats = run_walk_forward_inference(
             features_by_ticker, trading_dates, predictor_path,
             bucket=bucket, wf_params=wf_params,
+            remaining_s=_deadline_remaining_s(config),
         )
     else:
         model_path = download_gbm_model(bucket=bucket)

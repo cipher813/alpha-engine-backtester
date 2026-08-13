@@ -20,6 +20,10 @@
       "type": "string",
       "description": "'ok' iff the pass completed and `stats` is trustworthy. Any other value ('failed', 'error', 'insufficient_data', ...) means the compare stage must treat this pass as unavailable and emit its parity verdict as UNKNOWN — never as a pass (sf-pipeline-policy §2.3a)."
     },
+    "timed_out": {
+      "type": "boolean",
+      "description": "config#7199 (Brian ruling 2026-08-13): true iff this pass failed by hitting its wall rather than by any other error. The compare stage turns a timed-out pass into verdict FAIL and every other failure class into UNKNOWN — a check that ran and could not finish is a failure, not an absence, and the two are diagnosed differently. Recorded as a flag by the producer so no consumer has to string-match an exception message."
+    },
     "error_class": {
       "type": "string",
       "description": "Exception class name when status != 'ok' via the failure path."
@@ -31,6 +35,39 @@
     "wall_clock_seconds": {
       "type": ["number", "null"],
       "description": "Measured wall-clock of the isolated pass subprocess (alpha-engine-config-I6026 deliverable 2 — the series per-stage timeout calibration is seeded from). null when the pass was reused (see `reuse`) — a reused pass has no subprocess runtime to report and must not pollute the calibration series."
+    },
+    "coverage": {
+      "type": "object",
+      "description": "config#7199: how much of the intended window this pass actually covered. The walk-forward fold loop is self-deadlining — it stops before the wall while there is still time to publish — so a pass can complete honestly over a SUBSET of the grid. The compare stage turns this into the PARTIAL verdict, and a PARTIAL is never a pass (sf-pipeline-policy §2.3a rule 2). Absent on artifacts written before config#7199, which read as coverage-unmeasured (verdict PARTIAL), never as measured-complete.",
+      "properties": {
+        "coverage_fraction": {
+          "type": ["number", "null"],
+          "description": "n_test_dates_scored / n_test_dates_planned. null = the producer did not measure it; NOT 1.0."
+        },
+        "budget_stopped": {
+          "type": "boolean",
+          "description": "True iff the fold loop stopped early because another fold did not fit before the deadline."
+        },
+        "complete": {
+          "type": ["boolean", "null"],
+          "description": "True only when the producer asserted full coverage. null = not asserted."
+        },
+        "measured": {
+          "type": "boolean",
+          "description": "True iff coverage_fraction was actually measured by the producer, as opposed to being absent."
+        },
+        "n_folds_planned": { "type": ["integer", "null"] },
+        "n_folds_scored": { "type": ["integer", "null"] },
+        "n_folds_skipped_for_budget": { "type": ["integer", "null"] },
+        "n_test_dates_planned": { "type": ["integer", "null"] },
+        "n_test_dates_scored": { "type": ["integer", "null"] },
+        "covered_through": {
+          "type": ["string", "null"],
+          "description": "Last trading date actually scored — the truncation point both passes' return streams are aligned onto by the compare."
+        },
+        "note": { "type": "string" }
+      },
+      "additionalProperties": true
     },
     "reuse": {
       "type": "object",

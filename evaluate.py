@@ -2371,6 +2371,26 @@ def _main_impl() -> None:
                 (_pit_parity_report or {}).get("run_date")
                 if _pit_parity_report is not None else None
             ),
+            # config#7199 — the CONTAMINATION VERDICT, distinct from the
+            # stage-ran-or-not status above. `pit_parity_status` answers "did
+            # the check execute"; this answers "was this run free of look-ahead
+            # contamination". They are two claims and an external reader asks
+            # about them separately, so they are rendered as two. A report with
+            # no `verdict` key at all (pre-config#7199) reads UNKNOWN, never a
+            # pass (sf-pipeline-policy §2.3a rule 2).
+            "pit_parity_verdict": (
+                (_pit_parity_report or {}).get("verdict", "UNKNOWN")
+                if _pit_parity_report is not None else None
+            ),
+            "pit_parity_verdict_reason": (
+                (_pit_parity_report or {}).get("verdict_reason")
+                if _pit_parity_report is not None else None
+            ),
+            "pit_parity_coverage_fraction": (
+                ((_pit_parity_report or {}).get("coverage") or {})
+                .get("coverage_fraction")
+                if _pit_parity_report is not None else None
+            ),
         }
 
         # Compute the evaluator-revamp metric bundles. Each piece

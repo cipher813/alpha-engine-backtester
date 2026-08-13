@@ -420,6 +420,39 @@ def _section_pipeline_health(health: dict) -> list[str]:
     else:
         lines.append("- pit_parity: not run this week (stage disabled/skipped)")
 
+    # config#7199 — the contamination VERDICT line, rendered whenever the check
+    # produced a report at all. Separate from the status line above on purpose:
+    # "the stage ran" and "the numbers are uncontaminated" are two claims, and
+    # only the second is the one an external reader is asking about.
+    verdict = health.get("pit_parity_verdict")
+    if verdict is not None:
+        coverage = health.get("pit_parity_coverage_fraction")
+        coverage_txt = "" if coverage is None else f" (coverage {coverage:.1%})"
+        reason = health.get("pit_parity_verdict_reason") or ""
+        if verdict == "PASS":
+            lines.append(
+                "- Look-ahead contamination: **PASS** — the point-in-time vs "
+                "look-ahead delta is not distinguishable from zero over the "
+                "full window."
+            )
+        elif verdict == "PARTIAL":
+            lines.append(
+                f"- Look-ahead contamination: **PARTIAL**{coverage_txt} — clean "
+                f"over the window covered; the REMAINDER IS UNVERIFIED. "
+                f"{reason}"
+            )
+        elif verdict == "FAIL":
+            lines.append(
+                f"- Look-ahead contamination: **FAIL**{coverage_txt} — "
+                f"MATERIAL contamination detected. {reason}"
+            )
+        else:
+            lines.append(
+                f"- Look-ahead contamination: **UNKNOWN** — the check did not "
+                f"answer this week. These numbers carry NO contamination "
+                f"guarantee. {reason}"
+            )
+
     lines.append("")
     return lines
 
@@ -1836,27 +1869,22 @@ def save(
         ("quant_rank_quality.json", quant_rank_quality),
         ("agent_justification.json", agent_justification),
         ("barrier_coherence.json", barrier_coherence),
+        # config#7209 / config#7214 — MOVED from the OK-only block below.
+        # `portfolio_excursion.json` had never been written for ANY date: the
+        # producer (`analysis/excursion.py::summarize_excursions`, reached via
+        # `compute_portfolio_excursion_summary`) returns `insufficient_data` on
+        # the weekly run, and the OK-only gate then wrote nothing — so a
+        # producer that RUNS AND DEGRADES was indistinguishable, on S3, from a
+        # producer that never ran. That is the exact ambiguity the always-emit
+        # contract exists to remove (observability-policy §3.5: an explicit
+        # value from the N/A taxonomy, never silence). The old "no freshness
+        # monitor requires it" rationale was backwards — a row cannot be
+        # freshness-monitored while its key is absent by design.
+        ("portfolio_excursion.json", excursion_summary),
     ]:
         if data is not None:
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
             logger.info("Wrote %s (status=%s)", out_dir / filename, data.get("status"))
-            _persist(out_dir / filename)
-
-    # OK-ONLY contract (dashboard panels): write only on a meaningful result.
-    for filename, data in [
-        # NOTE: grading / trigger_scorecard / shadow_book / exit_timing /
-        # e2e_lift / veto_analysis / confusion_matrix / provenance_grounding /
-        # quant_rank_quality / agent_justification / barrier_coherence were
-        # moved to the ALWAYS-EMIT block above (config#726, Phase 0b sweep).
-        # score_calibration.json / macro_eval.json / portfolio_calibration.json
-        # were moved there earlier (config#1189). portfolio_excursion.json stays
-        # OK-only: its `excursion_summary` producer has no freshness monitor /
-        # absence-vs-no-data consumer requiring the always-emit contract.
-        ("portfolio_excursion.json", excursion_summary),
-    ]:
-        if data and data.get("status") in ("ok", "partial", "insufficient_lift"):
-            (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
-            logger.info("Wrote %s", out_dir / filename)
             _persist(out_dir / filename)
 
     return out_dir

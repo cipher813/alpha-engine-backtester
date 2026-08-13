@@ -804,14 +804,27 @@ class TestAlwaysEmitDecisionCapture:
         out = self._save(tmp_path, measurement_coverage=None)
         assert not (out / "coverage.json").exists()
 
-    def test_ok_only_artifact_skips_error_status(self, tmp_path):
-        """portfolio_excursion.json stays OK-only: a non-ok body is NOT
-        written. (It has no freshness-monitor / absence-vs-no-data consumer
-        requiring always-emit — see config#726.)"""
-        out = self._save(
-            tmp_path,
-            excursion_summary={"status": "error", "error": "boom"},
-        )
+    def test_excursion_always_emits_nonok_body(self, tmp_path):
+        """config#7209 / config#7214 — `portfolio_excursion.json` is ALWAYS-EMIT.
+
+        It was OK-only, and the measured consequence was that the key had never
+        existed for any date: the producer degrades to `insufficient_data` on
+        the weekly run, so a producer that ran and a producer that never ran
+        left byte-identical evidence on S3. The flip is what lets the artifact
+        carry a registry row at all — a key absent by design cannot be
+        freshness-monitored.
+        """
+        import json
+        for body in ({"status": "error", "error": "boom"},
+                     {"status": "insufficient_data"}):
+            out = self._save(tmp_path, excursion_summary=body)
+            f = out / "portfolio_excursion.json"
+            assert f.exists(), f"must always-emit {body['status']}"
+            assert json.loads(f.read_text())["status"] == body["status"]
+
+    def test_excursion_none_is_not_written(self, tmp_path):
+        """None still means the producer was never invoked → absence is correct."""
+        out = self._save(tmp_path, excursion_summary=None)
         assert not (out / "portfolio_excursion.json").exists()
 
     @pytest.mark.parametrize(

@@ -96,7 +96,18 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # of the incumbent conviction sizer vs risk-parity/fractional-Kelly arms;
     # grandfathered here with the same treatment as those siblings rather than
     # a freshness-SLA row.
-    "backtest.py": 13,
+    # +1 (13->14) 2026-08-13: alpha-engine-config-I7209 / I7214 — sizing_ab.json
+    # under backtest/{date}/. The producer (analysis/sizing_ab.py::run_sizing_ab)
+    # has existed with tests since before this; evaluate.py passed
+    # `sizing_ab=None,  # simulation-only` so the artifact was NEVER written for
+    # ANY date, which is why executor.position_sizing (weight 0.10) graded
+    # "insufficient data" on every card and was silently dropped from the
+    # denominator by grading/scorecard.py::_weighted_avg.
+    # Covered by the existing grandfathered `backtest/{trading_day}/` prefix, so
+    # the registry validator is satisfied; a dedicated freshness row is tracked
+    # as alpha-engine-config-I7209 rather than added here, because the decision
+    # of whether position_sizing keeps its weight at all is open in I7210.
+    "backtest.py": 14,
     # config#1405 research-free backfill parquet (predictor/research_free_backfill/
     # predictor_outcomes_research_free.parquet) — the durable producer→consumer wire
     # for the scanner→predictor-direct counterfactual (research.db pulls are

@@ -26,6 +26,7 @@ import datetime as _dt
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +35,103 @@ from analysis.parity_alarms import evaluate_parity_alarms
 
 logger = logging.getLogger(__name__)
 
+#: Mirror of ``synthetic.predictor_backtest.DEADLINE_EPOCH_CONFIG_KEY``, copied
+#: rather than imported: the PitParityCompare stage imports this module and has
+#: no reason to pull pandas + the whole predictor pipeline in behind a single
+#: string constant. ``tests/test_pit_parity_deadline_budget.py`` asserts the two
+#: copies agree, so the duplication cannot drift silently.
+DEADLINE_EPOCH_CONFIG_KEY = "_pass_deadline_epoch"
+
 SCHEMA = "pit_parity-1.0.0"
+
+# ── config#7199: the contamination VERDICT vocabulary ───────────────────────
+# Closed, and deliberately the same four strings the evaluator's
+# ``grading/attestation.py`` normalizes onto, so the two repos cannot drift
+# into two vocabularies for one claim.
+#
+#   PASS    — both passes ran to full coverage and the contamination delta is
+#             not material.
+#   FAIL    — the contamination delta IS material. Evidence of look-ahead
+#             leakage. A partial run that finds material contamination still
+#             FAILs: incomplete coverage withholds a clean bill of health, it
+#             never withholds a positive finding.
+#   PARTIAL — the comparison ran, honestly, over a strict SUBSET of the window
+#             (a pass stopped early on its own budget) and found nothing
+#             material in what it covered. `coverage_fraction` says how much.
+#             NEVER a pass: sf-pipeline-policy §2.3a rule 2.
+#   UNKNOWN — the check did not answer. Crash, missing pass artifact, zero
+#             coverage, unparseable input. Absence of evidence, never a pass.
+VERDICT_PASS = "PASS"
+VERDICT_FAIL = "FAIL"
+VERDICT_PARTIAL = "PARTIAL"
+VERDICT_UNKNOWN = "UNKNOWN"
+VALID_VERDICTS = frozenset(
+    {VERDICT_PASS, VERDICT_FAIL, VERDICT_PARTIAL, VERDICT_UNKNOWN}
+)
+
+#: Seconds subtracted from the parent's subprocess timeout when handing the
+#: deadline to the child, so the child always reaches its own write path before
+#: the parent's ``TimeoutExpired`` fires. Without the margin the two clocks race
+#: and the SIGKILL can still win, which is the failure this whole change exists
+#: to remove.
+_PASS_DEADLINE_HANDOVER_S = 120.0
+
+
+#: Substrings identifying a wall-kill in a recorded failure message. Matched
+#: only as the FALLBACK for artifacts written before the explicit ``timed_out``
+#: flag existed — the producer sets the flag, and a reader that has it never
+#: string-matches.
+_TIMEOUT_MARKERS = ("timed out", "timeout", "timeoutexpired")
+
+
+def is_timeout_failure(
+    error_class: str | None = None,
+    error_msg: str | None = None,
+    *,
+    timed_out: bool | None = None,
+) -> bool:
+    """Did this failure happen because the work hit its wall?
+
+    **Brian ruling, 2026-08-13: "anything that is timing out is considered
+    failed now."** This is strictly stronger than sf-pipeline-policy §2.3a for
+    the timeout case specifically. §2.3a says a missing verdict propagates as
+    UNKNOWN; the ruling says a check that RAN AND HIT ITS WALL is a FAILURE, not
+    an absence. The two are different findings and they are diagnosed
+    differently — "the stage never ran" is a scheduling or dependency problem,
+    "the stage could not finish in the budget it was given" is a capacity or
+    workload problem, and only the second says something about the work itself.
+
+    So: genuine absence (no artifact, stage skipped) stays UNKNOWN; a timeout
+    is FAIL. Do not collapse them.
+    """
+    if timed_out is not None:
+        return bool(timed_out)
+    haystack = f"{error_class or ''} {error_msg or ''}".lower()
+    return any(marker in haystack for marker in _TIMEOUT_MARKERS)
+
+
+def failure_verdict(
+    error_class: str | None = None,
+    error_msg: str | None = None,
+    *,
+    timed_out: bool | None = None,
+) -> str:
+    """``FAIL`` for a wall-kill, ``UNKNOWN`` for every other failure class."""
+    return (
+        VERDICT_FAIL
+        if is_timeout_failure(error_class, error_msg, timed_out=timed_out)
+        else VERDICT_UNKNOWN
+    )
+
+
+def verdict_is_pass(verdict: str | None) -> bool:
+    """True only for an explicit ``PASS``.
+
+    Consumers call this rather than testing truthiness, so ``None``, ``""``,
+    ``"ok"``, ``PARTIAL`` and ``UNKNOWN`` all withhold the guarantee and the
+    "missing reads as clean" bug cannot be written.
+    """
+    return verdict == VERDICT_PASS
 
 
 def _run_predictor_pass_isolated(safe_config: dict, which: str, run_date: str) -> dict:
@@ -70,8 +167,6 @@ def _run_predictor_pass_isolated(safe_config: dict, which: str, run_date: str) -
     with tempfile.TemporaryDirectory(prefix="pit_parity_") as td:
         cfg_path = os.path.join(td, "config.json")
         stats_path = os.path.join(td, "stats.pkl")
-        with open(cfg_path, "w") as f:
-            json.dump(safe_config, f)
         cmd = [
             sys.executable, str(repo_root / "backtest.py"),
             "--pit-parity-pass", pass_flag,
@@ -98,7 +193,20 @@ def _run_predictor_pass_isolated(safe_config: dict, which: str, run_date: str) -
         # propagates through run_pit_parity → handle_pit_parity_failure (writes
         # status=failed artifact + pages the operator) — pit_parity stays
         # observational/non-blocking; the SF proceeds to the parity stage.
+        # config#7199: the timeout is now the BACKSTOP, not the mechanism. The
+        # child is handed the same deadline (minus a handover margin) as a
+        # config key, so its walk-forward fold loop stops early and publishes a
+        # labelled PARTIAL instead of being SIGKILLed with nothing to show. The
+        # 2026-08-07 cycle is the measured motivation: the walkforward pass hit
+        # this ceiling, the artifact read `status: failed`, and the report card
+        # was written `status: ok` with no contamination verdict at all.
         _PIT_PARITY_PASS_TIMEOUT = 2700  # 45 min per pass
+        safe_config = dict(safe_config)
+        safe_config[DEADLINE_EPOCH_CONFIG_KEY] = (
+            time.time() + _PIT_PARITY_PASS_TIMEOUT - _PASS_DEADLINE_HANDOVER_S
+        )
+        with open(cfg_path, "w") as f:
+            json.dump(safe_config, f)
         try:
             proc = subprocess.run(
                 cmd, cwd=str(repo_root), stderr=subprocess.PIPE, text=True,
@@ -170,6 +278,12 @@ def write_failure_artifact(
         "schema": SCHEMA,
         "run_date": run_date,
         "status": "failed",
+        # config#7199: a crashed check answers explicitly, never with silence.
+        # A consumer reading this artifact must not have to infer the verdict
+        # from the absence of one. A WALL-KILL answers FAIL (Brian ruling
+        # 2026-08-13); any other crash answers UNKNOWN.
+        "verdict": failure_verdict(type(exc).__name__, str(exc)),
+        "timed_out": is_timeout_failure(type(exc).__name__, str(exc)),
         "error_class": type(exc).__name__,
         "error_msg": str(exc)[:1000],
         "observational": True,
@@ -219,6 +333,8 @@ def handle_pit_parity_failure(config: dict, exc: BaseException) -> dict:
             "schema": SCHEMA,
             "run_date": config.get("_run_date") or _dt.date.today().isoformat(),
             "status": "failed",
+            "verdict": failure_verdict(type(exc).__name__, str(exc)),
+            "timed_out": is_timeout_failure(type(exc).__name__, str(exc)),
             "error_class": type(exc).__name__,
             "error_msg": str(exc)[:1000],
             "observational": True,
@@ -508,6 +624,124 @@ def _dsr_materiality(pit_stats: dict, n_trials: int | None) -> dict | None:
     return dict(res)
 
 
+def _aligned_log_cum_return_delta(pit_stats: dict, cur_stats: dict) -> float | None:
+    """PIT-minus-lookahead cumulative log return over the ALIGNED common prefix.
+
+    Used when the walk-forward pass covered less of the window than the
+    look-ahead pass: summing each side's own full stream would difference two
+    different periods. ``None`` when either stream is absent — never a guess.
+    """
+    p, c = pit_stats.get("daily_log_returns"), cur_stats.get("daily_log_returns")
+    if p is None or c is None:
+        return None
+    p = np.asarray(p, dtype=np.float64)
+    c = np.asarray(c, dtype=np.float64)
+    n = min(p.size, c.size)
+    if n < 1:
+        return None
+    ps, cs = p[:n], c[:n]
+    ps, cs = ps[np.isfinite(ps)], cs[np.isfinite(cs)]
+    if ps.size == 0 or cs.size == 0:
+        return None
+    return float(ps.sum() - cs.sum())
+
+
+def coverage_from_wf_meta(wf_meta: dict | None) -> dict:
+    """Normalize the walk-forward pass's coverage block (config#7199).
+
+    ``wf_meta`` is ``predictor_metadata.walk_forward`` as
+    ``synthetic.predictor_backtest.run_walk_forward_inference`` emits it. A
+    pre-config#7199 artifact carries no coverage keys at all; that reads as
+    ``complete`` UNKNOWN-fraction rather than as a fabricated 1.0, so an old
+    artifact can never be presented as a measured full-coverage run.
+    """
+    meta = wf_meta if isinstance(wf_meta, dict) else {}
+    fraction = meta.get("coverage_fraction")
+    try:
+        fraction = None if fraction is None else float(fraction)
+    except (TypeError, ValueError):
+        fraction = None
+    budget_stopped = bool(meta.get("budget_stopped", False))
+    return {
+        "coverage_fraction": fraction,
+        "budget_stopped": budget_stopped,
+        # `complete` is asserted only when the producer said so. Absent keys =>
+        # not asserted => None, which the verdict treats as "not known to be
+        # partial" but never as "measured complete".
+        "complete": (None if "complete" not in meta
+                     else bool(meta.get("complete"))),
+        "n_folds_planned": meta.get("n_folds_planned"),
+        "n_folds_scored": meta.get("n_folds_scored"),
+        "n_test_dates_planned": meta.get("n_test_dates_planned"),
+        "n_test_dates_scored": meta.get("n_test_dates_scored"),
+        "covered_through": meta.get("covered_through"),
+        "measured": bool(meta) and "coverage_fraction" in meta,
+    }
+
+
+def compute_verdict(
+    *,
+    material: bool | None,
+    coverage: dict,
+    delta_available: bool,
+) -> tuple[str, str]:
+    """The contamination verdict + a one-line human reason (pure).
+
+    Ordering is deliberate and is NOT "worst wins" on coverage:
+
+    1. ``material is True`` -> ``FAIL`` **even on partial coverage**. Finding
+       look-ahead leakage in 62% of the window is a finding, not a partial one;
+       downgrading it to PARTIAL because the run was truncated would let an
+       incomplete run launder a positive result.
+    2. no comparison at all (no delta, or zero coverage) -> ``UNKNOWN``.
+    3. truncated coverage, nothing material found -> ``PARTIAL``. Clean over
+       what was covered; the guarantee is withheld over the rest.
+    4. full coverage, nothing material -> ``PASS``.
+    """
+    fraction = coverage.get("coverage_fraction")
+    if material is True:
+        return VERDICT_FAIL, (
+            "MATERIAL contamination detected"
+            + ("" if fraction is None else f" over {fraction:.1%} of the window")
+            + " — the look-ahead delta is statistically distinguishable from "
+              "zero. These numbers are NOT clean."
+        )
+    if coverage.get("budget_stopped") and fraction == 0.0:
+        # The pass ran and delivered nothing before its wall. Brian ruling
+        # 2026-08-13: that is a FAILURE, not an absence — it says something
+        # about the work (it does not fit its budget), which "never ran" does
+        # not.
+        return VERDICT_FAIL, (
+            "FAILED: the walk-forward pass exhausted its budget without "
+            "scoring a single fold. The contamination check did not fit in the "
+            "time it was given — a failure, not an absence."
+        )
+    if not delta_available or material is None or fraction == 0.0:
+        return VERDICT_UNKNOWN, (
+            "The contamination check did not answer this cycle — no usable "
+            "comparison was produced. Absence of a verdict is never a pass "
+            "(sf-pipeline-policy §2.3a rule 2)."
+        )
+    if coverage.get("budget_stopped") or (fraction is not None and fraction < 1.0):
+        return VERDICT_PARTIAL, (
+            "PARTIAL: no material contamination found over the "
+            + ("unrecorded fraction" if fraction is None else f"{fraction:.1%}")
+            + " of the window the walk-forward pass covered before its budget "
+              "ran out. The remaining window is UNVERIFIED — this is not a "
+              "clean bill of health for the full period."
+        )
+    if not coverage.get("measured"):
+        return VERDICT_PARTIAL, (
+            "PARTIAL: no material contamination found, but the walk-forward "
+            "pass did not report its coverage, so full-window coverage is "
+            "unproven. A coverage claim nobody measured is not a pass."
+        )
+    return VERDICT_PASS, (
+        "PASS: the look-ahead-vs-point-in-time delta is not statistically "
+        "distinguishable from zero over the full covered window."
+    )
+
+
 def _per_date_return_delta(pit_stats: dict, cur_stats: dict):
     """Aligned per-date PIT-minus-current portfolio log-return delta series,
     the input to the block-bootstrap materiality CI (decision C).
@@ -566,6 +800,34 @@ def build_contamination_report(
     """
     cur_b, pit_b = _basket(cur_stats), _basket(pit_stats)
     delta = _delta(pit_b, cur_b)
+    coverage = coverage_from_wf_meta(wf_meta)
+    # config#7199 — window-mismatch honesty. When the walk-forward pass stopped
+    # early, its scalar basket (Sortino, PSR, CVaR, max-DD, total_alpha) is
+    # computed over a SHORTER window than the look-ahead pass's, so their
+    # difference is not a contamination measurement — it is mostly the missing
+    # tail. Those legs are nulled rather than rendered, because a plausible
+    # wrong number is worse than an honest absence.
+    #
+    # `log_cum_return` survives: it is a SUM of the per-date log-return stream,
+    # so it can be honestly recomputed on the aligned common prefix here — no
+    # duplicated risk-metric arithmetic, no fabricated value. Folds are
+    # chronological and non-overlapping, so the truncation drops the tail and
+    # both streams stay aligned from index 0.
+    delta_basis = "full_window"
+    if coverage["budget_stopped"] or (
+        coverage["coverage_fraction"] is not None
+        and coverage["coverage_fraction"] < 1.0
+    ):
+        aligned = _aligned_log_cum_return_delta(pit_stats, cur_stats)
+        delta = {k: None for k in delta}
+        delta["log_cum_return"] = aligned
+        delta_basis = "aligned_common_prefix_log_return_only"
+        logger.error(
+            "[pit_parity] walk-forward coverage is PARTIAL (%s) — scalar basket "
+            "deltas withheld (windows differ); the materiality CI is computed on "
+            "the aligned common prefix.",
+            coverage["coverage_fraction"],
+        )
     pbo = _cscv_pbo(pit_block_matrix, spec_ids=pit_spec_ids)
 
     n_cfg = None
@@ -619,9 +881,20 @@ def build_contamination_report(
     # the paging flip itself is a separate, Brian-gated decision, config#2449).
     report_date = run_date or _dt.date.today().isoformat()
     alarms = evaluate_parity_alarms(delta, prior_delta, run_date=report_date)
+    verdict, verdict_reason = compute_verdict(
+        material=material,
+        coverage=coverage,
+        delta_available=any(v is not None for v in delta.values()),
+    )
     return {
         "schema": SCHEMA,
         "run_date": run_date or _dt.date.today().isoformat(),
+        # config#7199 — the §2.3a verdict. This is the field every consumer
+        # reads; `materiality.material` remains the underlying evidence.
+        "verdict": verdict,
+        "verdict_reason": verdict_reason,
+        "coverage": coverage,
+        "delta_basis": delta_basis,
         "anchor": (
             "skilled_risk_basket — Sortino (primary), PSR (deflation), "
             "CVaR, max-DD; log-domain market-relative (plan inv. 4/5). "
@@ -781,6 +1054,7 @@ def run_pit_parity(config: dict, predictor_stats: dict | None = None) -> dict:
         )
         report = {
             "schema": SCHEMA, "run_date": run_date, "status": "incomplete",
+            "verdict": VERDICT_UNKNOWN,
             "current_status": cur_stats.get("status"),
             "pit_status": pit_stats.get("status"),
             "reuse": {
