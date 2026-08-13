@@ -179,13 +179,19 @@ def _ensure_init() -> None:
     _init_done = True
 
 
-@monitor_handler
 def _remaining_seconds(context):
     """Zero-arg callable giving the seconds left in this invocation.
 
     ``None`` when there is no Lambda context (local runs, tests), which the
     batch module treats as "no deadline" — identical behaviour to before
     config#6920.
+
+    NOT decorated with ``@monitor_handler``: that decorator is flow-doctor's
+    crash capture and belongs on the entry point. config#6920 inserted this
+    helper directly above ``handler`` and the decorator stayed with the
+    line above it rather than the function it named, so from 2026-08-11 the
+    real handler ran unwrapped and an unhandled exception in it reached
+    Lambda without ever reaching ``fd.report``.
     """
     getter = getattr(context, "get_remaining_time_in_millis", None)
     if not callable(getter):
@@ -193,6 +199,7 @@ def _remaining_seconds(context):
     return lambda: getter() / 1000.0
 
 
+@monitor_handler
 def handler(event: dict, context) -> dict:
     """Compute + emit per-(agent_id, target_model) cheap-model concordance.
 
