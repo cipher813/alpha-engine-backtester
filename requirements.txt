@@ -27,7 +27,7 @@ vectorbt~=0.28.5
 # capping here reproduces that known-good resolution instead of floating
 # onto whatever numpy 2.5+ PyPI resolves next. alpha-engine-config#2975,
 # #2976.
-numpy>=2.0,<2.5
+numpy>=2.5.2,<2.6
 plotly<6
 pandas~=2.2
 boto3~=1.43
