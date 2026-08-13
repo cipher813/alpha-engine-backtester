@@ -5720,11 +5720,35 @@ def _run_predictor_pipeline(
     try:
         predictor_stats, predictor_sweep_df = run_predictor_param_sweep(config)
     except Exception as e:
-        logger.error("Predictor backtest failed: %s", e)
+        # config-I7259 follow-up: BOTH the log line and the artifact carry the
+        # traceback. On 2026-08-13 this handler wrote
+        # `{"status":"error","error":"cannot convert float NaN to integer"}` to
+        # backtest/2026-08-13/predictor_stats.json — a bare message naming
+        # neither the frame nor the field, from a `logger.error` with no
+        # exc_info, on a spot instance that self-terminated minutes later. The
+        # only evidence of WHERE it raised died with the box, so the defect was
+        # unfindable from the artifact that recorded it.
+        #
+        # It is not a cosmetic loss. predictor_stats.json is the walk-forward
+        # pass's reuse source (config#6032): status != ok makes it unusable, so
+        # the Parity stage falls back to re-running the full predictor pipeline
+        # in a subprocess, which then blew its 2700s per-pass ceiling — that
+        # Saturday's contamination verdict was UNKNOWN because of this one
+        # unlabelled exception.
+        logger.error("Predictor backtest failed: %s", e, exc_info=True)
         if fd:
             fd.report(e, severity="error", context={
                 "site": "predictor_backtest", "mode": args.mode})
-        predictor_stats = {"status": "error", "error": str(e)}
+        predictor_stats = {
+            "status": "error",
+            "error": str(e),
+            "error_class": type(e).__name__,
+            # Bounded: the consumer only needs the raising frame, and this
+            # object is uploaded whole.
+            "traceback": "".join(
+                traceback.format_exception(type(e), e, e.__traceback__)
+            )[-4000:],
+        }
         predictor_sweep_df = None
 
     # Auto-apply executor params from the predictor sweep ONLY as the
