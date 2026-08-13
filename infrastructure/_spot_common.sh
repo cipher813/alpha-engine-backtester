@@ -370,11 +370,48 @@ spot_common_resolve_predictor_config() {
             break
         fi
     done
+    # alpha-engine-config-I7216: stage it from the private config repo before
+    # declaring it missing. predictor.yaml is gitignored (the .example pattern),
+    # so a fresh dispatcher only has it because SOMETHING copied it there — and
+    # until now the only thing that did was ResearchPredictorParallel, three
+    # `cp` invocations buried in the weekly SF's PredictorTraining branch.
+    #
+    # That made this stage's prerequisite a SIDE EFFECT of a different stage.
+    # Measured 2026-08-13: a mechanical rerun (weekly_sf_rerun.py) correctly
+    # derived skip_predictor_training, because that stage had already completed
+    # — and PredictorBacktest then died here on a config the skipped stage
+    # would have staged. The recovery path is exactly the path that skips
+    # completed stages, so the dependency is invisible precisely when it bites.
+    # PredictorBacktest writes the live entry feed
+    # (predictor/research_free_backfill/), so this blocked the cohort refresh.
+    #
+    # Staging here rather than adding a fourth `cp` to the SF keeps the fix at
+    # the layer that DECLARES the requirement: the stage that needs the file
+    # obtains it, instead of every caller remembering to.
+    if [ -z "$PREDICTOR_CONFIG" ]; then
+        local _ref="$HOME/alpha-engine-config/experiments/reference/predictor/predictor.yaml"
+        local _dest="$HOME/alpha-engine-predictor/config/predictor.yaml"
+        if [ -f "$_ref" ] && [ -d "$(dirname "$_dest")" ]; then
+            echo "  predictor.yaml absent — staging from alpha-engine-config reference (config-I7216)"
+            # `rm -f` then plain `cp`, NOT `cp --remove-destination`: the SF's
+            # own three copies use the GNU flag, which exists only to replace a
+            # SYMLINKED destination and is unsupported by BSD cp. This form is
+            # equivalent on Linux and also runs on a developer's machine, which
+            # is what let this staging path be exercised before it shipped.
+            if rm -f "$_dest" && cp "$_ref" "$_dest"; then
+                PREDICTOR_CONFIG="$_dest"
+            else
+                echo "  WARNING: staging predictor.yaml from $_ref failed" >&2
+            fi
+        fi
+    fi
+
     if [ -z "$PREDICTOR_CONFIG" ]; then
         if [ "$required" = "1" ]; then
             echo "ERROR: predictor.yaml not found in any search path — this stage runs predictor_pipeline and cannot produce a real result without it:" >&2
             echo "  ~/alpha-engine-predictor/config/predictor.yaml" >&2
             echo "  ~/Development/alpha-engine-predictor/config/predictor.yaml" >&2
+            echo "  and staging from ~/alpha-engine-config/experiments/reference/predictor/predictor.yaml did not succeed" >&2
             exit 1
         fi
         echo "  WARNING: predictor.yaml not found — predictor backtest will be skipped"
