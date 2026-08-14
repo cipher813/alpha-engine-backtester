@@ -172,9 +172,22 @@ fi
 # Evaluator SF state, which always skips the backtest stage (that stage now
 # lives in the three separate spot_*backtest*.sh scripts). Distinguishes
 # intentional absence from an unexpected failure (config#2887).
-if ! $REMOTE_PYTHON -u evaluate.py --mode "\${EVAL_HALF}" --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE --skip-backtester --log-level INFO 2>&1; then
-    echo "ERROR: evaluate.py failed. Spot run marked FAILED." >&2
-    exit 1
+_EVAL_RC=0
+$REMOTE_PYTHON -u evaluate.py --mode "\${EVAL_HALF}" --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE --skip-backtester --log-level INFO 2>&1 || _EVAL_RC=\$?
+if [ "\$_EVAL_RC" -ne 0 ]; then
+    # config-I7258: preserve the REAL exit code — a bare \`exit 1\` here
+    # laundered rc=137 (OOM SIGKILL) into a generic 1 before ssm_dispatcher
+    # ever got to read it, which is why an OOM kill reached the operator as
+    # an indistinguishable "evaluate.py failed". \$_EVAL_RC is what SSM's
+    # get_command_invocation ResponseCode reports back, and krepis.ssm_dispatcher
+    # (>=0.60.0) classifies 137/-9 as RESOURCE KILL (OOM) and 124/-14/143 as
+    # RESOURCE KILL (TIMEOUT) directly from that field.
+    case "\$_EVAL_RC" in
+        137|-9) echo "ERROR: evaluate.py SIGKILLed (rc=\$_EVAL_RC) — likely OOM on \$(hostname) (\$(curl -s -m 2 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown-instance-type)). Spot run marked FAILED." >&2 ;;
+        124|-14|143) echo "ERROR: evaluate.py timed out (rc=\$_EVAL_RC) on \$(hostname). Spot run marked FAILED." >&2 ;;
+        *) echo "ERROR: evaluate.py failed (rc=\$_EVAL_RC). Spot run marked FAILED." >&2 ;;
+    esac
+    exit "\$_EVAL_RC"
 fi
 echo "▶ stage=evaluator END at \$(date -u +%H:%M:%S)"
 
