@@ -420,6 +420,29 @@ def _emit_degraded_parity_result(
         "field_divergence": [],
         "data_state": data_state,
         "data_state_note": note,
+        # ── Verdict fields (alpha-engine-config-I7222) ───────────────────
+        # Nine consecutive weekly reports carried data_state=
+        # "backtester_replay_error" with every metric 0.0, and NOTHING went
+        # red. The evaluator's backtester tile treats a non-ok data_state
+        # exactly like an ABSENT artifact — both fall to input_present=False
+        # → N/A — so "the replay is broken and says so" rendered identically
+        # to "no file this cycle". A declared failure that renders as no-data
+        # is the failure class this fleet keeps shipping (principles §2.7:
+        # a component emitting nothing is not healthy, it is unobserved).
+        #
+        # The absence marker written by spot_parity_replay.sh already carries
+        # schema/status/verdict/verdict_reason. Emit the SAME shape here so a
+        # present-but-degraded report is red on the same surface, by the same
+        # field, as a missing one — one predicate for every way this artifact
+        # can fail to be a grade.
+        "schema": "parity_report-0.0.0",
+        "status": "failed",
+        "verdict": "FAIL",
+        "verdict_reason": (
+            f"the parity replay produced no usable comparison this run "
+            f"(data_state={data_state}) - the backtester-to-executor "
+            f"fill-parity claim is unproven. {note}"
+        ),
     }
     report_dir = Path(os.environ.get("PARITY_REPORT_DIR", tempfile.gettempdir()))
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -442,7 +465,8 @@ def _emit_degraded_parity_result(
 
 def _run_backtester_for_dates(dates: list[str], bucket: str,
                               config_path: str | None = None,
-                              trades_db_path: str | None = None) -> list[dict]:
+                              trades_db_path: str | None = None,
+                              atr_excluded_out: dict[str, int] | None = None) -> list[dict]:
     """Replay the backtester for each date, return the aggregated order list.
 
     Thin wrapper over ``backtest.replay_for_dates`` — loads config, overrides
@@ -476,7 +500,14 @@ def _run_backtester_for_dates(dates: list[str], bucket: str,
         config["trades_db_path"] = trades_db_path
 
     per_date = os.environ.get("PARITY_PER_DATE_BOOTSTRAP", "").strip() == "1"
-    return _bt.replay_for_dates(sorted(dates), config, per_date_bootstrap=per_date)
+    return _bt.replay_for_dates(
+        sorted(dates), config,
+        per_date_bootstrap=per_date,
+        # config-I7222: names excluded from a cohort for want of a usable
+        # atr_14_pct land here and are published on the report — a coverage
+        # gap must be a number, not a silently shorter cohort.
+        atr_excluded_out=atr_excluded_out,
+    )
 
 
 # ── trades.db access ────────────────────────────────────────────────────────
@@ -1153,8 +1184,11 @@ def test_parity_replay_end_to_end():
     # naming the error (data_state="backtester_replay_error"), and return so
     # the trend shows a step-change instead of a gap. feature_maps WARN-logs
     # the offending ticker + reason at load time (full context lives there).
+    atr_excluded: dict[str, int] = {}
     try:
-        replay_orders = _run_backtester_for_dates(dates, bucket, trades_db_path=db_path)
+        replay_orders = _run_backtester_for_dates(
+            dates, bucket, trades_db_path=db_path, atr_excluded_out=atr_excluded,
+        )
     except Exception as exc:
         _emit_degraded_parity_result(
             data_state="backtester_replay_error",
@@ -1256,6 +1290,26 @@ def test_parity_replay_end_to_end():
         "trade_count_divergence": count_violations,
         "ticker_set_divergence": ticker_violations,
         "field_divergence": field_violations,
+        # config-I7222: ATR-coverage fact for this window. A name the feature
+        # store could not price an ATR for is excluded from its cohort rather
+        # than aborting the whole replay (backtest.py::_simulate_single_date);
+        # publishing the count is what keeps that exclusion from being a
+        # silent shrink of the population being compared.
+        "atr_excluded_tickers": dict(sorted(atr_excluded.items())),
+        "n_atr_excluded_tickers": len(atr_excluded),
+        # config-I7222: the same verdict fields the degraded path and the
+        # launcher's absence marker carry, so ONE predicate
+        # (`status`/`verdict`) covers every state this artifact can be in.
+        "schema": "parity_report-0.0.0",
+        "status": "ok",
+        "verdict": "PASS",
+        "verdict_reason": (
+            f"parity comparison ran over {len(dates)} cohort date(s): "
+            f"{len(replay_enters)} backtester ENTER(s) vs "
+            f"{len(matchable_enters)} matchable live ENTER(s)"
+            + (f"; {len(atr_excluded)} ticker(s) excluded for missing ATR"
+               if atr_excluded else "")
+        ),
     }
 
     # Write report for the spot-instance post-run hook

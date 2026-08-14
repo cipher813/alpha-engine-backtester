@@ -69,8 +69,21 @@ def load_precomputed_feature_maps(
         ``.get(ticker)`` lookup returns None naturally) — but the drop is
         NOT silent: every omitted ticker + reason is named in a WARN log
         before return, per feedback_no_silent_fails. A cohort ticker in that
-        set is the L3147 failure mode (opaque ``atr_map missing {ticker}``
-        downstream in ``decide_entries``).
+        set produces an ``atr_map missing {ticker}`` downstream in
+        ``decide_entries`` — in the LIVE executor. In a replay it is now
+        excluded from that date's cohort and counted instead
+        (``backtest.py::_simulate_single_date``, config-I7222).
+
+        Corrected 2026-08-14 (config-I7222): this docstring previously named
+        a drop here as "the L3147 failure mode", and the nine
+        ``backtester_replay_error`` parity reports of 2026-05-29 … 2026-07-17
+        were read that way for eleven weeks. They were NOT caused by a drop
+        here. EOG — the ticker every one of those reports named — was in the
+        universe with a present, positive, non-NaN ``atr_14_pct`` on every
+        day of the window. The replay paths simply never passed
+        ``atr_by_ticker`` at all, so ``atr_map`` was ``{}``. A ticker named in
+        that error is evidence of nothing until the map is confirmed
+        non-empty.
 
     vwap_series_by_ticker : dict[ticker, pd.Series]
         Full VWAP time-series per ticker (pd.Series indexed by date).
@@ -139,6 +152,9 @@ def load_precomputed_feature_maps(
     # surface = a WARN log naming each dropped ticker + reason below. Without
     # this, a cohort ticker that lands in this set surfaces only as an opaque
     # `atr_map missing {ticker}` RuntimeError deep in decide_entries (L3147).
+    # NOTE (config-I7222): that RuntimeError has TWO causes and this is the
+    # rarer one. The common one is an empty map — see the returns-section
+    # correction above before reading a named ticker as a data problem.
     dropped_atr_reasons: dict[str, str] = {}
     n_err = 0
     n_missing_vwap = 0
