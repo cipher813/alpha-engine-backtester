@@ -257,6 +257,68 @@ class TestPortfolioStatsExtensions:
         assert stats["alpha_vs_ew_high_vol"] is None
 
 
+class TestSharpeAgreesWithNousergonLib:
+    """config-I7236: sharpe_ratio must be EXACTLY nousergon_lib's √252 answer.
+
+    Before this fix, ``portfolio_stats()['sharpe_ratio']`` came from
+    ``pf.sharpe_ratio()`` (vectorbt, freq="D" -> √365 annualization) while
+    ``nousergon_lib.quant.riskstats.sharpe_ratio`` on the same daily_returns
+    series -> √252 — a ~20.3% systematic gap. This test pins agreement to
+    ~1e-9 so the two conventions can never diverge again silently: it fails
+    loudly if ``portfolio_stats`` is ever changed back to (or towards) a
+    vectorbt-internal annualization instead of calling the shared library
+    function directly.
+
+    Run against the PRE-fix code (``pf.sharpe_ratio()``, √365) this test
+    fails: observed pre-fix vs. lib(√252) on this fixture's own return series
+    disagree by a factor of √(365/252) ≈ 1.2034 (config-I7236 root-cause
+    measurement), which is roughly 4-5 orders of magnitude outside this
+    test's 1e-9 tolerance.
+    """
+
+    def _build_portfolio(self):
+        return TestPortfolioStatsExtensions._build_portfolio(self)
+
+    def test_sharpe_ratio_matches_riskstats_to_1e9(self):
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        from nousergon_lib.quant import riskstats
+
+        stats = portfolio_stats(pf)
+        independent = riskstats.sharpe_ratio(stats["daily_returns"].tolist())
+
+        assert stats["sharpe_ratio"] is not None
+        assert independent is not None
+        assert stats["sharpe_ratio"] == pytest.approx(independent, rel=0, abs=1e-9)
+
+    def test_sharpe_ratio_disagrees_with_a_365_day_annualization(self):
+        """Sanity check that this fixture's Sharpe is annualization-sensitive.
+
+        If √365 and √252 produced (near-)equal answers on this fixture, the
+        agreement test above couldn't distinguish the fixed convention from
+        the pre-fix one. This pins the fixture as a real discriminator.
+        """
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        from nousergon_lib.quant import riskstats
+
+        stats = portfolio_stats(pf)
+        returns = stats["daily_returns"].tolist()
+        sharpe_252 = riskstats.sharpe_ratio(returns, periods_per_year=252)
+        sharpe_365 = riskstats.sharpe_ratio(returns, periods_per_year=365)
+
+        assert sharpe_252 is not None and sharpe_365 is not None
+        assert abs(sharpe_365 - sharpe_252) > 1e-6
+        assert stats["sharpe_ratio"] == pytest.approx(sharpe_252, rel=0, abs=1e-9)
+        assert stats["sharpe_ratio"] != pytest.approx(sharpe_365, rel=0, abs=1e-6)
+
+
 class TestActiveWindowAnchoring:
     """Pin the active-window-anchored benchmark comparison fix (2026-05-24).
 

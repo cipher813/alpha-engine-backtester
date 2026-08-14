@@ -12,6 +12,7 @@ import math
 import numpy as np
 import pandas as pd
 import vectorbt as vbt
+from nousergon_lib.quant import riskstats
 
 from analysis.risk_matched_benchmark import compute_alpha_vs_benchmark
 
@@ -276,6 +277,12 @@ def orders_to_portfolio(
         cash_sharing=True,
         group_by=True,
         fees=total_fees,
+        # freq="D" tells vectorbt the index is calendar-daily, which is only
+        # needed for its own internal (365-day) annualization of drawdown/
+        # calmar timing math. It is NOT the annualization convention for
+        # Sharpe: portfolio_stats() below computes sharpe_ratio itself, via
+        # nousergon_lib.quant.riskstats (√252, trading-day convention),
+        # instead of calling pf.sharpe_ratio() (config-I7236).
         freq="D",
     )
 
@@ -347,6 +354,17 @@ def portfolio_stats(
     daily_log_returns = np.log1p(daily_returns.clip(lower=-0.999999))
     daily_log_returns.name = "daily_log_return"
 
+    # Sharpe is computed from `daily_returns` via nousergon_lib.quant.riskstats
+    # — the SAME library, SAME √252 trading-day annualization, and the SAME
+    # sample (ddof=1) variance the evaluator uses (config-I7236) — rather than
+    # `pf.sharpe_ratio()`, which annualizes by √365 (vectorbt reads freq="D" as
+    # calendar days). Using the shared lib function directly (not just copying
+    # its constant) means the two can never diverge again silently: an
+    # agreement test in tests/test_vectorbt_bridge.py pins this to ~1e-9.
+    # `riskstats.sharpe_ratio` returns None (not NaN) when volatility is zero
+    # or there are fewer than 2 observations — an explicit "undefined", never
+    # a measured zero (analysis/self_test.py::flat_market_sharpe_is_undefined).
+    sharpe = riskstats.sharpe_ratio(daily_returns.tolist())
     sortino = _compute_sortino_ratio(daily_returns)
     cvar_95 = _compute_cvar(daily_returns, q=0.05)
 
@@ -378,7 +396,7 @@ def portfolio_stats(
 
     stats = {
         "total_return": total_return,
-        "sharpe_ratio": float(pf.sharpe_ratio()),
+        "sharpe_ratio": sharpe,
         "sortino_ratio": sortino,
         "max_drawdown": float(pf.max_drawdown()),
         "calmar_ratio": float(pf.calmar_ratio()),
