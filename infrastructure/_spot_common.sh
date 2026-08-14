@@ -87,7 +87,16 @@ spot_common_init_defaults() {
     # IAM_PROFILE backs alpha-engine-executor-role, tracked+applied+drift-
     # checked from crucible-executor/infrastructure/iam/alpha-engine-executor-role/.
     IAM_PROFILE="alpha-engine-executor-profile"
-    LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python}"
+    # Lib CLI path: every spot launcher on the dispatcher box resolves its
+    # interpreter through the ops-owned guard /opt/nousergon/bin/lib-python
+    # (nous-ergon-ops: alpha-engine-dashboard/live/infrastructure/bin/lib-python).
+    # That guard execs the box's DECLARED krepis venv and aborts with EX_CONFIG
+    # (78), naming the version it found, when the venv is absent or below the
+    # launcher floor. It never falls back to a co-tenant checkout — the silent
+    # fallback is exactly the defect alpha-engine-config-I6931/I7343 removes.
+    # Do NOT add a guard block here: the contract lives ONCE, in the repo that
+    # owns this box's provisioning (nine copies across five repos is I6922).
+    LIB_PYTHON="${LIB_PYTHON:-/opt/nousergon/bin/lib-python}"
 
     # Common flag-parsed values — every script surfaces this same subset of
     # the monolith's flag surface (branch/instance-type/run-date/dry-run/
