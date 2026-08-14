@@ -372,6 +372,44 @@ spot_common_pre_launch_preflight() {
 spot_common_resolve_executor_config() {
     local experiment_id="${ALPHA_ENGINE_EXPERIMENT_ID:-reference}"
     EXECUTOR_CONFIG=""
+
+    # alpha-engine-config-I7247: refresh the alpha-engine-config checkout
+    # itself before resolving risk.yaml out of it. Unlike predictor.yaml (a
+    # DIFFERENT repo, staged in by an explicit `cp` per
+    # spot_common_resolve_predictor_config / config-I7216 / PR657), risk.yaml
+    # is read straight out of the alpha-engine-config checkout on the
+    # dispatch box — standing infrastructure that only freshens as a SIDE
+    # EFFECT of two independently-skippable early SF states
+    # (MorningEnrich/skip_morning_enrich, DataPhase1/skip_data_phase1) plus,
+    # incidentally, PredictorTraining/ModelZooSelect. A mechanical rerun that
+    # sets all three skip flags (recovery from a failure downstream of them,
+    # e.g. a Backtester-family failure) never refreshes the checkout for that
+    # execution — this function still finds a file (the checkout is standing
+    # infrastructure, not created per-run), so nothing fails loud and the
+    # stage runs against whatever risk.yaml content was on disk from a
+    # previous week's `git pull`. This is a STALENESS exposure, not the
+    # missing-file class PR657 fixed for predictor.yaml — no live failure was
+    # observed, only a silent-degrade window.
+    #
+    # Fixed at the layer that DECLARES the requirement (sf-pipeline-policy.md
+    # §2.2 — every stage proves its own preconditions): pull each checkout
+    # candidate to origin/main before searching it, rather than relying on
+    # three unrelated skip flags to keep it fresh. `git pull --ff-only` is
+    # cheap and idempotent — safe to run unconditionally, every invocation,
+    # not gated behind any skip flag. A failed refresh (offline runner,
+    # detached HEAD, local edits, network blip) is reported but never blocks
+    # resolution: the existing checkout, however stale, is still the best
+    # available input, and the checkout going missing entirely is still
+    # caught by the loud failure below.
+    local config_root
+    for config_root in "$HOME/alpha-engine-config" "$HOME/Development/alpha-engine-config"; do
+        if [ -d "$config_root/.git" ]; then
+            if ! git -C "$config_root" pull --ff-only --quiet 2>/dev/null; then
+                echo "  WARNING: git -C $config_root pull --ff-only failed — risk.yaml may be stale (config-I7247)" >&2
+            fi
+        fi
+    done
+
     local candidate
     for candidate in \
         "$HOME/alpha-engine-config/experiments/$experiment_id/executor/risk.yaml" \

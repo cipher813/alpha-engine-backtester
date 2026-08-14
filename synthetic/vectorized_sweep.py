@@ -1013,7 +1013,25 @@ def run_vectorized_sweep(
             ec, es = np.nonzero(entry_decisions.entry_passed)
             for c, s_idx in zip(ec, es):
                 shares = float(entry_decisions.entry_shares[c, s_idx])
-                if shares <= 0:
+                # `not (shares > 0)` rather than `shares <= 0` — the two differ
+                # only on NaN, and NaN is exactly what reached `int(shares)`
+                # below on 2026-08-13 / 2026-06-26 (config-I7259).
+                # `compute_vectorized_entries` now raises on a non-finite share
+                # count with the offending combo and input named, so this is
+                # the second layer: were a non-finite value ever to arrive
+                # here, it is skipped rather than crashing the whole stage on
+                # an uninformative `cannot convert float NaN to integer`.
+                if not (shares > 0):
+                    if shares != shares:  # NaN — never silent
+                        logger.error(
+                            "[vectorized_sweep] non-finite entry shares for "
+                            "combo=%s signal=%s ticker=%s on %s — skipping this "
+                            "order. This should have been raised by "
+                            "compute_vectorized_entries; reaching here means a "
+                            "second producer of entry_shares exists.",
+                            int(c), int(s_idx),
+                            signal_tickers_list[int(s_idx)], date_str,
+                        )
                     continue
                 s_int = int(s_idx)
                 ticker = signal_tickers_list[s_int]
