@@ -75,7 +75,7 @@ def test_expected_sharpe_is_derived_here_not_by_the_engine():
     mean = sum(observations) / n
     var = sum((r - mean) ** 2 for r in observations) / (n - 1)
     assert st._expected_closed_form_sharpe() == pytest.approx(
-        mean / math.sqrt(var) * math.sqrt(365), rel=0, abs=1e-15,
+        mean / math.sqrt(var) * math.sqrt(252), rel=0, abs=1e-15,
     )
 
 

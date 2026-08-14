@@ -46,21 +46,29 @@ vocabulary (``PASS``/``FAIL``/``UNKNOWN``) so a reader never has to translate.
 
 CONVENTIONS THIS BATTERY PINS (read before changing an expectation)
 -------------------------------------------------------------------
-``closed_form_sharpe`` pins a convention that is **measured, not endorsed**
-(2026-08-13, ``vectorbt 0.28.5``): ``vbt.Portfolio.sharpe_ratio()`` annualizes by
-**√365**, because ``orders_to_portfolio`` passes ``freq="D"`` and vectorbt reads
-that as calendar days — while ``_compute_sortino_ratio`` in the same function, and
-``nousergon_lib.quant.riskstats.sharpe_ratio`` on the evaluator side, both
-annualize by **√252**. The backtest's headline Sharpe is therefore ~20.3% higher
-than the same series' Sharpe on the Report Card. It also computes over the FULL
-return series including the leading ``0.0`` vectorbt emits for day 0 (no prior
-NAV), which dilutes both mean and volatility.
+``closed_form_sharpe`` pins the backtester's Sharpe annualization convention.
 
-That is a real inconsistency and it is tracked, **not fixed here**: changing it
-moves every historical Sharpe and every optimizer gate keyed to one, which is a
-ruling, not a drive-by. What this module does is make the convention **visible and
-pinned** — if it ever moves again, this case goes red on the very next cycle and
-the artifact names the old and new numbers side by side.
+**2026-08-13, Brian ruling on config-I7236 ("use sota"): FIXED to √252.**
+Until this PR, ``vbt.Portfolio.sharpe_ratio()`` (called via ``freq="D"``, which
+vectorbt reads as calendar days) annualized the headline Sharpe by **√365**,
+while ``_compute_sortino_ratio`` in the same function, and
+``nousergon_lib.quant.riskstats.sharpe_ratio`` on the evaluator side, both
+annualized by **√252** — a ~20.3% systematic gap between two Sharpe numbers on
+the same Report Card. ``portfolio_stats`` in ``vectorbt_bridge.py`` now calls
+``nousergon_lib.quant.riskstats.sharpe_ratio`` directly on the same
+``daily_returns`` series ``_compute_sortino_ratio`` uses, instead of
+``pf.sharpe_ratio()`` — the shared library function, not a copied constant, so
+the two conventions cannot silently diverge again (agreement-tested in
+``tests/test_vectorbt_bridge.py`` to ~1e-9). It still computes over the FULL
+return series including the leading ``0.0`` vectorbt emits for day 0 (no prior
+NAV, matching ``daily_returns``' own convention elsewhere in ``portfolio_stats``)
+— that dilution question was explicitly deferred by the issue and is unchanged
+by this fix.
+
+**Every historical backtester Sharpe is now ~17% lower than previously
+reported** (a multiplicative ×1/√(365/252) ≈ ×0.8305 rescale) — this is the
+expected, intended effect of the fix, not a regression. Numbers from before
+2026-08-13 will not match numbers after it for that reason alone.
 
 CONTRACT
 --------
@@ -317,19 +325,22 @@ def _size_linearity() -> float:
 # day 0 with zero fees, so NAV_t = shares * P_t and the portfolio's return series
 # IS the price return series.
 #
-# The observation vector vectorbt computes over is [0.0] + the 20 returns — day 0
-# has no prior NAV, and vectorbt emits 0.0 rather than dropping it. Over those
-# n = 21 observations:
+# The observation vector `daily_returns` computes over is [0.0] + the 20
+# returns — day 0 has no prior NAV, and vectorbt emits 0.0 for it rather than
+# NaN, so it survives the `dropna()` in portfolio_stats() and is included.
+# Over those n = 21 observations:
 #   mean = (10*0.02 + 10*(-0.01)) / 21 = 0.1/21
 #   var  = sum((r - mean)^2) / (n - 1)          [ddof = 1]
-#   sharpe = mean / sqrt(var) * sqrt(365)       [freq="D" -> CALENDAR days]
+#   sharpe = mean / sqrt(var) * sqrt(252)       [config-I7236: trading days]
 #
-# Both the leading zero and the √365 are measured properties of the deployed
-# engine, not endorsements — see this module's docstring.
+# The leading-zero inclusion is a measured property of the deployed engine,
+# not an endorsement (see this module's docstring) — √252 is the fixed,
+# institutional-standard annualization, matching Sortino beside it and
+# nousergon_lib.quant.riskstats.
 _SHARPE_UP = 0.02
 _SHARPE_DOWN = -0.01
 _SHARPE_CYCLES = 10
-_SHARPE_ANNUALIZATION_DAYS = 365
+_SHARPE_ANNUALIZATION_DAYS = 252
 
 
 def _sharpe_return_path() -> list[float]:
@@ -528,10 +539,10 @@ def build_cases() -> list[Case]:
                 f"{_SHARPE_CYCLES} x (+{_SHARPE_UP:.0%}, {_SHARPE_DOWN:.0%}) daily "
                 f"returns. Analytic Sharpe = mean/stdev(ddof=1) * sqrt("
                 f"{_SHARPE_ANNUALIZATION_DAYS}) over the 21-observation series "
-                "vectorbt computes on (a leading 0.0 for day 0, which has no prior "
-                "NAV). PINS a MEASURED convention: this engine annualizes by "
-                "sqrt(365) via freq='D', while sortino_ratio beside it and the "
-                "evaluator's nousergon_lib sharpe both use sqrt(252)"
+                "portfolio_stats computes on (a leading 0.0 for day 0, which has "
+                "no prior NAV). PINS the FIXED sqrt(252) convention (config-I7236, "
+                "2026-08-13): sharpe_ratio, sortino_ratio beside it, and the "
+                "evaluator's nousergon_lib sharpe all now annualize by sqrt(252)"
             ),
             inputs={"daily_return_up": _SHARPE_UP, "daily_return_down": _SHARPE_DOWN,
                     "cycles": _SHARPE_CYCLES, "n_observations": 2 * _SHARPE_CYCLES + 1,
