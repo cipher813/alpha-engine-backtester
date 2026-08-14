@@ -1001,6 +1001,7 @@ def _simulate_single_date(
     atr_by_ticker: dict[str, float] | None = None,
     vwap_series_by_ticker: dict[str, pd.Series] | None = None,
     coverage_by_ticker: dict[str, float] | None = None,
+    atr_excluded_counter: dict[str, int] | None = None,
     feature_lookup=None,
 ) -> tuple[list[dict] | None, str | None]:
     """Run one simulate date through the deciders directly (Tier 2).
@@ -1120,6 +1121,65 @@ def _simulate_single_date(
     market_regime = signals["market_regime"]
     sector_ratings = signals["sector_ratings"]
     enter_signals = signals["enter"]
+
+    # ── ATR-coverage contract (alpha-engine-config-I7222) ────────────────
+    # ``decide_entries`` raises ``atr_map missing {ticker}`` the moment an
+    # approved ENTER has no ATR — correct for the live executor (shipping a
+    # trade on a bogus zero ATR is worse than not trading), and NOT weakened
+    # here. But in a replay that raise has the wrong blast radius: one name
+    # aborts the whole multi-date cohort, and the parity artifact's product
+    # is a POPULATION comparison. Losing one name is a coverage fact; losing
+    # the run is an outage.
+    #
+    # Two distinct conditions, deliberately handled differently:
+    #
+    #  (a) atr_map is EMPTY while ENTER signals exist. That is never a data
+    #      fact — it is a wiring defect in the caller (the 2026-04-27→
+    #      2026-08-14 outage: ``replay_for_dates`` never passed
+    #      ``atr_by_ticker``, so every replayed date died on whichever
+    #      candidate reached the ATR line first). Raise here, naming the
+    #      caller contract, rather than letting it surface as an opaque
+    #      per-ticker message that reads like a data problem.
+    #
+    #  (b) atr_map is populated but a specific ticker is absent. That IS a
+    #      data fact — ``feature_maps.load_precomputed_feature_maps`` drops
+    #      names whose latest ``atr_14_pct`` is missing/NaN/non-positive.
+    #      Exclude that name from this date's cohort and COUNT it; never
+    #      silently, per the fail-loud rule: (a) the swallowed failure is a
+    #      per-ticker missing ATR, (b) the population comparison survives
+    #      intact minus that name, (c) the recording surface is the WARN
+    #      below plus ``atr_excluded_counter``, which the parity report
+    #      publishes as ``atr_excluded_tickers``.
+    if enter_signals:
+        if not atr_map:
+            raise RuntimeError(
+                f"_simulate_single_date({signal_date}): atr_map is empty but "
+                f"{len(enter_signals)} ENTER signal(s) are actionable — the "
+                "caller did not pass atr_by_ticker. Every entry would abort "
+                "in decide_entries with 'atr_map missing <TICKER>'. Load the "
+                "maps with store.feature_maps.load_precomputed_feature_maps "
+                "and pass atr_by_ticker / vwap_series_by_ticker / "
+                "coverage_by_ticker (alpha-engine-config-I7222)."
+            )
+        _no_atr = sorted({
+            s["ticker"] for s in enter_signals
+            if s.get("ticker") and s["ticker"] not in atr_map
+        })
+        if _no_atr:
+            if atr_excluded_counter is not None:
+                for _t in _no_atr:
+                    atr_excluded_counter[_t] = atr_excluded_counter.get(_t, 0) + 1
+            logger.warning(
+                "ATR coverage gap on %s: excluding %d ENTER candidate(s) with "
+                "no atr_14_pct in the feature map — %s. See the feature_maps "
+                "WARN for each drop reason (NaN/non-positive/absent latest "
+                "atr_14_pct). This date's cohort is short those names "
+                "(config-I7222).",
+                signal_date, len(_no_atr), _no_atr[:20],
+            )
+            enter_signals = [
+                s for s in enter_signals if s.get("ticker") in atr_map
+            ]
 
     # Tier 3 Part A: prefer the precomputed lookup when caller provided
     # one. Falls back to per-call rebuild if signal_lookup is None
@@ -1921,6 +1981,10 @@ def _replay_for_dates_per_date_bootstrap(
     bucket: str,
     merged_config: dict,
     strategy_config: dict,
+    atr_by_ticker: dict[str, float] | None = None,
+    vwap_series_by_ticker: dict | None = None,
+    coverage_by_ticker: dict[str, float] | None = None,
+    atr_excluded_counter: dict[str, int] | None = None,
 ) -> list[dict]:
     """Per-date-bootstrap implementation of ``replay_for_dates``.
 
@@ -2013,6 +2077,14 @@ def _replay_for_dates_per_date_bootstrap(
             signals_override=None,  # loaded per-date inside helper
             universe_symbols=_date_universe,
             rejected_ticker_counter=rejected_ticker_counter,
+            # config-I7222: this path shared the continuous path's defect —
+            # both replay entry points called _simulate_single_date with no
+            # feature maps, so atr_map collapsed to {} and every ENTER
+            # aborted. Fixing one call site of a systemic defect is not a fix.
+            atr_by_ticker=atr_by_ticker,
+            vwap_series_by_ticker=vwap_series_by_ticker,
+            coverage_by_ticker=coverage_by_ticker,
+            atr_excluded_counter=atr_excluded_counter,
         )
         if orders:
             captured.extend(orders)
@@ -2043,6 +2115,7 @@ def replay_for_dates(
     *,
     warmup_from_full_history: bool = True,
     per_date_bootstrap: bool = False,
+    atr_excluded_out: dict[str, int] | None = None,
 ) -> list[dict]:
     """
     Replay the backtester for a specific list of signal dates; return
@@ -2061,6 +2134,13 @@ def replay_for_dates(
         NAV / positions have time to evolve before the test window. Only
         orders on ``dates`` are returned. If False, only the requested dates
         are simulated starting from ``init_cash`` — fast but NAV-divergent.
+    atr_excluded_out : optional dict the caller supplies to receive the
+        per-ticker count of ENTER candidates excluded from a cohort because
+        the feature store carries no usable ``atr_14_pct`` for them
+        (alpha-engine-config-I7222). Populated in place; the parity producer
+        publishes it as ``atr_excluded_tickers`` on ``parity_report.json`` so
+        a coverage gap is a NUMBER on the artifact rather than a silently
+        shorter cohort.
     per_date_bootstrap : when True, bootstrap a FRESH sim_client per parity
         date from the eod_pnl row strictly preceding each date, run a single
         date through the executor, capture orders. Loses cumulative state
@@ -2121,6 +2201,38 @@ def replay_for_dates(
     bucket = config.get("signals_bucket", "alpha-engine-research")
     merged_config, strategy_config = _build_merged_simulate_config(config)
 
+    # ── Feature maps (alpha-engine-config-I7222) ─────────────────────────
+    # THE root cause of the 2026-04-27 → 2026-08-14 parity outage: the Tier-2
+    # refactor (crucible-executor#110, merged 2026-04-27 — one day after the
+    # last parity_report.json carrying `data_state: ok`) moved the backtester
+    # off the `executor_run(simulate=True)` shell, which loaded ATR from
+    # ArcticDB itself, onto direct `decide_entries` calls that take an
+    # INJECTED `atr_map`. `_run_simulation_loop` and `run_param_sweep` were
+    # wired to load and pass those maps; BOTH replay paths were not. With
+    # `atr_by_ticker=None` the map collapses to `{}` at the `_simulate_single_date`
+    # default (see `atr_map: dict = atr_by_ticker if ... else {}`), so every
+    # replayed date aborted on whichever ENTER candidate reached the ATR line
+    # first — reported for nine consecutive weeks as
+    # `atr_map missing EOG at decide_entries`, which reads like a data gap and
+    # is not one (EOG's atr_14_pct is present, positive and non-NaN across the
+    # entire window). Load once here and pass down BOTH paths.
+    from store.feature_maps import load_precomputed_feature_maps
+    _smoke_tickers = config.get("smoke_tickers")
+    _feature_allowlist = set(_smoke_tickers) if _smoke_tickers else None
+    atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker = (
+        load_precomputed_feature_maps(bucket, tickers_allowlist=_feature_allowlist)
+    )
+    if not atr_by_ticker:
+        raise RuntimeError(
+            f"replay_for_dates: load_precomputed_feature_maps returned an EMPTY "
+            f"atr_by_ticker for bucket {bucket!r} — every ENTER would abort in "
+            "decide_entries. Refusing to produce a parity artifact that reports "
+            "zero backtester orders as if it were a comparison "
+            "(alpha-engine-config-I7222)."
+        )
+    if atr_excluded_out is None:
+        atr_excluded_out = {}
+
     # Per-date bootstrap path — diverges from the continuous-bootstrap +
     # warmup paths because each parity date gets a fresh sim_client
     # anchored to live's eod_pnl state at the preceding day. See the
@@ -2139,6 +2251,10 @@ def replay_for_dates(
             bucket=bucket,
             merged_config=merged_config,
             strategy_config=strategy_config,
+            atr_by_ticker=atr_by_ticker,
+            vwap_series_by_ticker=vwap_series_by_ticker,
+            coverage_by_ticker=coverage_by_ticker,
+            atr_excluded_counter=atr_excluded_out,
         )
 
     requested = set(dates)
@@ -2281,6 +2397,10 @@ def replay_for_dates(
             signals_override=signals_override,
             universe_symbols=_date_universe,
             rejected_ticker_counter=rejected_ticker_counter,
+            atr_by_ticker=atr_by_ticker,
+            vwap_series_by_ticker=vwap_series_by_ticker,
+            coverage_by_ticker=coverage_by_ticker,
+            atr_excluded_counter=atr_excluded_out,
         )
         if orders and signal_date in requested:
             captured.extend(orders)

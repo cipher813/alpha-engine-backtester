@@ -24,6 +24,33 @@ import pytest
 import backtest as bt
 
 
+# ── Shared fixture: the replay's feature-map bulk read ─────────────────────
+
+#: Non-empty ATR / VWAP / coverage maps standing in for
+#: ``store.feature_maps.load_precomputed_feature_maps``.
+#:
+#: ``replay_for_dates`` performs this bulk read for real (config-I7222 — both
+#: replay paths previously called ``_simulate_single_date`` with no maps, so
+#: ``atr_map`` collapsed to ``{}`` and every ENTER aborted with
+#: ``atr_map missing <TICKER>``, which is what left ``parity_report.json``
+#: ungraded from 2026-04-27 to 2026-08-14). These smoke tests stub
+#: ``_setup_simulation`` but not ArcticDB, so without this patch the read
+#: returns the conftest MagicMock's zero symbols and trips the empty-map
+#: guard — a guard that must stay, because an empty map in production means
+#: a parity report of zero orders dressed up as a comparison.
+_STUB_ATR = {"AAPL": 0.02, "MSFT": 0.02}
+_STUB_COVERAGE = {"AAPL": 1.0, "MSFT": 1.0}
+
+
+@pytest.fixture
+def stub_feature_maps():
+    with patch(
+        "store.feature_maps.load_precomputed_feature_maps",
+        return_value=(_STUB_ATR, {}, _STUB_COVERAGE),
+    ) as m:
+        yield m
+
+
 # ── _build_replay_signals_by_date unit tests ───────────────────────────────
 
 class TestBuildReplaySignalsByDate:
@@ -153,6 +180,7 @@ class TestBuildReplaySignalsByDate:
 
 # ── replay_for_dates bootstrap-branch smoke ────────────────────────────────
 
+@pytest.mark.usefixtures("stub_feature_maps")
 class TestReplayForDatesBootstrapDailyHeartbeat:
     """Smoke test that the bootstrap branch iterates every trading day in
     [as_of, max(dates)] and routes signals correctly per day. Mocks out
@@ -340,6 +368,7 @@ class TestReplayForDatesBootstrapDailyHeartbeat:
 
 # ── per_date_bootstrap branch ──────────────────────────────────────────────
 
+@pytest.mark.usefixtures("stub_feature_maps")
 class TestReplayForDatesPerDateBootstrap:
     """Covers the per-parity-date bootstrap mode (ROADMAP P1
     "Per-parity-date bootstrap (alternative parity test mode)").
