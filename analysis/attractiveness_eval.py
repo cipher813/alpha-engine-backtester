@@ -53,7 +53,9 @@ What it computes
    drawn from". ``counterfactual.holding_rule`` is an explicit string
    (one per artifact, not per row — the same rule applies to every N /
    sector_balanced variant) so the number is never read as a
-   continuously-traded return.
+   continuously-traded return. ``live_gate`` carries the SAME population
+   leg (config-I7213): it is a basket too, and the incumbent arm's number
+   must not be the only one published without its denominator.
 
 Units + horizon
 ---------------
@@ -408,9 +410,14 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
     (date-clustered means, never pooled names)."""
     tabs = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
+    # The absent-data live_gate carries the population-leg keys explicitly as
+    # None (config-I7213): an ABSENT key and a MEASURED-NOTHING key must not
+    # be indistinguishable to a consumer — the same reason every other block
+    # here emits honest nulls with n-fields rather than omitting itself.
     empty = {"top_n": [], "live_gate": {"capture_rate": None,
                                         "mean_alpha": None,
-                                        "n_survivors": 0},
+                                        "n_survivors": 0,
+                                        **_excess_stats([], [])},
              "n_cycles": 0, "holding_rule": HOLDING_RULE}
     if "scanner_evaluations" not in tabs:
         empty["reason"] = "scanner_evaluations table absent"
@@ -438,7 +445,7 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
     variants = [(n, sb) for n in COUNTERFACTUAL_TOP_NS for sb in (False, True)]
     per_variant: dict = {v: {"capture": [], "alpha": [], "population": []}
                          for v in variants}
-    live = {"capture": [], "alpha": [], "n_survivors": 0}
+    live = {"capture": [], "alpha": [], "population": [], "n_survivors": 0}
     n_cycles = 0
 
     for _d, g in base.groupby("eval_date"):
@@ -449,15 +456,16 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
             continue
         n_cycles += 1
 
-        live["capture"].append(_capture_rate(g, survivors))
-        live["alpha"].append(float(survivors["alpha"].mean()))
-        live["n_survivors"] += int(len(survivors))
-
         # Population leg (config#7213): the FULL scanner-evaluated cycle
         # universe with realized alpha — ``g``, not ``scored`` — so a
         # selector that only scores a subset of the cycle can't shrink its
         # own population comparator (non-inferable gotcha #3, PIT universe).
         cycle_population_alpha = float(g["alpha"].mean())
+
+        live["capture"].append(_capture_rate(g, survivors))
+        live["alpha"].append(float(survivors["alpha"].mean()))
+        live["population"].append(cycle_population_alpha)
+        live["n_survivors"] += int(len(survivors))
 
         for n, sector_balanced in variants:
             if len(scored) < n:
@@ -488,13 +496,25 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
         }
         entry.update(_excess_stats(v["alpha"], v["population"]))
         top_n.append(entry)
+    # config-I7213 (symmetry): the live gate carries the SAME population leg
+    # every top_n row does. Without it the one number that renders best on the
+    # report card — live_gate.mean_alpha, +2.75% on 2026-08-13 — was the only
+    # basket published with no denominator, while every attractiveness cohort
+    # beside it stated one. A reader comparing +2.75% against a top-20's
+    # +0.15% is comparing a market-relative mean to a market-relative mean and
+    # silently attributing the whole gap to selection, when part of it is the
+    # cycle tape both were drawn from. Same estimator, same paired per-cycle
+    # series, same cycles (live contributes on exactly the cycles counted by
+    # n_cycles), so the two arms are read like for like.
+    live_gate = {
+        "capture_rate": _mean(live["capture"]),
+        "mean_alpha": _mean(live["alpha"]),
+        "n_survivors": int(live["n_survivors"]),
+    }
+    live_gate.update(_excess_stats(live["alpha"], live["population"]))
     return {
         "top_n": top_n,
-        "live_gate": {
-            "capture_rate": _mean(live["capture"]),
-            "mean_alpha": _mean(live["alpha"]),
-            "n_survivors": int(live["n_survivors"]),
-        },
+        "live_gate": live_gate,
         "n_cycles": n_cycles,
         # config#7213: cohort definition for every basket row above — a
         # counterfactual-level constant (not per-row: it's the same rule for

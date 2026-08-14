@@ -530,6 +530,92 @@ class TestScannerBasketReturn:
         assert top20["excess_vs_population"] is None
 
 
+class TestLiveGatePopulationLeg:
+    """config-I7213 symmetry: the live tech_score gate is a basket too, and it
+    must publish the SAME population denominator every top_n row publishes.
+
+    Why this is a defect and not a nicety: on the 2026-08-13 live artifact
+    ``live_gate.mean_alpha`` was +0.0275 while the top-20 cohorts sat near
+    +0.001..+0.007, and ``scanner_feed_counterfactual`` renders that gap on
+    the report card. Every attractiveness cohort stated the population mean it
+    was drawn against (+0.01055); the live gate — the number that reads best —
+    stated none, so the whole gap read as selection skill when part of it is
+    the tape of the cycles both arms were drawn from.
+    """
+
+    def _two_cycle_conn(self, tmp_path):
+        """Two cycles of DIFFERENT universe size, so a per-cycle-then-average
+        estimate is numerically distinguishable from a pooled-over-names one
+        (the same construction TestScannerBasketReturn uses)."""
+        a, b = _tickers(40), _tickers(20)
+        records = ([(t, "2026-07-02", 1 if i < 4 else 0) for i, t in enumerate(a)]
+                   + [(t, "2026-07-09", 1 if i < 2 else 0) for i, t in enumerate(b)])
+        conn = _make_conn_with_scanner_evals(tmp_path, records)
+        rows_ur, rows_m = [], []
+        for d, ts, step in (("2026-07-02", a, 0.004), ("2026-07-09", b, 0.010)):
+            for i, t in enumerate(ts):
+                rows_ur.append({"eval_date": d, "ticker": t,
+                                "alpha": 0.20 - i * step, "sector": "Tech"})
+                rows_m.append({"eval_date": d, "ticker": t,
+                               "attractiveness_score": float(len(ts) - i)})
+        return conn, pd.DataFrame(rows_m), pd.DataFrame(rows_ur)
+
+    def test_live_gate_carries_population_leg(self, tmp_path):
+        conn, merged, ur = self._two_cycle_conn(tmp_path)
+        lg = _counterfactual(conn, merged, ur)["live_gate"]
+        conn.close()
+        for key in ("population_mean_alpha", "excess_vs_population",
+                    "excess_t", "excess_p", "excess_ci95"):
+            assert key in lg, f"live_gate is missing the population leg key {key!r}"
+        assert lg["population_mean_alpha"] is not None
+        assert lg["excess_vs_population"] is not None
+
+    def test_live_gate_excess_is_per_cycle_then_averaged_not_pooled(self, tmp_path):
+        """The estimator, not just the presence of the key: with two cycles of
+        different size the paired per-cycle mean differs from the pooled one,
+        and only the per-cycle answer is correct (date-clustered, I7213 §1)."""
+        conn, merged, ur = self._two_cycle_conn(tmp_path)
+        cf = _counterfactual(conn, merged, ur)
+        conn.close()
+        lg = cf["live_gate"]
+
+        # Cycle A: 40 names, alpha 0.20 - 0.004i; survivors = i in 0..3.
+        a_alpha = [0.20 - i * 0.004 for i in range(40)]
+        a_excess = float(np.mean(a_alpha[:4])) - float(np.mean(a_alpha))
+        # Cycle B: 20 names, alpha 0.20 - 0.010i; survivors = i in 0..1.
+        b_alpha = [0.20 - i * 0.010 for i in range(20)]
+        b_excess = float(np.mean(b_alpha[:2])) - float(np.mean(b_alpha))
+        expected = (a_excess + b_excess) / 2  # equal weight per cycle
+
+        assert lg["excess_vs_population"] == pytest.approx(expected, abs=1e-4)
+
+        pooled = (float(np.mean(a_alpha[:4] + b_alpha[:2]))
+                  - float(np.mean(a_alpha + b_alpha)))
+        assert lg["excess_vs_population"] != pytest.approx(pooled, abs=1e-4)
+
+        # The denominator is the FULL cycle universe, and it is the SAME
+        # population every top_n row was measured against — that identity is
+        # what makes the two arms comparable on the card.
+        top20 = {(e["n"], e["sector_balanced"]): e
+                 for e in cf["top_n"]}[(20, False)]
+        assert (lg["population_mean_alpha"]
+                == pytest.approx(top20["population_mean_alpha"], abs=1e-6))
+
+    def test_absent_scanner_table_live_gate_keys_present_as_null(self, tmp_path):
+        """An absent key and a measured-nothing key must not be
+        indistinguishable to a consumer (fleet 'could-not-measure == found-
+        nothing' bug class)."""
+        db = tmp_path / "research.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE unrelated (x INTEGER)")
+        conn.commit()
+        lg = _counterfactual(conn, pd.DataFrame(), pd.DataFrame())["live_gate"]
+        conn.close()
+        for key in ("population_mean_alpha", "excess_vs_population",
+                    "excess_t", "excess_p", "excess_ci95"):
+            assert key in lg and lg[key] is None
+
+
 # ── Degraded-input paths ─────────────────────────────────────────────────────
 
 
