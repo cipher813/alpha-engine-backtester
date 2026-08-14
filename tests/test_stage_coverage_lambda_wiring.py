@@ -4,18 +4,30 @@ Counterfactual, the only crucible-backtester stages that are Lambda
 handlers rather than spot launchers (see
 test_stage_coverage_assertion_wiring.py for the shell-launcher coverage).
 
-Both handlers call the ONE shared `krepis.stage_coverage` module landed by
-a separate krepis PR. krepis is PyPI-published (this repo's
-`requirements.txt` already floors it at `krepis[openai]>=0.55.0` — a
-future release adding the module needs no pin-bump PR here), and does NOT
-carry that module at any released version yet — these tests verify BOTH
-sides of that gap: (1) the handler degrades loudly-but-harmlessly
-(ImportError caught, logged, handler outcome unchanged) against today's
-installed krepis, matching this environment's actually-installed version
-(confirmed absent: `python -c "import krepis.stage_coverage"` fails here
-exactly as it will in CI), and (2) once the module IS importable
-(simulated via a fake module injected into sys.modules), its verdict lands
-under the `stage_coverage` key in the returned payload.
+Both handlers call the ONE shared `krepis.stage_coverage` module, which
+ships from krepis 0.59.4 onward (this repo's `requirements.txt` and both
+Lambda Dockerfiles floor krepis at that version so the primitive is
+guaranteed present wherever these handlers actually run — a floor that
+does not carry the module makes the assertion a silent no-op in the
+deployed artifact, which is the alpha-engine-config-I7334 defect class).
+
+These tests verify BOTH sides of the contract, each against a SIMULATED
+condition rather than against whatever krepis happens to be installed:
+
+1. module ABSENT — the handler degrades loudly-but-harmlessly (ImportError
+   caught, logged at ERROR, handler outcome unchanged). The absence is
+   injected (``sys.modules["krepis.stage_coverage"] = None``), not
+   inherited from the environment. It used to be inherited: these tests
+   asserted "the installed krepis has no such module" as a fact, and went
+   red on 2026-08-14 the moment krepis published it, with nothing in this
+   repo having changed.
+2. module PRESENT — its verdict lands under the `stage_coverage` key in
+   the returned payload (fake module injected into sys.modules).
+
+`TestPrimitiveIsActuallyInstalled` pins the third thing neither of those
+can see: that the real module is importable at all under this repo's
+declared pins. A coverage assertion that cannot import reports nothing,
+and reports it in a shape indistinguishable from having found nothing.
 """
 
 from __future__ import annotations
@@ -86,13 +98,25 @@ def _ok_summary(handler_name: str) -> dict:
     }
 
 
-# ── Real environment: krepis.stage_coverage is NOT importable ────────
-# (Confirmed absent from the installed krepis at the current pin —
-# this is not a mock, it's this handler's genuine import path.)
+# ── Simulated absence: krepis.stage_coverage is NOT importable ──────────────
+
+
+@pytest.fixture
+def absent_stage_coverage(monkeypatch):
+    """Make ``from krepis.stage_coverage import ...`` raise ImportError.
+
+    ``None`` in ``sys.modules`` is the documented way to force that. The
+    root ``tests/conftest.py`` installs the same default for the whole
+    suite (so no handler test reaches real S3 through the primitive);
+    requesting it explicitly here states the precondition these tests
+    depend on instead of borrowing it.
+    """
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", None)
+    yield
 
 
 class TestModuleAbsentDegradesLoudlyNotSilently:
-    def test_import_error_does_not_change_handler_outcome(self, handler_case):
+    def test_import_error_does_not_change_handler_outcome(self, handler_case, absent_stage_coverage):
         name, mod, cfg = handler_case
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], return_value=_ok_summary(name)):
@@ -102,7 +126,7 @@ class TestModuleAbsentDegradesLoudlyNotSilently:
         assert result["status"] == "OK"
         assert "summary" in result
 
-    def test_import_error_is_logged_not_swallowed(self, handler_case):
+    def test_import_error_is_logged_not_swallowed(self, handler_case, absent_stage_coverage):
         name, mod, cfg = handler_case
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], return_value=_ok_summary(name)), \
@@ -115,7 +139,7 @@ class TestModuleAbsentDegradesLoudlyNotSilently:
         logged_msg = mock_error.call_args[0][0]
         assert "stage-coverage" in logged_msg
 
-    def test_stage_coverage_key_absent_when_module_unavailable(self, handler_case):
+    def test_stage_coverage_key_absent_when_module_unavailable(self, handler_case, absent_stage_coverage):
         name, mod, cfg = handler_case
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], return_value=_ok_summary(name)):
@@ -130,9 +154,10 @@ class TestModuleAbsentDegradesLoudlyNotSilently:
 def fake_stage_coverage_module():
     """Inject a fake krepis.stage_coverage into sys.modules so the
     handler's `from krepis.stage_coverage import assert_stage_coverage`
-    succeeds — simulating the state after the nousergon-lib pin bump lands
-    (a separate wave, per the PR body's merge order). Restores prior state
-    on teardown so this fixture cannot leak into other tests."""
+    succeeds AND returns a verdict this test controls. A fake rather than
+    the real module because the real one builds boto3 S3/CloudWatch
+    clients and reads a registry object out of S3. Restores prior state on
+    teardown so this fixture cannot leak into other tests."""
     calls = []
 
     def _assert_stage_coverage(stage, *, run_date, window_start):
@@ -216,3 +241,38 @@ class TestModulePresentVerdictLandsInPayload:
         assert result["status"] == "ERROR"
         assert "stage_coverage" not in result
         assert fake_stage_coverage_module == []
+
+
+# ── The primitive must actually be installable, not merely called ───────────
+
+
+class TestPrimitiveIsActuallyInstalled:
+    """alpha-engine-config-I7334 class: a coverage assertion whose import
+    fails emits nothing, and "emitted nothing" is byte-identical to "found
+    nothing wrong". Both simulated paths above pass whether or not krepis
+    really carries the module, so one test has to look at the real one."""
+
+    def test_krepis_stage_coverage_is_importable(self, monkeypatch):
+        monkeypatch.delitem(sys.modules, "krepis.stage_coverage", raising=False)
+        import importlib  # noqa: PLC0415 — deliberately deferred past the delitem
+
+        mod = importlib.import_module("krepis.stage_coverage")
+        assert callable(mod.assert_stage_coverage), (
+            "krepis.stage_coverage imported but has no assert_stage_coverage — "
+            "the handlers' observe-mode assertion would log an AttributeError "
+            "and measure nothing"
+        )
+
+    def test_assert_stage_coverage_accepts_the_signature_both_handlers_call(
+        self, monkeypatch
+    ):
+        """Both handlers call it as
+        ``assert_stage_coverage(stage, run_date=..., window_start=...)``.
+        A signature drift in krepis would surface only in production."""
+        monkeypatch.delitem(sys.modules, "krepis.stage_coverage", raising=False)
+        import importlib  # noqa: PLC0415 — deliberately deferred past the delitem
+        import inspect  # noqa: PLC0415
+
+        mod = importlib.import_module("krepis.stage_coverage")
+        sig = inspect.signature(mod.assert_stage_coverage)
+        sig.bind("ReplayConcordance", run_date="2026-05-09", window_start=None)

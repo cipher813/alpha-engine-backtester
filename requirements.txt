@@ -152,7 +152,16 @@ psutil>=7.2.2
 # a None default, so this bump is required for the field to ever be
 # non-None, not for correctness against an older krepis (that path already
 # degrades gracefully).
-krepis[openai]>=0.55.0
+#
+# Bumped to >=0.59.4 (alpha-engine-config-I7214): the FIRST published krepis
+# carrying krepis.stage_coverage, which both Lambda handlers in this repo
+# import to self-assert their declared output before returning. The prior
+# >=0.55.0 floor happens to resolve to a release that has it, but does not
+# REQUIRE one — and the handlers' ImportError guard is deliberately silent
+# about the handler's own outcome, so an install that satisfied the old
+# floor with an older krepis would leave the assertion emitting nothing,
+# indistinguishable from an assertion that found nothing (config-I7334).
+krepis[openai]>=0.59.4
 # Bumped to >=0.24.1 on main (2026-07-29). krepis 0.23.0 added callsite_id
 # as a REQUIRED keyword-only argument to LLMClient.__init__ (a breaking change
 # with no default) — replay/runner.py's _invoke_target_with_schema passes

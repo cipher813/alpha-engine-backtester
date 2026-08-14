@@ -31,9 +31,14 @@ RUN microdnf install -y git && microdnf clean all
 # krepis.llm.LLMClient's OpenRouter transport (DeepSeek V4 Flash) — the
 # fleet's off-direct-Anthropic migration. Floor bumped past v0.12.2, the
 # earliest tag carrying krepis.llm's OpenRouter unresolved/leaked-tool-call
-# safety fix.
+# safety fix. Floor raised again to >=0.59.4 (alpha-engine-config-I7214): the
+# first published krepis carrying krepis.stage_coverage, which handler.py
+# imports to self-assert ReplayConcordance's declared output. The import is
+# ImportError-guarded and observe-mode, so an older krepis in the image would
+# make the assertion silently emit nothing rather than fail the build
+# (config-I7334) — the floor is what keeps it measurable.
 COPY lambda_concordance/requirements-concordance.txt requirements-concordance.txt
-RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.57" "krepis[openai]>=0.12.2" && \
+RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.57" "krepis[openai]>=0.59.4" && \
     pip install --no-cache-dir -r requirements-concordance.txt && \
     rm -rf /root/.cache/pip
 

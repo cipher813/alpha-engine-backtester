@@ -90,3 +90,30 @@ def _block_real_alerts_publish(monkeypatch):
 
     monkeypatch.setattr("nousergon_lib.alerts.publish", _noop)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _stage_coverage_absent_unless_stubbed(monkeypatch):
+    """Default-deny the config-I7214 stage-coverage primitive in tests.
+
+    Both Lambda handlers in this repo call
+    ``krepis.stage_coverage.assert_stage_coverage`` immediately before
+    they return. That function constructs its OWN boto3 S3 and CloudWatch
+    clients and reads a registry object out of S3 — so once krepis
+    actually shipped the module (0.59.4), every handler test that runs a
+    handler end to end started making live AWS calls. Same posture as the
+    arcticdb stub above: unit tests must never reach real S3.
+
+    ``None`` in ``sys.modules`` makes the import raise ``ImportError``
+    deterministically. That matters twice over: it keeps the suite
+    hermetic, AND it makes the observe-mode degrade contract a SIMULATED
+    condition rather than an ambient one. The four tests that broke on
+    2026-08-14 asserted "krepis.stage_coverage is not importable" as a
+    fact about the installed environment; publishing the module flipped
+    them red without anything in this repo changing.
+
+    Tests that need the module-present path inject their own fake, which
+    overrides this entry (monkeypatch reverts LIFO at teardown).
+    """
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", None)
+    yield

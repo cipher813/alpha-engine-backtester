@@ -23,8 +23,16 @@ RUN microdnf install -y git && microdnf clean all
 # replay/__init__.py shares the surface). [flow_doctor] extra plumbs
 # flow-doctor's logging integration. No [arcticdb] / [rag] — counter-
 # factual reads decision artifacts from S3 only.
+#
+# krepis floor raised >=0.3.0 -> >=0.59.4 (alpha-engine-config-I7214): the
+# first published krepis carrying krepis.stage_coverage, which handler.py
+# imports to self-assert Counterfactual's declared output before returning.
+# That import is ImportError-guarded and observe-mode by design, so an image
+# built against the old floor would emit NOTHING and look exactly like an
+# assertion that found nothing wrong (config-I7334). The floor is the only
+# thing making the assertion measurable in the deployed artifact.
 COPY lambda_counterfactual/requirements-counterfactual.txt requirements-counterfactual.txt
-RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.57" "krepis>=0.3.0" && \
+RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.57" "krepis>=0.59.4" && \
     pip install --no-cache-dir -r requirements-counterfactual.txt && \
     rm -rf /root/.cache/pip
 
