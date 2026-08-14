@@ -1606,11 +1606,20 @@ else
     # 2026-07-20 weekday recovery rerun, config#3133) and now threads
     # --date explicitly in its own stage block below, so ALL stages key
     # off the single SF-declared date.
-    if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --date "\${RUN_DATE}" --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1; then
-        echo "ERROR: backtest.py failed. Spot run marked FAILED — check" >&2
+    _BT_RC=0
+    $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --date "\${RUN_DATE}" --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1 || _BT_RC=\$?
+    if [ "\$_BT_RC" -ne 0 ]; then
+        # config-I7258: preserve the REAL exit code — a bare \`exit 1\` here
+        # launders rc=137/OOM into a generic 1 before krepis.ssm_dispatcher
+        # (>=0.60.0) can classify it via SSM's ResponseCode.
+        case "\$_BT_RC" in
+            137|-9) echo "ERROR: backtest.py SIGKILLed (rc=\$_BT_RC) — likely OOM on \$(hostname). Spot run marked FAILED — check" >&2 ;;
+            124|-14|143) echo "ERROR: backtest.py timed out (rc=\$_BT_RC) on \$(hostname). Spot run marked FAILED — check" >&2 ;;
+            *) echo "ERROR: backtest.py failed (rc=\$_BT_RC). Spot run marked FAILED — check" >&2 ;;
+        esac
         echo "       flow-doctor alerts. Parity + evaluator stages skipped" >&2
         echo "       to prevent auto-promotion of unvalidated configs." >&2
-        exit 1
+        exit "\$_BT_RC"
     fi
     echo "▶ stage=backtest END at \$(date -u +%H:%M:%S)"
 fi
@@ -1849,9 +1858,16 @@ else
     # --eval-half=diagnostics / --eval-half=optimize, which map 1:1 to
     # evaluate.py's modes (the optimize half reads the S3 diagnostics
     # snapshot the diagnostics half wrote).
-    if ! $REMOTE_PYTHON -u evaluate.py --mode "\${EVAL_HALF}" --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE \$_EVAL_SKIP_BT --log-level INFO 2>&1; then
-        echo "ERROR: evaluate.py failed. Spot run marked FAILED." >&2
-        exit 1
+    _EVAL_RC=0
+    $REMOTE_PYTHON -u evaluate.py --mode "\${EVAL_HALF}" --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE \$_EVAL_SKIP_BT --log-level INFO 2>&1 || _EVAL_RC=\$?
+    if [ "\$_EVAL_RC" -ne 0 ]; then
+        # config-I7258: preserve the REAL exit code — see spot_evaluator.sh.
+        case "\$_EVAL_RC" in
+            137|-9) echo "ERROR: evaluate.py SIGKILLed (rc=\$_EVAL_RC) — likely OOM on \$(hostname). Spot run marked FAILED." >&2 ;;
+            124|-14|143) echo "ERROR: evaluate.py timed out (rc=\$_EVAL_RC) on \$(hostname). Spot run marked FAILED." >&2 ;;
+            *) echo "ERROR: evaluate.py failed (rc=\$_EVAL_RC). Spot run marked FAILED." >&2 ;;
+        esac
+        exit "\$_EVAL_RC"
     fi
     echo "▶ stage=evaluator END at \$(date -u +%H:%M:%S)"
 fi
