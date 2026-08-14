@@ -178,9 +178,18 @@ RUN_DATE="${RUN_DATE}"
 # against invalid sweep results and was the root cause of multiple
 # undetected param oscillations).
 echo "▶ stage=backtest START at \$(date -u +%H:%M:%S)"
-if ! $REMOTE_PYTHON -u backtest.py --mode param-sweep --date "\${RUN_DATE}" --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1; then
-    echo "ERROR: backtest.py failed. Spot run marked FAILED — check flow-doctor alerts." >&2
-    exit 1
+_BT_RC=0
+$REMOTE_PYTHON -u backtest.py --mode param-sweep --date "\${RUN_DATE}" --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1 || _BT_RC=\$?
+if [ "\$_BT_RC" -ne 0 ]; then
+    # config-I7258: preserve the REAL exit code (a bare \`exit 1\` here
+    # launders rc=137/OOM into a generic 1 before krepis.ssm_dispatcher
+    # (>=0.60.0) can classify it via SSM's ResponseCode).
+    case "\$_BT_RC" in
+        137|-9) echo "ERROR: backtest.py SIGKILLed (rc=\$_BT_RC) — likely OOM on \$(hostname) (\$(curl -s -m 2 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown-instance-type)). Spot run marked FAILED — check flow-doctor alerts." >&2 ;;
+        124|-14|143) echo "ERROR: backtest.py timed out (rc=\$_BT_RC) on \$(hostname). Spot run marked FAILED — check flow-doctor alerts." >&2 ;;
+        *) echo "ERROR: backtest.py failed (rc=\$_BT_RC). Spot run marked FAILED — check flow-doctor alerts." >&2 ;;
+    esac
+    exit "\$_BT_RC"
 fi
 echo "▶ stage=backtest END at \$(date -u +%H:%M:%S)"
 
