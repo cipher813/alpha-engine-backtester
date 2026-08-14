@@ -943,60 +943,49 @@ run_ssm() {
         --script-stdin
 }
 
-# ── Bootstrap spot: watchdog + python + git + clone + fetch configs ─────────
-# Single SSM call covering: spot-side hard-timeout watchdog,
-# python3.12/git install, the 3 HTTPS repo clones, 3 config-file
-# fetches from S3 staging (no .env post #890). Watchdog rationale: dispatcher-side
-# `trap cleanup EXIT` only fires when THIS bash script exits cleanly.
-# If the dispatcher SSM command is cancelled, the dispatcher EC2 is
-# stopped mid-run, or the shell gets SIGKILLed, the trap never runs and
-# the spot orphans until manually terminated — hit 3 times in April 2026.
-# Transient systemd timer fires shutdown -h now after
-# MAX_RUNTIME_SECONDS regardless of dispatcher state.
-echo "==> Bootstrapping spot (watchdog, python, clone, configs)..."
-run_ssm "bootstrap" 600 <<BOOTSTRAP
-set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=${AWS_REGION} AWS_DEFAULT_REGION=${AWS_REGION}
-
-# Spot-side hard-timeout watchdog (see bootstrap-step rationale above).
-systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog \
-    --description='alpha-engine spot hard-timeout' /sbin/shutdown -h now
-
-dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
-    dnf install -y -q python3 python3-pip python3-devel git gcc
-command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3
-echo "Using: \$(\$PYTHON_BIN --version)"
-
-# flow-doctor is now pulled in via alpha-engine-lib[flow_doctor] from
-# requirements.txt — no bundled editable install needed.
-# Three HTTPS clones (no SSH key needed; these repos are public siblings).
-# Repos were renamed + moved to the nousergon org 2026-06-15
-# (alpha-engine-* → crucible-*); local checkout dirs intentionally stay
-# alpha-engine-* (dir-name ≠ repo-name split) so every downstream path is
-# unchanged. Clone the new slugs explicitly rather than depending on
-# GitHub's chained rename/transfer 301 redirect from the old cipher813 paths.
-git clone --depth 1 --branch ${BRANCH} https://github.com/nousergon/crucible-backtester.git /home/ec2-user/alpha-engine-backtester
-git clone --depth 1 --branch ${BRANCH} https://github.com/nousergon/crucible-executor.git /home/ec2-user/alpha-engine
-git clone --depth 1 --branch ${BRANCH} https://github.com/nousergon/crucible-predictor.git /home/ec2-user/alpha-engine-predictor
-
-# Fetch staged configs from S3. (.env no longer staged/fetched — #890.)
-aws s3 cp ${S3_STAGING}/config.yaml /home/ec2-user/alpha-engine-backtester/config.yaml --region ${AWS_REGION} --quiet
-echo "Fetched config.yaml"
-
-mkdir -p /home/ec2-user/alpha-engine/config
-aws s3 cp ${S3_STAGING}/risk.yaml /home/ec2-user/alpha-engine/config/risk.yaml --region ${AWS_REGION} --quiet
-echo "Fetched risk.yaml"
-
-if [ "${STAGED_PREDICTOR_CONFIG}" = "1" ]; then
-    mkdir -p /home/ec2-user/alpha-engine-predictor/config
-    aws s3 cp ${S3_STAGING}/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml --region ${AWS_REGION} --quiet
-    echo "Fetched predictor.yaml"
-else
-    echo "predictor.yaml NOT staged (predictor backtest will be skipped)"
-fi
-
-echo "Bootstrap complete: 3 repos cloned, 3-4 configs fetched from ${S3_STAGING}."
-BOOTSTRAP
+# ── Bootstrap spot: watchdog + hard timeout + python + clones + configs ─────
+# Cutover to `krepis.spot_bootstrap` (alpha-engine-config-I7372). This is the
+# monolith's copy of the same bootstrap `_spot_common.sh` carried; both now
+# call the SAME renderer with the same argv, which is the consolidation that
+# matters. Merging the two FILES is a separate refactor and deliberately not
+# attempted here: `spot_backtest.sh` is linear top-level code with its own
+# variable names and its own cleanup trap, and cannot source the per-stage
+# helper without restructuring the launcher inside a cutover PR.
+#
+# What the previous heredoc did and did NOT do:
+#   DID  — arm a hard runtime cap via `systemd-run --on-active`, so the spot
+#          self-terminates after MAX_RUNTIME_SECONDS even when this dispatcher
+#          is cancelled, stopped or SIGKILLed and its `trap cleanup EXIT` never
+#          runs (hit 3 times in April 2026). Preserved as
+#          --max-runtime-seconds, and now FATAL when it cannot be armed.
+#   DID NOT — install any SSM-liveness watchdog. An instance whose SSM agent
+#          died was unreachable by this dispatcher AND uncapped by anything
+#          except that one timer. The renderer emits the `ec2-spot-watchdog`
+#          unit unconditionally; this repo GAINS it here, having never had it.
+#
+# The three HTTPS clones are `--extra-clone`s: the predictor replay runs the
+# predictor's modules in-process and the executor supplies risk.yaml's schema.
+# Checkout dirs deliberately stay `alpha-engine-*` while the repos are
+# `crucible-*` (2026-06-15 org rename); every downstream path depends on that
+# split, so the paths are reproduced EXACTLY. URLs are the new slugs as
+# launcher-side literals rather than a rename/transfer 301 redirect.
+echo "==> Bootstrapping spot (SSM watchdog, hard timeout, python, 3 clones, configs)..."
+BOOTSTRAP_SCRIPT="$("$LIB_PYTHON" -m krepis.spot_bootstrap render \
+    --repo-url "https://github.com/nousergon/crucible-backtester.git" \
+    --checkout /home/ec2-user/alpha-engine-backtester \
+    --branch "${BRANCH:-main}" \
+    --region "$AWS_REGION" \
+    --max-runtime-seconds "$MAX_RUNTIME_SECONDS" \
+    --export "S3_STAGING=${S3_STAGING}" \
+    --extra-clone "/home/ec2-user/alpha-engine=https://github.com/nousergon/crucible-executor.git@${BRANCH:-main}" \
+    --extra-clone "/home/ec2-user/alpha-engine-predictor=https://github.com/nousergon/crucible-predictor.git@${BRANCH:-main}" \
+    --config-copy "config.yaml:/home/ec2-user/alpha-engine-backtester/config.yaml" \
+    --config-copy "risk.yaml:/home/ec2-user/alpha-engine/config/risk.yaml" \
+    --config-copy-if "${STAGED_PREDICTOR_CONFIG}:predictor.yaml:/home/ec2-user/alpha-engine-predictor/config/predictor.yaml")"
+# Here-STRING, not a pipe: `run_ssm` records LAST_SSM_DESC for the EXIT trap's
+# "last run_ssm" diagnostic, and a pipeline would run it in a subshell where
+# that assignment dies with the subshell.
+run_ssm "bootstrap" 600 <<<"$BOOTSTRAP_SCRIPT"
 
 # ── Install python dependencies ──────────────────────────────────────────────
 echo "==> Installing Python dependencies..."
@@ -1009,7 +998,18 @@ cd /home/ec2-user/alpha-engine-backtester
 # alpha-engine-lib git+https URL in requirements.txt without auth (public repo).
 # Non-secret runtime config (EMAIL_*, OUTPUT_BUCKET) is read from config.yaml
 # by the python pipeline and by the per-stage BUCKET resolution below.
-command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m pip"
+# Strict interpreter resolution — NEVER a silent fallback to the AMI python3
+# (alpha-engine-config-I7372). requirements.txt is resolved against 3.12;
+# python3 resolves different wheels, and the divergence surfaces as an
+# ImportError deep inside the workload rather than here, at deps time, with the
+# log still in hand. The bootstrap already asserted python3.12 exists; if it is
+# absent HERE, something changed between two SSM steps — a hard fail, not a
+# substitution.
+command -v python3.12 >/dev/null || {
+    echo "FATAL: python3.12 not found on the spot — the bootstrap step asserted it. Refusing to install requirements.txt against a different interpreter (different wheel resolution)." >&2
+    exit 1
+}
+PIP="python3.12 -m pip"
 
 \$PIP install --upgrade pip -q
 \$PIP install -q -r requirements.txt
@@ -1190,7 +1190,14 @@ CACHE
 # sibling) — audited forward to prevent the identical Backtester/Parity/
 # Evaluator failure. No .env is sourced; OUTPUT_BUCKET is now read from the
 # staged config.yaml at each per-stage BUCKET resolution below.
-ENV_SOURCE='export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1; export ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true; export AWS_REGION=us-east-1; export AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1; command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3; export PYTHON_BIN;'
+# PYTHON_BIN is resolved STRICTLY — `python3.12` or a non-zero exit. This one
+# line is injected into EVERY downstream stage heredoc (smoke, backtest, parity,
+# pit-parity, evaluate, preflight), so the old
+# `command -v python3.12 && PYTHON_BIN=python3.12 || PYTHON_BIN=python3`
+# was not one silent fallback but the fallback for the entire run: fixing only
+# the bootstrap would have left every workload step free to resolve the AMI
+# python3 against wheels installed for 3.12 (alpha-engine-config-I7372).
+ENV_SOURCE='export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1; export ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true; export AWS_REGION=us-east-1; export AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1; command -v python3.12 >/dev/null || { echo "FATAL: python3.12 absent on the spot — bootstrap asserted it and deps installed against it. Refusing to run this step on a different interpreter (alpha-engine-config-I7372)." >&2; exit 1; }; PYTHON_BIN=python3.12; export PYTHON_BIN;'
 
 # Spot-side python is resolved inline per SSM step via PYTHON_BIN in the
 # ENV_SOURCE above. The pre-2026-05-27 SSH transport captured this on the
