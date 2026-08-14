@@ -958,8 +958,52 @@ def compute_vectorized_entries(
             (block_reason == BLOCK_NONE) & corr_failed, BLOCK_CORRELATION, block_reason,
         ).astype(np.int8)
 
+    # ── 12b. Finiteness contract (config-I7259) ─────────────────────
+    # A non-finite share count is an upstream contract violation, never a
+    # legitimate zero — and `NaN <= 0` is False, so the gate below would let it
+    # through as a PASSED entry. It then rode out through `final_shares` into
+    # `vectorized_sweep.run_vectorized_sweep`, whose own `if shares <= 0:
+    # continue` is blind in exactly the same way, and died 150 lines later at
+    # `shares=int(shares)` with `ValueError: cannot convert float NaN to
+    # integer` — a message naming neither the combo, the ticker, nor which
+    # input was bad. That killed the whole PredictorBacktest stage on
+    # 2026-08-13 and 2026-06-26.
+    #
+    # `shares = floor(dollar_size / safe_prices)` and `safe_prices` is already
+    # NaN-proof (`np.where(sig_prices > 0, sig_prices, 1.0)` — a NaN price
+    # fails `> 0` and falls to 1.0), so a non-finite result can only come from
+    # `dollar_size = nav_per_combo * position_weight`. Report which of the two
+    # is non-finite: that is the difference between a corrupted portfolio NAV
+    # and a corrupted sizing weight, and it is the whole question.
+    bad_shares = ~np.isfinite(shares)
+    if np.any(bad_shares):
+        bad_combos = np.unique(np.nonzero(bad_shares)[0])
+        bad_signals = np.unique(np.nonzero(bad_shares)[1])
+        nav_bad = np.nonzero(~np.isfinite(nav_per_combo))[0]
+        weight_bad = np.unique(np.nonzero(~np.isfinite(position_weight))[0])
+        raise ValueError(
+            "non-finite entry share count — upstream contract violation "
+            f"({int(bad_shares.sum())} of {bad_shares.size} combo/signal cells). "
+            f"combo_idx={bad_combos[:10].tolist()}"
+            f"{'...' if bad_combos.size > 10 else ''} "
+            f"signal_idx={bad_signals[:10].tolist()}"
+            f"{'...' if bad_signals.size > 10 else ''}. "
+            f"non-finite nav_per_combo at combo_idx={nav_bad[:10].tolist()} "
+            f"({nav_bad.size} total); "
+            f"non-finite position_weight at combo_idx={weight_bad[:10].tolist()} "
+            f"({weight_bad.size} total). "
+            "Raising here rather than emitting a passed entry with NaN shares: "
+            "a `shares <= 0` gate does not exclude NaN, so the value would be "
+            "sized, ordered and only surface as int(NaN) far downstream."
+        )
+
     # ── 13. Shares-round-to-zero (final gate) ───────────────────────
-    shares_zero = shares <= 0
+    # `~(shares > 0)` rather than `shares <= 0`: the two differ only on NaN,
+    # which the contract check above already rejects. Written in the
+    # NaN-excluding form as defense in depth so a future path that legitimately
+    # produces a non-finite share count is BLOCKED here rather than emitted as
+    # a passed entry (config-I7259).
+    shares_zero = ~(shares > 0)
     block_reason = np.where(
         (block_reason == BLOCK_NONE) & shares_zero, BLOCK_SHARES_ZERO, block_reason,
     ).astype(np.int8)
