@@ -134,6 +134,12 @@ def _select_baseline_dates(
 # count, which is ≤ n when junk-stance entries exist).
 UNKNOWN_SOURCE: str = "unknown"
 
+# The predictor's ``stance_source`` literal for the pillar-decomposed path
+# (crucible-predictor/model/stance_classifier.py). The Phase-5 acceptance
+# criterion is ONLY meaningful for entries carrying this source — see
+# _phase5_measurable (config-I7405).
+PILLAR_SOURCE: str = "pillar"
+
 
 def _load_stance_counts(
     bucket: str, dates: list[_dt.date], s3_client=None,
@@ -255,6 +261,50 @@ def _check_within_band(
     return result
 
 
+def _phase5_measurable(source_totals: dict[str, int]) -> bool:
+    """Did ANY entry in this run come from the pillar path?
+
+    The Phase-5 acceptance criterion (module docstring) is a statement about
+    the PILLAR-derived distribution: it exists to catch a pillar regression
+    within one Saturday cycle. When no entry carries ``stance_source ==
+    "pillar"``, the run compared the heuristic distribution against a
+    baseline of itself and the criterion was not evaluated at all.
+
+    Measured 2026-08-15 (config-I7405): across 2026-07-24, 07-31, 08-07,
+    08-13 and 08-14 the pillar source appears ZERO times — the live
+    ``signals_envelope`` producer emits ``sub_scores.qual = null`` for all
+    903 tickers, so ``_extract_pillar_assessment_for_stance`` returns None
+    for every one and ``classify_stance`` correctly falls back. The alert
+    nonetheless told every reader to "investigate classify_stance
+    pillar-vs-heuristic path" — a path that did not run.
+
+    sf-pipeline-policy.md 2.3a rule 2: a missing verdict propagates as
+    UNKNOWN, never as pass. Rule 3: every surface presenting the run's
+    results carries the verdict state. The source mix was already in hand
+    and already printed; it just was not used to qualify the conclusion
+    drawn from it.
+    """
+    return bool(source_totals.get(PILLAR_SOURCE, 0))
+
+
+def _verdict_sentence(source_totals: dict[str, int]) -> str:
+    """What this breach does and does not establish (config-I7405)."""
+    if _phase5_measurable(source_totals):
+        return (". Phase 5 acceptance check; investigate "
+                "classify_stance pillar-vs-heuristic path.")
+    observed = ", ".join(sorted(source_totals)) or "none"
+    return (
+        ". NOT a Phase 5 pillar result: ZERO entries carry "
+        f"stance_source='{PILLAR_SOURCE}' (observed source(s): {observed}), "
+        "so the pillar path did not run and the Phase 5 acceptance "
+        "criterion is UNMEASURED for this cycle. The band breach above is "
+        "real and is a shift in the heuristic distribution — do not read it "
+        "as a pillar regression, and do not investigate classify_stance's "
+        "pillar branch. Check the upstream signals producer's qual half "
+        "(config-I7405)."
+    )
+
+
 def _publish_drift_alert(report: dict) -> None:
     """Fan a stance-drift FAIL out to SNS + Telegram via the canonical
     ``nousergon_lib.alerts`` lift-to-lib primitive (v0.21.0+).
@@ -325,8 +375,7 @@ def _publish_drift_alert(report: dict) -> None:
         f"({', '.join(d for d in baseline_dates)}). "
         + " | ".join(failure_lines)
         + source_sentence
-        + ". Phase 5 acceptance check; investigate "
-        "classify_stance pillar-vs-heuristic path."
+        + _verdict_sentence(source_totals)
     )
     try:
         result = publish_ops_alert(
