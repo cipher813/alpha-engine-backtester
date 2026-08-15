@@ -440,3 +440,49 @@ def test_unknown_stance_in_predictions_is_ignored():
     assert report["status"] == "ok"
     # Junk stance should NOT show up in current_distribution
     assert set(report["current_distribution"].keys()) == set(sd.KNOWN_STANCES)
+
+
+# ── config-I7405 ────────────────────────────────────────────────────────────
+# The Phase-5 acceptance criterion is a statement about the PILLAR-derived
+# distribution. Measured 2026-08-15: across 2026-07-24, 07-31, 08-07, 08-13
+# and 08-14, `stance_source == "pillar"` appears ZERO times — the live
+# signals_envelope producer emits `sub_scores.qual = null` for all 903
+# tickers, so classify_stance correctly falls back to the heuristic for every
+# one. The alert nonetheless told every reader to investigate the pillar path.
+
+class TestTheVerdictNamesWhatItMeasured:
+    def test_a_zero_pillar_run_does_not_send_the_reader_to_the_pillar_path(self):
+        s = sd._verdict_sentence({"heuristic": 23})
+        assert "UNMEASURED" in s
+        # The directive form must be absent; the explicit negation is what
+        # replaces it, so a bare substring check would pass on the wrong text.
+        assert "investigate classify_stance pillar-vs-heuristic path" not in s
+        assert "do not investigate classify_stance's pillar branch" in s
+
+    def test_it_names_the_observed_sources(self):
+        s = sd._verdict_sentence({"heuristic": 23})
+        assert "heuristic" in s
+
+    def test_it_still_says_the_breach_is_real(self):
+        """Relabelled, never silenced — momentum 1.5 -> 6 is a genuine move."""
+        s = sd._verdict_sentence({"heuristic": 23})
+        assert "real" in s
+
+    def test_a_pillar_bearing_run_keeps_the_phase_5_sentence(self):
+        s = sd._verdict_sentence({"pillar": 20, "heuristic": 3})
+        assert "Phase 5 acceptance check" in s
+        assert "investigate classify_stance pillar-vs-heuristic path" in s
+        assert "UNMEASURED" not in s
+
+    def test_one_single_pillar_entry_is_enough_to_make_it_measurable(self):
+        assert sd._phase5_measurable({"pillar": 1, "heuristic": 22})
+        assert not sd._phase5_measurable({"heuristic": 23})
+
+    def test_an_empty_source_mix_is_unmeasured_not_measured(self):
+        """No classified entries at all is the strongest form of 'unknown'."""
+        assert not sd._phase5_measurable({})
+        assert "UNMEASURED" in sd._verdict_sentence({})
+
+    def test_the_pillar_literal_matches_the_predictor_contract(self):
+        """A spelling drift here silently makes every run read as unmeasured."""
+        assert sd.PILLAR_SOURCE == "pillar"
