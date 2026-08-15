@@ -186,8 +186,9 @@ fi
 # Evaluator SF state, which always skips the backtest stage (that stage now
 # lives in the three separate spot_*backtest*.sh scripts). Distinguishes
 # intentional absence from an unexpected failure (config#2887).
+_STAGE_TAIL_LOG="\$(mktemp /tmp/evaluator-stage-XXXXXX.log)"
 _EVAL_RC=0
-$REMOTE_PYTHON -u evaluate.py --mode "\${EVAL_HALF}" --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE --skip-backtester --log-level INFO 2>&1 || _EVAL_RC=\$?
+$REMOTE_PYTHON -u evaluate.py --mode "\${EVAL_HALF}" --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE --skip-backtester --log-level INFO 2>&1 | tee "\$_STAGE_TAIL_LOG" || _EVAL_RC=\$?
 if [ "\$_EVAL_RC" -ne 0 ]; then
     # config-I7258: preserve the REAL exit code — a bare \`exit 1\` here
     # laundered rc=137 (OOM SIGKILL) into a generic 1 before ssm_dispatcher
@@ -201,6 +202,18 @@ if [ "\$_EVAL_RC" -ne 0 ]; then
         124|-14|143) echo "ERROR: evaluate.py timed out (rc=\$_EVAL_RC) on \$(hostname). Spot run marked FAILED." >&2 ;;
         *) echo "ERROR: evaluate.py failed (rc=\$_EVAL_RC). Spot run marked FAILED." >&2 ;;
     esac
+    # config-I7396 / config-I7399: SSM's GetCommandInvocation returns only the
+    # FIRST 24 KB of stdout, and this stage's stdout is thousands of INFO
+    # lines, so a traceback at the END of the run is structurally unreachable
+    # there -- no amount of bounding the chatter helps, because truncation is
+    # from the front. STDERR comes back intact and is what the Step Function
+    # copies verbatim into its failure cause and its alert, so the real cause
+    # is republished here. Without this the operator reads
+    # "evaluate.py failed (rc=1)" and nothing else, which is exactly what
+    # happened on 2026-08-15 while the traceback sat unread in S3.
+    echo "--- tail of evaluator stage output (the real cause; stdout is truncated by SSM at 24 KB) ---" >&2
+    tail -n 60 "\$_STAGE_TAIL_LOG" 2>/dev/null >&2 || echo "(no stage log captured)" >&2
+    echo "--- end of evaluator stage tail ---" >&2
     exit "\$_EVAL_RC"
 fi
 echo "▶ stage=evaluator END at \$(date -u +%H:%M:%S)"
