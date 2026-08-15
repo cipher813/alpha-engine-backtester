@@ -172,7 +172,15 @@ psutil>=7.2.2
 # arguments AFTER a spot instance already exists and is billing. The floor is
 # also what makes `tests/test_spot_bootstrap_no_inline_fork.py` meaningful:
 # `scan_for_inline_bootstraps` ships in the same release.
-krepis[openai]>=0.59.6
+# Bumped to >=0.59.7 (alpha-engine-config-I7393): the FIRST published krepis
+# whose cost records carry the four contract columns the transparency
+# inventory's `cost_telemetry` row asserts — schema_version, run_id,
+# agent_id, model_name. This repo's concordance Lambda becomes a cost
+# PRODUCER in this PR, so a resolve below 0.59.7 would emit rows missing
+# them and keep that row the weekly substrate health check's single [FAIL].
+# >=0.59.6 happens to resolve to 0.59.7 today; that is resolution luck, not
+# a requirement.
+krepis[openai]>=0.59.7
 # Bumped to >=0.24.1 on main (2026-07-29). krepis 0.23.0 added callsite_id
 # as a REQUIRED keyword-only argument to LLMClient.__init__ (a breaking change
 # with no default) — replay/runner.py's _invoke_target_with_schema passes
