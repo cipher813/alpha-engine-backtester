@@ -46,7 +46,16 @@ import re
 
 import pytest
 
-_SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "infrastructure" / "spot_backtest.sh"
+_INFRA = pathlib.Path(__file__).resolve().parent.parent / "infrastructure"
+
+# Every launcher that dispatches an unquoted heredoc to a box, not just the
+# monolith this test was written against. The 2026-05-31 L4472 phase-split
+# copied `spot_backtest.sh`'s heredoc shape into four per-stage launchers and
+# this guard stayed pinned to the original file, so the same class could ship
+# again in any of them undetected (config-I7399 sweep).
+_SCRIPTS = sorted(
+    p for p in _INFRA.glob("spot_*.sh") if "<<" in p.read_text()
+)
 
 _ASSIGN = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
 # An unescaped $VAR / ${VAR}. The negative lookbehind is the whole point:
@@ -58,8 +67,30 @@ _UNESCAPED_REF = re.compile(r"(?<!\\)\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 _HEREDOC_OPEN = re.compile(r"<<([A-Za-z_][A-Za-z0-9_]*)\s*$")
 
 
-def _lines() -> list[str]:
-    return _SCRIPT.read_text().split("\n")
+def _lines(script: pathlib.Path) -> list[str]:
+    return script.read_text().split("\n")
+
+
+def _sourced_assignments() -> set[str]:
+    """Names assigned in the shared library every launcher sources.
+
+    Without this the detector reports each launcher's deliberate
+    ``RUN_DATE="${RUN_DATE}"`` pass-through as heredoc-local, because
+    ``RUN_DATE`` is assigned by ``spot_common_normalize_run_date`` in
+    ``_spot_common.sh`` rather than in the launcher's own text. Those are
+    intentional dispatcher-side injections, which the module docstring
+    already exempts — the exemption just has to see the whole outer shell,
+    not one file of it.
+    """
+    common = _INFRA / "_spot_common.sh"
+    if not common.is_file():
+        return set()
+    return {
+        m.group(1)
+        for line in common.read_text().split("\n")
+        for m in [_ASSIGN.match(line)]
+        if m
+    }
 
 
 def _unquoted_heredocs(lines: list[str]) -> list[tuple[str, int, int]]:
@@ -79,21 +110,37 @@ def _unquoted_heredocs(lines: list[str]) -> list[tuple[str, int, int]]:
     return out
 
 
-def test_the_script_and_its_heredocs_are_discoverable():
+def test_the_launcher_set_is_discoverable():
+    """A glob that matched nothing would make every assertion below vacuous."""
+    assert _SCRIPTS, f"no spot_*.sh launchers with heredocs found under {_INFRA}"
+    names = {p.name for p in _SCRIPTS}
+    for required in (
+        "spot_backtest.sh",
+        "spot_backtester.sh",
+        "spot_predictor_backtest.sh",
+        "spot_portfolio_optimizer_backtest.sh",
+        "spot_evaluator.sh",
+    ):
+        assert required in names, f"{required} dropped out of the guarded set"
+
+
+@pytest.mark.parametrize("script", _SCRIPTS, ids=lambda p: p.name)
+def test_the_script_and_its_heredocs_are_discoverable(script):
     """A regex that matched nothing would make every assertion below vacuous."""
-    assert _SCRIPT.is_file(), f"{_SCRIPT} missing"
-    heredocs = _unquoted_heredocs(_lines())
-    assert heredocs, "no unquoted heredocs found — the parser is broken, not the script"
+    assert script.is_file(), f"{script} missing"
+    heredocs = _unquoted_heredocs(_lines(script))
+    assert heredocs, f"no unquoted heredocs found in {script.name} — the parser is broken, not the script"
 
 
-def test_no_heredoc_local_variable_is_expanded_by_the_dispatching_shell():
+@pytest.mark.parametrize("script", _SCRIPTS, ids=lambda p: p.name)
+def test_no_heredoc_local_variable_is_expanded_by_the_dispatching_shell(script):
     """THE REGRESSION (2026-08-01).
 
     Un-escaping ``\\$_BACKTEST_WAS_SKIPPED`` at line 1716 makes this fail with
     that variable named — the exact condition that killed the weekly run.
     """
-    lines = _lines()
-    outer_assigned = set()
+    lines = _lines(script)
+    outer_assigned = _sourced_assignments()
     heredocs = _unquoted_heredocs(lines)
     body_spans = [(o, t) for _, o, t in heredocs]
 
@@ -124,7 +171,7 @@ def test_no_heredoc_local_variable_is_expanded_by_the_dispatching_shell():
                     )
 
     assert not offenders, (
-        "Heredoc-local variable(s) expanded by the DISPATCHING shell — they are "
+        f"{script.name}: heredoc-local variable(s) expanded by the DISPATCHING shell — they are "
         "unset locally and abort the dispatcher under `set -u`, with bash "
         "reporting the error at the heredoc's OPENING line:\n"
         + "\n".join(offenders)

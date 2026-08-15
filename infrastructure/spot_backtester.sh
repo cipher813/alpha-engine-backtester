@@ -181,8 +181,9 @@ RUN_DATE="${RUN_DATE}"
 # against invalid sweep results and was the root cause of multiple
 # undetected param oscillations).
 echo "▶ stage=backtest START at \$(date -u +%H:%M:%S)"
+_STAGE_TAIL_LOG="\$(mktemp /tmp/backtester-stage-XXXXXX.log)"
 _BT_RC=0
-$REMOTE_PYTHON -u backtest.py --mode param-sweep --date "\${RUN_DATE}" --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1 || _BT_RC=\$?
+$REMOTE_PYTHON -u backtest.py --mode param-sweep --date "\${RUN_DATE}" --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1 | tee "\$_STAGE_TAIL_LOG" || _BT_RC=\$?
 if [ "\$_BT_RC" -ne 0 ]; then
     # config-I7258: preserve the REAL exit code (a bare \`exit 1\` here
     # launders rc=137/OOM into a generic 1 before krepis.ssm_dispatcher
@@ -192,6 +193,18 @@ if [ "\$_BT_RC" -ne 0 ]; then
         124|-14|143) echo "ERROR: backtest.py timed out (rc=\$_BT_RC) on \$(hostname). Spot run marked FAILED — check flow-doctor alerts." >&2 ;;
         *) echo "ERROR: backtest.py failed (rc=\$_BT_RC). Spot run marked FAILED — check flow-doctor alerts." >&2 ;;
     esac
+    # config-I7396 / config-I7399: SSM's GetCommandInvocation returns only the
+    # FIRST 24 KB of stdout, and this stage's stdout is thousands of INFO
+    # lines, so a traceback at the END of the run is structurally unreachable
+    # there -- no amount of bounding the chatter helps, because truncation is
+    # from the front. STDERR comes back intact and is what the Step Function
+    # copies verbatim into its failure cause and its alert, so the real cause
+    # is republished here. Without this the operator reads
+    # "backtest.py failed (rc=1)" and nothing else, which is exactly what
+    # happened on 2026-08-15 while the traceback sat unread in S3.
+    echo "--- tail of backtester stage output (the real cause; stdout is truncated by SSM at 24 KB) ---" >&2
+    tail -n 60 "\$_STAGE_TAIL_LOG" 2>/dev/null >&2 || echo "(no stage log captured)" >&2
+    echo "--- end of backtester stage tail ---" >&2
     exit "\$_BT_RC"
 fi
 echo "▶ stage=backtest END at \$(date -u +%H:%M:%S)"
