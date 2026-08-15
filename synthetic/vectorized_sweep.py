@@ -825,6 +825,7 @@ def run_vectorized_sweep(
     correlation_lookback = int(np.max(entry_cfg.correlation_lookback_days))
 
     n_exits_total = 0
+    n_exit_deferrals_total = 0
     n_entries_total = 0
     t_loop = _time.monotonic()
 
@@ -931,6 +932,9 @@ def run_vectorized_sweep(
                     reason_code=int(exit_decisions.exit_reason[c, t]),
                 )
             n_exits_total += int(ec.size)
+
+        if exit_decisions.deferred_no_price is not None:
+            n_exit_deferrals_total += int(exit_decisions.deferred_no_price.sum())
 
         apply_vectorized_exits(sim, exit_decisions, prices)
 
@@ -1062,8 +1066,9 @@ def run_vectorized_sweep(
     walltime = _time.monotonic() - t_loop
     logger.info(
         "vectorized_sweep: %d combos × %d dates in %.1fs "
-        "(entries=%d, exits=%d)",
+        "(entries=%d, exits=%d, exit_deferrals_no_price=%d)",
         n_combos, n_dates, walltime, n_entries_total, n_exits_total,
+        n_exit_deferrals_total,
     )
 
     # Provide the lookups consumers need to materialize per-combo
@@ -1078,6 +1083,12 @@ def run_vectorized_sweep(
         "walltime_sec": walltime,
         "entries_applied": n_entries_total,
         "exits_applied": n_exits_total,
+        # (combo, ticker, date) cells where a held position could not be
+        # evaluated for exit because the ticker had no usable price that day.
+        # Nonzero is normal (the price matrix is ~95.6% filled); a sudden jump
+        # means the price feed lost coverage, so it is published rather than
+        # left as a log line.
+        "exit_deferrals_no_price": n_exit_deferrals_total,
         "nav_history": nav_history,  # [n_combos, n_dates], for stats
     }
     return orders_per_combo, diagnostics

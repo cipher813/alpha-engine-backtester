@@ -53,6 +53,49 @@ logger = logging.getLogger(__name__)
 _NO_ENTRY = -1
 
 
+def _assert_finite_orders(side, combo_idx, ticker_idx, shares, prices):
+    """Reject non-finite order legs before they touch ``cash``.
+
+    ``cash`` is the one piece of simulator state with no NaN-proofing
+    downstream: ``update_nav`` sanitizes prices (NaN -> 0) and positions can
+    only be set from finiteness-guarded entry decisions, so
+    ``cash += shares * price`` is the sole path by which a non-finite value
+    enters NAV. And once it does it is PERMANENT and SILENT — every later
+    date's ``nav = cash + positions @ prices`` stays NaN, every drawdown gate
+    reads NaN, and the run only dies much later and somewhere else.
+
+    That is exactly how the 2026-08-15 weekly SF died: a time-decay exit fired
+    on a held ticker with no price for that date (branch 5 of
+    ``compute_vectorized_exits`` is price-independent), ``apply_sell``
+    credited ``shares * NaN``, and the failure surfaced ~1700 dates later in
+    ``compute_vectorized_entries``'s share-count contract as
+    "non-finite nav_per_combo at combo_idx=[50]" — the right guard reporting
+    the wrong stage. Same root cause, different mask, as 2026-08-13 and
+    2026-06-26 (config-I7259).
+
+    Callers must gate on price availability themselves; this is the backstop
+    that makes a missed gate loud AT THE CORRUPTION SITE rather than a NaN
+    that propagates. Raising is correct rather than skipping the leg: an order
+    at an unknown price is not an order that happened at some other price.
+    """
+    bad = ~np.isfinite(shares) | ~np.isfinite(prices) | (prices <= 0)
+    if not np.any(bad):
+        return
+    i = np.nonzero(bad)[0]
+    raise ValueError(
+        f"{side}: non-finite or non-positive order leg — "
+        f"{i.size} of {bad.size} order(s) would corrupt cash permanently. "
+        f"First offenders: "
+        + "; ".join(
+            f"combo={int(combo_idx[k])} ticker_idx={int(ticker_idx[k])} "
+            f"shares={float(shares[k])!r} price={float(prices[k])!r}"
+            for k in i[:5].tolist()
+        )
+        + ". The caller must exclude legs with no usable price before "
+        "applying them (see compute_vectorized_exits' price_ok gate)."
+    )
+
+
 @dataclass
 class VectorizedSimulator:
     """Matrix-axis simulator for parameter-sweep backtesting.
@@ -299,6 +342,7 @@ class VectorizedSimulator:
             raise ValueError("BUY input shape mismatch across orders")
         if combo_idx.size == 0:
             return
+        _assert_finite_orders("BUY", combo_idx, ticker_idx, shares, prices)
         self.positions[combo_idx, ticker_idx] = shares.astype(np.float64)
         self.avg_costs[combo_idx, ticker_idx] = prices.astype(np.float64)
         self.entry_dates[combo_idx, ticker_idx] = np.int32(date_idx)
@@ -342,6 +386,7 @@ class VectorizedSimulator:
             raise ValueError("SELL input shape mismatch across orders")
         if combo_idx.size == 0:
             return
+        _assert_finite_orders("SELL", combo_idx, ticker_idx, shares, prices)
         # Guard: numpy fancy-indexed assignment is last-write-wins on
         # duplicate (combo, ticker) pairs, which would silently corrupt
         # state if two SELL orders target the same position. Production
