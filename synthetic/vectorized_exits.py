@@ -195,11 +195,17 @@ class ExitDecisions:
         Number of shares to sell. Equals ``positions[c,t]`` for EXIT,
         ``floor(positions[c,t] * reduce_fraction[c])`` for REDUCE,
         0 otherwise.
+    deferred_no_price : bool[n_combos, n_tickers] | None
+        Cells that were held and research-eligible but had no usable price
+        on this date, so no exit could be evaluated for them. Counted rather
+        than dropped: the deferral is a decision the sweep made on data
+        grounds and must be visible to the caller.
     """
 
     exit_action: np.ndarray
     exit_reason: np.ndarray
     exit_shares: np.ndarray
+    deferred_no_price: np.ndarray | None = None
 
 
 def compute_vectorized_exits(
@@ -282,12 +288,31 @@ def compute_vectorized_exits(
                 f"got {arr.shape}"
             )
 
-    # Eligibility: held AND research not in (EXIT, REDUCE).
+    # Eligibility: held AND research not in (EXIT, REDUCE) AND priced today.
     research_blocking = (
         (research_action_per_ticker == RA_EXIT)
         | (research_action_per_ticker == RA_REDUCE)
     )  # [n_tickers]
-    eligible = held & ~research_blocking[None, :]  # [n_combos, n_tickers]
+    # A position cannot be sold on a date the ticker has no usable price —
+    # there is no print to transact against, and `apply_sell` would credit
+    # `shares * NaN` into cash, permanently NaN-ing this combo's NAV (see
+    # vectorized_sim._assert_finite_orders). Mirrors the entry side, which has
+    # gated this since inception via BLOCK_NO_PRICE; the exit side never did,
+    # and branches 4 (momentum) and 5 (time decay) are entirely
+    # price-independent, so either could fire on an unpriced held ticker. The
+    # price matrix is ~95.6% filled in production, so the unpriced case is
+    # ordinary, not exotic.
+    #
+    # Deferral, not cancellation: the position stays held and re-evaluates on
+    # the next priced date, which is what an untradeable name actually does.
+    # Marking it NAV-wise is already handled — update_nav treats a missing
+    # price as a 0 contribution.
+    price_ok = np.isfinite(prices) & (prices > 0)  # [n_tickers]
+    eligible = held & ~research_blocking[None, :] & price_ok[None, :]
+    # Telemetry for the deferral: a silently-skipped exit is a decision, and
+    # decisions this sweep makes for data reasons must be countable (fleet
+    # fail-loud rule — no silent swallows).
+    deferred_no_price = held & ~research_blocking[None, :] & ~price_ok[None, :]
 
     exit_action = np.zeros((n_combos, n_tickers), dtype=np.int8)
     exit_reason = np.zeros((n_combos, n_tickers), dtype=np.int8)
@@ -443,6 +468,7 @@ def compute_vectorized_exits(
         exit_action=exit_action,
         exit_reason=exit_reason,
         exit_shares=exit_shares,
+        deferred_no_price=deferred_no_price,
     )
 
 
