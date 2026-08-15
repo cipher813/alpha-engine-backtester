@@ -111,6 +111,20 @@ echo ""
 echo "==> Waiting for Lambda update to complete..."
 aws lambda wait function-updated --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}"
 
+# ── Step 5b: Merge cost-sink environment onto the function ──────────────────
+# replay/runner.py's _invoke_target_model builds krepis.llm.LLMClient with no
+# cost_sink (alpha-engine-config-I7179) — every DeepSeek call this Lambda
+# makes was landing on no cost record. The fix is NOT a per-call-site
+# cost_sink= at the runner.py call — that reproduces the gap for the next
+# call site added. krepis>=0.57.0 (krepis-PR140) makes LLMClient resolve a
+# default sink from these two env vars when cost_sink is not supplied.
+# merge-lambda-env is read-modify-write: it preserves every var already on
+# the live function. Must run BEFORE publish-version so the version this
+# deploy promotes actually carries the sink config, not the version after it.
+echo ""
+echo "==> Merging cost-sink environment onto ${LAMBDA_FUNCTION}..."
+python3 -m krepis.aws merge-lambda-env --function-name alpha-engine-replay-concordance --set KREPIS_COST_SINK_BUCKET=alpha-engine-research --set KREPIS_COST_SINK_PREFIX=decision_artifacts/_cost_raw --region "${AWS_REGION}"
+
 # ── Step 6: Publish version (do NOT promote 'live' yet) ──────────────────────
 echo ""
 echo "==> Publishing Lambda version..."

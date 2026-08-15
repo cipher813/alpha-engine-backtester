@@ -172,7 +172,15 @@ psutil>=7.2.2
 # arguments AFTER a spot instance already exists and is billing. The floor is
 # also what makes `tests/test_spot_bootstrap_no_inline_fork.py` meaningful:
 # `scan_for_inline_bootstraps` ships in the same release.
-krepis[openai]>=0.59.6
+# Bumped to >=0.59.7 (alpha-engine-config-I7393): the FIRST published krepis
+# whose cost records carry the four contract columns the transparency
+# inventory's `cost_telemetry` row asserts — schema_version, run_id,
+# agent_id, model_name. This repo's concordance Lambda becomes a cost
+# PRODUCER in this PR, so a resolve below 0.59.7 would emit rows missing
+# them and keep that row the weekly substrate health check's single [FAIL].
+# >=0.59.6 happens to resolve to 0.59.7 today; that is resolution luck, not
+# a requirement.
+krepis[openai]>=0.59.7
 # Bumped to >=0.24.1 on main (2026-07-29). krepis 0.23.0 added callsite_id
 # as a REQUIRED keyword-only argument to LLMClient.__init__ (a breaking change
 # with no default) — replay/runner.py's _invoke_target_with_schema passes
@@ -180,6 +188,14 @@ krepis[openai]>=0.59.6
 # alpha-engine-config's LLM_CALLSITE_REGISTRY.yaml). krepis <0.23.0 raises
 # TypeError on that keyword, so the floor must match the actual parameter
 # the code passes.
+#
+# Bumped to >=0.57.0 (alpha-engine-config-I7179, krepis-PR140): LLMClient
+# now resolves a default cost_sink from KREPIS_COST_SINK_BUCKET/
+# KREPIS_COST_SINK_PREFIX when the caller does not pass one explicitly —
+# replay/runner.py's _invoke_target_model never has, so every DeepSeek call
+# this module makes was landing on no cost record. The env wiring lives in
+# infrastructure/deploy_concordance.sh (merge-lambda-env), not here; this
+# floor just ensures the installed krepis is new enough to read it.
 
 # alpha-engine-config#7199 — pytest is a RUNTIME dependency of this repo, not
 # only a dev one. The backtester-to-executor replay parity artifact
