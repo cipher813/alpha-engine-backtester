@@ -201,6 +201,46 @@ def _remaining_seconds(context):
 
 @monitor_handler
 def handler(event: dict, context) -> dict:
+    """Entry point. Runs the concordance, then flushes cost telemetry.
+
+    The `finally` is the whole point (alpha-engine-config-I7423).
+    `krepis.cost_sink.S3JsonlCostSink` buffers to 200 records per
+    `(date, callsite_id)` group and otherwise relies on an `atexit` hook —
+    and **an AWS Lambda container is FROZEN between invocations, not
+    exited, so `atexit` never runs.** A handler finishing below the
+    threshold writes nothing at all, and the container may be reclaimed
+    hours later without ever reaching interpreter shutdown.
+
+    Measured 2026-08-15 on weekly-SF execution `watch-rerun-2026-08-15-2`:
+    this Lambda ran 812 seconds of DeepSeek calls over 119 artifacts, and
+    `AggregateCosts` then reported `replay-concordance` among `2 stage(s)
+    ran and emitted no cost record ... Observed producers: (none)`. The env
+    wiring was correct (config-I7179), the sink was constructed, the records
+    were priced and accepted — and every one of them died in memory.
+
+    It wraps `_run` rather than living inside it because `_run` has four
+    return paths (dry-run, hard failure, PARTIAL, OK); a flush on the last
+    one only would have kept exactly the failure this fixes on the others.
+
+    `flush_default_sink` returns 0 when no sink is configured and never
+    raises — telemetry must not take down the work it measures.
+    """
+    try:
+        return _run(event, context)
+    finally:
+        try:
+            from krepis.cost_sink import flush_default_sink
+            _n = flush_default_sink()
+            if _n:
+                logger.info("[lambda_concordance] cost sink flushed: %d object(s)", _n)
+        except ImportError as exc:
+            # Loud, not silent: the image's krepis pin predates the function
+            # (floor is >=0.59.8). Cost records for this run are lost, and
+            # AggregateCosts' fan-in coverage check will say so by name.
+            logger.error("cost-sink flush unavailable — records lost: %s", exc)
+
+
+def _run(event: dict, context) -> dict:
     """Compute + emit per-(agent_id, target_model) cheap-model concordance.
 
     Returns a status envelope:

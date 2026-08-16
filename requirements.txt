@@ -180,7 +180,12 @@ psutil>=7.2.2
 # them and keep that row the weekly substrate health check's single [FAIL].
 # >=0.59.6 happens to resolve to 0.59.7 today; that is resolution luck, not
 # a requirement.
-krepis[openai]>=0.59.7
+#
+# Raised to >=0.59.8 (alpha-engine-config-I7423): the first published krepis
+# carrying `krepis.cost_sink.flush_default_sink()`, which lambda_concordance's
+# handler now calls in a `finally`. Without it the emitted rows never leave the
+# in-process buffer, so 0.59.7's four contract columns are correct and unwritten.
+krepis[openai]>=0.59.8
 # Bumped to >=0.24.1 on main (2026-07-29). krepis 0.23.0 added callsite_id
 # as a REQUIRED keyword-only argument to LLMClient.__init__ (a breaking change
 # with no default) — replay/runner.py's _invoke_target_with_schema passes

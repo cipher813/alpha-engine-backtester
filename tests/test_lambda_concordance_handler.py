@@ -324,3 +324,64 @@ class TestShellRunDryPath:
         m_compute.assert_called_once()
         assert m_compute.call_args.kwargs["emit_metrics"] is False
         assert result["status"] == "OK"
+
+
+class TestCostSinkFlush:
+    """alpha-engine-config-I7423.
+
+    A Lambda container is frozen between invocations, not exited, so the cost
+    sink's `atexit` hook never runs and a handler finishing below the 200-record
+    buffer threshold writes nothing. Measured on weekly-SF execution
+    `watch-rerun-2026-08-15-2` (2026-08-15): 812 seconds of DeepSeek calls,
+    `Observed producers: (none)`.
+    """
+
+    def test_flush_called_on_the_success_path(self, handler_mod):
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.batch.compute_and_emit_concordance",
+                   return_value=_ok_summary()), \
+             patch("krepis.cost_sink.flush_default_sink", return_value=3) as m_flush:
+            result = handler_mod.handler({}, context=None)
+        assert result["status"] == "OK"
+        m_flush.assert_called_once_with()
+
+    def test_flush_called_on_the_dry_run_early_return(self, handler_mod):
+        """The dry path returns before the replay scan — and before any
+        `finally` that lived inside the compute block would have run."""
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("krepis.cost_sink.flush_default_sink", return_value=0) as m_flush:
+            handler_mod.handler({"dry_run_llm": "true"}, context=None)
+        m_flush.assert_called_once_with()
+
+    def test_flush_called_when_the_computation_raises_hard(self, handler_mod):
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.batch.compute_and_emit_concordance",
+                   side_effect=RuntimeError("s3 listing blew up")), \
+             patch("krepis.cost_sink.flush_default_sink", return_value=1) as m_flush:
+            result = handler_mod.handler({}, context=None)
+        assert result["status"] == "ERROR"
+        m_flush.assert_called_once_with()
+
+    def test_a_failing_flush_does_not_change_the_handler_outcome(self, handler_mod):
+        """Telemetry must never take down the work it measures.
+
+        `flush_default_sink` is documented as never raising, but the import
+        itself can fail on an image whose krepis pin predates the function.
+        """
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.batch.compute_and_emit_concordance",
+                   return_value=_ok_summary()), \
+             patch("krepis.cost_sink.flush_default_sink",
+                   side_effect=ImportError("no flush_default_sink")):
+            result = handler_mod.handler({}, context=None)
+        assert result["status"] == "OK"
+
+    def test_flush_is_in_a_finally_not_a_single_return_path(self):
+        """Static guard: a new return path must not be able to skip the flush."""
+        src = _HANDLER_PATH.read_text()
+        wrapper = src.split("def handler(", 1)[1].split("\ndef _run(", 1)[0]
+        assert "finally:" in wrapper, (
+            "handler must flush the cost sink in a `finally` — `_run` has four "
+            "return paths and a flush on one of them is the bug I7423 fixed"
+        )
+        assert "flush_default_sink" in wrapper

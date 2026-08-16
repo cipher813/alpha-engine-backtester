@@ -176,7 +176,10 @@ def test_budget_stopped_downgrades_the_handler_status():
 
     from lambda_concordance import handler as H
 
-    source = inspect.getsource(H.handler)
+    # `_run`, not `handler`: config-I7423 split the entry point into a thin
+    # `handler` wrapper whose only job is the cost-sink flush in a `finally`,
+    # and `_run`, which carries the status logic this test pins.
+    source = inspect.getsource(H._run)
     assert 'budget_stopped' in source, (
         "the handler ignores budget_stopped, so a truncated sweep returns OK "
         "and the SF treats a partial corpus as a full one"
