@@ -12,9 +12,10 @@ by owning tile so the evaluator's tiles read contiguously.
 
 from __future__ import annotations
 
-from analysis.contribution_lift.groups import cost_adjusted_quality
+from analysis.contribution_lift.groups import cost_adjusted_quality, research_composite
 from analysis.contribution_lift.harness import ReplaySpec
 
 SPECS: list[ReplaySpec] = [
     cost_adjusted_quality.SPEC,
+    *research_composite.SPECS,
 ]

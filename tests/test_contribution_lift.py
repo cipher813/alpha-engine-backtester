@@ -672,7 +672,12 @@ def test_report_matches_the_contract_shape(monkeypatch):
         assert component["n_floor"] == 60
         assert component["source_path"].startswith("s3://test-bucket/backtest/")
         assert "#components/" in component["source_path"]
-        assert set(component["dsr"]) == {"baseline", "ablated", "n_trials"}
+        # An N/A component measured no arm, so it carries no DSR block
+        # (`_na_component` emits null) — only a measured one must.
+        if component["status"] == "ok":
+            assert set(component["dsr"]) == {"baseline", "ablated", "n_trials"}
+        else:
+            assert component["dsr"] is None
         for arm in component["arms"].values():
             assert _ARM_KEYS <= set(arm)
             assert isinstance(arm["per_cycle_log_alpha_21d"], dict)
