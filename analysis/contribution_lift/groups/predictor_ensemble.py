@@ -68,15 +68,29 @@ Three properties make this exact rather than approximate:
   rank-preserving, so either field yields the same ablated ordering. ``_raw``
   is preferred and ``predicted_alpha`` is the documented fallback for
   pre-neutralization prediction files.
-* **The served ridge is fitted on RAW feature columns.** ``MetaModel.fit``
-  applies an optional standardize+winsorize transform to the *directional*
-  columns (``META_STANDARDIZE_ENABLED``, default ``False``); when it is on,
-  ``coef_`` multiplies ``clip((x−μ)/σ, ±3)`` and the subtraction above is
-  invalid without μ/σ — which live ONLY inside ``meta_model.pkl``. The JSON
-  sidecar that would carry them (``meta_model.pkl.meta.json``) is **stale**:
-  2026-05-30 against a 2026-08-15 pickle, and predates the ``meta_scaler``
-  field entirely. So the transform is DETECTED rather than assumed, from the
-  manifest itself — see :func:`_standardized_features`.
+* **The ablation applies the SAME transform the ridge was fitted through.**
+  ``MetaModel.fit`` applies an optional standardize+winsorize to the
+  *directional* columns (``META_STANDARDIZE_ENABLED``); when it is on,
+  ``coef_`` multiplies ``clip((x−μ)/σ, ±w)`` and subtracting ``coef·x_raw``
+  would be removing the wrong quantity.
+
+  μ/σ/w are now read from ``meta_scaler`` in ``predictor/weights/meta/
+  manifest.json`` (alpha-engine-config-I7502, ``crucible-predictor-PR508``),
+  written unconditionally on every training run. Before that they lived only
+  inside ``meta_model.pkl``, with the ``meta_model.pkl.meta.json`` sidecar as
+  their nominal transport — and that sidecar had been **frozen since
+  2026-05-30** beside a 2026-08-15 pickle, because
+  ``training/meta_trainer.py`` set ``gate_passed = promoted`` with
+  ``promoted = False`` unconditionally after the challenger-first cutover,
+  making its upload branch dead code. This module's response was to DETECT
+  the transform and refuse (alpha-engine-config-I7511 is the correction):
+  refusing was right against the old contract and is wrong against the new
+  one, because the numbers it was missing are now present.
+
+  The refusal survives for one case only — a feature the manifest's own
+  ``feature_std`` says was standardized but which ``meta_scaler`` does not
+  cover. Reconstructing that would mean guessing μ/σ, and a fabricated
+  ablation is worse than an ``N/A``.
 
 Two arms do not reconstruct anything and are unaffected by all of the above:
 
@@ -229,6 +243,49 @@ def _standardized_features(manifest: dict) -> set[str]:
     return suspect
 
 
+def _meta_scaler(manifest: dict) -> dict | None:
+    """The persisted directional standardize+winsorize transform, or ``None``.
+
+    Written unconditionally by every training run since
+    ``crucible-predictor-PR508`` (alpha-engine-config-I7502). Shape, from
+    ``model/meta_model.py::MetaModel._build_scaler``::
+
+        {"directional": [name, ...], "mean": {name: mu},
+         "std": {name: sigma}, "winsor": w}
+
+    ``None`` for a legacy or unstandardized model — which is not an error and
+    not a gap: with no transform fitted, the raw column IS what the ridge
+    multiplied, so the identity is correct and the ablation is exact.
+    """
+    scaler = manifest.get("meta_scaler")
+    if not isinstance(scaler, dict):
+        return None
+    if not isinstance(scaler.get("directional"), list):
+        raise TypeError(
+            f"{MANIFEST_KEY}: meta_scaler is present but its 'directional' key "
+            f"is {type(scaler.get('directional')).__name__}, expected a list — "
+            "a malformed scaler must not be silently treated as absent, which "
+            "would reconstruct the ablation against the wrong column space"
+        )
+    return scaler
+
+
+def _scaled(scaler: dict | None, feature: str, x: float) -> float:
+    """``x`` as the fitted ridge saw it — ``clip((x-mu)/sigma, +-w)``.
+
+    Mirrors ``MetaModel._apply_scaler`` exactly, including its degenerate-sigma
+    rule (a column whose fitted std was ~0 is recorded as 1.0, so the transform
+    is the identity for it rather than a divide-by-tiny-sigma amplification).
+    An untransformed feature returns unchanged.
+    """
+    if scaler is None or feature not in (scaler.get("directional") or []):
+        return float(x)
+    mu = float((scaler.get("mean") or {}).get(feature, 0.0))
+    sigma = float((scaler.get("std") or {}).get(feature, 1.0)) or 1.0
+    w = float(scaler.get("winsor", 3.0))
+    return float(min(max((float(x) - mu) / sigma, -w), w))
+
+
 # --------------------------------------------------------------------------
 # Per-cycle candidate construction
 # --------------------------------------------------------------------------
@@ -377,19 +434,24 @@ def _drop_one_l1(inputs: ReplayInputs, feature: str) -> ArmSet | NotAvailable:
         )
     coefficient = float(coefficients[feature])
 
-    if feature in _standardized_features(manifest):
+    scaler = _meta_scaler(manifest)
+    # The ONE case that still cannot be reconstructed: the manifest's own
+    # feature_std says this column was standardized, but meta_scaler does not
+    # carry it. Reconstructing would mean guessing mu/sigma, and a fabricated
+    # ablation reads exactly like a measured one (alpha-engine-config-I7511).
+    if feature in _standardized_features(manifest) and (
+        scaler is None or feature not in (scaler.get("directional") or [])
+    ):
         return NotAvailable(
             status="N/A-MISSING-INPUT",
             reason=(
-                f"the served ridge appears to be fitted on a STANDARDIZED "
-                f"'{feature}' column (models.meta_model.importance.feature_std "
-                f"~= 1.0 in {MANIFEST_KEY}), so its coefficient multiplies "
-                f"clip((x-mu)/sigma, +-3) and the term cannot be removed "
-                f"without mu/sigma. Those live only inside meta_model.pkl; the "
-                f"JSON sidecar meta_model.pkl.meta.json is stale (2026-05-30 vs "
-                f"a 2026-08-15 pickle) and predates its meta_scaler field. The "
-                f"predictor must persist the fitted meta_scaler alongside "
-                f"meta_coefficients in {MANIFEST_KEY} ({ISSUE})"
+                f"the served ridge is fitted on a STANDARDIZED '{feature}' "
+                f"column (models.meta_model.importance.feature_std ~= 1.0 in "
+                f"{MANIFEST_KEY}), so its coefficient multiplies "
+                f"clip((x-mu)/sigma, +-w) — but meta_scaler "
+                f"{'is absent from the manifest' if scaler is None else 'does not list this column'}, "
+                f"so mu/sigma are unknown and the term cannot be removed "
+                f"without inventing them ({ISSUE})"
             ),
         )
 
@@ -410,7 +472,12 @@ def _drop_one_l1(inputs: ReplayInputs, feature: str) -> ArmSet | NotAvailable:
         ablated_cycles.append({
             "date": date,
             "picks": _top_n(
-                [(t, a - coefficient * x) for t, a, x in candidates], width
+                # coef multiplies the column AS FITTED, so the term removed is
+                # coef * scaled(x) — identical to coef * x when no transform
+                # was fitted (alpha-engine-config-I7511).
+                [(t, a - coefficient * _scaled(scaler, feature, x))
+                 for t, a, x in candidates],
+                width,
             ),
         })
 
@@ -428,7 +495,8 @@ def _drop_one_l1(inputs: ReplayInputs, feature: str) -> ArmSet | NotAvailable:
         baseline=picks_arm("as-configured (L2 predicted_alpha)", baseline_cycles),
         ablated=picks_arm(
             f"L2 with the {feature} term removed "
-            f"(coef={coefficient:+.6g}, from the currently promoted manifest)",
+            f"(coef={coefficient:+.6g}, from the currently promoted manifest; "
+            f"{'standardized via meta_scaler' if scaler and feature in (scaler.get('directional') or []) else 'raw column, no transform fitted'})",
             ablated_cycles,
         ),
     )
