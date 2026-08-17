@@ -32,9 +32,11 @@ from optimizer.champion_promotion import (
     ARM_FEED_DEPENDENCIES,
     CONFIDENCE_INSUFFICIENT,
     CONFIDENCE_NOT_LEADERBOARD_SCORED,
+    MIN_CYCLES_FOR_INFERENCE,
     CONFIDENCE_OK,
     CONFIDENCE_THIN,
     CONFIDENCE_UNKNOWN,
+    _BLOCKED_BY_SLUGS,
     CONFIDENCE_UNRECOGNISED,
     GATE_HORIZON_DAYS,
     LEADERBOARD_STALENESS_DAYS,
@@ -545,19 +547,33 @@ class TestEvidenceConfidenceGate:
         )
         assert lenient["scores"]["thinktank_coverage"] == pytest.approx(0.03)
 
-    def test_scanner_predictor_direct_confidence_is_not_a_leaderboard_verdict(self):
-        """That arm is scored from this repo's own counterfactual, so a
-        missing confidence must never render as a thin one."""
+    def test_scanner_predictor_direct_confidence_comes_from_its_own_floor(self):
+        """That arm is scored from this repo's own counterfactual, so its
+        verdict is measured against this repo's own floor — never inherited
+        from, and never left absent because of, the leaderboard.
+
+        Superseded ``not_leaderboard_scored`` (alpha-engine-config-I7549
+        champion-side half): naming the SOURCE of the evidence where the field
+        states how MUCH of it there is left the arm the gate compares against
+        with no verdict at all. The constant stays defined for read-tolerance
+        of records written in that window; nothing emits it.
+        """
         result = build_weekly_arm_scores(
             _e2e_lift_ok(), _tt_leaderboard_ok(), run_date="2026-07-18",
             leaderboard_date_used="2026-07-18",
         )
-        assert result["arm_confidence"]["scanner_predictor_direct"] == (
+        assert result["arm_confidence"]["scanner_predictor_direct"] == CONFIDENCE_OK
+        assert result["arm_confidence"]["scanner_predictor_direct"] != (
             CONFIDENCE_NOT_LEADERBOARD_SCORED
         )
-        assert CONFIDENCE_NOT_LEADERBOARD_SCORED not in (
-            CONFIDENCE_OK, CONFIDENCE_THIN, CONFIDENCE_INSUFFICIENT,
+        # A leaderboard verdict must never leak onto this arm: the thin
+        # leaderboard row below does not make the counterfactual thin.
+        thin_lb = build_weekly_arm_scores(
+            _e2e_lift_ok(), _tt_leaderboard_ok(n_dates_scored=1),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
+        assert thin_lb["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_THIN
+        assert thin_lb["arm_confidence"]["scanner_predictor_direct"] == CONFIDENCE_OK
 
     def test_confidence_reaches_the_audit_record(self):
         """I7549 deliverable 4 / §7.2: failing to decide must be VISIBLE, and
@@ -1861,3 +1877,158 @@ class TestRunWeeklyEvaluationFeedLiveness:
         assert result["outcome"] == "promoted"
         assert result["champion_after"] == "thinktank_coverage"
         assert result["blocked_by"] is None
+
+
+# ── Champion-side evidence floor (alpha-engine-config-I7549, second half) ──
+
+
+class TestChampionSideEvidenceFloor:
+    """#688 floored the arm scored off the producer leaderboard. This class
+    pins the OTHER arm of the same two-arm gate.
+
+    ``analysis/end_to_end.py::_scanner_then_predictor_topN`` returns a result
+    at ``if n_cycles < 1``, so ``scanner_predictor_direct`` could enter the
+    comparison as a single observation while ``thinktank_coverage`` was held to
+    five date clusters. The gate acts on the DIFFERENCE between the two: a thin
+    champion makes that difference noise exactly as a thin challenger does, and
+    the audit record reads the same either way.
+
+    Verified RED against #688's code (champion-challenger-policy.md §7.4):
+    ``_score_scanner_predictor_direct`` there returns a 2-tuple with no floor,
+    so ``test_one_cycle_champion_cannot_defend_or_flip`` promotes on a
+    one-cycle mean.
+    """
+
+    def test_one_cycle_champion_cannot_defend_or_flip(self):
+        """A one-cycle champion score is not evidence in either direction: it
+        cannot defend the incumbency and it cannot lose it."""
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(sn_lift=0.09, n_cycles=1),
+            _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["scanner_predictor_direct"] is None
+        assert result["unavailable_reasons"]["scanner_predictor_direct"] == (
+            "scanner_predictor_direct_thin_evidence"
+        )
+        assert result["arm_confidence"]["scanner_predictor_direct"] == CONFIDENCE_THIN
+        # ... and the well-evidenced challenger does not win by default either.
+        gate = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=result, freeze=False,
+        )
+        assert gate["outcome"] == "no_contest"
+        assert gate["champion_after"] == "scanner_predictor_direct"
+        assert gate["blocked_by"] == ["scanner_predictor_direct_thin_evidence"]
+
+    def test_thin_champion_cannot_be_flipped_off_by_a_challenger(self):
+        """Reversed seats — the same protection, in the direction that moves
+        the pointer. thinktank_coverage is champion; a one-cycle
+        scanner_predictor_direct number must not promote."""
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(sn_lift=0.5, n_cycles=1),
+            _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        gate = evaluate_gates(
+            champion_before="thinktank_coverage", arm_scores=result, freeze=False,
+        )
+        assert gate["outcome"] == "no_contest"
+        assert gate["champion_after"] == "thinktank_coverage"
+
+    def test_at_the_floor_scores_exactly_as_before(self):
+        assert MIN_CYCLES_FOR_INFERENCE == 5
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(sn_lift=0.09, n_cycles=MIN_CYCLES_FOR_INFERENCE),
+            _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["scanner_predictor_direct"] == 0.09
+        assert result["arm_confidence"]["scanner_predictor_direct"] == CONFIDENCE_OK
+        assert result["unavailable_reasons"] == {}
+
+    def test_live_cycle_count_is_above_the_floor(self):
+        """The floor bounds the degenerate case; it must not freeze the live
+        gate. Measured 2026-08-17 from
+        research/producer_leaderboard_champion_gate/2026-08-14.json:
+        n_cycles=15, n_picks=119."""
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(sn_lift=-0.00203, n_cycles=15),
+            _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["scanner_predictor_direct"] == -0.00203
+        assert result["arm_confidence"]["scanner_predictor_direct"] == CONFIDENCE_OK
+
+    def test_missing_n_cycles_is_refused_not_trusted(self):
+        """Same posture leaderboard_row_confidence takes toward an artifact
+        that cannot supply a usable verdict: refuse, never guess."""
+        lift = _e2e_lift_ok(sn_lift=0.09)
+        del lift["scanner_then_predictor_counterfactual"]["n_cycles"]
+        result = build_weekly_arm_scores(
+            lift, _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["scanner_predictor_direct"] is None
+        assert result["unavailable_reasons"]["scanner_predictor_direct"] == (
+            "scanner_predictor_direct_confidence_unknown"
+        )
+        assert result["arm_confidence"]["scanner_predictor_direct"] == CONFIDENCE_UNKNOWN
+
+    def test_absent_counterfactual_keeps_its_existing_slug(self):
+        """No behaviour change where the arm produced nothing at all — that
+        was never the defect, and the slug other consumers already match on
+        must not move."""
+        result = build_weekly_arm_scores(
+            None, _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        assert result["unavailable_reasons"]["scanner_predictor_direct"] == (
+            "scanner_predictor_direct_counterfactual_unavailable"
+        )
+        assert result["arm_confidence"]["scanner_predictor_direct"] == (
+            CONFIDENCE_INSUFFICIENT
+        )
+
+    def test_champion_side_verdict_reaches_the_audit_record(self):
+        arm_scores = build_weekly_arm_scores(
+            _e2e_lift_ok(sn_lift=0.09, n_cycles=2),
+            _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        record = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores,
+            freeze=False,
+        )
+        audit = build_champion_audit("2026-07-18", record, freeze=False)
+        assert audit["arm_confidence"]["scanner_predictor_direct"] == CONFIDENCE_THIN
+        assert audit["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_OK
+        assert audit["blocked_by"] == ["scanner_predictor_direct_thin_evidence"]
+        jsonschema = pytest.importorskip("jsonschema", reason="jsonschema not installed")
+        jsonschema.validate(
+            instance=audit, schema=json.loads(AUDIT_SCHEMA_PATH.read_text()),
+        )
+
+    def test_both_arms_thin_names_both(self):
+        arm_scores = build_weekly_arm_scores(
+            _e2e_lift_ok(sn_lift=0.09, n_cycles=2),
+            _tt_leaderboard_ok(mean=0.01, n_dates_scored=1),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        record = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores,
+            freeze=False,
+        )
+        assert record["blocked_by"] == [
+            "scanner_predictor_direct_thin_evidence",
+            "thinktank_coverage_thin_evidence",
+        ]
+
+    def test_champion_side_slugs_are_registered_in_the_schema_enum(self):
+        schema = json.loads(AUDIT_SCHEMA_PATH.read_text())
+        enum = set(schema["properties"]["blocked_by"]["oneOf"][1]["items"]["enum"])
+        for slug in (
+            "scanner_predictor_direct_thin_evidence",
+            "scanner_predictor_direct_confidence_unknown",
+        ):
+            assert slug in _BLOCKED_BY_SLUGS
+            assert slug in enum
