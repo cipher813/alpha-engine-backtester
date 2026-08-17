@@ -39,7 +39,9 @@ def run_sizing_ab(
     # Config B: equal-weight (disable all sizing adjustments)
     config_b = deepcopy(base_config)
     config_b["atr_sizing_enabled"] = False
-    config_b["confidence_sizing_enabled"] = False
+    # confidence_sizing_enabled dropped 2026-08-17 (alpha-engine-config-I7525):
+    # the executor's confidence factor is retired, so the flag no longer
+    # disables anything and setting it here would imply a knob that is gone.
     config_b["staleness_discount_enabled"] = False
     config_b["earnings_sizing_enabled"] = False
     # Keep sector_adj and drawdown — those are risk management, not sizing

@@ -51,7 +51,7 @@ def _deepcopy_safe_config(base: dict) -> dict:
 # top-5% combination (Bergstra & Bengio).  Grid size: 4×3×4×3×3×4 = 1,728.
 #
 # Deferred parameters (revisit at 6+ months of live data):
-#   reduce_fraction, atr_sizing_target_risk, confidence_sizing_*,
+#   reduce_fraction, atr_sizing_target_risk,
 #   staleness_decay_per_day, earnings_*, momentum_gate/exit_threshold,
 #   correlation_block_threshold, drawdown_circuit_breaker (safety param,
 #   never auto-applied).
@@ -75,15 +75,16 @@ EXTENDED_GRID = {
     "profit_take_pct": [0.15, 0.20, 0.25, 0.30],
     "reduce_fraction": [0.25, 0.33, 0.50],
     "atr_sizing_target_risk": [0.01, 0.02, 0.03],
-    # L300 (2026-06-01): confidence_sizing_min/range REMOVED from the sweep.
-    # They scale position size by per-ticker ``prediction_confidence``, but the
-    # backtester sim runs with ``predictions_by_ticker={}`` → confidence is
-    # always None → the sizer's confidence_adj resolves to 1.0 → sweeping these
-    # was a SILENT NO-OP that still emitted misleading "tuned" recommendations.
-    # Confidence-conditioned sizing is tuned OFFLINE against realized outcomes
-    # (the institutional pattern): predictor_sizing_optimizer already owns the
-    # live confidence path via p_up (use_p_up_sizing). The executor falls back
-    # to its FACTORY_DEFAULTS for confidence_sizing_* (unchanged). See [[feedback_no_silent_fails]].
+    # L300 (2026-06-01) removed confidence_sizing_min/range from this sweep:
+    # the sim runs with ``predictions_by_ticker={}``, so prediction_confidence
+    # was always None and sweeping them was a SILENT NO-OP that still emitted
+    # misleading "tuned" recommendations. As of 2026-08-17 the mechanism itself
+    # is retired in the executor (alpha-engine-config-I7525, Brian ruling) — its
+    # constants were on the pre-2026-05-12 confidence axis and it sat behind the
+    # optimizer cutover — so the params are gone from FACTORY_DEFAULTS and from
+    # the executor_params boundary, not merely absent from the grid.
+    # Conviction reaches live sizing through the MVO optimizer's predicted_alpha;
+    # p_up sizing (use_p_up_sizing) remains the offline-tuned per-name path.
     "staleness_decay_per_day": [0.02, 0.03, 0.05],
     "earnings_sizing_reduction": [0.30, 0.50, 0.70],
     "earnings_proximity_days": [3, 5, 7],

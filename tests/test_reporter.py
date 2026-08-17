@@ -341,8 +341,6 @@ class TestReporterCleanupBundle:
                 "time_decay_reduce_days": 7, "time_decay_exit_days": 14,
                 # The "—" rows from today's email — present in factory, NOT in sweep:
                 "atr_sizing_target_risk": 0.02,
-                "confidence_sizing_min": 0.70,
-                "confidence_sizing_range": 0.60,
                 "correlation_block_threshold": 0.80,
                 "earnings_proximity_days": 5,
                 "earnings_sizing_reduction": 0.50,
@@ -372,7 +370,7 @@ class TestReporterCleanupBundle:
         # the row count is restricted, not full key presence.
         row_lines = [
             line for line in md.split("\n")
-            if line.startswith("| atr_") or line.startswith("| confidence_")
+            if line.startswith("| atr_")
             or line.startswith("| earnings_") or line.startswith("| momentum_")
             or line.startswith("| profit_") or line.startswith("| reduce_")
             or line.startswith("| staleness_") or line.startswith("| correlation_")
@@ -383,17 +381,18 @@ class TestReporterCleanupBundle:
         unswept_row_lines = [
             r for r in row_lines
             if "| atr_sizing_target_risk |" in r
-            or "| confidence_sizing_min |" in r
+            or "| correlation_block_threshold |" in r
             or "| earnings_proximity_days |" in r
         ]
         assert len(unswept_row_lines) == 0
 
-        # Header reflects coverage: "5 of 16".
-        assert "5 of 16" in md
+        # Header reflects coverage. 14, not 16: confidence_sizing_min/range left
+        # factory_defaults when the mechanism was retired (alpha-engine-config-I7525).
+        assert "5 of 14" in md
         # Footer names the unswept set.
         assert "Not in sweep grid" in md
         assert "atr_sizing_target_risk" in md
-        assert "confidence_sizing_min" in md
+        assert "correlation_block_threshold" in md
 
     def test_executor_recommendations_caption_skill_mode_leads_with_sortino_and_psr(self):
         """When fit_target=skill_composite, the caption surfaces Sortino +

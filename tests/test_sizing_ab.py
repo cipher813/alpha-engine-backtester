@@ -10,7 +10,6 @@ from analysis.sizing_ab import _MIN_TRADES, run_sizing_ab
 def _base_config():
     return {
         "atr_sizing_enabled": True,
-        "confidence_sizing_enabled": True,
         "staleness_discount_enabled": True,
         "earnings_sizing_enabled": True,
         "sector_adj": {"overweight": 1.2, "market_weight": 1.0, "underweight": 0.8},
@@ -128,7 +127,11 @@ def test_config_b_disables_sizing_knobs():
 
     assert config_a["atr_sizing_enabled"] is True
     assert config_b["atr_sizing_enabled"] is False
-    assert config_b["confidence_sizing_enabled"] is False
+    # confidence_sizing_enabled is no longer set by run_sizing_ab, and no longer
+    # in the base fixture: the executor's confidence factor was retired
+    # 2026-08-17 (alpha-engine-config-I7525), so toggling the flag would disable
+    # nothing and would imply a knob that is gone.
+    assert "confidence_sizing_enabled" not in config_b
     assert config_b["staleness_discount_enabled"] is False
     assert config_b["earnings_sizing_enabled"] is False
     assert config_b["sector_adj"] == {"overweight": 1.0, "market_weight": 1.0, "underweight": 1.0}

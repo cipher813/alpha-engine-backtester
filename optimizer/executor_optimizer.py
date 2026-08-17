@@ -80,11 +80,11 @@ SAFE_PARAMS = [
     "max_position_pct",
     "reduce_fraction",
     "atr_sizing_target_risk",
-    # L300 (2026-06-01): confidence_sizing_min/range removed — the param sweep
-    # over them was a silent no-op (predictionless sim → prediction_confidence
-    # None → confidence_adj 1.0). Confidence sizing is tuned offline via p_up
-    # (predictor_sizing_optimizer). FACTORY_DEFAULTS below keep them for drift
-    # monitoring + executor fallback.
+    # confidence_sizing_min/range: removed from this list on 2026-06-01 (L300 —
+    # sweeping them was a silent no-op in the predictionless sim), and removed
+    # from FACTORY_DEFAULTS on 2026-08-17 when the mechanism was retired in the
+    # executor (alpha-engine-config-I7525). Nothing to keep defaults for: the
+    # executor no longer reads them.
     "staleness_decay_per_day",
     "earnings_sizing_reduction",
     "earnings_proximity_days",
@@ -117,8 +117,6 @@ FACTORY_DEFAULTS = {
     "max_position_pct": 0.05,
     "reduce_fraction": 0.50,
     "atr_sizing_target_risk": 0.02,
-    "confidence_sizing_min": 0.70,
-    "confidence_sizing_range": 0.60,
     "staleness_decay_per_day": 0.03,
     "earnings_sizing_reduction": 0.50,
     "earnings_proximity_days": 5,
