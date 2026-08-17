@@ -90,6 +90,27 @@ _UNIVERSE_RETURNS_EXEMPT = frozenset({
     "evaluate.py",                         # reads u.log_return_21d FROM universe_returns
 })
 
+# A THIRD, distinct category (RC v3 T5, config-I7475). These files match a
+# wide-column literal because the report card's contribution_lift artifact
+# carries `log_alpha_21d` as a metric UNIT LABEL — the emitted name of the
+# objective's return space, fixed by the contribution_lift.json v1 contract and
+# by krepis#158's `unit` field, which crucible-evaluator's tile joins on. It is
+# not a column, not a table, and not read from anywhere: nothing here selects
+# from score_performance OR universe_returns.
+#
+# Kept separate from _UNIVERSE_RETURNS_EXEMPT rather than folded into it,
+# because that set's honesty test asserts the opposite property (the file MUST
+# read universe_returns). Smuggling a unit label into it would have made that
+# invariant vacuous for those entries. This set carries its own honesty test
+# below: an entry must read NEITHER outcome table, so the day one of these
+# files starts reading a real horizon-suffixed column, it fails here instead of
+# being silently pre-forgiven.
+_METRIC_UNIT_LABEL_EXEMPT = frozenset({
+    "analysis/contribution_lift/harness.py",    # UNIT = "log_alpha_21d"
+    "analysis/contribution_lift/objective.py",  # docstring naming the objective
+    "analysis/contribution_lift/report.py",     # OBJECTIVE_NAME literal
+})
+
 
 def test_wide_horizon_column_burndown():
     """Shared-primitive ratchet: no ungrandfathered wide-column reads, no stale
@@ -98,7 +119,7 @@ def test_wide_horizon_column_burndown():
     assert_burndown(
         _REPO,
         migrating=_MIGRATING,
-        exempt=_UNIVERSE_RETURNS_EXEMPT,
+        exempt=_UNIVERSE_RETURNS_EXEMPT | _METRIC_UNIT_LABEL_EXEMPT,
         exclude_prefixes=_EXCLUDE_PREFIXES,
     )
 
@@ -128,3 +149,27 @@ def test_universe_returns_exempt_entries_are_honest():
         elif "score_performance" in text and "universe_returns" not in text:
             problems[rel] = "reads score_performance, not universe_returns — migrate to outcome_store"
     assert not problems, f"dishonest _UNIVERSE_RETURNS_EXEMPT entries: {problems}"
+
+
+def test_metric_unit_label_exempt_entries_are_honest():
+    """REPO-SPECIFIC: a metric-unit-label exemption must read NEITHER outcome
+    table. The literal is the emitted NAME of the objective's return space
+    (contribution_lift.json v1 `unit`), never a column selected from
+    score_performance or universe_returns. If one of these files ever starts
+    reading a real wide outcome column, this fails and the file must be moved
+    onto the appropriate set — or migrated to analysis.outcome_store."""
+    problems = {}
+    for rel in _METRIC_UNIT_LABEL_EXEMPT:
+        path = _REPO / rel
+        if not path.exists():
+            problems[rel] = "file no longer exists — remove from exempt"
+            continue
+        text = path.read_text(errors="ignore")
+        if not wide_columns_in(path):
+            problems[rel] = "no longer matches a wide-column literal — remove from exempt"
+        elif "score_performance" in text or "universe_returns" in text:
+            problems[rel] = (
+                "reads an outcome table — this is not a bare unit label; move to "
+                "the correct set or migrate to analysis.outcome_store"
+            )
+    assert not problems, f"dishonest _METRIC_UNIT_LABEL_EXEMPT entries: {problems}"
