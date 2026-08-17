@@ -1,16 +1,25 @@
 """
-grading.py — Unified component scorecard for the weekly backtester report.
+grading.py — Raw component diagnostics for the weekly backtester report.
 
-Consumes results from all analysis modules and produces a single scorecard
-with 0-100 grades and letter grades for every system component:
+Consumes results from all analysis modules and produces a per-component
+0-100 diagnostic score (NOT a rendered grade) for every system component:
 
   Research: Scanner, 6 Sector Teams, Macro Agent, CIO, Composite Scoring
   Predictor: GBM Model, Veto Gate, Confidence Calibration
   Executor: Entry Triggers, Risk Guard, Exit Rules, Position Sizing, Portfolio
 
-Each grade combines precision, recall, and domain-specific metrics into a
-weighted composite. Components with insufficient data receive a grade of None
-and are excluded from module-level averages.
+Each score combines precision, recall, and domain-specific metrics into a
+weighted composite. Components with insufficient data receive a score of
+None and are excluded from module-level averages.
+
+RC v3 T1 (alpha-engine-config-I7474, 2026-08-16): the v1 A-F letter grade
+(``GRADE_BANDS``/``_letter``) is RETIRED as a rendered surface — v2's
+report_card.json (``crucible-evaluator``) is the one card. This module's
+numeric ``grade`` field and ``detail`` blocks survive as raw diagnostics:
+grading.json still carries them (consumed by the evaluator's
+``evaluator_coverage`` meta-metric — see ``grading/tiles/backtester.py``),
+but nothing renders them as a grade/letter anymore. Weekly report.md and
+both dashboard skins render zero letter grades post-T1 (Closes-when).
 """
 
 import logging
@@ -22,32 +31,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Grade bands
 # ---------------------------------------------------------------------------
-
-GRADE_BANDS = [
-    (90, "A"),
-    (80, "A-"),
-    (73, "B+"),
-    (65, "B"),
-    (58, "B-"),
-    (50, "C+"),
-    (42, "C"),
-    (35, "C-"),
-    (28, "D+"),
-    (20, "D"),
-    (0, "F"),
-]
-
-
-def _letter(score: float | None) -> str:
-    """Map a 0-100 numeric grade to a letter grade."""
-    if score is None:
-        return "N/A"
-    score = max(0.0, min(100.0, score))
-    for threshold, letter in GRADE_BANDS:
-        if score >= threshold:
-            return letter
-    return "F"
-
 
 def _na_reason(
     artifact: dict | None,
@@ -227,7 +210,7 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
     """Grade the quant scanner filter."""
     sl = _safe_get(e2e, "scanner_lift")
     if not sl or _safe_get(sl, "n_passing") is None:
-        return {"grade": None, "letter": "N/A",
+        return {"grade": None,
                 "reason": "no scanner-lift data this cycle"}
 
     lift = _safe_get(sl, "lift")
@@ -281,7 +264,7 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
     detail["n_passing"] = n_passing
     detail["n_universe"] = n_universe
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_sector_team(team: dict, team_metrics: dict | None = None) -> dict:
@@ -306,7 +289,7 @@ def _grade_sector_team(team: dict, team_metrics: dict | None = None) -> dict:
 
     if n_picks < 3:
         return {
-            "team_id": team_id, "grade": None, "letter": "N/A",
+            "team_id": team_id, "grade": None,
             "reason": f"only {n_picks} picks", "n_picks": n_picks,
         }
 
@@ -360,7 +343,7 @@ def _grade_sector_team(team: dict, team_metrics: dict | None = None) -> dict:
     detail["n_picks"] = n_picks
 
     return {
-        "team_id": team_id, "grade": grade, "letter": _letter(grade),
+        "team_id": team_id, "grade": grade,
         "detail": detail,
     }
 
@@ -429,7 +412,7 @@ def _grade_team_skill_composite(
             ) if g is not None
         ]
         return {
-            "team_id": team_id, "grade": None, "letter": "N/A",
+            "team_id": team_id, "grade": None,
             "reason": (
                 f"{n_picks} picks but 0/5 sub-metrics computable"
                 if not passed
@@ -459,7 +442,7 @@ def _grade_team_skill_composite(
         detail["alpha_vs_beta_spy"] = f"{bm_pp:+.2f}%"
 
     return {
-        "team_id": team_id, "grade": grade, "letter": _letter(grade),
+        "team_id": team_id, "grade": grade,
         "detail": detail,
     }
 
@@ -467,7 +450,7 @@ def _grade_team_skill_composite(
 def _grade_macro(macro_eval: dict | None) -> dict:
     """Grade the macro agent's contribution."""
     if not macro_eval or macro_eval.get("status") != "ok":
-        return {"grade": None, "letter": "N/A",
+        return {"grade": None,
                 "reason": _na_reason(macro_eval, label="macro evaluation")}
 
     acc_lift = macro_eval.get("accuracy_lift")
@@ -489,7 +472,7 @@ def _grade_macro(macro_eval: dict | None) -> dict:
         detail["alpha_lift"] = f"{alpha_lift:+.2f}%"
     detail["assessment"] = assessment
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_cio(e2e: dict | None, cio_opt: dict | None) -> dict:
@@ -502,12 +485,12 @@ def _grade_cio(e2e: dict | None, cio_opt: dict | None) -> dict:
     # (not a misleading "fewer than 3 advance decisions" message, and never a
     # zero/RED that would drag the research grade).
     if isinstance(cio_lift, dict) and cio_lift.get("status") == "retired":
-        return {"grade": None, "letter": "N/A",
+        return {"grade": None,
                 "reason": (f"CIO orchestration retired {cio_lift.get('retired_date')} "
                            f"(config#1580 / config-I2993)")}
 
     if not cio_lift or _safe_get(cio_lift, "n_advance", default=0) < 3:
-        return {"grade": None, "letter": "N/A",
+        return {"grade": None,
                 "reason": ("no CIO decision-lift data this cycle" if not cio_lift
                            else "fewer than 3 CIO advance decisions this cycle")}
 
@@ -564,14 +547,14 @@ def _grade_cio(e2e: dict | None, cio_opt: dict | None) -> dict:
     detail["n_advance"] = cio_lift.get("n_advance", 0)
     detail["n_reject"] = cio_lift.get("n_reject", 0)
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_composite_scoring(signal_quality: dict | None,
                              score_cal: dict | None) -> dict:
     """Grade the composite scoring system (monotonicity + bucket accuracy)."""
     if not signal_quality or signal_quality.get("status") != "ok":
-        return {"grade": None, "letter": "N/A",
+        return {"grade": None,
                 "reason": _na_reason(signal_quality, label="composite-scoring analysis")}
 
     overall = signal_quality.get("overall", {})
@@ -609,7 +592,7 @@ def _grade_composite_scoring(signal_quality: dict | None,
         detail["90+_accuracy"] = f"{high_acc:.1%}"
     detail.update(cal_detail)
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_calibration(score_cal: dict | None) -> tuple[float | None, dict]:
@@ -664,7 +647,7 @@ def _grade_meta_model(predictor_sizing: dict | None,
     if not predictor_sizing or predictor_sizing.get("status") != "ok":
         # Fall back to veto result for any signal of model quality
         if not veto_result or veto_result.get("status") not in ("ok", "insufficient_lift"):
-            return {"grade": None, "letter": "N/A",
+            return {"grade": None,
                     "reason": _na_reason(
                         veto_result,
                         label="meta-model inputs (predictor sizing + veto)",
@@ -698,14 +681,14 @@ def _grade_meta_model(predictor_sizing: dict | None,
     if sizing_lift is not None:
         detail["sizing_lift"] = f"{sizing_lift:+.2f}%"
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_veto_gate(veto_result: dict | None,
                      veto_value: dict | None) -> dict:
     """Grade the predictor's veto system."""
     if not veto_result or veto_result.get("status") not in ("ok", "insufficient_lift"):
-        return {"grade": None, "letter": "N/A",
+        return {"grade": None,
                 "reason": _na_reason(
                     veto_result, label="veto-gate result",
                     ok_statuses=("ok", "insufficient_lift"),
@@ -758,13 +741,13 @@ def _grade_veto_gate(veto_result: dict | None,
         detail["net_value"] = f"${net_value:+,.0f}"
     detail["threshold"] = rec_thresh
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_entry_triggers(trigger_scorecard: dict | None) -> dict:
     """Grade entry trigger effectiveness."""
     if not trigger_scorecard or trigger_scorecard.get("status") != "ok":
-        return {"grade": None, "letter": "N/A",
+        return {"grade": None,
                 "reason": _na_reason(trigger_scorecard, label="trigger scorecard")}
 
     summary = trigger_scorecard.get("summary", {})
@@ -813,18 +796,17 @@ def _grade_entry_triggers(trigger_scorecard: dict | None) -> dict:
         trigger_grades.append({
             "trigger": t.get("trigger"),
             "grade": t_grade,
-            "letter": _letter(t_grade),
             "n_trades": t.get("n_trades", 0),
         })
     detail["per_trigger"] = trigger_grades
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_risk_guard(shadow_book: dict | None) -> dict:
     """Grade the risk guard's blocking decisions."""
     if not shadow_book or shadow_book.get("status") != "ok":
-        return {"grade": None, "letter": "N/A",
+        return {"grade": None,
                 "reason": _na_reason(shadow_book, label="shadow-book sweep")}
 
     assessment = shadow_book.get("assessment", "neutral")
@@ -886,13 +868,13 @@ def _grade_risk_guard(shadow_book: dict | None) -> dict:
     if guard_lift is not None:
         detail["guard_lift"] = f"{guard_lift:+.2f}%"
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_exit_rules(exit_timing: dict | None) -> dict:
     """Grade exit rule effectiveness."""
     if not exit_timing or exit_timing.get("status") != "ok":
-        return {"grade": None, "letter": "N/A",
+        return {"grade": None,
                 "reason": _na_reason(exit_timing, label="exit-timing analysis")}
 
     summary = exit_timing.get("summary", {})
@@ -932,13 +914,13 @@ def _grade_exit_rules(exit_timing: dict | None) -> dict:
         detail["avg_return"] = f"{avg_return:+.2f}%"
     detail["n_roundtrips"] = exit_timing.get("n_roundtrips", 0)
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_position_sizing(sizing_ab: dict | None) -> dict:
     """Grade position sizing vs equal-weight baseline."""
     if not sizing_ab or sizing_ab.get("status") != "ok":
-        return {"grade": None, "letter": "N/A",
+        return {"grade": None,
                 "reason": _na_reason(sizing_ab, label="sizing A/B")}
 
     sharpe_diff = sizing_ab.get("sharpe_diff")
@@ -962,7 +944,7 @@ def _grade_position_sizing(sizing_ab: dict | None) -> dict:
     if alpha_diff is not None:
         detail["alpha_diff"] = f"{alpha_diff:+.2f}%"
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_portfolio(signal_quality: dict | None,
@@ -1053,7 +1035,7 @@ def _grade_portfolio(signal_quality: dict | None,
     if max_dd is not None:
         detail["max_drawdown"] = f"{max_dd:.1%}"
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 # ---------------------------------------------------------------------------
@@ -1074,13 +1056,13 @@ def _grade_calibration_diagnostics(calibration: dict | None) -> dict:
     """
     if not calibration or calibration.get("status") not in ("ok",):
         return {
-            "grade": None, "letter": "N/A",
+            "grade": None,
             "reason": calibration.get("reason") if calibration else "no data",
         }
 
     ece = calibration.get("ece")
     if ece is None:
-        return {"grade": None, "letter": "N/A", "reason": "ece missing"}
+        return {"grade": None, "reason": "ece missing"}
 
     if ece < 0.05:
         grade = 90.0
@@ -1101,7 +1083,7 @@ def _grade_calibration_diagnostics(calibration: dict | None) -> dict:
     if calibration.get("bins"):
         detail["n_bins"] = len(calibration["bins"])
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_action_entropy(action_entropy: dict | None) -> dict:
@@ -1118,7 +1100,7 @@ def _grade_action_entropy(action_entropy: dict | None) -> dict:
     """
     if not action_entropy or action_entropy.get("status") != "ok":
         return {
-            "grade": None, "letter": "N/A",
+            "grade": None,
             "reason": _na_reason(action_entropy, label="action-entropy analysis"),
         }
 
@@ -1142,7 +1124,7 @@ def _grade_action_entropy(action_entropy: dict | None) -> dict:
     if action_entropy.get("n") is not None:
         detail["n"] = action_entropy["n"]
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 def _grade_excursion(excursion_summary: dict | None) -> dict:
@@ -1156,7 +1138,7 @@ def _grade_excursion(excursion_summary: dict | None) -> dict:
     """
     if not excursion_summary or excursion_summary.get("status") != "ok":
         return {
-            "grade": None, "letter": "N/A",
+            "grade": None,
             "reason": _na_reason(excursion_summary, label="excursion analysis"),
         }
 
@@ -1182,7 +1164,7 @@ def _grade_excursion(excursion_summary: dict | None) -> dict:
     if excursion_summary.get("n") is not None:
         detail["n"] = excursion_summary["n"]
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    return {"grade": grade, "detail": detail}
 
 
 # ---------------------------------------------------------------------------
@@ -1210,14 +1192,15 @@ def compute_scorecard(
     action_entropy: dict | None = None,
     excursion_summary: dict | None = None,
 ) -> dict:
-    """Compute the unified system scorecard.
+    """Compute raw component diagnostics (RC v3 T1: no letter grade — see
+    module docstring).
 
     Returns a dict with:
         status: "ok" | "partial" | "insufficient_data"
-        overall: {grade, letter}
-        research: {grade, letter, components: {...}}
-        predictor: {grade, letter, components: {...}}
-        executor: {grade, letter, components: {...}}
+        overall: {grade}
+        research: {grade, components: {...}}
+        predictor: {grade, components: {...}}
+        executor: {grade, components: {...}}
     """
     # -----------------------------------------------------------------------
     # Research components
@@ -1260,7 +1243,7 @@ def compute_scorecard(
     research_components = {
         "scanner": scanner,
         "sector_teams": teams,
-        "sector_teams_avg": {"grade": avg_team_grade, "letter": _letter(avg_team_grade)},
+        "sector_teams_avg": {"grade": avg_team_grade},
         "macro_agent": macro,
         "cio": cio,
         "composite_scoring": composite,
@@ -1270,7 +1253,6 @@ def compute_scorecard(
 
     research = {
         "grade": research_grade,
-        "letter": _letter(research_grade),
         "components": research_components,
     }
 
@@ -1287,7 +1269,6 @@ def compute_scorecard(
 
     predictor = {
         "grade": predictor_grade,
-        "letter": _letter(predictor_grade),
         "components": {
             "meta_model": meta,
             "veto_gate": veto,
@@ -1330,7 +1311,6 @@ def compute_scorecard(
 
     executor = {
         "grade": executor_grade,
-        "letter": _letter(executor_grade),
         "components": executor_components,
     }
 
@@ -1354,7 +1334,7 @@ def compute_scorecard(
 
     return {
         "status": status,
-        "overall": {"grade": overall_grade, "letter": _letter(overall_grade)},
+        "overall": {"grade": overall_grade},
         "research": research,
         "predictor": predictor,
         "executor": executor,

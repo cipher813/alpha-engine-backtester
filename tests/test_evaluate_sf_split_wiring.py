@@ -186,19 +186,10 @@ class TestReportTailIsOptimizeHalfDeliverable:
             "the diagnostics half must not upload a partial report"
         )
 
-    def test_grade_history_gated_on_run_optimizers(self, main_impl):
-        appends = [
-            n
-            for n in ast.walk(main_impl)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "append_grades"
-        ]
-        assert appends, "append_grades call expected"
-        assert _any_enclosing_if_has(main_impl, appends[0], "run_optimizers"), (
-            "append_grades must be gated on run_optimizers — the diagnostics "
-            "half must not land a partial grade history entry"
-        )
+    # test_grade_history_gated_on_run_optimizers removed RC v3 T1
+    # (config-I7474, 2026-08-16): analysis/grade_history.py + its
+    # append_grades call site are deleted — the v1 composite-grade history
+    # writer, retired along with the letter/weight grader it fed.
 
     def test_digest_email_gated_on_run_optimizers(self, main_impl):
         sends = [

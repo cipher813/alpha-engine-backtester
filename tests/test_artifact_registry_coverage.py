@@ -64,7 +64,9 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # freshness-tracked SLA artifact; the backtest/{trading_day}/_sim_checkpoint/
     # prefix is grandfathered in ARTIFACT_REGISTRY.yaml.
     "store/sim_checkpoint.py": 1,
-    "analysis/grade_history.py": 1,
+    # analysis/grade_history.py deleted RC v3 T1 (config-I7474, 2026-08-16) —
+    # the v1 composite-grade history writer; grader retired as a rendered
+    # surface. s3://.../backtest/grade_history.json is retained, unwritten.
     "analysis/pit_parity.py": 1,
     # alpha-engine-config#6030: per-pass pit_stats artifacts
     # (parity/{run_date}/pit_stats_{pass}.json) + the compare's

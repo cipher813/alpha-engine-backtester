@@ -110,236 +110,11 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
     return lines
 
 
-def _section_scorecard(grading: dict) -> list[str]:
-    """Build the System Report Card section from grading results."""
-    lines = ["## System Report Card", ""]
-
-    overall = grading.get("overall", {})
-    og = overall.get("grade")
-    ol = overall.get("letter", "N/A")
-    if og is not None:
-        lines.append(f"**OVERALL SYSTEM GRADE: {ol} ({og:.0f}/100)**")
-    else:
-        lines.append("**OVERALL SYSTEM GRADE: N/A** (insufficient data)")
-    lines.append("")
-
-    # Module summary table
-    lines.append("| Module | Grade | Score | Key Metric |")
-    lines.append("|--------|-------|-------|------------|")
-
-    for module_key, label in [("research", "Research"), ("predictor", "Predictor"), ("executor", "Executor")]:
-        mod = grading.get(module_key, {})
-        mg = mod.get("grade")
-        ml = mod.get("letter", "N/A")
-        # Pick a single key metric for the summary row
-        key_metric = _scorecard_key_metric(mod)
-        if mg is not None:
-            lines.append(f"| **{label}** | **{ml}** | {mg:.0f} | {key_metric} |")
-        else:
-            lines.append(f"| **{label}** | N/A | — | insufficient data |")
-
-    lines.append("")
-
-    # Research detail
-    research = grading.get("research", {})
-    r_comps = research.get("components", {})
-    lines.append("### Research Components")
-    lines.append("")
-    lines.append("| Component | Grade | Score | Detail |")
-    lines.append("|-----------|-------|-------|--------|")
-
-    for comp_key, comp_label in [
-        ("scanner", "Scanner"),
-        ("macro_agent", "Macro Agent"),
-        ("cio", "CIO"),
-        ("composite_scoring", "Composite Scoring"),
-        ("calibration_diagnostics", "Calibration"),
-    ]:
-        c = r_comps.get(comp_key)
-        if c is None:
-            continue  # component not wired through in this run
-        _append_component_row(lines, comp_label, c)
-
-    # Sector teams
-    teams = r_comps.get("sector_teams", [])
-    avg = r_comps.get("sector_teams_avg", {})
-    if teams:
-        avg_g = avg.get("grade")
-        avg_l = avg.get("letter", "N/A")
-        if avg_g is not None:
-            lines.append(f"| **Sector Teams (avg)** | **{avg_l}** | {avg_g:.0f} | |")
-        for t in teams:
-            tid = t.get("team_id", "?").replace("_", " ").title()
-            _append_component_row(lines, f"  {tid}", t)
-
-    lines.append("")
-
-    # Predictor detail
-    predictor = grading.get("predictor", {})
-    p_comps = predictor.get("components", {})
-    lines.append("### Predictor Components")
-    lines.append("")
-    lines.append("| Component | Grade | Score | Detail |")
-    lines.append("|-----------|-------|-------|--------|")
-    for comp_key, comp_label in [("meta_model", "Meta Model"), ("veto_gate", "Veto Gate")]:
-        c = p_comps.get(comp_key, {})
-        _append_component_row(lines, comp_label, c)
-    lines.append("")
-
-    # Executor detail
-    executor = grading.get("executor", {})
-    e_comps = executor.get("components", {})
-    lines.append("### Executor Components")
-    lines.append("")
-    lines.append("| Component | Grade | Score | Detail |")
-    lines.append("|-----------|-------|-------|--------|")
-    for comp_key, comp_label in [
-        ("entry_triggers", "Entry Triggers"),
-        ("risk_guard", "Risk Guard"),
-        ("exit_rules", "Exit Rules"),
-        ("position_sizing", "Position Sizing"),
-        ("portfolio", "Portfolio"),
-        ("excursion", "MFE/MAE (Excursion)"),
-        ("action_entropy", "Action Entropy"),
-    ]:
-        c = e_comps.get(comp_key)
-        if c is None:
-            continue  # component not wired through in this run
-        _append_component_row(lines, comp_label, c)
-    lines.append("")
-
-    lines.append("---")
-    lines.append("")
-    return lines
-
-
-def _append_component_row(lines: list[str], label: str, comp: dict):
-    """Append a single component row to the scorecard table."""
-    g = comp.get("grade")
-    l = comp.get("letter", "N/A")
-    detail = comp.get("detail", {})
-    reason = comp.get("reason")
-
-    if g is not None:
-        detail_str = ", ".join(f"{k}: {v}" for k, v in detail.items()
-                               if k != "per_trigger" and not isinstance(v, list))
-        lines.append(f"| {label} | {l} | {g:.0f} | {detail_str} |")
-    else:
-        lines.append(f"| {label} | N/A | — | {reason or 'insufficient data'} |")
-
-
-def _section_skill_vs_beta(grading: dict) -> list[str]:
-    """Skill vs. Beta panel — per-team skilled-risk-taking metrics + ECE.
-
-    Renders only when the evaluator-revamp metrics are wired through.
-    For each sector team, surfaces the four skill-composite signals that
-    answer "given the risk you took, did you outperform the dumb version?"
-    plus the system-wide calibration row.
-    """
-    research = grading.get("research", {})
-    r_comps = research.get("components", {})
-    teams = r_comps.get("sector_teams", []) or []
-
-    # Detect skill-composite teams: their detail has IC + at least one of
-    # alpha_vs_ew_high_vol / alpha_vs_beta_spy. If no team has those
-    # fields, the legacy lift-based path was used and this section
-    # has nothing skill-specific to render.
-    skill_teams = [
-        t for t in teams
-        if "ic" in (t.get("detail") or {})
-        and any(k in (t.get("detail") or {})
-                for k in ("alpha_vs_ew_high_vol", "alpha_vs_beta_spy"))
-    ]
-    calibration = r_comps.get("calibration_diagnostics")
-
-    if not skill_teams and not calibration:
-        return []
-
-    lines = ["## Skill vs. Beta", ""]
-    lines.append(
-        "_Risk-matched alpha + decision-quality diagnostics. Answers: "
-        "given the risk taken, did the agents outperform the dumb version "
-        "of taking that risk?_"
-    )
-    lines.append("")
-
-    if skill_teams:
-        lines.append("### Per-Team Skill Composite")
-        lines.append("")
-        lines.append(
-            "| Team | Grade | IC | Hit% | W/L | MFE/MAE | α vs EW-high-vol | α vs β-SPY |"
-        )
-        lines.append("|---|---|---|---|---|---|---|---|")
-        for t in skill_teams:
-            tid = t.get("team_id", "?").replace("_", " ").title()
-            d = t.get("detail") or {}
-            grade = t.get("grade")
-            grade_str = f"{t.get('letter', 'N/A')} ({grade:.0f})" if grade is not None else "N/A"
-            lines.append(
-                f"| {tid} | {grade_str} "
-                f"| {d.get('ic', '—')} "
-                f"| {d.get('hit_rate', '—')} "
-                f"| {d.get('win_loss_ratio', '—')} "
-                f"| {d.get('mfe_mae_ratio', '—')} "
-                f"| {d.get('alpha_vs_ew_high_vol', '—')} "
-                f"| {d.get('alpha_vs_beta_spy', '—')} |"
-            )
-        lines.append("")
-
-    if calibration:
-        d = calibration.get("detail") or {}
-        ece = d.get("ece", "—")
-        n = d.get("n", "—")
-        quality = d.get("quality", "—")
-        grade = calibration.get("grade")
-        grade_str = (
-            f"{calibration.get('letter', 'N/A')} ({grade:.0f})"
-            if grade is not None else "N/A"
-        )
-        lines.append("### Calibration (Decision Quality)")
-        lines.append("")
-        lines.append(
-            f"_When agents say {{conviction}}%, do those picks actually win {{conviction}}%?_"
-        )
-        lines.append("")
-        lines.append(
-            f"- ECE: **{ece}** (lower = better calibrated)"
-        )
-        lines.append(f"- Quality label: **{quality}**")
-        lines.append(f"- Grade: {grade_str}")
-        lines.append(f"- n samples: {n}")
-        lines.append("")
-
-    lines.append("---")
-    lines.append("")
-    return lines
-
-
-def _scorecard_key_metric(mod: dict) -> str:
-    """Extract a single key metric string for the module summary row."""
-    comps = mod.get("components", {})
-
-    # Research: show composite scoring accuracy
-    cs = comps.get("composite_scoring", {})
-    cs_detail = cs.get("detail", {})
-    if "accuracy_21d" in cs_detail:
-        return f"21d accuracy: {cs_detail['accuracy_21d']}"
-
-    # Predictor: show IC
-    meta = comps.get("meta_model", {})
-    meta_detail = meta.get("detail", {})
-    if "rank_ic" in meta_detail:
-        return f"IC: {meta_detail['rank_ic']}"
-
-    # Executor: show portfolio detail
-    pf = comps.get("portfolio", {})
-    pf_detail = pf.get("detail", {})
-    if "sharpe" in pf_detail:
-        return f"Sharpe: {pf_detail['sharpe']}"
-    if "accuracy_21d" in pf_detail:
-        return f"accuracy: {pf_detail['accuracy_21d']}"
-
-    return ""
+# RC v3 T1 (alpha-engine-config-I7474, 2026-08-16): _section_scorecard,
+# _append_component_row, _section_skill_vs_beta, _scorecard_key_metric
+# (the weekly report.md's v1 letter-grade "System Report Card" / "Skill vs.
+# Beta" sections) deleted — v2's report_card.json (crucible-evaluator) is
+# the one card; report.md no longer renders a competing letter grade.
 
 
 def _section_pipeline_health(health: dict) -> list[str]:
@@ -1207,16 +982,9 @@ def build_report(
     if agent_justification:
         lines += _section_agent_justification(agent_justification)
 
-    # System Report Card (component grades)
-    if grading and grading.get("status") in ("ok", "partial"):
-        lines += _section_scorecard(grading)
-        # Skill vs. Beta panel — surfaces the per-team risk-matched
-        # alpha numbers + ECE detail when the evaluator-revamp metrics
-        # are wired through. Falls back to no-op when team_metrics
-        # isn't populated (PR 4 wiring).
-        skill_lines = _section_skill_vs_beta(grading)
-        if skill_lines:
-            lines += skill_lines
+    # RC v3 T1 (config-I7474): the v1 "System Report Card" / "Skill vs. Beta"
+    # sections rendered here from `grading` (letter grades) are retired —
+    # v2's report_card.json (crucible-evaluator) is the one card.
 
     # What Changed This Week (promotion decisions, twin sim, regression)
     lines += _section_what_changed(
@@ -1477,9 +1245,8 @@ def build_digest(
     if optimizer_param_sweep is not None:
         lines += _section_optimizer_param_sweep(optimizer_param_sweep)
 
-    # System Report Card — overall + per-module grades.
-    if grading and grading.get("status") in ("ok", "partial"):
-        lines += _section_scorecard(grading)
+    # RC v3 T1 (config-I7474): the v1 "System Report Card" section rendered
+    # here from `grading` is retired — v2's report_card.json is the one card.
 
     # What Changed This Week — config promotions + regression verdict.
     lines += _section_what_changed(
@@ -1679,15 +1446,17 @@ def save(
         logger.info("Wrote %s", out_dir / "signal_quality.csv")
         _persist(out_dir / "signal_quality.csv")
 
-    # Metrics JSON (overall summary + report card)
+    # Metrics JSON (overall summary)
     overall = signal_quality.get("overall", {})
     metrics = {
         "run_date": run_date,
         "status": signal_quality.get("status"),
         **overall,
     }
-    if grading and grading.get("status") in ("ok", "partial"):
-        metrics["report_card"] = grading
+    # RC v3 T1 (config-I7474): metrics["report_card"] (the v1 grading dict,
+    # rendered by views/3_Analysis.py) is retired — grading.json is still
+    # written separately below for the evaluator's coverage meta-metric;
+    # nothing reads it from metrics.json anymore.
     # Observe-first significance verdicts (config#1426). Persist the per-optimizer
     # would-promote-vs-did records into the durable per-Saturday metrics.json so
     # the observe→enforce soak (Phase 4) has a reviewable history at a stable S3
