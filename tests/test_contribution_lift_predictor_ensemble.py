@@ -69,9 +69,15 @@ def _manifest(
     coefficients: dict | None = None,
     feature_std: dict | None = None,
     standalone: dict | None = None,
+    meta_scaler: dict | None = None,
 ) -> dict:
-    """The live manifest's shape, with the fields this group reads."""
-    return {
+    """The live manifest's shape, with the fields this group reads.
+
+    ``meta_scaler`` defaults to ABSENT, matching a legacy or unstandardized
+    model — that is the identity path, not a gap. Pass one to exercise the
+    standardized path (alpha-engine-config-I7511).
+    """
+    body = {
         "meta_coefficients": coefficients
         if coefficients is not None
         else {
@@ -100,6 +106,19 @@ def _manifest(
             "momentum_score": {"xsec_ic": -0.058143, "n_dates": 91},
             "expected_move": {"xsec_ic": 0.105547, "n_dates": 91},
         },
+    }
+    if meta_scaler is not None:
+        body["meta_scaler"] = meta_scaler
+    return body
+
+
+def _scaler(*features: str, mean=0.5, std=0.25, winsor=3.0) -> dict:
+    """A meta_scaler in the shape MetaModel._build_scaler emits."""
+    return {
+        "directional": list(features),
+        "mean": {f: mean for f in features},
+        "std": {f: std for f in features},
+        "winsor": winsor,
     }
 
 
@@ -352,8 +371,14 @@ def test_tickers_missing_the_ablated_feature_leave_both_arms():
 # --------------------------------------------------------------------------
 
 
-def test_standardized_column_is_refused_naming_the_missing_scaler():
-    """feature_std ~= 1.0 means coef multiplies a z-scored column, not the raw one."""
+def test_standardized_column_is_refused_when_meta_scaler_cannot_cover_it():
+    """feature_std ~= 1.0 means coef multiplies a z-scored column, not the raw one.
+
+    Refusing is correct ONLY while mu/sigma are unavailable. Since
+    crucible-predictor-PR508 (alpha-engine-config-I7502) they are in the
+    manifest, so this refusal narrowed to the one case that genuinely cannot
+    be reconstructed: standardized per feature_std, absent from meta_scaler.
+    """
     manifest = _manifest(
         feature_std={
             "research_calibrator_prob": 0.98,
@@ -366,8 +391,165 @@ def test_standardized_column_is_refused_naming_the_missing_scaler():
     assert isinstance(na, NotAvailable)
     assert na.status == "N/A-MISSING-INPUT"
     assert "meta_scaler" in na.reason
+    assert "absent from the manifest" in na.reason
     # its unstandardized siblings still measure
     assert isinstance(grp.build_volatility_l1(inputs), ArmSet)
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I7511 — the consumer contract for meta_scaler
+# ---------------------------------------------------------------------------
+
+
+def test_a_standardized_column_now_measures_when_meta_scaler_carries_it():
+    """The whole point of I7502/I7511: what was N/A is now a measurement."""
+    manifest = _manifest(
+        feature_std={
+            "research_calibrator_prob": 0.98,
+            "momentum_score": 0.0791,
+            "expected_move": 0.010621,
+        },
+        meta_scaler=_scaler("research_calibrator_prob", mean=0.5, std=0.25),
+    )
+    inputs = _inputs(s3_client=_FakeS3({grp.MANIFEST_KEY: manifest}))
+
+    arms = grp.build_research_calibrator_l1(inputs)
+
+    assert isinstance(arms, ArmSet), (
+        "with mu/sigma present the term IS removable — refusing here would be "
+        "the old contract outliving the data that retired it"
+    )
+    assert "meta_scaler" in arms.ablated.label
+
+
+def test_the_ablation_subtracts_the_SCALED_term_not_the_raw_one():
+    """The correctness core: coef multiplies the column AS FITTED.
+
+    The default fixture cannot show this — its feature values are rank-aligned
+    with alpha, and an affine transform of a monotone column is still monotone,
+    so the ablated ORDER is identical either way and a picks-differ assertion
+    would pass for the wrong reason. This uses feature values where winsorizing
+    bites ASYMMETRICALLY: two names sit far outside the +-w band and clip to the
+    same value, collapsing a raw gap the unscaled arm would have kept.
+    """
+    feature_std = {
+        "research_calibrator_prob": 0.0145,
+        "momentum_score": 0.0791,
+        "expected_move": 0.010621,
+    }
+    # The column's fitted sigma is large relative to its spread, so after
+    # standardization the term contributes almost nothing and the ablated
+    # ranking is driven by alpha. Subtracting the RAW column instead lets a
+    # wide-but-unimportant feature dominate — which is exactly the error.
+    predictions = {
+        d: {
+            "AAA": _prediction("AAA", alpha=0.05, research_calibrator_prob=9.0),
+            "BBB": _prediction("BBB", alpha=0.20, research_calibrator_prob=5.0),
+            "CCC": _prediction("CCC", alpha=0.09, research_calibrator_prob=0.30),
+            "DDD": _prediction("DDD", alpha=0.08, research_calibrator_prob=0.10),
+        }
+        for d in DATES
+    }
+    scaled = _inputs(
+        predictions=predictions,
+        s3_client=_FakeS3({grp.MANIFEST_KEY: _manifest(
+            feature_std=feature_std,
+            meta_scaler=_scaler("research_calibrator_prob", mean=0.0, std=1000.0),
+        )}),
+    )
+    raw = _inputs(
+        predictions=predictions,
+        s3_client=_FakeS3({grp.MANIFEST_KEY: _manifest(feature_std=feature_std)}),
+    )
+
+    a_scaled = grp.build_research_calibrator_l1(scaled)
+    a_raw = grp.build_research_calibrator_l1(raw)
+
+    assert isinstance(a_scaled, ArmSet) and isinstance(a_raw, ArmSet)
+    assert a_scaled.baseline.picks == a_raw.baseline.picks, (
+        "the baseline arm never applies the transform — only the removed term does"
+    )
+    assert a_scaled.ablated.picks != a_raw.ablated.picks, (
+        "identical ablated arms would mean the scaler was read and then ignored"
+    )
+
+
+def test_no_scaler_is_the_identity_and_not_a_gap():
+    """A legacy / unstandardized model must still measure, unchanged.
+
+    With no transform fitted, the raw column IS what the ridge multiplied, so
+    the ablation is exact. Treating an absent scaler as missing input would
+    N/A every pre-L4565 model for no reason.
+    """
+    manifest = _manifest(
+        feature_std={
+            "research_calibrator_prob": 0.014518,
+            "momentum_score": 0.0791,
+            "expected_move": 0.010621,
+        }
+    )
+    assert "meta_scaler" not in manifest
+    inputs = _inputs(s3_client=_FakeS3({grp.MANIFEST_KEY: manifest}))
+
+    arms = grp.build_research_calibrator_l1(inputs)
+
+    assert isinstance(arms, ArmSet)
+    assert "no transform fitted" in arms.ablated.label
+
+
+def test_a_degenerate_sigma_is_the_identity_mirroring_the_producer():
+    """MetaModel._build_scaler records a ~0 std as 1.0; the consumer must agree.
+
+    Reading a literal 0.0 and dividing would produce infinities in an artifact
+    the evaluator parses as strict JSON.
+    """
+    assert grp._scaled(_scaler("f", mean=2.0, std=0.0), "f", 5.0) == pytest.approx(3.0)
+
+
+def test_the_transform_matches_the_producers_apply_scaler_exactly():
+    """Independent oracle for clip((x-mu)/sigma, +-w), including both bounds."""
+    scaler = _scaler("f", mean=1.0, std=2.0, winsor=3.0)
+    assert grp._scaled(scaler, "f", 5.0) == pytest.approx(2.0)
+    assert grp._scaled(scaler, "f", 99.0) == pytest.approx(3.0)   # clipped high
+    assert grp._scaled(scaler, "f", -99.0) == pytest.approx(-3.0)  # clipped low
+    # A feature the scaler does not list is untouched, whatever else it carries.
+    assert grp._scaled(scaler, "other", 7.5) == pytest.approx(7.5)
+
+
+def test_a_malformed_meta_scaler_raises_rather_than_reading_as_absent():
+    """Fail loud: 'absent' and 'malformed' want opposite handling.
+
+    Absent means "no transform was fitted, use the raw column" — a correct
+    measurement. Malformed means the producer contract broke, and silently
+    taking the identity path would reconstruct the ablation against the wrong
+    column space and report it as a measurement.
+    """
+    manifest = _manifest(meta_scaler={"directional": "research_calibrator_prob"})
+    with pytest.raises(TypeError, match="meta_scaler"):
+        grp._meta_scaler(manifest)
+
+
+def test_no_executable_read_of_the_retired_sidecar_remains():
+    """I7511 closes-when: the .meta.json staleness branch is gone.
+
+    Docstrings are stripped before matching — this module deliberately RECORDS
+    why the sidecar was abandoned, and that history must not trip a guard
+    aimed at code.
+    """
+    import io as _io
+    import tokenize as _tokenize
+
+    path = REPO_ROOT / "analysis" / "contribution_lift" / "groups" / "predictor_ensemble.py"
+    with open(path, "rb") as handle:
+        code = " ".join(
+            tok.string
+            for tok in _tokenize.tokenize(_io.BytesIO(handle.read()).readline)
+            if tok.type not in (_tokenize.COMMENT, _tokenize.STRING)
+        )
+    assert "meta_model" not in code or "pkl" not in code, (
+        "predictor_ensemble.py still reads the meta_model.pkl.meta.json sidecar; "
+        "the scaler comes from manifest.json::meta_scaler (config-I7511)"
+    )
 
 
 def test_missing_feature_std_map_refuses_every_reconstructed_arm():
