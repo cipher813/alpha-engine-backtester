@@ -69,13 +69,14 @@ class TestExecutorOptimizerStanceSizing:
         )
 
     @pytest.mark.parametrize("param", ["confidence_sizing_min", "confidence_sizing_range"])
-    def test_confidence_sizing_removed_from_safe_params(self, param):
-        from optimizer.executor_optimizer import SAFE_PARAMS
-        assert param not in SAFE_PARAMS, (
-            f"{param} must NOT be in SAFE_PARAMS (L300): inert in the "
-            "predictionless sim; confidence sizing is tuned offline via p_up "
-            "(predictor_sizing_optimizer)."
-        )
+    def test_confidence_sizing_params_are_gone_entirely(self, param):
+        """L300 kept these out of SAFE_PARAMS while leaving them in
+        FACTORY_DEFAULTS for executor fallback. alpha-engine-config-I7525 (Brian
+        ruling 2026-08-17) retired the mechanism itself, so there is nothing left
+        to fall back to — the executor does not read them."""
+        from optimizer.executor_optimizer import FACTORY_DEFAULTS, SAFE_PARAMS
+        assert param not in SAFE_PARAMS
+        assert param not in FACTORY_DEFAULTS
 
     def test_stance_size_factory_defaults_match_executor(self):
         """Factory defaults must match executor's position_sizer fallbacks

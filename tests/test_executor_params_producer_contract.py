@@ -37,8 +37,11 @@ DECLARED = {
     # applied by the executor (_PARAM_MAP)
     "atr_multiplier", "time_decay_reduce_days", "time_decay_exit_days",
     "min_score", "max_position_pct", "reduce_fraction",
-    "atr_sizing_target_risk", "confidence_sizing_min",
-    "confidence_sizing_range", "staleness_decay_per_day",
+    # confidence_sizing_min/range REMOVED 2026-08-17 (alpha-engine-config-I7525,
+    # Brian ruling) — confidence-weighted sizing is retired in the executor, so
+    # the boundary no longer carries them. Dropped from PIPELINE_CONTRACT.yaml
+    # and the executor consumer contract in the same arc.
+    "atr_sizing_target_risk", "staleness_decay_per_day",
     "earnings_sizing_reduction", "earnings_proximity_days",
     "momentum_gate_threshold", "correlation_block_threshold",
     "profit_take_pct", "momentum_exit_threshold",
@@ -60,12 +63,16 @@ DECLARED = {
 
 # Keys that appear in the live artifact without a CURRENT producer code path:
 # - manual_override: operator-written (executor advisory list documents it).
-# - confidence_sizing_min/range: retired from SAFE_PARAMS (L300 2026-06-01 —
-#   the sweep over them was a silent no-op) but still executor-understood
-#   (_PARAM_MAP) and may persist in the live key via the assembler's merge
-#   base (the current live config), so they stay declared.
+#
+# confidence_sizing_min/range used to sit here: retired from SAFE_PARAMS on
+# 2026-06-01 (L300 — the sweep over them was a silent no-op) but still
+# executor-understood, so they stayed declared. As of 2026-08-17 the executor
+# does not understand them either (alpha-engine-config-I7525): the mechanism is
+# retired, so the keys leave the boundary entirely. They may still persist in
+# the live artifact via the assembler's merge base; the executor now ignores
+# them, which is the intended end state rather than a drop to detect.
 _DECLARED_NOT_EMITTED = {
-    "manual_override", "confidence_sizing_min", "confidence_sizing_range",
+    "manual_override",
 }
 
 # executor_optimizer.apply()'s legacy payload envelope (the assembler's merge
