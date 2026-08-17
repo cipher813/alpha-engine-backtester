@@ -42,7 +42,9 @@ selection are broken by ticker ascending.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -98,6 +100,12 @@ class ReplayInputs:
     usable signal dates. An observational artifact is emitted either way —
     absence of ``contribution_lift.json`` must always mean "the producer
     never ran" (reporter.py's always-emit contract).
+
+    ``live_selection`` is the champion-aware ground truth for "which names did
+    this system actually open on this cycle" — see :func:`build_live_selection`.
+    It is assembled once by the loader; a directly-constructed ``ReplayInputs``
+    (tests, ad-hoc replays) leaves it ``None`` and :func:`live_picks_by_date`
+    derives it lazily from the same two feeds.
     """
 
     run_date: str
@@ -117,10 +125,218 @@ class ReplayInputs:
     status: str = "ok"
     reason: str | None = None
     source_paths: list[str] = field(default_factory=list)
+    live_selection: "LiveSelection | None" = None
 
     @property
     def horizon_days(self) -> int:
         return HORIZON_DAYS
+
+
+# --------------------------------------------------------------------------
+# Live selection — the champion-aware baseline (config-I7501)
+# --------------------------------------------------------------------------
+
+
+#: ``trades.db`` action value for an opened position. The same table and
+#: discriminator ``analysis/post_trade.py`` and ``analysis/shadow_book.py``
+#: already read — reused, never re-derived.
+_ENTER = "ENTER"
+
+#: Feed identifiers carried on :class:`LiveSelection.source` and surfaced on
+#: every baseline arm's label, so an artifact reader can tell which record the
+#: comparison was anchored to without re-deriving it.
+SOURCE_TRADES = "trades.db"
+SOURCE_SIGNALS = "signals.json"
+
+
+@dataclass(frozen=True)
+class LiveSelection:
+    """Which names the system actually opened, per cycle, and from which feed.
+
+    **Why this is not simply ``signals.json``.** Entry selection moved OUT of
+    the signals producer on 2026-07-13, when ``scanner_predictor_direct``
+    became the champion arm (config-I7216): the executor now draws its
+    candidates directly from the predictor and ``signals/{date}/signals.json``
+    has carried **zero ENTER rows on every cycle since 2026-07-18** — correctly,
+    not as a fault. A replay whose baseline arm reads that feed therefore
+    measures an empty book on every recent cycle and grades green while
+    measuring nothing (config-I7501).
+
+    The executed record in ``trades.db`` is the ground truth in BOTH eras: it
+    is what the pre-champion signals path produced *and* what the champion arm
+    produces, so it needs no era switch and no champion-name lookup. The
+    ``signals.json`` reader survives only as the fallback for a run with no
+    ``trades_db_path`` at all, and the arm label names which one was used.
+    """
+
+    source: str
+    by_date: Mapping[str, tuple[str, ...]]
+
+    @property
+    def label(self) -> str:
+        if self.source == SOURCE_TRADES:
+            return "live executed selection (trades.db ENTER)"
+        return "live signalled selection (signals.json ENTER)"
+
+
+def read_trades_enters(trades_db_path: str) -> dict[str, tuple[str, ...]]:
+    """``{cycle_date: (tickers entered,)}`` from ``trades.db``.
+
+    Same SQL as ``analysis/post_trade.py``. "no such table" is the only
+    recoverable schema state (a fresh trades.db with no history yet); anything
+    else propagates (contract §Rules: fail loud, no silent swallow).
+    """
+    if not trades_db_path or not Path(trades_db_path).exists():
+        return {}
+    conn = sqlite3.connect(f"file:{trades_db_path}?mode=ro", uri=True)
+    try:
+        frame = pd.read_sql_query(
+            f"SELECT date, ticker FROM trades WHERE action = '{_ENTER}'", conn
+        )
+    except pd.errors.DatabaseError as exc:
+        msg = str(exc).lower()
+        if "no such table" in msg or "no such column" in msg:
+            return {}
+        raise
+    finally:
+        conn.close()
+    if frame.empty:
+        return {}
+    out: dict[str, set[str]] = {}
+    for row in frame.itertuples(index=False):
+        ticker = str(row.ticker) if row.ticker is not None else ""
+        # trades.db stores a date string; a timestamped value is truncated to
+        # its calendar day so it joins the cycle axis the price matrix uses.
+        date = str(row.date)[:10] if row.date is not None else ""
+        if ticker and date:
+            out.setdefault(date, set()).add(ticker)
+    return {d: tuple(sorted(t)) for d, t in sorted(out.items())}
+
+
+def read_signals_enters(signals_by_date: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+    """``{cycle_date: (ENTER-signalled tickers,)}`` from the signals artifact.
+
+    The pre-champion feed, kept only as the no-trades.db fallback. Reads it
+    exactly as ``loaders/signal_loader`` documents it: ``signals`` is a
+    ``{ticker: row}`` mapping (legacy payloads emit a list) and the
+    discriminator is ``row["signal"]``.
+    """
+    out: dict[str, tuple[str, ...]] = {}
+    for date, body in (signals_by_date or {}).items():
+        raw = (body or {}).get("signals") or {}
+        rows = list(raw.values()) if isinstance(raw, dict) else list(raw)
+        picks = sorted({
+            row["ticker"]
+            for row in rows
+            if isinstance(row, dict)
+            and isinstance(row.get("ticker"), str)
+            and str(row.get("signal", "")).upper() == _ENTER
+        })
+        if picks:
+            out[str(date)] = tuple(picks)
+    return out
+
+
+def build_live_selection(
+    *,
+    trades_db_path: str | None = None,
+    signals_by_date: Mapping[str, Any],
+    trades_enters: Mapping[str, tuple[str, ...]] | None = None,
+) -> LiveSelection:
+    """The champion-aware live selection, preferring the executed record.
+
+    ``trades.db`` wins whenever it is present and carries ENTER rows. The
+    signals fallback exists for a replay run without a trades database at all
+    (an isolated unit test, an ad-hoc historical replay) — never as a silent
+    substitute when the executed record is merely empty for the window, which
+    is a real absence and is reported as one by the groups.
+
+    ``trades_enters`` lets a caller that has already read the database (the
+    loader, which needs the ENTER dates to choose its window) hand the result
+    in rather than pay a second read of the same file.
+    """
+    if trades_db_path or trades_enters is not None:
+        # The run HAS an executed record. Whatever it says is the answer,
+        # including "nothing" — an empty trades.db over the window is a real
+        # absence, and quietly substituting the signals feed there would put
+        # the pre-champion feed back in the baseline by the back door.
+        by_date = (
+            dict(trades_enters)
+            if trades_enters is not None
+            else read_trades_enters(trades_db_path)
+        )
+        return LiveSelection(source=SOURCE_TRADES, by_date=by_date)
+    return LiveSelection(
+        source=SOURCE_SIGNALS, by_date=read_signals_enters(signals_by_date)
+    )
+
+
+def live_selection_of(inputs: ReplayInputs) -> LiveSelection:
+    """The run's :class:`LiveSelection`, derived lazily when the loader did not."""
+    if inputs.live_selection is not None:
+        return inputs.live_selection
+    return build_live_selection(
+        trades_db_path=inputs.trades_db_path,
+        signals_by_date=inputs.signals_by_date,
+    )
+
+
+def live_picks_by_date(inputs: ReplayInputs) -> dict[str, tuple[str, ...]]:
+    """``{cycle_date: (tickers,)}`` for the cycles in this run's window.
+
+    Restricted to the run's ``dates`` and to names the price matrix can
+    actually price — an unpriceable name is silently dropped by
+    :func:`picks_to_orders`, so counting it here would make the declared width
+    disagree with the traded width and turn a correct comparison into a
+    spurious count-match gap.
+    """
+    selection = live_selection_of(inputs)
+    columns = {str(c) for c in inputs.price_matrix.columns}
+    window = set(inputs.dates)
+    out: dict[str, tuple[str, ...]] = {}
+    for date, tickers in selection.by_date.items():
+        if window and date not in window:
+            continue
+        priceable = tuple(t for t in tickers if not columns or t in columns)
+        if priceable:
+            out[date] = priceable
+    return out
+
+
+def live_picks_by_cycle(inputs: ReplayInputs) -> list[dict]:
+    """``[{"date", "picks"}, ...]`` — the picks-arm shape of the live selection."""
+    return [
+        {"date": date, "picks": list(picks)}
+        for date, picks in sorted(live_picks_by_date(inputs).items())
+    ]
+
+
+def live_widths(inputs: ReplayInputs) -> dict[str, int]:
+    """``{cycle_date: n_names opened}`` — the width every arm is matched to."""
+    return {d: len(t) for d, t in live_picks_by_date(inputs).items()}
+
+
+def live_selection_label(inputs: ReplayInputs) -> str:
+    """The baseline arm's feed name, for the artifact's ``arms.baseline.label``."""
+    return live_selection_of(inputs).label
+
+
+def no_live_selection(inputs: ReplayInputs, issue: str, *, needs: str) -> NotAvailable:
+    """The shared ``N/A-MISSING-INPUT`` for a window with no live selection.
+
+    Names the feed that was actually read, so the artifact distinguishes "the
+    executed record is empty over this window" from "this run had no trades
+    database and the retired signals feed was consulted instead".
+    """
+    selection = live_selection_of(inputs)
+    return NotAvailable(
+        status="N/A-MISSING-INPUT",
+        reason=(
+            f"no cycle in the {len(inputs.dates)}-date window carries a "
+            f"priceable live selection from {selection.source} "
+            f"({selection.label}) — {needs} ({issue})"
+        ),
+    )
 
 
 # --------------------------------------------------------------------------

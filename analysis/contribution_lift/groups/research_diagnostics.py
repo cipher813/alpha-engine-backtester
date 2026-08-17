@@ -87,6 +87,8 @@ from analysis.contribution_lift.harness import (
     NotAvailable,
     ReplayInputs,
     ReplaySpec,
+    live_picks_by_date,
+    live_selection_label,
     picks_arm,
 )
 
@@ -95,9 +97,6 @@ logger = logging.getLogger(__name__)
 ISSUE = "alpha-engine-config-I7483"
 
 MODULE = "research"
-
-#: The ``signals.json`` per-ticker ``signal`` value that means "open a position".
-_ENTER = "ENTER"
 
 #: The six pillar fields of ``factors/profiles/{date}/by_ticker.json``. Verified
 #: 2026-08-16 to be the universe board's own ``pillars`` block verbatim, with
@@ -151,12 +150,10 @@ def _rows_by_ticker(inputs: ReplayInputs, date: str) -> dict[str, dict]:
     }
 
 
-def _enter_tickers(rows: dict[str, dict]) -> list[str]:
-    """The ENTER-signalled names of one cycle, ticker-ascending."""
-    return sorted(
-        t for t, row in rows.items()
-        if str(row.get("signal", "")).upper() == _ENTER
-    )
+# The live book for a cycle comes from ``harness.live_picks_by_date``
+# (config-I7501) — the executed ENTERs in trades.db, which is the ground truth
+# in both the pre-champion and the champion era. The signals rows below are
+# still read, but only for the SCORED UNIVERSE the ablated arm re-ranks.
 
 
 # --------------------------------------------------------------------------
@@ -271,11 +268,12 @@ def _pillar_arms(
     n_enter_cycles = 0
     n_profiled_cycles = 0
 
+    live = live_picks_by_date(inputs)
     for date in inputs.dates:
-        rows = _rows_by_ticker(inputs, date)
-        picks = _enter_tickers(rows)
+        picks = list(live.get(date) or ())
         if not picks:
             continue
+        rows = _rows_by_ticker(inputs, date)
         n_enter_cycles += 1
         profiles = inputs.pillar_profiles_by_date.get(date) or {}
         candidates = _profiled_candidates(rows, profiles)
@@ -295,10 +293,9 @@ def _pillar_arms(
     if not baseline_cycles:
         if n_enter_cycles == 0:
             reason = (
-                f"no cycle in the {len(inputs.dates)}-date window carries an "
-                f"ENTER-signalled name in s3://{inputs.bucket}/signals/{{date}}/"
-                f"signals.json, so there is no live book to ablate {what} "
-                f"against ({ISSUE})"
+                f"no cycle in the {len(inputs.dates)}-date window carries a "
+                f"priceable live selection ({live_selection_label(inputs)}), "
+                f"so there is no live book to ablate {what} against ({ISSUE})"
             )
         elif n_profiled_cycles == 0:
             reason = (
@@ -320,7 +317,9 @@ def _pillar_arms(
         ablated_label, len(baseline_cycles), n_enter_cycles,
     )
     return ArmSet(
-        baseline=picks_arm("as-configured (live ENTER picks)", baseline_cycles),
+        baseline=picks_arm(
+            f"as-configured — {live_selection_label(inputs)}", baseline_cycles
+        ),
         ablated=picks_arm(ablated_label, ablated_cycles),
     )
 
@@ -379,11 +378,12 @@ def build_macro_agent_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
     n_enter_cycles = 0
     n_tilted_cycles = 0
 
+    live = live_picks_by_date(inputs)
     for date in inputs.dates:
-        rows = _rows_by_ticker(inputs, date)
-        picks = _enter_tickers(rows)
+        picks = list(live.get(date) or ())
         if not picks:
             continue
+        rows = _rows_by_ticker(inputs, date)
         n_enter_cycles += 1
         modifiers = (inputs.signals_by_date.get(date) or {}).get(
             "sector_modifiers"
@@ -413,10 +413,9 @@ def build_macro_agent_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
     if not baseline_cycles:
         if n_enter_cycles == 0:
             reason = (
-                f"no cycle in the {len(inputs.dates)}-date window carries an "
-                f"ENTER-signalled name in s3://{inputs.bucket}/signals/{{date}}/"
-                f"signals.json — no live book to remove the macro tilt from "
-                f"({ISSUE})"
+                f"no cycle in the {len(inputs.dates)}-date window carries a "
+                f"priceable live selection ({live_selection_label(inputs)}) — "
+                f"no live book to remove the macro tilt from ({ISSUE})"
             )
         elif n_tilted_cycles == 0:
             reason = (
@@ -439,7 +438,9 @@ def build_macro_agent_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
         "ENTER-bearing", len(baseline_cycles), n_enter_cycles,
     )
     return ArmSet(
-        baseline=picks_arm("as-configured (live ENTER picks)", baseline_cycles),
+        baseline=picks_arm(
+            f"as-configured — {live_selection_label(inputs)}", baseline_cycles
+        ),
         ablated=picks_arm(
             "macro sector tilt removed (score - macro_shift, tilt set to 1.0)",
             ablated_cycles,

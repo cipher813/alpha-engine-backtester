@@ -50,11 +50,16 @@ Ablation design — PICKS AT MATCHED WIDTH, not a shadow-book replay of the
 literal blocked orders:
 
     N(cycle)  = the live executed ENTER count that cycle (trades.db,
-                trades WHERE action='ENTER', DISTINCT ticker, GROUP BY date)
-    baseline  = top-N by predicted_alpha among ENTER-signalled names with
-                gbm_veto falsy (the as-configured book)
-    ablated   = top-N by predicted_alpha among ALL ENTER-signalled names,
-                gbm_veto included (the gate disabled)
+                trades WHERE action='ENTER', DISTINCT ticker, GROUP BY date —
+                via harness.live_widths)
+    pool      = the predictor's scored set for the cycle, i.e. every ticker in
+                predictor/predictions/{date}.json (config-I7501: this replaced
+                the ENTER-signalled set from signals.json, which the champion
+                cutover emptied on 2026-07-13)
+    baseline  = top-N by predicted_alpha among pool names with gbm_veto falsy
+                (the as-configured book)
+    ablated   = top-N by predicted_alpha among the WHOLE pool, gbm_veto
+                included (the gate disabled)
     width     = min(N, |non-vetoed candidates|) — the SAME width is used to
                 cap the ablated arm's top-N, so both arms are exactly
                 count-matched by construction on every cycle, never a
@@ -124,16 +129,15 @@ already-a-lift metric would be measuring the metric against itself.
 from __future__ import annotations
 
 import logging
-import sqlite3
 from pathlib import Path
-
-import pandas as pd
 
 from analysis.contribution_lift.harness import (
     ArmSet,
     NotAvailable,
     ReplayInputs,
     ReplaySpec,
+    live_selection_label,
+    live_widths,
     picks_arm,
 )
 
@@ -141,49 +145,33 @@ logger = logging.getLogger(__name__)
 
 ISSUE = "alpha-engine-config-I7480"
 
-#: The signals.json per-ticker ``signal`` value that means "open a position"
-#: (mirrors behavioral.cost_adjusted_quality._ENTER).
-_ENTER = "ENTER"
+
+def _candidate_pool(inputs: ReplayInputs, date: str) -> list[str]:
+    """The names ``gbm_veto`` was in a position to veto on ``date``.
+
+    The predictor's own scored set for the cycle — every ticker with a row in
+    ``predictor/predictions/{date}.json``. That is the pool the champion arm
+    (``scanner_predictor_direct``, live since 2026-07-13) draws its book from,
+    and it is a superset of the pool in the pre-champion era, so one reader
+    covers both.
+
+    It deliberately replaced the ENTER-signalled set from
+    ``signals/{date}/signals.json`` (config-I7501): that feed has carried zero
+    ENTER rows since 2026-07-18 by design, which left this replay ranking an
+    empty candidate pool on every recent cycle and reporting
+    ``N/A-MISSING-INPUT`` while the gate it grades was running normally.
+    """
+    rows = inputs.predictions_by_date.get(date) or {}
+    return sorted(t for t, row in rows.items() if isinstance(row, dict))
 
 
-def _enter_candidates(inputs: ReplayInputs, date: str) -> list[str]:
-    """ENTER-signalled tickers for ``date``, per ``signals/{date}/signals.json``."""
-    raw = (inputs.signals_by_date.get(date) or {}).get("signals") or {}
-    rows = list(raw.values()) if isinstance(raw, dict) else list(raw)
-    return sorted({
-        row["ticker"]
-        for row in rows
-        if isinstance(row, dict)
-        and isinstance(row.get("ticker"), str)
-        and str(row.get("signal", "")).upper() == _ENTER
-    })
-
-
-def _live_enter_counts(trades_db_path: str) -> dict[str, int]:
+def _live_enter_counts(inputs: ReplayInputs) -> dict[str, int]:
     """``{date: distinct ticker count}`` of live executed ENTER orders.
 
-    Same table/discriminator ``analysis/post_trade.py`` and
-    ``analysis/shadow_book.py`` already read (``trades WHERE action='ENTER'``)
-    — reused rather than re-derived. "no such table" is the only recoverable
-    schema state (a fresh trades.db with no history yet); anything else
-    propagates (contract §Rules: fail loud, no silent swallow).
+    Delegates to ``harness.live_widths`` — the one trades.db ENTER reader every
+    group shares (config-I7501), rather than a private copy of the same SQL.
     """
-    conn = sqlite3.connect(trades_db_path)
-    try:
-        df = pd.read_sql_query(
-            "SELECT date, ticker FROM trades WHERE action = 'ENTER'", conn,
-        )
-    except pd.errors.DatabaseError as exc:
-        msg = str(exc).lower()
-        if "no such table" in msg or "no such column" in msg:
-            return {}
-        raise
-    finally:
-        conn.close()
-    if df.empty:
-        return {}
-    counts = df.groupby("date")["ticker"].nunique()
-    return {str(d): int(n) for d, n in counts.items()}
+    return live_widths(inputs)
 
 
 def _rank_top_n(
@@ -228,7 +216,7 @@ def build_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
             ),
         )
 
-    live_counts = _live_enter_counts(inputs.trades_db_path)
+    live_counts = _live_enter_counts(inputs)
     if not live_counts:
         return NotAvailable(
             status="N/A-MISSING-INPUT",
@@ -245,7 +233,7 @@ def build_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
         n_live = live_counts.get(date)
         if not n_live:
             continue
-        candidates = _enter_candidates(inputs, date)
+        candidates = _candidate_pool(inputs, date)
         if not candidates:
             continue
         predictions = inputs.predictions_by_date.get(date) or {}
@@ -277,13 +265,17 @@ def build_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
         return NotAvailable(
             status="N/A-MISSING-INPUT",
             reason=(
-                "no cycle in the replay window has both a live ENTER count "
-                "and at least one ENTER-signalled candidate with a scored "
+                "no cycle in the replay window has both a live executed ENTER "
+                "count and at least one predictor candidate with a scored "
                 f"predicted_alpha — nothing to rank ({ISSUE})"
             ),
         )
 
-    baseline = picks_arm("as-configured (gbm_veto applied)", baseline_cycles)
+    baseline = picks_arm(
+        f"as-configured, gbm_veto applied — width from "
+        f"{live_selection_label(inputs)}",
+        baseline_cycles,
+    )
     ablated = picks_arm("gbm_veto disabled (top-N incl. vetoed)", ablated_cycles)
     return ArmSet(baseline=baseline, ablated=ablated)
 
