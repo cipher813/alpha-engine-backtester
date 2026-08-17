@@ -774,7 +774,6 @@ run_ssm() {
         --region "$AWS_REGION" \
         --diagnostics-bucket "$S3_BUCKET" \
         --diagnostics-prefix "_spot_diagnostics/ae-${SPOT_STAGE_NAME}" \
-        --resource-limit "instance-types=${INSTANCE_TYPES}" \
         --script-stdin
 }
 
