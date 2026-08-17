@@ -30,6 +30,13 @@ import pytest
 
 from optimizer.champion_promotion import (
     ARM_FEED_DEPENDENCIES,
+    CONFIDENCE_INSUFFICIENT,
+    CONFIDENCE_NOT_LEADERBOARD_SCORED,
+    CONFIDENCE_OK,
+    CONFIDENCE_THIN,
+    CONFIDENCE_UNKNOWN,
+    CONFIDENCE_UNRECOGNISED,
+    GATE_HORIZON_DAYS,
     LEADERBOARD_STALENESS_DAYS,
     OUTCOMES,
     VALID_CHAMPIONS,
@@ -42,6 +49,7 @@ from optimizer.champion_promotion import (
     hac_significance,
     leaderboard_entry_from_e2e_lift,
     leaderboard_gate_inputs,
+    leaderboard_row_confidence,
     read_champion_pointer,
     read_latest_research_producer_leaderboard,
     read_prior_leaderboard_history,
@@ -119,15 +127,80 @@ def _e2e_lift_ok(sn_lift=0.02, n_cycles=6):
     }
 
 
-def _tt_leaderboard_ok(run_date="2026-07-18", mean=0.015, n_dates_scored=5):
+# The producer's own evidence floor (crucible-research
+# scoring/leaderboard_scoring.py::MIN_DATES_FOR_INFERENCE, declared per slot in
+# LEADERBOARD_SLOTS and stamped onto the artifact as min_dates_for_inference).
+# Mirrored here ONLY to build realistic fixtures — the module under test reads
+# it off the artifact and never hardcodes it (alpha-engine-config-I7542/I7549).
+FIXTURE_MIN_DATES_FOR_INFERENCE = 5
+
+# Distinguishes "caller did not override confidence" from an explicit
+# ``confidence=None`` (= build a PRE-I7542 artifact with no confidence key).
+_MISSING = object()
+
+
+def _confidence_for(n_dates_scored):
+    """The producer's own confidence rule, replicated for fixture realism
+    (crucible-research scoring/leaderboard_scoring.py::confidence_for)."""
+    n = int(n_dates_scored or 0)
+    if n <= 0:
+        return CONFIDENCE_INSUFFICIENT
+    if n < FIXTURE_MIN_DATES_FOR_INFERENCE:
+        return CONFIDENCE_THIN
+    return CONFIDENCE_OK
+
+
+def _tt_leaderboard_ok(
+    run_date="2026-07-18", mean=0.015, n_dates_scored=5, *, confidence=_MISSING,
+):
     """Mimics the REAL crucible-research schema
     (scoring/leaderboard_producers.py::build_producer_leaderboard /
     scoring/leaderboard_scoring.py::score_leaderboard) verified against the
     crucible-research checkout 2026-07-20 (alpha-engine-config-I2998:
     champion is optional, ``topn_alpha_vs_benchmark`` added -- the gate's
     actual score source; ``topn_alpha_vs_champion`` kept for schema realism
-    but no longer read by ``_score_thinktank_coverage``). ``mean`` sets
-    ``topn_alpha_vs_benchmark.mean`` for the thinktank_coverage row."""
+    but no longer read by ``_score_thinktank_coverage``), re-verified against
+    ``origin/main`` 2026-08-17 after crucible-research PR643 /
+    alpha-engine-config-I7542 added the per-spec ``confidence`` field and
+    I7540 added the artifact-level ``min_dates_for_inference`` /
+    ``horizons_days`` / ``horizons`` multi-horizon block. ``mean`` sets
+    ``topn_alpha_vs_benchmark.mean`` for the thinktank_coverage row.
+
+    ``confidence`` overrides the thinktank_coverage row's verdict (pass
+    ``None`` to build a PRE-I7542 artifact whose row carries no confidence key
+    at all); by default it is derived from ``n_dates_scored`` exactly as the
+    producer would."""
+    tt_confidence = (
+        _confidence_for(n_dates_scored) if confidence is _MISSING else confidence
+    )
+    tt_row = {
+        "name": "thinktank_coverage", "kind": "challenger",
+        "realized_rank_ic": {"mean": 0.04, "se": 0.02, "t_stat": 2.0, "n_dates": n_dates_scored},
+        "topn_alpha_vs_champion": {"mean": mean, "se": 0.01, "t_stat": 1.5, "n_dates": n_dates_scored},
+        "topn_alpha_vs_benchmark": {"mean": mean, "se": 0.01, "t_stat": 1.5, "n_dates": n_dates_scored},
+        "n_dates_scored": n_dates_scored,
+    }
+    if tt_confidence is not None:
+        tt_row["confidence"] = tt_confidence
+    specs = [
+        {
+            "name": "agentic_sector_teams", "kind": "champion",
+            "realized_rank_ic": {"mean": 0.05, "se": 0.02, "t_stat": 2.5, "n_dates": 12},
+            "topn_alpha_vs_champion": None,
+            "topn_alpha_vs_benchmark": {"mean": 0.01, "se": 0.01, "t_stat": 1.0, "n_dates": 12},
+            "n_dates_scored": 12,
+            "confidence": CONFIDENCE_OK,
+        },
+        {
+            "name": "no_agent_quant", "kind": "challenger",
+            "realized_rank_ic": {"mean": 0.03, "se": 0.02, "t_stat": 1.5, "n_dates": 12},
+            "topn_alpha_vs_champion": {"mean": 0.008, "se": 0.01, "t_stat": 0.8, "n_dates": 12},
+            "topn_alpha_vs_benchmark": {"mean": 0.006, "se": 0.01, "t_stat": 0.6, "n_dates": 12},
+            "n_dates_scored": 12,
+            "confidence": CONFIDENCE_OK,
+        },
+        tt_row,
+    ]
     return {
         "champion": "agentic_sector_teams",
         "horizon_days": 21,
@@ -136,28 +209,19 @@ def _tt_leaderboard_ok(run_date="2026-07-18", mean=0.015, n_dates_scored=5):
         "n_dates": 12,
         "date": run_date,
         "leaderboard_id": "producer",
-        "specs": [
-            {
-                "name": "agentic_sector_teams", "kind": "champion",
-                "realized_rank_ic": {"mean": 0.05, "se": 0.02, "t_stat": 2.5, "n_dates": 12},
-                "topn_alpha_vs_champion": None,
-                "topn_alpha_vs_benchmark": {"mean": 0.01, "se": 0.01, "t_stat": 1.0, "n_dates": 12},
-                "n_dates_scored": 12,
-            },
-            {
-                "name": "no_agent_quant", "kind": "challenger",
-                "realized_rank_ic": {"mean": 0.03, "se": 0.02, "t_stat": 1.5, "n_dates": 12},
-                "topn_alpha_vs_champion": {"mean": 0.008, "se": 0.01, "t_stat": 0.8, "n_dates": 12},
-                "topn_alpha_vs_benchmark": {"mean": 0.006, "se": 0.01, "t_stat": 0.6, "n_dates": 12},
-                "n_dates_scored": 12,
-            },
-            {
-                "name": "thinktank_coverage", "kind": "challenger",
-                "realized_rank_ic": {"mean": 0.04, "se": 0.02, "t_stat": 2.0, "n_dates": n_dates_scored},
-                "topn_alpha_vs_champion": {"mean": mean, "se": 0.01, "t_stat": 1.5, "n_dates": n_dates_scored},
-                "topn_alpha_vs_benchmark": {"mean": mean, "se": 0.01, "t_stat": 1.5, "n_dates": n_dates_scored},
-                "n_dates_scored": n_dates_scored,
-            },
+        "specs": specs,
+        # alpha-engine-config-I7540 multi-horizon block. The 21-session block
+        # is ALSO spread across the top level above (§3 continuity), which is
+        # what the gate reads; 126/252 are immature at rollout.
+        "horizons_days": [21, 126, 252],
+        "min_dates_for_inference": FIXTURE_MIN_DATES_FOR_INFERENCE,
+        "horizons": [
+            {"horizon_days": 21, "status": "ok", "reason": None,
+             "n_dates": 12, "specs": specs},
+            {"horizon_days": 126, "status": "immature", "reason": "cohort not matured",
+             "n_dates": 0, "specs": []},
+            {"horizon_days": 252, "status": "immature", "reason": "cohort not matured",
+             "n_dates": 0, "specs": []},
         ],
     }
 
@@ -283,6 +347,340 @@ class TestBuildWeeklyArmScores:
         )
         assert result["scores"]["thinktank_coverage"] == pytest.approx(0.021)
         assert "thinktank_coverage" not in result["unavailable_reasons"]
+
+
+# ── Evidence-confidence gate (alpha-engine-config-I7549) ───────────────────
+#
+# RED-FIRST EVIDENCE (champion-challenger-policy.md §7.4). Every test in this
+# class was run against the PRE-FIX optimizer/champion_promotion.py (the
+# `if not row.get("n_dates_scored")` truthiness check) and observed to FAIL
+# before the fix landed -- see the PR body for the recorded run. The
+# load-bearing one is test_thin_row_is_not_evidence: at n_dates_scored=1 the
+# pre-fix gate returned a SCORE of -0.060751 and no unavailable reason, i.e.
+# it would have compared a one-date mean carrying a null SE and a null t-stat
+# against the live champion.
+
+
+class TestEvidenceConfidenceGate:
+    """A thin arm is not evidence. The gate refuses to promote OR demote on a
+    non-``ok`` confidence row, and says which evidence declined to decide."""
+
+    def test_thin_row_is_not_evidence(self):
+        """The live 2026-08-14 shape: n_dates_scored=1, mean present, se and
+        t_stat null. Pre-fix this SCORED (n=1 is truthy) and could have moved
+        config/producer_champion.json."""
+        lb = _tt_leaderboard_ok(n_dates_scored=1, mean=-0.060751)
+        for s in lb["specs"]:
+            if s["name"] == "thinktank_coverage":
+                assert s["confidence"] == CONFIDENCE_THIN
+                s["topn_alpha_vs_benchmark"]["se"] = None
+                s["topn_alpha_vs_benchmark"]["t_stat"] = None
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["thinktank_coverage"] is None
+        assert result["unavailable_reasons"]["thinktank_coverage"] == (
+            "thinktank_coverage_thin_evidence"
+        )
+        assert result["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_THIN
+
+    def test_thin_slug_is_distinct_from_absent_slug(self):
+        """I7549: `thin` (wait for the cohort) and `insufficient` (go look at
+        the producer) are different operator responses, so they must never
+        share a slug."""
+        thin = build_weekly_arm_scores(
+            _e2e_lift_ok(), _tt_leaderboard_ok(n_dates_scored=2),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        absent = build_weekly_arm_scores(
+            _e2e_lift_ok(), _tt_leaderboard_ok(n_dates_scored=0),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        assert thin["unavailable_reasons"]["thinktank_coverage"] == (
+            "thinktank_coverage_thin_evidence"
+        )
+        assert absent["unavailable_reasons"]["thinktank_coverage"] == (
+            "thinktank_coverage_no_resolved_outcomes"
+        )
+        assert (
+            thin["unavailable_reasons"]["thinktank_coverage"]
+            != absent["unavailable_reasons"]["thinktank_coverage"]
+        )
+        assert thin["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_THIN
+        assert absent["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_INSUFFICIENT
+
+    def test_ok_row_scores_exactly_as_before(self):
+        """No behaviour change on the healthy path -- the whole point of
+        gating on the producer's verdict rather than on a new local rule."""
+        lb = _tt_leaderboard_ok(mean=0.0173, n_dates_scored=9)
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["thinktank_coverage"] == pytest.approx(0.0173)
+        assert "thinktank_coverage" not in result["unavailable_reasons"]
+        assert result["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_OK
+
+    def test_thin_row_cannot_demote_the_sitting_champion_either(self):
+        """§5.2 is not weakened: a thin row holds the pointer in BOTH
+        directions. With thinktank_coverage as the sitting champion and a thin
+        row, the gate must no-contest -- never hand the seat to
+        scanner_predictor_direct on non-evidence."""
+        arm_scores = build_weekly_arm_scores(
+            _e2e_lift_ok(sn_lift=0.05), _tt_leaderboard_ok(n_dates_scored=1),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        record = evaluate_gates(
+            champion_before="thinktank_coverage", arm_scores=arm_scores, freeze=False,
+        )
+        assert record["outcome"] == "no_contest"
+        assert record["champion_after"] == "thinktank_coverage"
+        assert "thinktank_coverage_thin_evidence" in record["blocked_by"]
+
+    def test_thin_row_cannot_promote_the_challenger_either(self):
+        """The mirror case: a thin row with a great mean must not take the
+        seat from the incumbent."""
+        arm_scores = build_weekly_arm_scores(
+            _e2e_lift_ok(sn_lift=0.001),
+            _tt_leaderboard_ok(n_dates_scored=1, mean=0.99),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        record = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores,
+            freeze=False,
+        )
+        assert record["outcome"] == "no_contest"
+        assert record["champion_after"] == "scanner_predictor_direct"
+        assert record["challenger_score"] is None
+
+    def test_legacy_artifact_without_confidence_falls_back_to_declared_floor(self):
+        """A pre-I7542 artifact carries no `confidence`, but DOES carry the
+        artifact-level floor -- derive the verdict from it rather than
+        trusting the row."""
+        thin = _tt_leaderboard_ok(n_dates_scored=1, confidence=None)
+        assert "confidence" not in [
+            k for s in thin["specs"] if s["name"] == "thinktank_coverage" for k in s
+        ]
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), thin, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["thinktank_coverage"] is None
+        assert result["unavailable_reasons"]["thinktank_coverage"] == (
+            "thinktank_coverage_thin_evidence"
+        )
+
+        healthy = _tt_leaderboard_ok(n_dates_scored=11, mean=0.02, confidence=None)
+        ok_result = build_weekly_arm_scores(
+            _e2e_lift_ok(), healthy, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert ok_result["scores"]["thinktank_coverage"] == pytest.approx(0.02)
+
+    def test_legacy_artifact_with_neither_field_is_unavailable_not_ok(self):
+        """The defect being fixed, repeated one layer down: an artifact that
+        can say NOTHING about how much evidence stands behind its row must
+        never be read as confident."""
+        lb = _tt_leaderboard_ok(n_dates_scored=1, confidence=None)
+        lb.pop("min_dates_for_inference")
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["thinktank_coverage"] is None
+        assert result["unavailable_reasons"]["thinktank_coverage"] == (
+            "thinktank_coverage_confidence_unknown"
+        )
+        assert result["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_UNKNOWN
+
+    def test_unrecognised_confidence_value_is_refused_not_guessed(self):
+        lb = _tt_leaderboard_ok(n_dates_scored=12, confidence="excellent")
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["thinktank_coverage"] is None
+        assert result["unavailable_reasons"]["thinktank_coverage"] == (
+            "thinktank_coverage_confidence_unknown"
+        )
+        assert result["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_UNRECOGNISED
+
+    def test_confidence_ok_but_metric_absent_is_still_unavailable(self):
+        """An internally inconsistent row -- confidence says ok, the primary
+        metric is missing. Fail static, keep the claimed confidence so the
+        audit shows the contradiction."""
+        lb = _tt_leaderboard_ok(n_dates_scored=12)
+        for s in lb["specs"]:
+            if s["name"] == "thinktank_coverage":
+                s["topn_alpha_vs_benchmark"] = None
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["thinktank_coverage"] is None
+        assert result["unavailable_reasons"]["thinktank_coverage"] == (
+            "thinktank_coverage_no_resolved_outcomes"
+        )
+        assert result["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_OK
+
+    def test_the_floor_is_read_off_the_artifact_never_hardcoded(self):
+        """champion-challenger-policy.md §10: the evidence floor is a per-slot
+        fact owned by the producer's registry. A row at n=6 is `ok` under a
+        floor of 5 and `thin` under a floor of 8 -- this module must follow
+        the artifact, not a literal of its own."""
+        lb = _tt_leaderboard_ok(n_dates_scored=6, mean=0.03, confidence=None)
+        lb["min_dates_for_inference"] = 8
+        strict = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert strict["unavailable_reasons"]["thinktank_coverage"] == (
+            "thinktank_coverage_thin_evidence"
+        )
+        lb["min_dates_for_inference"] = 5
+        lenient = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert lenient["scores"]["thinktank_coverage"] == pytest.approx(0.03)
+
+    def test_scanner_predictor_direct_confidence_is_not_a_leaderboard_verdict(self):
+        """That arm is scored from this repo's own counterfactual, so a
+        missing confidence must never render as a thin one."""
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), _tt_leaderboard_ok(), run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert result["arm_confidence"]["scanner_predictor_direct"] == (
+            CONFIDENCE_NOT_LEADERBOARD_SCORED
+        )
+        assert CONFIDENCE_NOT_LEADERBOARD_SCORED not in (
+            CONFIDENCE_OK, CONFIDENCE_THIN, CONFIDENCE_INSUFFICIENT,
+        )
+
+    def test_confidence_reaches_the_audit_record(self):
+        """I7549 deliverable 4 / §7.2: failing to decide must be VISIBLE, and
+        the record must name WHICH evidence declined."""
+        arm_scores = build_weekly_arm_scores(
+            _e2e_lift_ok(), _tt_leaderboard_ok(n_dates_scored=1),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        record = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores,
+            freeze=False,
+        )
+        audit = build_champion_audit("2026-07-18", record, freeze=False)
+        assert audit["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_THIN
+        assert audit["blocked_by"] == ["thinktank_coverage_thin_evidence"]
+        jsonschema = pytest.importorskip("jsonschema", reason="jsonschema not installed")
+        jsonschema.validate(
+            instance=audit, schema=json.loads(AUDIT_SCHEMA_PATH.read_text()),
+        )
+
+    def test_declining_to_decide_is_logged_not_silent(self, caplog):
+        """§7.2: fail-soft must never extend to silence. The no-op has to be
+        readable on the run's own surface, not only in S3."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="optimizer.champion_promotion"):
+            build_weekly_arm_scores(
+                _e2e_lift_ok(), _tt_leaderboard_ok(n_dates_scored=1),
+                run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+            )
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "thinktank_coverage NOT scored" in joined
+        assert "thin" in joined
+        assert "thinktank_coverage_thin_evidence" in joined
+
+
+class TestGateHorizon:
+    """Which horizon the champion gate decides on, asserted rather than
+    inherited (alpha-engine-config-I7540/I7549)."""
+
+    def test_gate_decides_at_the_primary_21_session_horizon(self):
+        assert GATE_HORIZON_DAYS == 21
+
+    def test_non_primary_horizon_blocks_do_not_move_the_gate(self):
+        """The artifact now carries 126/252-session blocks under `horizons`.
+        A spectacular 252-session thinktank_coverage number must not touch
+        this gate: scanner_predictor_direct has no 252-session score, so
+        ranking them would violate §4's same-horizon requirement."""
+        lb = _tt_leaderboard_ok(mean=0.015, n_dates_scored=9)
+        lb["horizons"][2] = {
+            "horizon_days": 252, "status": "ok", "reason": None, "n_dates": 40,
+            "specs": [{
+                "name": "thinktank_coverage", "kind": "challenger",
+                "realized_rank_ic": None,
+                "topn_alpha_vs_champion": None,
+                "topn_alpha_vs_benchmark": {
+                    "mean": 0.91, "se": 0.02, "t_stat": 9.0, "n_dates": 40,
+                },
+                "n_dates_scored": 40, "confidence": CONFIDENCE_OK,
+            }],
+        }
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["thinktank_coverage"] == pytest.approx(0.015)
+
+    def test_upstream_primary_horizon_change_is_a_loud_no_contest(self):
+        """If the producer ever moves its primary block off 21 sessions, this
+        gate must stop, not silently rescore the live champion on a horizon
+        the other arm is not measured at."""
+        lb = _tt_leaderboard_ok(mean=0.9, n_dates_scored=40)
+        lb["horizon_days"] = 252
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["thinktank_coverage"] is None
+        assert result["unavailable_reasons"]["thinktank_coverage"] == (
+            "leaderboard_horizon_mismatch"
+        )
+
+    def test_pre_multi_horizon_artifact_without_horizon_days_still_scores(self):
+        """Tolerant of the field's ABSENCE (it always meant 21), intolerant of
+        it disagreeing."""
+        lb = _tt_leaderboard_ok(mean=0.02, n_dates_scored=9)
+        lb.pop("horizon_days")
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["thinktank_coverage"] == pytest.approx(0.02)
+
+
+class TestLeaderboardRowConfidence:
+    """The shared, arm-agnostic verdict helper (I7549 deliverable 2): any
+    future arm scored off this artifact routes through here rather than
+    growing a second thinness test."""
+
+    @pytest.mark.parametrize("declared", [CONFIDENCE_OK, CONFIDENCE_THIN, CONFIDENCE_INSUFFICIENT])
+    def test_producers_verdict_wins_over_any_local_derivation(self, declared):
+        # n_dates_scored deliberately contradicts the declared verdict: the
+        # producer owns the floor, this module does not second-guess it.
+        assert leaderboard_row_confidence(
+            {"name": "x", "confidence": declared, "n_dates_scored": 12},
+            {"min_dates_for_inference": 5},
+        ) == declared
+
+    def test_never_infers_ok_without_a_declared_floor(self):
+        assert leaderboard_row_confidence(
+            {"name": "x", "n_dates_scored": 999}, {},
+        ) == CONFIDENCE_UNKNOWN
+
+    @pytest.mark.parametrize("floor", [None, 0, -1, "5", True, 1.5])
+    def test_malformed_floor_is_unknown_not_ok(self, floor):
+        assert leaderboard_row_confidence(
+            {"name": "x", "n_dates_scored": 7}, {"min_dates_for_inference": floor},
+        ) == CONFIDENCE_UNKNOWN
+
+    @pytest.mark.parametrize("n_scored", [None, "7", -1, True, 1.5])
+    def test_malformed_n_dates_scored_is_unknown_not_ok(self, n_scored):
+        assert leaderboard_row_confidence(
+            {"name": "x", "n_dates_scored": n_scored}, {"min_dates_for_inference": 5},
+        ) == CONFIDENCE_UNKNOWN
 
 
 # ── Gate engine (pure function, weekly winner-take-all) ────────────────────
