@@ -18,6 +18,7 @@ from analysis.contribution_lift.groups import (
     research_composite,
     executor_rules,
     research_diagnostics,
+    predictor_ensemble,
 )
 from analysis.contribution_lift.harness import ReplaySpec
 
@@ -32,4 +33,5 @@ SPECS: list[ReplaySpec] = [
     executor_rules.SPEC_EXIT_RULES,
     executor_rules.SPEC_POSITION_SIZING,
     *research_diagnostics.SPECS,
+    *predictor_ensemble.SPECS,
 ]
