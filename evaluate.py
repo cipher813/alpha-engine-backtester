@@ -2778,13 +2778,11 @@ def _main_impl() -> None:
             )
             print(f"\nUploaded to s3://{config.get('output_bucket')}/{config.get('output_prefix', 'evaluation')}/{args.date}/")
 
-            # Grade history
-            if grading_result and grading_result.get("status") in ("ok", "partial"):
-                try:
-                    from analysis.grade_history import append_grades
-                    append_grades(grading_result, args.date, config.get("output_bucket", "alpha-engine-research"))
-                except Exception as e:
-                    logger.warning("Grade history update failed (non-fatal): %s", e)
+            # RC v3 T1 (config-I7474, 2026-08-16): grade-history writer
+            # retired — analysis/grade_history.py appended the v1 composite
+            # grade every cycle; that grader is retired as a rendered
+            # surface. The existing s3://.../backtest/grade_history.json is
+            # RETAINED (data is an asset), just no longer appended to.
 
         # Evaluator email — now a THIN digest (System Report Card + What Changed
         # + completeness) that deep-links to the console Analysis page for the

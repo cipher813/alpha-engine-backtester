@@ -16,7 +16,6 @@ from analysis.grading import (
     _grade_risk_guard,
     _grade_veto_gate,
     _ic_to_grade,
-    _letter,
     _lift_to_grade,
     _na_reason,
     _pct_to_grade,
@@ -60,24 +59,9 @@ class TestGradeCalibration:
 # ---------------------------------------------------------------------------
 
 
-class TestLetter:
-    def test_a(self):
-        assert _letter(92) == "A"
-
-    def test_b_plus(self):
-        assert _letter(75) == "B+"
-
-    def test_f(self):
-        assert _letter(10) == "F"
-
-    def test_none(self):
-        assert _letter(None) == "N/A"
-
-    def test_clamped_above_100(self):
-        assert _letter(105) == "A"
-
-    def test_zero(self):
-        assert _letter(0) == "F"
+# TestLetter removed RC v3 T1 (config-I7474, 2026-08-16): GRADE_BANDS/_letter
+# deleted from analysis/grading.py — the v1 A-F letter grade retired as a
+# rendered surface.
 
 
 class TestPctToGrade:
@@ -230,7 +214,6 @@ class TestComputeScorecard:
         assert result["status"] == "ok"
         assert result["overall"]["grade"] is not None
         assert 0 <= result["overall"]["grade"] <= 100
-        assert result["overall"]["letter"] != "N/A"
 
         # All modules should have grades
         assert result["research"]["grade"] is not None
@@ -272,7 +255,6 @@ class TestComputeScorecard:
         teams = result["research"]["components"]["sector_teams"]
         tiny = next(t for t in teams if t["team_id"] == "tiny_team")
         assert tiny["grade"] is None
-        assert tiny["letter"] == "N/A"
 
     def test_scorecard_structure(self):
         """Verify the scorecard has the expected structure."""
@@ -283,7 +265,8 @@ class TestComputeScorecard:
         assert "predictor" in result
         assert "executor" in result
         assert "grade" in result["overall"]
-        assert "letter" in result["overall"]
+        # RC v3 T1: "letter" is retired from every level of this structure.
+        assert "letter" not in result["overall"]
         assert "components" in result["research"]
         assert "components" in result["predictor"]
         assert "components" in result["executor"]
@@ -406,14 +389,12 @@ class TestGradeCalibrationDiagnostics:
             "status": "ok", "ece": 0.03, "n": 200, "quality": "good",
         })
         assert result["grade"] == 90.0
-        assert result["letter"] == "A"
 
     def test_poor_calibration_low_grade(self):
         result = _grade_calibration_diagnostics({
             "status": "ok", "ece": 0.25, "n": 200, "quality": "poor",
         })
         assert result["grade"] == 10.0
-        assert result["letter"] == "F"
 
     def test_missing_ece(self):
         result = _grade_calibration_diagnostics({"status": "ok"})
@@ -718,5 +699,5 @@ class TestGraderNAReasons:
             _grade_veto_gate(None, None),
         ]
         for d in na_dicts:
-            assert d["letter"] == "N/A"
+            assert d["grade"] is None
             assert d["reason"] != "insufficient data"
