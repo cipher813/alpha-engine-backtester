@@ -568,57 +568,72 @@ spot_common_launch_instance() {
     fi
     echo "  Instance ID: $INSTANCE_ID"
 
-    spot_common_prune_stale_staging
+    # (config-I7442) The launch-time prune retired into
+    # `krepis.spot_evidence teardown`, which sweeps both tmp/spot_<slug>/ and
+    # _spot_evidence/<slug>/ on every teardown — including for stages that
+    # have stopped running, which the per-stage prune here could never reach.
     RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-${INSTANCE_ID}"
     S3_STAGING_PREFIX="tmp/spot_${SPOT_STAGE_NAME}/${RUN_ID}"
     S3_STAGING="s3://${S3_BUCKET}/${S3_STAGING_PREFIX}"
 }
 
-# ── Staging retention bound (config-I7396) ─────────────────────────────────
-# The cleanup trap now RETAINS the staging prefix on failure, because it holds
-# the only full copy of a failed stage's output. That retention has to be
-# bounded by something, and the bucket lifecycle policy is not it today:
-# `nousergon-data/infrastructure/apply_s3_lifecycle.sh` is run by no workflow,
-# so a rule added there would be an operator step -- which
-# pull-request-policy.md 4.2 does not permit as a post-merge action, and which
-# would leave the bound un-applied and undetected.
+# ── Staging teardown (config-I7442, superseding config-I7396) ──────────────
+# The staging prefix holds the ONLY full copy of a stage's stdout and stderr:
+# `run_ssm` points SSM's OutputS3KeyPrefix at ${S3_STAGING_PREFIX}/ssm-output,
+# and GetCommandInvocation returns just the FIRST 24 KB, so on any long stage
+# the tail -- where the failure is -- exists nowhere else.
 #
-# So each stage prunes its OWN prefix at launch. Self-bounding, needs no new
-# permission (the same s3 rm the cleanup path already uses), and cannot drift
-# from the retention it bounds because they ship together. SOTA remains a
-# bucket lifecycle rule on tmp/ -- strictly better, since it also covers a
-# stage that stops running entirely -- and is tracked separately rather than
-# skipped silently.
-SPOT_STAGING_RETENTION_DAYS="${SPOT_STAGING_RETENTION_DAYS:-14}"
-
-spot_common_prune_stale_staging() {
-    local _prefix="tmp/spot_${SPOT_STAGE_NAME}/"
-    local _cutoff _run
-    # RUN_ID is `YYYYmmddTHHMMSSZ-i-...`, so a lexical compare against a
-    # cutoff stamp of the same shape is a date compare -- no per-object HEAD.
-    _cutoff="$(date -u -v-"${SPOT_STAGING_RETENTION_DAYS}"d +%Y%m%dT%H%M%SZ 2>/dev/null \
-        || date -u -d "${SPOT_STAGING_RETENTION_DAYS} days ago" +%Y%m%dT%H%M%SZ 2>/dev/null)"
-    if [ -z "$_cutoff" ]; then
-        echo "  (staging prune skipped: no usable date CLI)" >&2
-        return 0
-    fi
-    aws s3 ls "s3://${S3_BUCKET}/${_prefix}" --region "$AWS_REGION" 2>/dev/null \
-      | awk '{print $2}' | tr -d '/' \
-      | while read -r _run; do
-            [ -n "$_run" ] || continue
-            if [ "$_run" \< "$_cutoff" ]; then
-                echo "  Pruning staging older than ${SPOT_STAGING_RETENTION_DAYS}d: ${_prefix}${_run}/"
-                aws s3 rm "s3://${S3_BUCKET}/${_prefix}${_run}" --recursive --quiet 2>/dev/null || true
-            fi
-        done
-    return 0
-}
+# config-I7396 (#675) stopped this path deleting that prefix on failure, and
+# bounded the resulting retention with a per-stage bash prune at launch. That
+# fixed THIS repo. It was still the wrong shape for the class:
+#
+#   * three `_spot_common.sh` twins and four surviving monoliths ran the same
+#     unguarded `aws s3 rm "$S3_STAGING" --recursive` inside their own failure
+#     handlers, and mirroring a 55-line retain-plus-prune into each is exactly
+#     what policy-shared-code forbids at the second adoption;
+#   * the prune only ever reached the prefix of a stage that RAN AGAIN, so a
+#     retired stage's staging leaked forever -- named in #675's own comment as
+#     the residual;
+#   * it needed a `date -u -v-Nd` / `date -u -d` fallback pair to compute a
+#     cutoff, and the evidence stayed inside `tmp/`, the prefix everything
+#     here recursively deletes.
+#
+# `krepis.spot_evidence teardown` is the chokepoint that replaces both. It
+# copies the prefix to `_spot_evidence/<slug>/<date>/<run-id>/` -- outside
+# `tmp/` -- and deletes staging ONLY if that copy succeeded; on a successful
+# run it deletes with nothing retained, so no green run accrues storage. It
+# also sweeps both trees on every teardown, which is where the prune went.
+# The ordering lives in that module's call graph, so it cannot be undone here
+# by adding a line.
 
 # ── Cleanup / reclaim-relaunch / error-artifact publishing ──────────────────
 # Always terminate the instance + clean S3 staging, with diagnostics on
 # failure, and re-exec on a CONFIRMED spot reclaim (#883). Installs a
 # `trap cleanup EXIT` — call once, after INSTANCE_ID is set.
 spot_common_install_cleanup_trap() {
+    spot_common_teardown_staging() {
+        local _exit_code="$1"
+        if [ -z "${S3_STAGING:-}" ]; then
+            echo "  Instance terminated; no S3 staging was provisioned."
+            return 0
+        fi
+        if "$LIB_PYTHON" -m krepis.spot_evidence teardown \
+                --staging "$S3_STAGING" \
+                --slug "$SPOT_STAGE_NAME" \
+                --exit-code "$_exit_code"; then
+            return 0
+        fi
+        # The chokepoint is unreachable on this box -- a krepis older than the
+        # release carrying `spot_evidence`, or a broken interpreter. RETAIN rather
+        # than fall back to `aws s3 rm`: an unswept prefix is a cost bounded by the
+        # next teardown's sweep, where losing the diagnosis is config-I7442 again.
+        # This is also what makes the merge order safe -- this change is correct on
+        # a box whose krepis pin has not yet been bumped.
+        echo "  spot_evidence: chokepoint unavailable via $LIB_PYTHON — S3 staging RETAINED at $S3_STAGING/ (not deleted)" >&2
+        echo "    Full stage stdout/stderr: $S3_STAGING/ssm-output/" >&2
+        return 0
+    }
+
     # shellcheck disable=SC2329
     # invoked via `trap cleanup EXIT` below — shellcheck doesn't associate
     # a same-function trap registration as a call site.
@@ -692,30 +707,7 @@ publish_ops_alert(
         fi
         echo "==> Terminating spot instance $INSTANCE_ID..."
         aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
-        if [ "$exit_code" -ne 0 ]; then
-            # config-I7396: the staging prefix holds the ONLY full copy of the
-            # stage's stdout and stderr. SSM's GetCommandInvocation returns
-            # just the FIRST 24 KB, so on any long stage the tail -- which is
-            # where a traceback lives -- exists nowhere else.
-            #
-            # This path used to delete it, immediately after the failure
-            # message above printed the path as the place to look. On
-            # 2026-08-15 the weekly SF died at PredictorBacktest and the
-            # prefix its own error named was empty by the time anyone read
-            # it. A message pointing at evidence the same exit path just
-            # removed is worse than no message.
-            #
-            # Retained ONLY on failure; the success path still cleans, so
-            # steady-state storage is unchanged. Bounded by the stage-prefix
-            # prune at launch (spot_common_prune_stale_staging).
-            echo "  Instance terminated; S3 staging RETAINED for diagnosis (exit_code=$exit_code):"
-            echo "    $S3_STAGING/"
-            echo "    Full stage stdout/stderr:"
-            echo "    $S3_STAGING/ssm-output/"
-        else
-            aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
-            echo "  Instance terminated; S3 staging cleaned."
-        fi
+        spot_common_teardown_staging "$exit_code"
         if [ "$_will_relaunch" = "1" ]; then
             echo "==> Spot RECLAIMED by AWS (reason_code='$reason_code' state='$state' transition='$state_reason') — relaunching on a fresh spot (attempt $((SPOT_ATTEMPT + 1))/$MAX_SPOT_ATTEMPTS)"
             trap - EXIT
