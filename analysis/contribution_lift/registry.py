@@ -16,6 +16,7 @@ from analysis.contribution_lift.groups import (
     cost_adjusted_quality,
     predictor_gates,
     research_composite,
+    executor_rules,
 )
 from analysis.contribution_lift.harness import ReplaySpec
 
@@ -25,4 +26,8 @@ SPECS: list[ReplaySpec] = [
     predictor_gates.SPEC,
     predictor_gates.OUTPUT_DISTRIBUTION_GATE_SPEC,
     predictor_gates.DIRECTION_ACCURACY_SPEC,
+    executor_rules.SPEC_ENTRY_TRIGGERS,
+    executor_rules.SPEC_RISK_GUARD,
+    executor_rules.SPEC_EXIT_RULES,
+    executor_rules.SPEC_POSITION_SIZING,
 ]
