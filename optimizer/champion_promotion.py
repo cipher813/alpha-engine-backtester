@@ -102,7 +102,10 @@ with under I2518):**
     int, "specs": [{"name", "kind", "realized_rank_ic",
     "topn_alpha_vs_champion": {...} | None,
     "topn_alpha_vs_benchmark": {"mean","se","t_stat","n_dates"} | None,
-    "n_dates_scored"}, ...]}``. We read the ``specs`` row named
+    "n_dates_scored", "confidence"}, ...],
+    "horizons_days": [21, 126, 252], "min_dates_for_inference": 5,
+    "horizons": [{"horizon_days", "status", "reason", "n_dates", "specs"},
+    ...]}``. We read the ``specs`` row named
     ``"thinktank_coverage"`` and take its ``topn_alpha_vs_benchmark.mean``
     — the SAME kind of statistic as ``scanner_predictor_direct``'s score
     (a mean top-N realized return lift vs the SPY benchmark, date
@@ -143,6 +146,85 @@ with under I2518):**
     ``leaderboard_date_used`` (additive, contracts/producer_champion_audit
     .schema.json) so the audit trail always shows which week's evidence
     decided (or declined to decide) a flip.
+
+    **EVIDENCE-CONFIDENCE gate (alpha-engine-config-I7549, 2026-08-17):**
+    until this change the gate accepted a leaderboard row on
+    ``n_dates_scored`` being TRUTHY. ``n_dates_scored == 1`` is truthy, so
+    a one-date mean — carrying ``se: null`` and ``t_stat: null`` because
+    neither can be computed at n=1 — could move the live champion pointer.
+    That was not hypothetical: ``research/producer_leaderboard/
+    2026-08-14.json`` carried ``thinktank_coverage`` with
+    ``n_dates_scored: 1``, ``topn_alpha_vs_benchmark.mean: -0.060751``,
+    ``se: null``, ``t_stat: null``.
+
+    crucible-research PR643 (alpha-engine-config-I7542) now stamps every
+    spec row with an explicit ``confidence`` —
+    ``insufficient`` (nothing scored) / ``thin`` (scored on fewer than the
+    artifact's ``min_dates_for_inference`` dates) / ``ok`` — produced by
+    ``scoring/leaderboard_scoring.py::confidence_for`` against the slot's
+    registered evidence floor (``LEADERBOARD_SLOTS``). This module CONSUMES
+    that field; it deliberately does not reimplement the thinness test, so
+    the floor stays a single per-slot fact owned by the producer
+    (champion-challenger-policy.md §10).
+
+    Only a ``confidence == "ok"`` row is scored. A ``thin`` row yields
+    ``thinktank_coverage_thin_evidence``; an ``insufficient`` row keeps the
+    existing ``thinktank_coverage_no_resolved_outcomes`` — deliberately
+    DIFFERENT slugs, because they call for different operator responses
+    (wait for the cohort to mature vs go find out why nothing scored).
+
+    This does NOT weaken §5's fast path. §5 permits promoting on
+    DIRECTIONAL evidence without a full statistical gate because the
+    platform is paper and the decision is reversible; it says nothing that
+    makes n=1 evidence. A thin row is not a weak directional signal, it is
+    a number whose own dispersion is undefined. Excluding it removes
+    non-evidence from the fast path rather than adding a statistical gate
+    to it: the promotion rule remains "strictly higher score wins", with
+    no significance test, PSR/DSR bar, or cohort-count requirement.
+
+    Nor does it weaken §5.2 hysteresis. This module's hysteresis under the
+    I2518 winner-take-all ruling is "the pointer never moves on a null or
+    an exactly-equal signal — ties favour the incumbent". Every path added
+    here produces a ``None`` score, i.e. strictly MORE reasons to leave the
+    pointer where it is, in BOTH directions (a thin champion row cannot
+    demote the incumbent either — a no_contest holds the pointer). Nothing
+    here can cause a flip that would not have happened before.
+
+    **Backwards compatibility is fail-STATIC, never fail-``ok``.** A
+    pre-I7542 artifact carries no ``confidence`` key. Treating its absence
+    as ``ok`` would be the very defect being fixed, so this module derives
+    the verdict from the artifact's OWN declared floor
+    (``min_dates_for_inference``) against ``n_dates_scored``; when the
+    artifact declares neither, the row is unavailable under its own slug
+    (``thinktank_coverage_confidence_unknown``) rather than trusted. Same
+    slug for a ``confidence`` value outside the known vocabulary — a
+    producer that changed its vocabulary is a reason to stop, not to
+    guess. The audit record's ``arm_confidence`` distinguishes the two
+    (``unknown`` vs ``unrecognized``).
+
+    **HORIZON: the gate reads the artifact's PRIMARY (21-session) block,
+    and now says so (alpha-engine-config-I7540/I7549).** The leaderboard
+    now scores every arm at 21, 126 and 252 sessions and emits one block
+    per horizon under ``horizons``; the PRIMARY horizon's block is also
+    spread across the artifact's top level, which is what ``specs`` here
+    is. The gate stays on 21 for two binding reasons, not by inertia:
+    (1) §4 requires the same horizon across every arm in a slot, and the
+    other arm — ``scanner_predictor_direct`` — is scored from this repo's
+    own ``sector_neutral_mean_alpha_21d`` counterfactual, a 21-session
+    statistic with no 126/252 equivalent; ranking a 252-session
+    thinktank_coverage number against a 21-session scanner number is not a
+    comparison. (2) §3 requires a promoted arm's series to stay
+    continuous; the live pointer's whole history is 21-session, and
+    silently rebasing the gate onto a different horizon would reset it.
+    Moving this gate to a longer horizon is a real and arguably correct
+    future change — the scanner's stated objective is a ~1-year view — but
+    it requires a 126/252-session score for BOTH arms first, and it is an
+    explicit decision, not a side effect of the producer growing a field.
+    ``GATE_HORIZON_DAYS`` names the choice, and a leaderboard whose
+    top-level ``horizon_days`` disagrees with it is refused
+    (``leaderboard_horizon_mismatch``) rather than scored — so an upstream
+    change of primary horizon surfaces as a loud no-contest instead of
+    silently rescoring the champion gate.
 
   **config-I2993 item 2 (windowing ``end_to_end.py``'s
   ``sn_lift_vs_agentic_cio`` aggregation) is NO LONGER a dependency for
@@ -255,8 +337,11 @@ _BLOCKED_BY_SLUGS = (
     "scanner_predictor_direct_counterfactual_unavailable",
     "thinktank_coverage_not_in_leaderboard",
     "thinktank_coverage_no_resolved_outcomes",
+    "thinktank_coverage_thin_evidence",
+    "thinktank_coverage_confidence_unknown",
     "leaderboard_unavailable",
     "leaderboard_stale_gt_8d",
+    "leaderboard_horizon_mismatch",
     "arm_score_unavailable",
     "feed_producer_dead",
     "frozen",
@@ -281,6 +366,38 @@ _BLOCKED_BY_SLUGS = (
 # scored — see find_latest_research_producer_leaderboard_date /
 # _score_thinktank_coverage.
 LEADERBOARD_STALENESS_DAYS = 8
+
+# ── Evidence-confidence contract with crucible-research (alpha-engine-config
+# -I7549 consuming I7542) ─────────────────────────────────────────────────
+#
+# The per-spec confidence vocabulary PRODUCED by crucible-research
+# scoring/leaderboard_scoring.py::confidence_for. This module consumes it and
+# deliberately does NOT reimplement the thinness test: the evidence floor is a
+# per-slot fact owned by the producer's LEADERBOARD_SLOTS registry
+# (champion-challenger-policy.md §10), and a second copy here would drift.
+CONFIDENCE_OK = "ok"
+CONFIDENCE_THIN = "thin"
+CONFIDENCE_INSUFFICIENT = "insufficient"
+LEADERBOARD_CONFIDENCE_VOCABULARY = (
+    CONFIDENCE_OK, CONFIDENCE_THIN, CONFIDENCE_INSUFFICIENT,
+)
+
+# Verdicts this module records for itself when the ARTIFACT did not supply a
+# usable one. Both are refusals, never a pass — see the module docstring's
+# backwards-compatibility note.
+CONFIDENCE_UNKNOWN = "unknown"            # pre-I7542 artifact, no floor to derive from
+CONFIDENCE_UNRECOGNISED = "unrecognised"  # confidence present, outside the vocabulary
+# Recorded for an arm that is not scored off the producer leaderboard at all
+# (scanner_predictor_direct reads this repo's own counterfactual), so the audit
+# record never renders a missing confidence as a thin one.
+CONFIDENCE_NOT_LEADERBOARD_SCORED = "not_leaderboard_scored"
+
+# The horizon this gate decides on, in trading sessions. See the module
+# docstring's HORIZON section: 21 is the leaderboard's PRIMARY horizon (whose
+# block is spread across the artifact's top level) and the only horizon at
+# which BOTH arms are scored. Named here so the choice is an assertion rather
+# than an accident of which block happens to sit at the top level.
+GATE_HORIZON_DAYS = 21
 
 RESEARCH_PRODUCER_LEADERBOARD_PREFIX = "research/producer_leaderboard/"
 _RESEARCH_PRODUCER_LEADERBOARD_KEY_RE = re.compile(
@@ -565,9 +682,20 @@ def evaluate_gates(
     Pure function — no I/O — independently unit-testable against synthetic
     score fixtures.
 
+    ``arm_confidence`` (additive, alpha-engine-config-I7549) is threaded
+    straight through from ``build_weekly_arm_scores`` onto every outcome
+    record. Under I7549 a ``None`` score can now also mean "the arm WAS
+    scored, on evidence too thin to compare" (``thinktank_coverage_thin
+    _evidence``) — indistinguishable from every other no-contest by
+    ``blocked_by`` alone once a second thin-adjacent slug exists, so the
+    verdict itself is recorded. This strengthens rather than weakens the
+    §5.2 hysteresis posture: every I7549 path produces a ``None`` score,
+    which is already a definitional no-contest holding the pointer in BOTH
+    directions, so no flip becomes possible that was not possible before.
+
     Returns a dict with keys: outcome, champion_before, champion_after,
     challenger, champion_score, challenger_score, blocked_by,
-    leaderboard_date_used.
+    leaderboard_date_used, arm_confidence.
     """
     challenger = _other_champion(champion_before)
     scores = arm_scores.get("scores", {})
@@ -583,6 +711,9 @@ def evaluate_gates(
         "challenger_score": chall_score,
         "blocked_by": None,
         "leaderboard_date_used": arm_scores.get("leaderboard_date_used"),
+        # alpha-engine-config-I7549 — carried on EVERY outcome, so the audit
+        # trail names the evidence that decided, or declined to decide.
+        "arm_confidence": arm_scores.get("arm_confidence") or None,
     }
 
     if champ_score is None or chall_score is None:
@@ -777,7 +908,18 @@ def build_champion_audit(
     champion could be read). Always derived from ``champion_after``, never
     ``champion_before`` — this field names what the LIVE pointer now
     depends on, which is unchanged from before this run on every
-    non-promoted outcome and newly the challenger's feed on a promotion."""
+    non-promoted outcome and newly the challenger's feed on a promotion.
+
+    ``arm_confidence`` (additive, alpha-engine-config-I7549, 2026-08-17) is
+    the per-arm evidence verdict that decided — or declined to decide — this
+    week: ``{"scanner_predictor_direct": "not_leaderboard_scored",
+    "thinktank_coverage": "ok"|"thin"|"insufficient"|"unknown"|
+    "unrecognised"}``. Null only on ``outcome="error"`` (evaluation aborted
+    before scoring). Without it, a week held at ``blocked_by=
+    ["thinktank_coverage_thin_evidence"]`` records THAT the gate declined but
+    not on what — and the whole point of the I7549 change is that a thin row
+    is a different fact from an absent one (champion-challenger-policy.md
+    §7.2)."""
     if error is not None or gate_result is None:
         return {
             "schema_version": AUDIT_SCHEMA_VERSION,
@@ -793,6 +935,7 @@ def build_champion_audit(
             "detail": error or "gate evaluation did not run",
             "leaderboard_date_used": None,
             "feed_dependencies": None,
+            "arm_confidence": None,
         }
     return {
         "schema_version": AUDIT_SCHEMA_VERSION,
@@ -808,6 +951,7 @@ def build_champion_audit(
         "freeze": freeze,
         "leaderboard_date_used": gate_result.get("leaderboard_date_used"),
         "feed_dependencies": ARM_FEED_DEPENDENCIES.get(gate_result["champion_after"]) or None,
+        "arm_confidence": gate_result.get("arm_confidence"),
     }
 
 
@@ -845,9 +989,66 @@ def _score_scanner_predictor_direct(e2e_lift: dict | None) -> tuple[float | None
     return entry["sector_neutral_mean_alpha_21d"], None
 
 
+def leaderboard_row_confidence(row: dict, leaderboard: dict) -> str:
+    """How much evidence stands behind one producer-leaderboard spec ``row``.
+
+    Returns one of ``LEADERBOARD_CONFIDENCE_VOCABULARY`` (the producer's own
+    verdict, read straight off the row — alpha-engine-config-I7542), or one of
+    this module's two refusal verdicts (``CONFIDENCE_UNKNOWN`` /
+    ``CONFIDENCE_UNRECOGNISED``) when the artifact did not supply a usable one.
+
+    NEVER returns ``ok`` on inference — ``ok`` is only ever the producer's own
+    word, or derived from the artifact's OWN declared
+    ``min_dates_for_inference`` floor for a pre-I7542 artifact. An old artifact
+    read as confident is the same class of defect as the one I7549 fixes.
+
+    Shared, arm-agnostic, and applied by name: any FUTURE arm scored off this
+    artifact routes through here rather than growing a second thinness test
+    (issue I7549 deliverable 2).
+    """
+    declared = row.get("confidence")
+    if isinstance(declared, str):
+        if declared in LEADERBOARD_CONFIDENCE_VOCABULARY:
+            return declared
+        # A producer that changed its vocabulary is a reason to stop, not to
+        # guess which side of the floor an unknown word falls on.
+        logger.warning(
+            "[champion_promotion] leaderboard row %r carries an unrecognised "
+            "confidence %r (known: %s) — refusing to score it",
+            row.get("name"), declared, LEADERBOARD_CONFIDENCE_VOCABULARY,
+        )
+        return CONFIDENCE_UNRECOGNISED
+    # Pre-I7542 artifact: derive from the artifact's own declared floor.
+    floor = leaderboard.get("min_dates_for_inference")
+    n_scored = row.get("n_dates_scored")
+    if isinstance(floor, bool) or not isinstance(floor, int) or floor < 1:
+        return CONFIDENCE_UNKNOWN
+    if isinstance(n_scored, bool) or not isinstance(n_scored, int) or n_scored < 0:
+        return CONFIDENCE_UNKNOWN
+    if n_scored == 0:
+        return CONFIDENCE_INSUFFICIENT
+    if n_scored < floor:
+        return CONFIDENCE_THIN
+    return CONFIDENCE_OK
+
+
+# Confidence verdict -> the blocked_by slug the gate reports when it declines
+# to score a row carrying that verdict. ``ok`` is the only verdict absent from
+# this map: it is the only one that scores.
+_CONFIDENCE_BLOCK_SLUGS: dict[str, str] = {
+    # Nothing scored at all — go look at the producer.
+    CONFIDENCE_INSUFFICIENT: "thinktank_coverage_no_resolved_outcomes",
+    # Scored, but below the slot's evidence floor — wait for the cohort.
+    CONFIDENCE_THIN: "thinktank_coverage_thin_evidence",
+    # The artifact could not tell us, either way.
+    CONFIDENCE_UNKNOWN: "thinktank_coverage_confidence_unknown",
+    CONFIDENCE_UNRECOGNISED: "thinktank_coverage_confidence_unknown",
+}
+
+
 def _score_thinktank_coverage(
     tt_leaderboard: dict | None, run_date: str, leaderboard_date_used: str | None,
-) -> tuple[float | None, str | None]:
+) -> tuple[float | None, str | None, str]:
     """thinktank_coverage's weekly score: read from crucible-research's
     ``research/producer_leaderboard/{date}.json`` (see module docstring for
     the verified schema and the coverage_complete-enforced-upstream
@@ -862,9 +1063,17 @@ def _score_thinktank_coverage(
     than ``run_date`` is treated as unavailable (this IS the semantically
     correct behavior, not a compromise — the gate scores realized outcomes
     of PRIOR weeks' selections, which a same-day leaderboard could not
-    contain anyway; see module docstring)."""
+    contain anyway; see module docstring).
+
+    Returns ``(score, unavailable_slug, confidence_verdict)``. The third
+    element (alpha-engine-config-I7549) is ALWAYS populated — including on
+    every refusal path — so the audit record can name the evidence that
+    declined to decide, not merely that something did
+    (champion-challenger-policy.md §7.2). Paths that fail before a row is even
+    reached report ``CONFIDENCE_UNKNOWN``: no row means no verdict, and that
+    is itself the honest answer."""
     if not isinstance(tt_leaderboard, dict) or leaderboard_date_used is None:
-        return None, "leaderboard_unavailable"
+        return None, "leaderboard_unavailable", CONFIDENCE_UNKNOWN
     age_days = (
         date.fromisoformat(run_date) - date.fromisoformat(leaderboard_date_used)
     ).days
@@ -873,12 +1082,27 @@ def _score_thinktank_coverage(
         # selects a date > run_date, but a caller passing
         # leaderboard_date_used directly (bypassing that selection) must
         # never have a "future" artifact trusted as this week's evidence.
-        return None, "leaderboard_unavailable"
+        return None, "leaderboard_unavailable", CONFIDENCE_UNKNOWN
     if age_days > LEADERBOARD_STALENESS_DAYS:
-        return None, "leaderboard_stale_gt_8d"
+        return None, "leaderboard_stale_gt_8d", CONFIDENCE_UNKNOWN
+    # alpha-engine-config-I7549: assert the horizon the gate decides on rather
+    # than inheriting whichever block the producer spreads across the top
+    # level. See the module docstring's HORIZON section. Tolerant of the field
+    # being absent (a pre-multi-horizon artifact always meant 21) but never of
+    # it DISAGREEING — an upstream primary-horizon change must surface as a
+    # loud no-contest, not silently rescore the live champion gate.
+    declared_horizon = tt_leaderboard.get("horizon_days")
+    if declared_horizon is not None and declared_horizon != GATE_HORIZON_DAYS:
+        logger.warning(
+            "[champion_promotion] producer leaderboard %s declares "
+            "horizon_days=%r but this gate decides at %d sessions "
+            "(GATE_HORIZON_DAYS) — refusing to score, no-contest",
+            leaderboard_date_used, declared_horizon, GATE_HORIZON_DAYS,
+        )
+        return None, "leaderboard_horizon_mismatch", CONFIDENCE_UNKNOWN
     specs = tt_leaderboard.get("specs")
     if not isinstance(specs, list):
-        return None, "leaderboard_unavailable"
+        return None, "leaderboard_unavailable", CONFIDENCE_UNKNOWN
     row = next(
         (s for s in specs if isinstance(s, dict) and s.get("name") == "thinktank_coverage"),
         None,
@@ -890,9 +1114,34 @@ def _score_thinktank_coverage(
         # condition is now fully independent of whether a champion producer
         # is registered (alpha-engine-config-I2998 decoupled the two
         # concerns — score_leaderboard writes this row champion-free).
-        return None, "thinktank_coverage_not_in_leaderboard"
-    if not row.get("n_dates_scored"):
-        return None, "thinktank_coverage_no_resolved_outcomes"
+        return None, "thinktank_coverage_not_in_leaderboard", CONFIDENCE_UNKNOWN
+    # alpha-engine-config-I7549: the evidence gate. Replaces the pre-fix
+    # truthiness check on n_dates_scored, under which n_dates_scored == 1 --
+    # a mean with a null SE and a null t_stat -- could move the live champion
+    # pointer. Only the producer's own "ok" scores; every other verdict is a
+    # no-contest that holds the pointer in BOTH directions.
+    confidence = leaderboard_row_confidence(row, tt_leaderboard)
+    if confidence != CONFIDENCE_OK:
+        slug = _CONFIDENCE_BLOCK_SLUGS[confidence]
+        # §7.2: a gate that declines to decide must SAY SO. The blocked_by
+        # slug and arm_confidence land in the durable weekly audit record;
+        # this log is the same fact on the run's own surface. Deliberately
+        # NOT an ops alert: `thin` is a WAIT state that resolves as the
+        # cohort matures, and a weekly page for a self-resolving condition
+        # is the noise §7.2 exists to prevent. The dead/absent cases that
+        # DO warrant a page are already covered by _publish_gate_error_alert
+        # and the ARTIFACT_REGISTRY freshness monitor.
+        logger.warning(
+            "[champion_promotion] thinktank_coverage NOT scored this week: "
+            "confidence=%s (n_dates_scored=%r, artifact "
+            "min_dates_for_inference=%r, leaderboard=%s) -> blocked_by=%s. "
+            "The champion pointer is unchanged; a thin arm is not evidence "
+            "(champion-challenger-policy.md §5, alpha-engine-config-I7549).",
+            confidence, row.get("n_dates_scored"),
+            tt_leaderboard.get("min_dates_for_inference"),
+            leaderboard_date_used, slug,
+        )
+        return None, slug, confidence
     # alpha-engine-config-I2998: direct lift vs the SPY benchmark, computed
     # champion-free — the SAME kind of statistic as
     # scanner_predictor_direct's score (mean top-N realized return lift vs
@@ -902,8 +1151,11 @@ def _score_thinktank_coverage(
     # successor champion registered).
     alpha = row.get("topn_alpha_vs_benchmark")
     if not isinstance(alpha, dict) or alpha.get("mean") is None:
-        return None, "thinktank_coverage_no_resolved_outcomes"
-    return float(alpha["mean"]), None
+        # confidence said "ok" but the primary metric is absent — an
+        # internally inconsistent row. Fail static, and keep the confidence
+        # the row actually claimed so the audit shows the contradiction.
+        return None, "thinktank_coverage_no_resolved_outcomes", confidence
+    return float(alpha["mean"]), None, confidence
 
 
 def build_weekly_arm_scores(
@@ -927,9 +1179,18 @@ def build_weekly_arm_scores(
     ``read_latest_research_producer_leaderboard`` — it is threaded straight
     through into the returned dict (and from there into every
     ``evaluate_gates`` outcome record) so the audit trail always shows
-    which week's evidence decided (or declined to decide) a flip."""
+    which week's evidence decided (or declined to decide) a flip.
+
+    ``arm_confidence`` (additive, alpha-engine-config-I7549) names, per arm,
+    how much evidence stood behind its score this week —
+    ``ok``/``thin``/``insufficient`` from the producer leaderboard row itself,
+    ``unknown``/``unrecognised`` when the artifact could not say, and
+    ``not_leaderboard_scored`` for ``scanner_predictor_direct``, which reads
+    this repo's own counterfactual rather than the leaderboard. Threaded
+    through ``evaluate_gates`` into the weekly audit record so the audit trail
+    shows WHICH EVIDENCE declined to decide, not merely that something did."""
     spd_score, spd_reason = _score_scanner_predictor_direct(e2e_lift)
-    tt_score, tt_reason = _score_thinktank_coverage(
+    tt_score, tt_reason, tt_confidence = _score_thinktank_coverage(
         tt_leaderboard, run_date, leaderboard_date_used,
     )
     reasons: dict[str, str] = {}
@@ -943,6 +1204,10 @@ def build_weekly_arm_scores(
             "thinktank_coverage": tt_score,
         },
         "unavailable_reasons": reasons,
+        "arm_confidence": {
+            "scanner_predictor_direct": CONFIDENCE_NOT_LEADERBOARD_SCORED,
+            "thinktank_coverage": tt_confidence,
+        },
         "leaderboard_date_used": leaderboard_date_used,
     }
 
