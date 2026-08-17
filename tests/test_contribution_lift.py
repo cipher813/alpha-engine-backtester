@@ -14,6 +14,8 @@ Anchors:
 from __future__ import annotations
 
 import math
+import re
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -55,11 +57,34 @@ def _flat_prices(axis: pd.DatetimeIndex, tickers: list[str]) -> pd.DataFrame:
     return pd.DataFrame(100.0, index=axis, columns=tickers)
 
 
+def _trades_db(path: Path, enters: dict[str, list[str]]) -> str:
+    """A synthetic trades.db carrying the executed ENTER rows of ``enters``.
+
+    Same table and columns ``analysis/post_trade.py`` reads, so a fixture that
+    passes here is a fixture the production SQL can read.
+    """
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE trades (date TEXT, ticker TEXT, action TEXT, "
+            "shares REAL, price_at_order REAL)"
+        )
+        conn.executemany(
+            "INSERT INTO trades VALUES (?, ?, 'ENTER', 10.0, 100.0)",
+            [(d, t) for d, tickers in enters.items() for t in tickers],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return str(path)
+
+
 def _inputs(
     *,
     axis: pd.DatetimeIndex | None = None,
     dates: list[str] | None = None,
     signals_by_date: dict | None = None,
+    trades_db_path: str | None = None,
     fees: float = 0.001,
     slippage_bps: float = 10.0,
 ) -> ReplayInputs:
@@ -79,6 +104,7 @@ def _inputs(
         fees=fees,
         slippage_bps=slippage_bps,
         init_cash=1_000_000.0,
+        trades_db_path=trades_db_path,
         source_paths=["s3://test-bucket/signals/{date}/signals.json"],
     )
 
@@ -552,7 +578,8 @@ def test_cost_adjusted_quality_na_when_no_enter_signal():
 
     assert isinstance(result, NotAvailable)
     assert result.status == "N/A-MISSING-INPUT"
-    assert "ENTER-signalled name" in result.reason
+    assert "no traded book to price" in result.reason
+    assert "signals.json" in result.reason
     assert "I7484" in result.reason
 
 
@@ -575,7 +602,8 @@ def test_cost_adjusted_quality_measures_the_cost_drag_end_to_end(monkeypatch):
     dates = [d.strftime("%Y-%m-%d") for d in axis[:60]]
     inputs = _inputs(axis=axis, dates=dates, signals_by_date=_signals(dates))
     monkeypatch.setattr(harness, "simulate_arm", _FakeSim({
-        "as-configured": pd.Series(0.0010, index=axis),
+        f"as-configured — {harness.live_selection_label(inputs)}":
+            pd.Series(0.0010, index=axis),
         "zero-cost (fees=0, slippage=0)": pd.Series(0.0012, index=axis),
     }))
 
@@ -611,7 +639,8 @@ def _report(monkeypatch, **kwargs) -> dict:
     inputs = _inputs(axis=axis, dates=dates, signals_by_date=_signals(dates),
                      **kwargs)
     monkeypatch.setattr(harness, "simulate_arm", _FakeSim({
-        "as-configured": pd.Series(0.0010, index=axis),
+        f"as-configured — {harness.live_selection_label(inputs)}":
+            pd.Series(0.0010, index=axis),
         "zero-cost (fees=0, slippage=0)": pd.Series(0.0012, index=axis),
     }))
     monkeypatch.setattr(report, "_account_trials", lambda inputs, n: 1234)
@@ -785,6 +814,119 @@ def test_horizon_is_not_hardcoded():
             f"{path} hardcodes 21; use HORIZON_DAYS "
             "(nousergon_lib.quant.horizons.DEFAULT_POLICY.primary_horizon)"
         )
+
+
+def test_no_group_reads_the_signals_enter_feed_directly():
+    """config-I7501: one champion-aware live-selection reader, in the harness.
+
+    Entry selection left ``signals.json`` on 2026-07-13 (the
+    ``scanner_predictor_direct`` champion cutover), and every group that had
+    re-implemented its own ENTER-picks reader over that feed silently began
+    measuring an empty book. The rule that survives the class is structural:
+    a group module may not read the ``signal`` discriminator at all, and may
+    not define a private ENTER reader — it calls the harness helper.
+    """
+    groups = REPO_ROOT / "analysis" / "contribution_lift" / "groups"
+    for path in sorted(groups.rglob("*.py")):
+        code = _code_only(path)
+        # The discriminator is only ever spelled as this module-level constant
+        # (string literals are stripped by _code_only), so its presence in a
+        # group IS a private read of the signals feed. Verified against the
+        # pre-fix sources: it fires on all five groups that had one.
+        assert not re.search(r"(?<![\w.])_ENTER(?![\w])", code), (
+            f"{path.name} reads the signals.json ENTER discriminator directly; "
+            "use harness.live_picks_by_cycle / live_picks_by_date / live_widths "
+            "(config-I7501)"
+        )
+        for private in ("_enter_picks", "_enter_picks_by_date", "_enter_tickers",
+                        "_enter_candidates"):
+            assert f"def {private}" not in code, (
+                f"{path.name} defines a private live-selection reader "
+                f"({private}); the harness owns that reader (config-I7501)"
+            )
+
+
+def test_live_selection_prefers_the_executed_trades_over_signals(tmp_path):
+    """trades.db is the ground truth in BOTH eras; signals is only a fallback."""
+    axis = _axis(200)
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:60]]
+    db = _trades_db(tmp_path / "trades.db", {d: ["AAA", "CCC"] for d in dates})
+    inputs = _inputs(
+        axis=axis, dates=dates, signals_by_date=_signals(dates), trades_db_path=db
+    )
+
+    selection = harness.live_selection_of(inputs)
+
+    assert selection.source == harness.SOURCE_TRADES
+    # signals.json says AAA+BBB; the executed record says AAA+CCC and wins.
+    assert harness.live_picks_by_date(inputs)[dates[0]] == ("AAA", "CCC")
+    assert "trades.db" in harness.live_selection_label(inputs)
+
+
+def test_live_selection_falls_back_to_signals_without_a_trades_db():
+    axis = _axis(200)
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:60]]
+    inputs = _inputs(axis=axis, dates=dates, signals_by_date=_signals(dates))
+
+    selection = harness.live_selection_of(inputs)
+
+    assert selection.source == harness.SOURCE_SIGNALS
+    assert harness.live_picks_by_date(inputs)[dates[0]] == ("AAA", "BBB")
+
+
+def test_live_selection_survives_the_champion_era_empty_signals_feed(tmp_path):
+    """The exact I7501 failure: every signals row HOLD, a real executed book.
+
+    Before the fix this window produced zero picks and every picks-based
+    component graded ``N/A-MISSING-INPUT`` while the system was trading.
+    """
+    axis = _axis(200)
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:60]]
+    all_hold = {
+        d: {"signals": {t: {"ticker": t, "signal": "HOLD"} for t in ("AAA", "BBB")}}
+        for d in dates
+    }
+    db = _trades_db(tmp_path / "trades.db", {d: ["AAA", "BBB"] for d in dates})
+    inputs = _inputs(
+        axis=axis, dates=dates, signals_by_date=all_hold, trades_db_path=db
+    )
+
+    arms = cost_adjusted_quality.build_arms(inputs)
+
+    assert isinstance(arms, ArmSet)
+    assert len(arms.baseline.picks) == len(dates)
+    assert "trades.db" in arms.baseline.label
+
+
+def test_live_picks_drop_unpriceable_names_and_out_of_window_cycles(tmp_path):
+    """Declared width must equal traded width, or count-matching breaks."""
+    axis = _axis(200)
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:60]]
+    outside = axis[80].strftime("%Y-%m-%d")
+    db = _trades_db(
+        tmp_path / "trades.db",
+        {dates[0]: ["AAA", "ZZZ"], outside: ["AAA"]},
+    )
+    inputs = _inputs(axis=axis, dates=dates, trades_db_path=db)
+
+    picks = harness.live_picks_by_date(inputs)
+
+    assert picks == {dates[0]: ("AAA",)}  # ZZZ unpriceable, `outside` off-window
+
+
+def test_read_trades_enters_truncates_a_timestamped_date(tmp_path):
+    db = _trades_db(tmp_path / "trades.db", {"2026-08-17T14:30:00Z": ["AAA"]})
+
+    assert harness.read_trades_enters(db) == {"2026-08-17": ("AAA",)}
+
+
+def test_read_trades_enters_tolerates_a_fresh_database(tmp_path):
+    """A trades.db with no trades table yet is a real state, not a crash."""
+    path = tmp_path / "empty.db"
+    sqlite3.connect(path).close()
+
+    assert harness.read_trades_enters(str(path)) == {}
+    assert harness.read_trades_enters(str(tmp_path / "absent.db")) == {}
 
 
 def test_unit_literal_matches_the_krepis_metric_unit():

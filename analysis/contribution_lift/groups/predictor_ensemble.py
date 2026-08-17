@@ -122,6 +122,7 @@ from analysis.contribution_lift.harness import (
     NotAvailable,
     ReplayInputs,
     ReplaySpec,
+    live_widths,
     picks_arm,
 )
 
@@ -159,9 +160,6 @@ _BEST_L1_CANDIDATES = ("expected_move", "research_calibrator_prob", "momentum_sc
 #: (research_calibrator_prob), 0.0791 (momentum_score), 0.0106 (expected_move)
 #: — all decisively raw.
 _STD_BAND = 0.15
-
-#: The signals.json per-ticker ``signal`` value that means "open a position".
-_ENTER = "ENTER"
 
 
 # --------------------------------------------------------------------------
@@ -245,14 +243,14 @@ def _alpha_of(row: dict) -> float | None:
 
 
 def _enter_count(inputs: ReplayInputs, date: str) -> int:
-    """How many names the live book opened on ``date`` — the arm width."""
-    raw = (inputs.signals_by_date.get(date) or {}).get("signals") or {}
-    rows = list(raw.values()) if isinstance(raw, dict) else list(raw)
-    return sum(
-        1
-        for row in rows
-        if isinstance(row, dict) and str(row.get("signal", "")).upper() == _ENTER
-    )
+    """How many names the live book opened on ``date`` — the arm width.
+
+    From ``harness.live_widths`` (config-I7501): the executed ENTERs in
+    trades.db, which is the width in both the pre-champion and the champion
+    era. The signals feed carried the width only until 2026-07-13, when
+    ``scanner_predictor_direct`` moved entry selection out of it.
+    """
+    return live_widths(inputs).get(date, 0)
 
 
 def _signal_scores(inputs: ReplayInputs, date: str) -> dict[str, float]:
@@ -334,8 +332,8 @@ def _no_cycles(what: str) -> NotAvailable:
         status="N/A-MISSING-INPUT",
         reason=(
             f"no cycle in the window produced a count-matched pair of arms for "
-            f"{what} — every cycle lacked either an ENTER-signalled width in "
-            f"signals/{{date}}/signals.json or a usable "
+            f"{what} — every cycle lacked either a live executed width "
+            f"(trades.db ENTER) or a usable "
             f"predictor/predictions/{{date}}.json candidate set ({ISSUE})"
         ),
     )

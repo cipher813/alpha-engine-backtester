@@ -10,8 +10,9 @@ The baseline arm it needs is the zero-cost counterfactual. Both arms trade the
 SAME names, on the same dates, in the same sizes — the ONLY difference is the
 cost model:
 
-* **baseline** — the live signals' ENTER picks at the configured
-  ``simulation_fees`` / ``simulation.slippage_bps``.
+* **baseline** — the live selection (``harness.live_picks_by_cycle``: the
+  executed ENTERs from trades.db, champion-aware per config-I7501) at the
+  configured ``simulation_fees`` / ``simulation.slippage_bps``.
 * **ablated**  — byte-identical picks at ``fees=0, slippage_bps=0``.
 
 So ``lift = baseline_alpha − ablated_alpha`` is the measured cost drag, and it
@@ -37,48 +38,20 @@ from analysis.contribution_lift.harness import (
     NotAvailable,
     ReplayInputs,
     ReplaySpec,
+    live_picks_by_cycle,
+    live_selection_label,
+    no_live_selection,
     picks_arm,
 )
 
 ISSUE = "alpha-engine-config-I7484"
 
-#: The signals.json per-ticker ``signal`` value that means "open a position".
-_ENTER = "ENTER"
-
-
-def _enter_picks(inputs: ReplayInputs) -> list[dict]:
-    """``[{"date", "picks"}]`` — the ENTER-signalled names per cycle.
-
-    Reads the live selection exactly as ``loaders/signal_loader`` documents it:
-    ``signals`` is a ``{ticker: row}`` mapping (legacy payloads emit a list),
-    and the ENTER discriminator is ``row["signal"]``.
-    """
-    cycles: list[dict] = []
-    for date in inputs.dates:
-        raw = (inputs.signals_by_date.get(date) or {}).get("signals") or {}
-        rows = list(raw.values()) if isinstance(raw, dict) else list(raw)
-        picks = sorted({
-            row["ticker"]
-            for row in rows
-            if isinstance(row, dict)
-            and isinstance(row.get("ticker"), str)
-            and str(row.get("signal", "")).upper() == _ENTER
-        })
-        if picks:
-            cycles.append({"date": date, "picks": picks})
-    return cycles
-
 
 def build_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
-    cycles = _enter_picks(inputs)
+    cycles = live_picks_by_cycle(inputs)
     if not cycles:
-        return NotAvailable(
-            status="N/A-MISSING-INPUT",
-            reason=(
-                f"no cycle in the {len(inputs.dates)}-date window carries an "
-                f"ENTER-signalled name in s3://{inputs.bucket}/signals/{{date}}/"
-                f"signals.json — there is no traded book to price ({ISSUE})"
-            ),
+        return no_live_selection(
+            inputs, ISSUE, needs="there is no traded book to price"
         )
     if inputs.fees <= 0.0 and inputs.slippage_bps <= 0.0:
         return NotAvailable(
@@ -91,7 +64,7 @@ def build_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
             ),
         )
 
-    baseline = picks_arm("as-configured", cycles)
+    baseline = picks_arm(f"as-configured — {live_selection_label(inputs)}", cycles)
     ablated = picks_arm(
         "zero-cost (fees=0, slippage=0)", cycles, fees=0.0, slippage_bps=0.0
     )

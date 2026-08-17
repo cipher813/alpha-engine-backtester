@@ -14,10 +14,19 @@ without an operator injecting anything.
 
 Sources (all live as of 2026-08-17):
 
-* ``s3://{bucket}/signals/{date}/signals.json``     — the selection actually made
+* ``trades.db`` (``trades WHERE action='ENTER'``) — the selection actually made
+* ``s3://{bucket}/signals/{date}/signals.json``     — the per-cycle scored universe
 * ``s3://{bucket}/predictor/predictions/{date}.json`` — the per-name alpha hats
 * ``s3://{bucket}/factors/profiles/{date}/by_ticker.json`` — sub-factor pillars
 * ArcticDB (via ``store.arctic_reader.load_universe_from_arctic``) — prices + SPY
+
+The cycle axis is the **live selection's** dates, not the signals partitions'
+(config-I7501). Entry selection left the signals producer on 2026-07-13 when
+``scanner_predictor_direct`` became the champion, so ``signals.json`` carries a
+scored universe but no ENTER rows; the executed record in ``trades.db`` is the
+only feed that spans both eras, and it reaches back to 2026-04 where ``signals/``
+holds ~58 partitions. Anchoring the window to it is what makes the harness's
+60-cycle ``n_floor`` reachable at all.
 
 Explicitly NOT an input: the retired six-team + CIO research-graph tables
 (``team_candidates`` / ``cio_evaluations``, retired 2026-07-12 per
@@ -32,7 +41,13 @@ from typing import Any
 
 import pandas as pd
 
-from analysis.contribution_lift.harness import HORIZON_DAYS, ReplayInputs
+from analysis.contribution_lift.harness import (
+    HORIZON_DAYS,
+    LiveSelection,
+    ReplayInputs,
+    build_live_selection,
+    read_trades_enters,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +77,16 @@ def _empty_matrix() -> pd.DataFrame:
 
 
 def _skipped(
-    run_date: str, bucket: str, config: dict, reason: str, s3_client: Any
+    run_date: str,
+    bucket: str,
+    config: dict,
+    reason: str,
+    s3_client: Any,
+    live_selection: LiveSelection | None = None,
 ) -> ReplayInputs:
     fees, slippage_bps, init_cash = _cost_model(config)
     return ReplayInputs(
+        live_selection=live_selection,
         run_date=run_date,
         dates=[],
         signals_by_date={},
@@ -92,18 +113,20 @@ def load_replay_inputs(
 ) -> ReplayInputs:
     """Assemble the live replay inputs shared by every T5 spec.
 
-    Window selection: the most recent ``lookback_cycles`` signal dates that
-    still have at least ``HORIZON_DAYS`` price rows AFTER them, so every cycle
-    the harness returns has a fully-defined objective. Cycles inside the
-    horizon tail are excluded here rather than truncated later — a short
-    window is a different measurement, not a noisier one.
+    Window selection: the most recent ``lookback_cycles`` **cycle dates that
+    have a live selection** (config-I7501) and that still have at least
+    ``HORIZON_DAYS`` price rows AFTER them, so every cycle the harness returns
+    has both a book to price and a fully-defined objective. Cycles inside the
+    horizon tail are excluded here rather than truncated later — a short window
+    is a different measurement, not a noisier one.
 
     Fails LOUD when ArcticDB is unreachable or returns nothing for a non-empty
     cohort: an empty price matrix would make every arm's return 0.0 and every
     lift exactly 0.0, which is indistinguishable on the artifact from "this
     component contributes nothing". Degrades to ``status="skipped"`` ONLY when
-    there are zero signal dates at all — there is genuinely nothing to replay,
-    and the report is still emitted (always-emit contract).
+    there is genuinely nothing to replay — no cycle carries a live selection,
+    or none of them clears the horizon — and the report is still emitted
+    (always-emit contract).
     """
     import boto3
 
@@ -121,14 +144,27 @@ def load_replay_inputs(
     )
     run_date = run_date or pd.Timestamp.today().strftime("%Y-%m-%d")
 
+    trades_db_path = config.get("_trades_db") or config.get("trades_db")
     signal_dates = _list_date_partitions(s3, bucket, "signals/", "/")
-    if not signal_dates:
+
+    # The cycle axis comes from the EXECUTED record, which spans both the
+    # pre-champion and the champion era; signals partitions contribute only the
+    # per-cycle scored universe the substitution arms re-rank (config-I7501).
+    trades_enters = read_trades_enters(trades_db_path) if trades_db_path else {}
+    if not trades_enters and not signal_dates:
         return _skipped(
             run_date, bucket, config,
-            f"no signals/{{date}}/signals.json partitions under s3://{bucket}/signals/",
+            (
+                f"no live selection to replay: trades.db ({trades_db_path!r}) "
+                f"carries no ENTER rows and there are no "
+                f"signals/{{date}}/signals.json partitions under "
+                f"s3://{bucket}/signals/"
+            ),
             s3,
         )
-    candidate_dates = signal_dates[-max(lookback * 2, lookback):]
+    candidate_dates = sorted(set(signal_dates) | set(trades_enters))[
+        -max(lookback * 2, lookback):
+    ]
 
     pred_dates = set(
         _list_date_partitions(s3, bucket, "predictor/predictions/", ".json")
@@ -136,17 +172,20 @@ def load_replay_inputs(
 
     signals_by_date: dict[str, dict] = {}
     predictions_by_date: dict[str, dict] = {}
-    cohort: set[str] = set()
+    # Every executed name is in the cohort whether or not that cycle has a
+    # signals partition — under the champion the book is opened from the
+    # predictor feed, and a name absent from the price matrix is unpriceable.
+    cohort: set[str] = {t for names in trades_enters.values() for t in names}
+    signal_date_set = set(signal_dates)
     for d in candidate_dates:
-        sig = _load_json(s3, bucket, f"signals/{d}/signals.json")
-        if not isinstance(sig, dict):
-            continue
-        signals_by_date[d] = sig
-        signals = sig.get("signals") or {}
-        rows = list(signals.values()) if isinstance(signals, dict) else list(signals)
-        for row in rows:
-            if isinstance(row, dict) and isinstance(row.get("ticker"), str):
-                cohort.add(row["ticker"])
+        sig = _load_json(s3, bucket, f"signals/{d}/signals.json") if d in signal_date_set else None
+        if isinstance(sig, dict):
+            signals_by_date[d] = sig
+            signals = sig.get("signals") or {}
+            rows = list(signals.values()) if isinstance(signals, dict) else list(signals)
+            for row in rows:
+                if isinstance(row, dict) and isinstance(row.get("ticker"), str):
+                    cohort.add(row["ticker"])
         if d in pred_dates:
             prd = _load_json(s3, bucket, f"predictor/predictions/{d}.json")
             if isinstance(prd, dict):
@@ -159,12 +198,24 @@ def load_replay_inputs(
                 cohort.update(by_ticker)
     cohort -= {_SPY, _CASH}
 
-    if not signals_by_date:
+    selection = build_live_selection(
+        trades_db_path=trades_db_path,
+        signals_by_date=signals_by_date,
+        # None (not {}) when this run has no trades database at all, so the
+        # signals fallback engages there and ONLY there.
+        trades_enters=trades_enters if trades_db_path else None,
+    )
+    if not selection.by_date:
         return _skipped(
             run_date, bucket, config,
-            f"{len(candidate_dates)} signal partitions listed but none parsed "
-            "into a usable signals.json body",
+            (
+                f"{len(candidate_dates)} candidate cycles inspected but none "
+                f"carries a live selection: trades.db ({trades_db_path!r}) has "
+                f"no ENTER rows and no signals.json body in the window carries "
+                f"an ENTER-signalled name"
+            ),
             s3,
+            selection,
         )
 
     from store.arctic_reader import (  # type: ignore[import-not-found]
@@ -198,19 +249,21 @@ def load_replay_inputs(
         )
 
     axis = pd.DatetimeIndex(price_matrix.index).sort_values()
-    dates = _select_window(sorted(signals_by_date), axis, lookback)
+    dates = _select_window(sorted(selection.by_date), axis, lookback)
     if not dates:
         return _skipped(
             run_date, bucket, config,
-            f"{len(signals_by_date)} signal dates loaded but none has "
-            f"{HORIZON_DAYS} price rows after it — every cycle's objective "
-            "would be undefined",
+            f"{len(selection.by_date)} cycles with a live selection "
+            f"({selection.source}) but none has {HORIZON_DAYS} price rows "
+            "after it — every cycle's objective would be undefined",
             s3,
+            selection,
         )
 
     pillar_profiles_by_date = _load_pillar_profiles(bucket, dates)
 
     source_paths = [
+        f"{trades_db_path or 'trades.db (absent)'} (trades WHERE action='ENTER')",
         f"s3://{bucket}/signals/{{date}}/signals.json",
         f"s3://{bucket}/predictor/predictions/{{date}}.json",
         f"s3://{bucket}/factors/profiles/{{date}}/by_ticker.json",
@@ -219,15 +272,16 @@ def load_replay_inputs(
 
     fees, slippage_bps, init_cash = _cost_model(config)
     logger.info(
-        "contribution_lift inputs: %d cycles (%s -> %s), cohort=%d, "
+        "contribution_lift inputs: %d cycles (%s -> %s) from %s, cohort=%d, "
         "price_matrix=%dx%d, fees=%.4f slippage_bps=%.1f",
-        len(dates), dates[0], dates[-1], len(cohort),
+        len(dates), dates[0], dates[-1], selection.source, len(cohort),
         len(price_matrix), len(price_matrix.columns), fees, slippage_bps,
     )
     return ReplayInputs(
+        live_selection=selection,
         run_date=run_date,
         dates=dates,
-        signals_by_date={d: signals_by_date[d] for d in dates},
+        signals_by_date={d: signals_by_date[d] for d in dates if d in signals_by_date},
         predictions_by_date={
             d: predictions_by_date[d] for d in dates if d in predictions_by_date
         },
@@ -238,7 +292,7 @@ def load_replay_inputs(
         fees=fees,
         slippage_bps=slippage_bps,
         init_cash=init_cash,
-        trades_db_path=config.get("_trades_db") or config.get("trades_db"),
+        trades_db_path=trades_db_path,
         research_db_path=config.get("research_db"),
         s3_client=s3,
         status="ok",
@@ -247,11 +301,11 @@ def load_replay_inputs(
 
 
 def _select_window(
-    signal_dates: list[str], axis: pd.DatetimeIndex, lookback: int
+    cycle_dates: list[str], axis: pd.DatetimeIndex, lookback: int
 ) -> list[str]:
-    """Most recent ``lookback`` signal dates with a FULL horizon of prices after."""
+    """Most recent ``lookback`` live-selection dates with a FULL horizon after."""
     usable: list[str] = []
-    for d in signal_dates:
+    for d in cycle_dates:
         pos = int(axis.searchsorted(pd.Timestamp(d), side="right"))
         if pos == 0 or pos + HORIZON_DAYS > len(axis):
             continue

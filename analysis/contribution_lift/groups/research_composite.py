@@ -23,8 +23,10 @@ row mean. The board's terminal cross-sectional percentile is a monotone
 transform, so ranking on this blend IS ranking on the live
 ``attractiveness_score``.
 
-* baseline — top-N by that composite, N = the live signals' ENTER count for the
-  same cycle (count-matched to the book the system actually opened).
+* baseline — top-N by that composite, N = the live selection's width for the
+  same cycle (``harness.live_picks_by_date``: the executed ENTERs in trades.db,
+  champion-aware per config-I7501 — count-matched to the book the system
+  actually opened).
 * ablated  — **every pillar replaced by its own cross-sectional mean**. That is
   the leave-one-out for a *ranking* component: substituting each input by its
   cross-sectional mean collapses every winsorized-z to zero, so the composite
@@ -63,8 +65,8 @@ leave-one-out is to bypass it.
 ``scanner_feed_counterfactual`` — **measured**. The component is the scanner's
 ranking of the ~900-name PIT universe down to the passing pool.
 
-* baseline — the live selection: the ENTER-signalled names in
-  ``signals/{date}/signals.json``.
+* baseline — the live selection: the names actually entered that cycle
+  (``harness.live_picks_by_date``, config-I7501).
 * ablated  — the same count drawn from the **pre-scanner** PIT population
   (every ``scanner_evaluations`` row for the as-of research cycle, i.e. the
   names the scanner had in front of it) with its ranking removed, by the same
@@ -103,15 +105,15 @@ from analysis.contribution_lift.harness import (
     NotAvailable,
     ReplayInputs,
     ReplaySpec,
+    live_picks_by_date,
+    live_selection_label,
+    no_live_selection,
     picks_arm,
 )
 
 logger = logging.getLogger(__name__)
 
 ISSUE = "alpha-engine-config-I7478"
-
-#: The signals.json per-ticker ``signal`` value that means "open a position".
-_ENTER = "ENTER"
 
 #: Winsorization bound of the live universe board's per-pillar z-score.
 _PILLAR_CLIP = 3.0
@@ -130,30 +132,9 @@ _PROFILES_KEY = "factors/profiles/{date}/by_ticker.json"
 # --------------------------------------------------------------------------
 
 
-def _enter_picks_by_date(inputs: ReplayInputs) -> dict[str, tuple[str, ...]]:
-    """``{cycle_date: (ENTER tickers,)}`` from the live signals artifact.
-
-    Restricted to names the price matrix can actually price — an unpriceable
-    name is silently dropped by ``picks_to_orders``, so counting it here would
-    make the declared width disagree with the traded width.
-    """
-    columns = set(map(str, inputs.price_matrix.columns))
-    out: dict[str, tuple[str, ...]] = {}
-    for date in inputs.dates:
-        raw = (inputs.signals_by_date.get(date) or {}).get("signals") or {}
-        rows = list(raw.values()) if isinstance(raw, dict) else list(raw)
-        picks = sorted({
-            row["ticker"]
-            for row in rows
-            if isinstance(row, dict)
-            and isinstance(row.get("ticker"), str)
-            and str(row.get("signal", "")).upper() == _ENTER
-            and row["ticker"] in columns
-        })
-        if picks:
-            out[date] = tuple(picks)
-    return out
-
+# The live selection — and the width every arm is count-matched to — comes
+# from ``harness.live_picks_by_date`` (config-I7501), which reads the executed
+# ENTERs in trades.db rather than the signals feed the champion left empty.
 
 # --------------------------------------------------------------------------
 # The live attractiveness composite
@@ -234,20 +215,14 @@ def _rotated_slice(universe: Sequence[str], n: int, cycle_index: int) -> tuple[s
 
 
 def _no_enter(inputs: ReplayInputs) -> NotAvailable:
-    return NotAvailable(
-        status="N/A-MISSING-INPUT",
-        reason=(
-            f"no cycle in the {len(inputs.dates)}-date window carries a priceable "
-            f"ENTER-signalled name in s3://{inputs.bucket}/signals/{{date}}/"
-            f"signals.json — there is no live width to count-match against "
-            f"({ISSUE})"
-        ),
+    return no_live_selection(
+        inputs, ISSUE, needs="there is no live width to count-match against"
     )
 
 
 def build_research_composite_ic_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
     """Top-N by the live attractiveness composite vs the same width, unranked."""
-    live_width = _enter_picks_by_date(inputs)
+    live_width = live_picks_by_date(inputs)
     if not live_width:
         return _no_enter(inputs)
     if not inputs.pillar_profiles_by_date:
@@ -334,7 +309,7 @@ def build_neutralization_live_efficacy_arms(
     """Neutralized composite vs raw composite — the residualizer's own lift."""
     from analysis.end_to_end import DEFAULT_NEUTRALIZE_FACTORS, _xs_neutralize
 
-    live_width = _enter_picks_by_date(inputs)
+    live_width = live_picks_by_date(inputs)
     if not live_width:
         return _no_enter(inputs)
     if not inputs.pillar_profiles_by_date:
@@ -464,7 +439,7 @@ def build_scanner_feed_counterfactual_arms(
     inputs: ReplayInputs,
 ) -> ArmSet | NotAvailable:
     """The live selection vs the same width drawn unranked from its own feed."""
-    live_width = _enter_picks_by_date(inputs)
+    live_width = live_picks_by_date(inputs)
     if not live_width:
         return _no_enter(inputs)
 
@@ -523,7 +498,10 @@ def build_scanner_feed_counterfactual_arms(
             ),
         )
     return ArmSet(
-        baseline=picks_arm("live scanner-fed selection (signals ENTER)", baseline_cycles),
+        baseline=picks_arm(
+            f"live scanner-fed selection — {live_selection_label(inputs)}",
+            baseline_cycles,
+        ),
         ablated=picks_arm(
             "same width drawn unranked from the pre-scanner PIT population "
             "(cycle-rotated ticker order)",
