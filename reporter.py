@@ -1355,6 +1355,7 @@ def save(
     shadow_book: dict | None = None,
     exit_timing: dict | None = None,
     e2e_lift: dict | None = None,
+    contribution_lift: dict | None = None,
     veto_result: dict | None = None,
     confusion_matrix: dict | None = None,
     post_trade: dict | None = None,
@@ -1632,6 +1633,12 @@ def save(
         ("shadow_book.json", shadow_book),
         ("exit_timing.json", exit_timing),
         ("e2e_lift.json", e2e_lift),
+        # Contribution-lift replay harness (RC v3 T5, config-I7475) — the
+        # measured marginal contribution of each graded component to the one
+        # objective. Always-emit like every artifact above: a `skipped` body
+        # (no signal dates) and an absent object mean different things, and
+        # only the artifact can tell them apart.
+        ("contribution_lift.json", contribution_lift),
         ("veto_analysis.json", veto_result),
         ("confusion_matrix.json", confusion_matrix),
         ("provenance_grounding.json", provenance_grounding),

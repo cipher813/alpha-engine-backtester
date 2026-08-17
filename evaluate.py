@@ -74,6 +74,7 @@ from analysis.optimizer_churn import compute_optimizer_churn
 from analysis.walk_forward_stability import compute_walk_forward_stability
 from analysis import factor_blend_sensitivity
 from analysis import factor_blend_counterfactual_replay
+from analysis.contribution_lift.report import run_contribution_lift
 from analysis import veto_analysis
 from analysis import decision_capture_coverage, executor_decision_capture_coverage, measurement_coverage, provenance_grounding, quant_rank_quality
 from analysis import cio_rule_tag_precision
@@ -748,6 +749,24 @@ def _run_diagnostics(
     results["factor_blend_counterfactual_replay"] = tracker.run_module(
         "factor_blend_counterfactual_replay",
         lambda: _run_factor_blend_counterfactual_replay(config),
+        required_inputs={},
+    )
+
+    # Contribution-lift replay harness (RC v3 T5, config-I7475). Measures each
+    # graded component's MARGINAL contribution to the one objective — per-cycle
+    # net-of-cost 21d log-alpha vs SPY — by replaying the pipeline as-configured
+    # against an ablated arm, both through the cost-bearing simulator.
+    #
+    # LIVE, not opt-in — deliberately unlike the two replay precedents above.
+    # `factor_blend_counterfactual_replay` and `sector_constraint_replay` both
+    # take their cycles + price matrix as INJECTED config, and nothing in the
+    # live weekly path injects them, so the former is a guaranteed `skipped` on
+    # every Saturday run and the latter has zero live callers. This module loads
+    # its own inputs (signals/ + predictor/predictions/ + factors/profiles/ +
+    # ArcticDB) so the report card is built on a replay that actually ran.
+    results["contribution_lift"] = tracker.run_module(
+        "contribution_lift",
+        lambda: run_contribution_lift(config, run_date=config.get("_run_date")),
         required_inputs={},
     )
 
@@ -2713,6 +2732,7 @@ def _main_impl() -> None:
             walk_forward_stability=walk_forward_stability_result,
             significance_observe=_collect_significance_observe(opt_results),
             e2e_lift=diagnostics.get("e2e_lift"),
+            contribution_lift=diagnostics.get("contribution_lift"),
             veto_result=opt_results.get("veto_result"),
             confusion_matrix=diagnostics.get("confusion_matrix"),
             post_trade=diagnostics.get("post_trade"),
