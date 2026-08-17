@@ -840,8 +840,20 @@ publish_ops_alert(
     fi
     echo "==> Terminating spot instance $INSTANCE_ID..."
     aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
-    aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
-    echo "  Instance terminated; S3 staging cleaned."
+    # config-I7442 — NOT `aws s3 rm "$S3_STAGING" --recursive`. This prefix
+    # holds SSM's own upload of the FULL remote stdout/stderr (run_ssm points
+    # OutputS3KeyPrefix at ${S3_STAGING_PREFIX}/ssm-output); the recursive
+    # delete that used to sit here destroyed the only un-truncated copy of a
+    # failure's evidence as part of handling that failure. See the same
+    # replacement in _spot_common.sh, which this retained-rollback monolith
+    # mirrors. A launcher that keeps an unguarded delete is the defect
+    # regardless of whether it is the live path today.
+    if ! "$LIB_PYTHON" -m krepis.spot_evidence teardown \
+            --staging "$S3_STAGING" \
+            --slug "backtest" \
+            --exit-code "$exit_code"; then
+        echo "  spot_evidence: chokepoint unavailable via $LIB_PYTHON — S3 staging RETAINED at $S3_STAGING/ (not deleted)" >&2
+    fi
     # #883 — on a classified reclaim, relaunch a FRESH spot with the SAME
     # argv, threading the incremented SPOT_ATTEMPT via the env. `trap - EXIT`
     # first so the exec'd process installs its own trap cleanly; exec
