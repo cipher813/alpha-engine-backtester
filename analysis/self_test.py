@@ -103,14 +103,16 @@ from typing import Any, Callable
 
 from nousergon_lib.quant.selftest import (
     CASE_TIMEOUT_SECONDS,
-    FAIL,
-    PASS,
-    UNKNOWN,
     Case,
     code_sha as _lib_code_sha,
     resolved_library_versions as _lib_resolved_library_versions,
     run_self_test as _lib_run_self_test,
-    verdict_is_pass,
+)
+from nousergon_lib.quant.selftest import FAIL as FAIL  # noqa: PLC0414 — re-exported (st.FAIL)
+from nousergon_lib.quant.selftest import PASS as PASS  # noqa: PLC0414 — re-exported (st.PASS)
+from nousergon_lib.quant.selftest import UNKNOWN as UNKNOWN  # noqa: PLC0414 — re-exported (st.UNKNOWN)
+from nousergon_lib.quant.selftest import (
+    verdict_is_pass as verdict_is_pass,  # noqa: PLC0414 — re-exported (st.verdict_is_pass)
 )
 
 logger = logging.getLogger(__name__)
