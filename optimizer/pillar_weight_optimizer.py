@@ -22,6 +22,46 @@ Pillar shapes are the canonical nousergon-lib types
 than re-deriving the composite arithmetic, so it scores against exactly the
 breakdown the research module persists.
 
+RETIRED 2026-08-18 — alpha-engine-config-I7637
+---------------------------------------------
+**This optimizer has never selected anything, and its input no longer exists.**
+
+``_score_name`` reconstructs a composite from ``{pillar}_quant`` /
+``{pillar}_qual`` and ``legacy_blend_score``. Those columns came from
+``investment_thesis.composite_breakdown``, emitted by the six-team + CIO
+research graph — **retired 2026-07-12 (config#1580)**. The live producer since
+that date is ``signals_envelope.py``, and it does not emit them.
+
+Measured against live S3 on 2026-08-18 rather than inferred from the code:
+
+* ``s3://alpha-engine-research/signals/latest.json`` — ``investment_thesis``
+  present on **0 of 903** signals. The per-name shape is
+  ``{quant_score, qual_score, sub_scores: {quant, qual}, factor_quality_score}``
+  — a FLAT quant/qual pair, with no per-pillar decomposition at any depth.
+* ``s3://alpha-engine-research/config/scoring_weights_shadow_history/`` —
+  **empty**, and ``latest.json`` 404s. ``apply()`` runs only on ``status: ok``,
+  so it has never fired since inception.
+
+So I7637's option (a) — "wire the columns from ``composite_breakdown``" — is
+**not available**: there is no live producer to wire, and the six-pillar
+decomposition the sweep needs does not exist anywhere in the current pipeline.
+Option (b), retire, declared and dated the way ``team_metrics`` was retired
+under config#7616, is what this is.
+
+**Why an empty prefix was not good enough.** Anyone reading this repo saw
+pillar weights being optimised on a shadow cadence with a promotion path. What
+existed was a function that returned early on missing columns and an S3 prefix
+that had never received an object. The silent early return is what made it
+invisible; ``recommend`` now returns ``status: retired`` explicitly and
+``apply`` refuses, so the state is legible from the artifact rather than from
+an absence.
+
+**To revive it**, a producer must emit per-pillar quant/qual splits onto
+``score_performance`` again. Restore the guard's inputs first and re-run in
+shadow for at least one full cycle before arming any promotion path: this
+optimizer has never produced a number, so its first output is unvalidated by
+construction (I7637 deliverable 3).
+
 SHADOW MODE ONLY — HARD INVARIANT
 ---------------------------------
 This optimizer NEVER writes the live scoring-weights config key
@@ -54,6 +94,19 @@ from nousergon_lib.quant.horizons import DEFAULT_POLICY
 from optimizer.weight_optimizer import S3_SHADOW_WEIGHTS_PREFIX
 
 logger = logging.getLogger(__name__)
+
+#: alpha-engine-config-I7637. Dated and reasoned so a reader sees "retired
+#: 2026-08-18 because X" rather than an empty S3 prefix they must investigate.
+RETIRED_ON = "2026-08-18"
+RETIRED_REASON = (
+    "the six-pillar quant/qual decomposition this optimizer scores from was "
+    "emitted by the research graph retired 2026-07-12 (config#1580). Measured "
+    "2026-08-18: investment_thesis is present on 0 of 903 live signals, the "
+    "per-name shape carries only a flat quant/qual pair, and "
+    "config/scoring_weights_shadow_history/ is empty — apply() has never fired "
+    "since inception. Retired under alpha-engine-config-I7637; see the module "
+    "docstring for what a revival needs."
+)
 
 # The LIVE scoring-weights key — imported ONLY so callers/tests can assert this
 # module never writes it. This module has no code path that puts to it.
@@ -332,6 +385,37 @@ def recommend(
     NOTE: recommend() is pure — it performs NO S3 writes. Shadow archival is
     :func:`apply`.
     """
+    # RETIRED (alpha-engine-config-I7637). Returns before any work, with the
+    # reason ON the artifact. Deliberately NOT left as the pre-existing silent
+    # early return on missing columns: that shape is exactly why an optimizer
+    # with no inputs looked like a dormant feature for two months rather than a
+    # declared capability the system does not have.
+    #
+    # The implementation below is PRESERVED, not deleted, and stays under test
+    # via `_recommend_impl`. A revival needs a producer emitting the six
+    # per-pillar quant/qual columns again (module docstring); it must not also
+    # need this arithmetic re-derived and re-validated from scratch.
+    return {
+        "status": "retired",
+        "retired_on": RETIRED_ON,
+        "retired_reason": RETIRED_REASON,
+        "note": f"pillar_weight_optimizer was retired {RETIRED_ON} — {RETIRED_REASON}",
+    }
+
+
+def _recommend_impl(
+    df: pd.DataFrame,
+    current_weights: dict | None = None,
+) -> dict:
+    """The preserved sweep-then-rank body of :func:`recommend`.
+
+    Unreachable in production — :func:`recommend` returns ``retired`` above it
+    (alpha-engine-config-I7637). Kept callable and kept under test so the
+    composite-reconstruction and alpha-floor arithmetic does not have to be
+    re-validated from scratch if a producer ever emits the per-pillar columns
+    again. Do NOT wire this to a caller: the revival path is to re-point
+    ``recommend`` at it, deliberately, after one full shadow cycle.
+    """
     prepared = _prepare(df)
     if isinstance(prepared, dict):
         return prepared  # early exit
@@ -573,6 +657,11 @@ def apply(result: dict, bucket: str) -> dict:
     live-cutover branch. Always returns ``{"applied": False, ...}`` — shadow
     archival is not a live apply.
     """
+    # Retirement reaches here for free: `recommend` returns status "retired",
+    # which is not "ok", so nothing is written and the reason rides on the
+    # result. Stated rather than left implicit — a future reader must not
+    # "fix" the empty shadow prefix by relaxing this guard
+    # (alpha-engine-config-I7637).
     if result.get("status") != "ok":
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
