@@ -49,6 +49,31 @@ RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.
     pip install --no-cache-dir -r requirements-concordance.txt && \
     rm -rf /root/.cache/pip
 
+# nous-ergon-ops-I738: krepis-PR95 (v0.59.15/0.59.16, merged 2026-08-18)
+# added an in-process DLP scan hook to krepis.llm.LLMClient that shells
+# out to `gitleaks` and fails closed (LLMError DLP_SCAN_ERROR) when the
+# binary is missing from PATH. The `krepis[openai]>=0.59.8` floor above
+# has no ceiling, so a fresh image build resolves to 0.59.16 — and
+# handler.py's `replay.batch` path calls replay/runner.py's
+# `_invoke_target_with_schema`, which invokes the real
+# krepis.llm.LLMClient.structured() LIVE against OpenRouter every weekly
+# concordance run. Without gitleaks on PATH, every live production
+# invocation would fail closed. Same pinned version/checksum as krepis's
+# own CI step (krepis .github/workflows/test.yml, commit 3488b0dc); no
+# `sudo` since this runs as root in the build.
+RUN microdnf install -y tar gzip && microdnf clean all && \
+    GITLEAKS_VERSION="8.30.1" && \
+    GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" && \
+    curl -sSL -o /tmp/gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" && \
+    echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks && \
+    chmod +x /tmp/gitleaks && \
+    mv /tmp/gitleaks /usr/local/bin/gitleaks && \
+    rm -f /tmp/gitleaks.tar.gz && \
+    gitleaks version && \
+    mkdir -p /opt/groom-llm-routing && \
+    printf '[extend]\nuseDefault = true\n' > /opt/groom-llm-routing/gitleaks-egress.toml
+
 # Application code — mirror lambda_health's per-file COPY pattern.
 # Lambda Lambda task layout flattens lambda_concordance/handler.py to
 # /var/task/handler.py (handler resolves LAMBDA_TASK_ROOT). replay/
