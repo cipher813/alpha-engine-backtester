@@ -801,7 +801,7 @@ class TestSavePersistence:
         from reporter import save
         return save(
             report_md="# r",
-            signal_quality={},
+            signal_quality={"status": "skipped"},
             score_analysis=[],
             run_date="2026-06-04",
             results_dir=str(tmp_path),
@@ -871,6 +871,73 @@ class TestSavePersistence:
         assert not (out / "team_metrics.json").exists()
 
 
+class TestSaveSignalQualityJson:
+    """config-I7599: signal_quality.json is a first-class ALWAYS-EMIT artifact
+    carrying the full `compute_accuracy` output — including `by_score_bucket`,
+    which metrics.json's flatten-`overall`-to-top-level shape structurally
+    cannot carry (crucible-evaluator's `_METRICS_NON_OVERALL_KEYS` exclusion
+    reconstructs `overall` only)."""
+
+    def _save(self, tmp_path, signal_quality, **kw):
+        from reporter import save
+        return save(
+            report_md="# r",
+            signal_quality=signal_quality,
+            score_analysis=[],
+            run_date="2026-06-04",
+            results_dir=str(tmp_path),
+            **kw,
+        )
+
+    def test_full_payload_round_trips(self, tmp_path):
+        import json
+        sq = {
+            "status": "ok",
+            "rows_5d_populated": 120,
+            "rows_21d_populated": 118,
+            "overall": {
+                "accuracy_5d": 0.55, "accuracy_21d": 0.58,
+                "avg_alpha_5d": 0.012, "avg_alpha_21d": 0.031,
+                "n_5d": 120, "n_21d": 118,
+            },
+            "by_score_bucket": [
+                {"bucket": "60-70", "accuracy_21d": 0.52, "n": 40},
+                {"bucket": "90+", "accuracy_21d": 0.71, "n": 12},
+            ],
+        }
+        out = self._save(tmp_path, sq)
+        assert (out / "signal_quality.json").exists()
+        loaded = json.loads((out / "signal_quality.json").read_text())
+        assert loaded == sq
+        assert loaded["by_score_bucket"][1]["bucket"] == "90+"
+
+    def test_non_ok_status_is_still_persisted(self, tmp_path):
+        import json
+        out = self._save(tmp_path, {"status": "insufficient_data", "rows_21d_populated": 3})
+        assert (out / "signal_quality.json").exists()
+        assert json.loads((out / "signal_quality.json").read_text())["status"] == "insufficient_data"
+
+    def test_skipped_default_is_still_persisted(self, tmp_path):
+        import json
+        # ALWAYS-EMIT: evaluate.py's default before signal-quality runs
+        # ({"status": "skipped"}) must land, distinguishing "ran with nothing
+        # to report" is not this artifact's job — absence-detection is
+        # metrics.json/status-based upstream; this artifact's own presence is
+        # the freshness signal.
+        out = self._save(tmp_path, {"status": "skipped"})
+        assert (out / "signal_quality.json").exists()
+        assert json.loads((out / "signal_quality.json").read_text()) == {"status": "skipped"}
+
+    def test_missing_status_key_rejected_at_write_time(self, tmp_path):
+        # Producer-side contract (config-I7599, M0 rule): `status` is
+        # required by contracts/signal_quality.schema.json. A stub that
+        # forgot it must fail loud at write time, not ship a malformed
+        # artifact for the evaluator to choke on.
+        import jsonschema
+        with pytest.raises(jsonschema.ValidationError):
+            self._save(tmp_path, {})
+
+
 # ── save() — Phase B1d optimizer/diagnostic artifact persistence ─────────────
 
 
@@ -884,7 +951,7 @@ class TestSaveB1dOptimizerArtifacts:
         from reporter import save
         return save(
             report_md="# r",
-            signal_quality={},
+            signal_quality={"status": "skipped"},
             score_analysis=[],
             run_date="2026-06-04",
             results_dir=str(tmp_path),
@@ -932,7 +999,7 @@ class TestSaveRiskRatioCI:
         from reporter import save
         return save(
             report_md="# r",
-            signal_quality={},
+            signal_quality={"status": "skipped"},
             score_analysis=[],
             run_date="2026-06-04",
             results_dir=str(tmp_path),
