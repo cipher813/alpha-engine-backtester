@@ -8,6 +8,13 @@ omit = [
     "tests/*",
     ".venv/*",
     "venv/*",
+    # Sibling repos checked out into this tree by CI so the cross-repo parity
+    # tests can import their live source (config-I7619). They are OTHER repos'
+    # code measured by OTHER repos' suites — counting them here would mean this
+    # repo's ratchet moves whenever crucible-executor or nousergon-data grows a
+    # file, which is a coverage number that says nothing about this repo.
+    ".executor-src/*",
+    ".sf-defs/*",
 ]
 
 [tool.coverage.report]
