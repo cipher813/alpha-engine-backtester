@@ -392,7 +392,7 @@ class TestColdStartDeferral:
 # The tag every deploy artifact must pin. `tests/test_lib_pin_lockstep.py`
 # asserts requirements.txt and the three Lambda Dockerfiles all carry the SAME
 # tag; this constant is what that tag must be.
-_EXPECTED_LIB_TAG = "v0.124.68"
+_EXPECTED_LIB_TAG = "v0.124.69"
 
 
 class TestLibVersionPin:
@@ -417,13 +417,17 @@ class TestLibVersionPin:
             )
         ), (
             f"nousergon-lib should pin to {_EXPECTED_LIB_TAG} — bumped for "
+            "nousergon_lib.quant.selftest, the shared self-test runner "
+            "(config-I7238 / nousergon-lib-PR328): this repo's "
+            "analysis/self_test.py now imports the Case/verdict taxonomy and "
+            "the perturbation-sensitivity helper from the library instead of "
+            "carrying its own ~231-line copy, so below this pin the module "
+            "does not import. Prior: v0.124.68 — "
             "nousergon_lib.quant.riskstats.downside_deviation and the "
             "`denominator` parameter on sortino_ratio (config-I7597: the "
             "backtester's risk-ratio call sites and vectorbt_bridge's "
-            "Sortino now call the library instead of re-deriving it). This "
-            "tag is nousergon-lib-PR327's merge-time autobump from v0.124.66; "
-            "if that merge published a different patch, this is the one "
-            "line to correct. Prior: v0.124.66 — the first published release "
+            "Sortino call the library instead of re-deriving it). "
+            "Prior: v0.124.66 — the first published release "
             "carrying the producer_champion_audit contract (nousergon-lib-"
             "PR325, alpha-engine-config-I7605); this repo's test suite reads "
             "that schema from the installed library rather than from a "
