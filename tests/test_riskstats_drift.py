@@ -81,11 +81,33 @@ def test_vectorized_sortino_matches_library(name: str) -> None:
         assert got == pytest.approx(want, **_TOL), name
 
 
+def _ref_sortino_n_down(r: list[float], ppy: int = 252) -> float | None:
+    """The RETIRED n_down convention, written out from the definition.
+
+    Deliberately not a library call. config-I7638 deleted the ``"downside"``
+    branch from ``nousergon_lib.quant.riskstats`` — asking the library for the
+    convention it just removed would make this file's verdict depend on which
+    library version happens to be installed, which is exactly the drift this
+    file exists to catch. Written out here, the test pins the kernel against
+    BOTH conventions on any pinned library.
+    """
+    if len(r) < 2:
+        return None
+    mean = sum(r) / len(r)
+    short = [x for x in r if x < 0.0]
+    if not short:
+        return None
+    dd = math.sqrt(sum(d * d for d in short) / len(short))
+    if not dd:
+        return None
+    return (mean / dd) * math.sqrt(ppy)
+
+
 def test_vectorized_kernel_uses_the_full_sample_denominator() -> None:
     """The kernel must be on the config-I7271 n-denominator, not n_down."""
     r = CORPUS["mixed"]
     got = float(vectorized_stats.compute_sortino_ratio(np.array([r], dtype=np.float64))[0])
-    n_down_variant = riskstats.sortino_ratio(r, denominator="downside")
+    n_down_variant = _ref_sortino_n_down(r)
     assert n_down_variant is not None
     assert got != pytest.approx(n_down_variant, **_TOL)
     assert got == pytest.approx(riskstats.sortino_ratio(r), **_TOL)
@@ -138,7 +160,7 @@ def test_sortino_call_sites_are_on_the_fleet_denominator(name: str) -> None:
 
     config-I7618 converted the last three holdouts (``risk_ratio_ci._sortino``,
     ``factor_blend_sensitivity._sortino``, ``pillar_weight_optimizer._sortino``)
-    off the ``denominator="downside"`` variant, which divided by the count of
+    off the retired n_down variant, which divided by the count of
     below-target observations and understated each by sqrt(n / n_down). This
     pins them to ``"full"`` so a silent change of convention fails here.
     """
@@ -162,18 +184,23 @@ def test_no_source_file_asks_for_the_downside_denominator() -> None:
     """config-I7618 class guard: the non-standard variant cannot be reintroduced.
 
     A per-call-site numeric test only catches the sites it already knows about;
-    this catches the NEXT one. Scoped to production source — ``tests/`` is
-    exempt because ``test_the_two_conventions_really_do_differ`` below must name
-    the variant to prove the two conventions have not collapsed into each other.
+    this catches the NEXT one. ``tests/`` is no longer exempt: config-I7638
+    rewrote ``test_the_two_conventions_really_do_differ`` to write the retired
+    convention out from the definition, so nothing in this repo needs to name
+    the variant in a live call any more.
 
-    The library still HAS the branch: ``nousergon_lib.quant.stats.regime_sortino``
-    calls it (measured 2026-08-18 on nousergon-lib origin/main), so config-I7618
-    deliverable 4 (delete the branch) stays blocked on converting that consumer.
-    This guard is what makes the branch's continued existence harmless here.
+    The library no longer HAS the branch either — config-I7638 converted
+    ``nousergon_lib.quant.stats.regime_sortino``, the last two call sites, and
+    deleted it, so a call site anywhere in the fleet now raises ValueError
+    rather than silently computing the retired convention. This guard is the
+    repo-local half: it fails in review rather than at runtime.
     """
     repo_root = pathlib.Path(__file__).resolve().parent.parent
-    skip_dirs = {".git", ".venv", "venv", "tests", "build", "dist",
+    skip_dirs = {".git", ".venv", "venv", "build", "dist",
                  "__pycache__", "node_modules", ".worktrees"}
+    # Spelled in pieces so this detector is not its own first offender.
+    retired = "down" + "side"
+    needles = (f'denominator="{retired}"', f"denominator='{retired}'")
     offenders = []
     for path in repo_root.rglob("*.py"):
         if any(part in skip_dirs for part in path.relative_to(repo_root).parts):
@@ -182,20 +209,27 @@ def test_no_source_file_asks_for_the_downside_denominator() -> None:
         for i, line in enumerate(text.splitlines(), 1):
             if line.lstrip().startswith("#"):
                 continue  # a comment may explain the variant it does not use
-            if 'denominator="downside"' in line or "denominator='downside'" in line:
+            if any(needle in line for needle in needles):
                 offenders.append(f"{path.relative_to(repo_root)}:{i}")
     assert not offenders, (
-        "denominator=\"downside\" is the non-standard n_down convention "
-        "config-I7271 ruled against and config-I7618 removed from this repo. "
-        "Use denominator=\"full\". Offenders: " + ", ".join(offenders)
+        f'denominator="{retired}" is the retired n_down convention '
+        "config-I7271 ruled against, config-I7618 removed from this repo and "
+        'config-I7638 deleted from the library. Use denominator="full". '
+        "Offenders: " + ", ".join(offenders)
     )
 
 
 def test_the_two_conventions_really_do_differ() -> None:
-    """Guard against the variants collapsing into each other and hiding drift."""
+    """Guard against the variants collapsing into each other and hiding drift.
+
+    The retired side comes from :func:`_ref_sortino_n_down`, not the library —
+    see the note there. What this pins is that the number this repo publishes is
+    the FULL-sample one and is sqrt(n / n_down) away from what it used to be; it
+    keeps saying that on a library where the retired branch no longer exists.
+    """
     r = CORPUS["mixed"]
     n, n_down = len(r), sum(1 for x in r if x < 0)
     full = riskstats.sortino_ratio(r)
-    down = riskstats.sortino_ratio(r, denominator="downside")
+    down = _ref_sortino_n_down(r)
     assert full is not None and down is not None
     assert full / down == pytest.approx(math.sqrt(n / n_down), rel=1e-12)
