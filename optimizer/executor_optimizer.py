@@ -137,6 +137,12 @@ FACTORY_DEFAULTS = {
 
 # ── Fallback defaults (override via executor_optimizer section in config.yaml) ──
 _MIN_VALID_COMBOS = 5
+# RELATIVE improvement (a ratio), not a Sharpe-unit value, and both sides of
+# that ratio — `baseline_sharpe` and `best_sharpe` — are rows of the SAME
+# sweep_df computed in the SAME run (see `baseline_row = _find_closest_combo(
+# valid, ...)`), so they always carry the same annualization convention. The
+# config-I7236 sqrt(365)->sqrt(252) rescale cancels exactly here and this value
+# is unchanged by it (config-I7598, option (c): still correct as it stands).
 _MIN_SHARPE_IMPROVEMENT = 0.10
 _MIN_SORTINO_IMPROVEMENT = 0.05
 _MIN_TRADES_TO_PROMOTE = 50
@@ -211,10 +217,33 @@ _IMPROVEMENT_DENOM_FLOOR = 1e-6
 #
 # Floors are metric-specific because the rank columns roll in
 # structurally different units:
-#  * sortino_ratio / sharpe_ratio: dimensionless risk-adjusted return
-#    ratios; typical 0–2 range, 0.05 is the floor at which the ratio
-#    becomes distinguishable from zero on typical 10–12 month sweep
-#    windows.
+#  * sortino_ratio: dimensionless risk-adjusted return ratio; typical
+#    0–2 range. 0.05 keeps a near-zero baseline out of the percent
+#    framing. Sortino's annualization did not change in config-I7236,
+#    so this floor's basis is unchanged.
+#  * sharpe_ratio: same units, but the Sharpe SCALE moved. config-I7236
+#    replaced vectorbt's sqrt(365) annualization with the fleet's
+#    sqrt(252) (`vectorbt_bridge.py:360`), so every Sharpe this repo
+#    reports is now sqrt(252/365) = 0.83045x its pre-fix value for
+#    identical returns. A floor left at 0.05 therefore rejects ~20% MORE
+#    baselines than it did before the fix, with no decision behind the
+#    change. Re-derived on the new scale (config-I7598):
+#        0.05 * sqrt(252/365) = 0.05 * 0.830455 = 0.0415
+#    This is a unit conversion, and it is the whole of what it claims to
+#    be: a denominator-blowup guard that holds its pre-fix behaviour.
+#    It is NOT a significance floor, whatever the wording here used to
+#    say. The standard error of an annualized Sharpe estimated over T
+#    years is ~sqrt((1 + SR^2/2)/T), i.e. ~1.0 on the 10-12 month sweep
+#    windows this runs over — twenty times this floor. Neither 0.05 nor
+#    0.0415 has ever made a baseline "distinguishable from zero", and
+#    dividing by the annualization ratio does not make it so.
+#    What WOULD measure it: `analysis/risk_ratio_ci.py` already
+#    bootstraps the sampling distribution of exactly this statistic
+#    (moving-block, RISK_RATIO_SAMPLE_FLOOR=126). The floor should be
+#    the baseline's own bootstrap CI half-width on the run's actual
+#    sweep window — a per-run measurement, not a constant. Until that is
+#    wired, this stays a blowup guard and the gate's `note` should not
+#    be read as a significance claim.
 #  * alpha_vs_ew_high_vol: raw return (portfolio - vol-matched basket);
 #    typical 0.01–0.10 range, 50bps (0.005) is the noise floor at
 #    which the risk-matched-alpha basket comparison becomes
@@ -227,7 +256,10 @@ _IMPROVEMENT_DENOM_FLOOR = 1e-6
 #    ``{sortino_ratio: 0.1, alpha_vs_ew_high_vol: 0.01}``).
 _MIN_BASELINE_MAGNITUDE_BY_RANK: dict[str, float] = {
     "sortino_ratio": 0.05,
-    "sharpe_ratio": 0.05,
+    # 0.05 * sqrt(252/365) — the sqrt(365)->sqrt(252) re-derivation above.
+    # Deliberately NOT equal to the sortino floor any more: the two metrics
+    # are on different scales since config-I7236.
+    "sharpe_ratio": 0.0415,
     "alpha_vs_ew_high_vol": 0.005,
 }
 

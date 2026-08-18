@@ -1142,6 +1142,8 @@ class TestBaselineSignificanceGate:
         # The deviation/operator info still surfaces — refusing to
         # promote does NOT suppress the diagnostic numbers.
         assert result["improvement_delta"] == 0.5
+        # Sortino floor unchanged by config-I7598 — Sortino's annualization
+        # never moved; only the sharpe_ratio key was re-derived.
         assert result["min_baseline_magnitude"] == 0.05
 
     def test_skill_baseline_at_floor_promotes(self):
@@ -1182,7 +1184,9 @@ class TestBaselineSignificanceGate:
         })
         assert result["status"] == "baseline_insignificant"
         assert result["improvement_significant"] is False
-        assert result["min_baseline_magnitude"] == 0.05
+        # 0.05 * sqrt(252/365) = 0.0415 — config-I7598 re-derivation of the
+        # legacy-Sharpe-path floor onto the sqrt(252) scale.
+        assert result["min_baseline_magnitude"] == 0.0415
 
     def test_risk_matched_alpha_floor_lower_than_sortino_floor(self):
         # alpha_vs_ew_high_vol rolls in raw-return units (typical

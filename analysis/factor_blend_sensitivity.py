@@ -28,11 +28,10 @@ Plan doc: alpha-engine-docs/private/scanner-260514.md PR 6.
 from __future__ import annotations
 
 import logging
-import math
 from typing import Optional
 
-import numpy as np
 import pandas as pd
+from nousergon_lib.quant import riskstats
 
 logger = logging.getLogger(__name__)
 
@@ -87,19 +86,22 @@ def _sortino(returns: pd.Series, target: float = 0.0) -> float | None:
 
     Returns ``None`` on insufficient data (< 2 obs) or zero downside
     deviation (all returns ≥ target — degenerate, no risk to scale by).
-    Not annualized; the caller decides annualization scale.
+    Not annualized; the caller decides annualization scale. The maths is
+    ``nousergon_lib.quant.riskstats.sortino_ratio`` (config-I7597) — see the
+    ``denominator`` note below.
     """
     returns = returns.dropna()
     if len(returns) < 2:
         return None
-    excess = returns - target
-    downside = excess[excess < 0]
-    if len(downside) == 0:
-        return None  # no losses — Sortino undefined
-    downside_dev = math.sqrt((downside ** 2).mean())
-    if downside_dev == 0:
-        return None
-    return float(excess.mean() / downside_dev)
+    excess = [float(x) - target for x in returns]
+    # periods_per_year=1 => no annualization (the caller decides the scale).
+    # denominator="downside" => the downside RMS is over the COUNT OF LOSING
+    # ROWS, not the full sample. That is NOT the fleet n-denominator convention
+    # (config-I7271) and understates this Sortino by sqrt(n / n_down); it is
+    # named at the call rather than re-implemented so the divergence is visible
+    # (config-I7597 reports it).
+    v = riskstats.sortino_ratio(excess, periods_per_year=1, denominator="downside")
+    return None if v is None else float(v)
 
 
 def _hit_rate(beats: pd.Series) -> float | None:

@@ -46,6 +46,7 @@ from nousergon_lib.eval_artifacts import (
     new_eval_run_id,
 )
 from nousergon_lib.pillars import PILLARS
+from nousergon_lib.quant import riskstats
 from nousergon_lib.quant.horizons import DEFAULT_POLICY
 
 # Reuse (do NOT redefine) the previously-dead shadow-archive prefix constant.
@@ -253,21 +254,21 @@ def _candidate_return_stream(df: pd.DataFrame, vec: dict) -> pd.Series | None:
 def _sortino(returns: pd.Series, target: float = 0.0) -> float | None:
     """Sortino ratio — mean excess / downside deviation (not annualized).
 
-    Same definition as ``analysis.factor_blend_sensitivity._sortino`` /
-    ``vectorbt_bridge._compute_sortino_ratio``: RMS of below-target excursions.
+    The maths is ``nousergon_lib.quant.riskstats.sortino_ratio`` (config-I7597).
+    Same convention as ``analysis.factor_blend_sensitivity._sortino``:
+    ``denominator="downside"``, i.e. the RMS of below-target excursions divided
+    by the COUNT OF THOSE EXCURSIONS. It is NOT the same as
+    ``vectorbt_bridge._compute_sortino_ratio``, whose downside deviation runs
+    over the full sample (the config-I7271 convention) — the docstring that
+    claimed otherwise was wrong, and the two differ by sqrt(n / n_down).
     ``None`` on < 2 obs or zero downside deviation.
     """
     returns = returns.dropna()
     if len(returns) < 2:
         return None
-    excess = returns - target
-    downside = excess[excess < 0]
-    if len(downside) == 0:
-        return None
-    downside_dev = math.sqrt((downside ** 2).mean())
-    if downside_dev == 0:
-        return None
-    return float(excess.mean() / downside_dev)
+    excess = [float(x) - target for x in returns]
+    v = riskstats.sortino_ratio(excess, periods_per_year=1, denominator="downside")
+    return None if v is None else float(v)
 
 
 def _prepare(df: pd.DataFrame) -> pd.DataFrame | dict:
