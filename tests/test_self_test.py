@@ -1,6 +1,6 @@
 """Tests for `analysis/self_test.py` — the published known-answer self-test.
 
-Two layers, and the second is the load-bearing one:
+Three layers, and the last two are load-bearing:
 
 1. **The battery agrees on THIS runner.** Every case passes here too, so a CI
    failure and an in-pipeline failure mean the same thing and can be compared.
@@ -10,6 +10,10 @@ Two layers, and the second is the load-bearing one:
    substituted cases rather than by breaking the engine, because the taxonomy is
    what must not be reimplemented or drifted, and it is the part that decides
    whether a harness fault gets reported as a correctness regression.
+3. **The battery can actually FAIL** (alpha-engine-config-I7262's acceptance
+   criterion, generalised to this repo since it applies cleanly here too — see
+   `test_a_perturbed_sharpe_annualization_is_caught` below). A self-test never
+   shown to fail is not evidence.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import json
 import math
 
 import pytest
+from nousergon_lib.quant.selftest_perturbation import assert_perturbation_caught
 
 from analysis import self_test as st
 
@@ -225,3 +230,37 @@ def test_evaluate_records_the_verdict_on_the_completeness_tracker():
     assert 'name="self_test"' in source
     assert '_self_test_is_pass(_self_test.get("verdict")) else "degraded"' in source
     assert "self_test=_self_test," in source
+
+
+# ── layer 3: the battery can FAIL — generalising I7262's acceptance criterion ──
+
+def test_a_perturbed_sharpe_annualization_is_caught(monkeypatch):
+    """Recreates the EXACT defect class that started this arc
+    (alpha-engine-config-I7236: sqrt(365) vs sqrt(252), a 20.3% divergence)
+    and asserts the battery catches it.
+
+    Perturbed at the production FUNCTION
+    (`nousergon_lib.quant.riskstats.sharpe_ratio`) rather than at a constant,
+    because `periods_per_year`'s default is bound to `_TRADING_DAYS` at
+    function-definition time — patching the module constant afterward would
+    not reach an already-bound default, so a constant-only perturbation here
+    would be a no-op that silently proves nothing.
+    """
+    from nousergon_lib.quant import riskstats
+
+    original_sharpe_ratio = riskstats.sharpe_ratio
+
+    def sqrt_365(returns, *, risk_free_rate=0.0, periods_per_year=365):
+        return original_sharpe_ratio(
+            returns, risk_free_rate=risk_free_rate, periods_per_year=periods_per_year,
+        )
+
+    out = assert_perturbation_caught(
+        monkeypatch,
+        module_path="nousergon_lib.quant.riskstats",
+        attr="sharpe_ratio",
+        perturbed=sqrt_365,
+        run=lambda: st.run_self_test(run_date="2026-08-15"),
+        case_name="closed_form_sharpe",
+    )
+    assert out["n_failed"] >= 1
