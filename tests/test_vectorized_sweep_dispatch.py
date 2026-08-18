@@ -14,8 +14,6 @@ downstream optimizers / reporters, the swap is safe.
 """
 from __future__ import annotations
 
-import os
-import sys
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -23,9 +21,11 @@ import pandas as pd
 import pytest
 
 
-_EXECUTOR_ROOT = os.path.expanduser("~/Development/alpha-engine")
-if os.path.isdir(_EXECUTOR_ROOT) and _EXECUTOR_ROOT not in sys.path:
-    sys.path.insert(0, _EXECUTOR_ROOT)
+# Resolution centralized in tests/_sibling_checkout.py (alpha-engine-config-
+# I7619): CI sets EXECUTOR_ROOT_DIR after checking crucible-executor out.
+from tests._sibling_checkout import ensure_executor_on_sys_path
+
+_EXECUTOR_ROOT = ensure_executor_on_sys_path()
 
 
 from backtest import _run_vectorized_param_sweep

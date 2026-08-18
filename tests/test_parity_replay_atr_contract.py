@@ -37,8 +37,6 @@ from __future__ import annotations
 import ast
 import inspect
 import json
-import os
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -47,10 +45,19 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 
 # Ensure executor on sys.path before importing backtester functions
-# (mirrors tests/test_simulate_via_deciders.py).
-_EXECUTOR_ROOT = os.path.expanduser("~/Development/alpha-engine")
-if os.path.isdir(_EXECUTOR_ROOT) and _EXECUTOR_ROOT not in sys.path:
-    sys.path.insert(0, _EXECUTOR_ROOT)
+# (mirrors tests/test_simulate_via_deciders.py). Resolution is centralized
+# in tests/_sibling_checkout.py (alpha-engine-config-I7619): CI sets
+# EXECUTOR_ROOT_DIR after checking crucible-executor out; a missing
+# checkout on CI hard-fails collection instead of silently skipping
+# forever, and only skips (per test, below) on a dev laptop.
+from tests._sibling_checkout import (
+    ensure_executor_on_sys_path,
+    executor_missing_reason,
+    executor_root_missing_hard_fail_on_ci,
+)
+
+_EXECUTOR_ROOT = ensure_executor_on_sys_path()
+_EXECUTOR_ROOT_MISSING = executor_root_missing_hard_fail_on_ci(_EXECUTOR_ROOT)
 
 
 # ── Structural guard: the maps reach _simulate_single_date ──────────────────
@@ -213,8 +220,8 @@ def _fixture(tickers: list[str], date_str: str = "2026-05-13"):
 
 
 @pytest.mark.skipif(
-    not os.path.isdir(_EXECUTOR_ROOT),
-    reason="alpha-engine sibling repo not present at ~/Development/alpha-engine",
+    _EXECUTOR_ROOT_MISSING,
+    reason=executor_missing_reason(_EXECUTOR_ROOT),
 )
 class TestAtrCoverageBounding:
     """The abort itself is CORRECT for the live executor — shipping an entry on
