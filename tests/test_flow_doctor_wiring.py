@@ -392,7 +392,7 @@ class TestColdStartDeferral:
 # The tag every deploy artifact must pin. `tests/test_lib_pin_lockstep.py`
 # asserts requirements.txt and the three Lambda Dockerfiles all carry the SAME
 # tag; this constant is what that tag must be.
-_EXPECTED_LIB_TAG = "v0.124.69"
+_EXPECTED_LIB_TAG = "v0.124.70"
 
 
 class TestLibVersionPin:
@@ -416,7 +416,17 @@ class TestLibVersionPin:
                 rf"nousergon-lib@{re.escape(_EXPECTED_LIB_TAG)}[0-9.]", text
             )
         ), (
-            f"nousergon-lib should pin to {_EXPECTED_LIB_TAG} — bumped for "
+            f"nousergon-lib should pin to {_EXPECTED_LIB_TAG} — bumped to "
+            "restore CO-INSTALL PARITY with crucible-predictor / "
+            "nousergon-data / crucible-research, which all moved to v0.124.70 "
+            "on 2026-08-18 (nousergon-lib-PR329, the run-scope registry entry "
+            "for alpha-engine-config-I7620). This repo stayed at v0.124.69, "
+            "and the weekly SF's `LibPinDriftGate` HARD-FAILS on that "
+            "mismatch: measured 2026-08-18 22:03 UTC, a manual "
+            "ne-weekly-freshness-pipeline execution died 90 seconds in with "
+            "`co-install parity: crucible-backtester=v0.124.69 != "
+            "crucible-predictor=v0.124.70`. Saturday's scheduled run would "
+            "have failed identically. Prior: v0.124.69 — "
             "nousergon_lib.quant.selftest, the shared self-test runner "
             "(config-I7238 / nousergon-lib-PR328): this repo's "
             "analysis/self_test.py now imports the Case/verdict taxonomy and "
