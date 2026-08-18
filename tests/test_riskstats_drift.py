@@ -21,6 +21,7 @@ battery, which only runs inside a report-card cycle.
 from __future__ import annotations
 
 import math
+import pathlib
 
 import numpy as np
 import pandas as pd
@@ -132,16 +133,18 @@ def test_risk_ratio_ci_sharpe_and_ir_match_library(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", sorted(CORPUS))
-def test_downside_denominator_call_sites_match_the_named_variant(name: str) -> None:
-    """The three n_down call sites must track the library's "downside" variant.
+def test_sortino_call_sites_are_on_the_fleet_denominator(name: str) -> None:
+    """Every Sortino call site in this repo is on the config-I7271 n-denominator.
 
-    They are NOT on the fleet n-denominator convention (config-I7271). That is a
-    reported divergence, not an accident — this test pins which variant each one
-    is on so a silent change of convention fails here.
+    config-I7618 converted the last three holdouts (``risk_ratio_ci._sortino``,
+    ``factor_blend_sensitivity._sortino``, ``pillar_weight_optimizer._sortino``)
+    off the ``denominator="downside"`` variant, which divided by the count of
+    below-target observations and understated each by sqrt(n / n_down). This
+    pins them to ``"full"`` so a silent change of convention fails here.
     """
     r = CORPUS[name]
-    ann = riskstats.sortino_ratio(r, denominator="downside")
-    raw = riskstats.sortino_ratio(r, periods_per_year=1, denominator="downside")
+    ann = riskstats.sortino_ratio(r, denominator="full")
+    raw = riskstats.sortino_ratio(r, periods_per_year=1, denominator="full")
 
     got_ci = risk_ratio_ci._sortino(np.array(r, dtype=np.float64))
     assert (got_ci is None) == (ann is None), name
@@ -153,6 +156,39 @@ def test_downside_denominator_call_sites_match_the_named_variant(name: str) -> N
         assert (got is None) == (raw is None), f"{name}/{fn.__module__}"
         if raw is not None:
             assert got == pytest.approx(raw, **_TOL), f"{name}/{fn.__module__}"
+
+
+def test_no_source_file_asks_for_the_downside_denominator() -> None:
+    """config-I7618 class guard: the non-standard variant cannot be reintroduced.
+
+    A per-call-site numeric test only catches the sites it already knows about;
+    this catches the NEXT one. Scoped to production source — ``tests/`` is
+    exempt because ``test_the_two_conventions_really_do_differ`` below must name
+    the variant to prove the two conventions have not collapsed into each other.
+
+    The library still HAS the branch: ``nousergon_lib.quant.stats.regime_sortino``
+    calls it (measured 2026-08-18 on nousergon-lib origin/main), so config-I7618
+    deliverable 4 (delete the branch) stays blocked on converting that consumer.
+    This guard is what makes the branch's continued existence harmless here.
+    """
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    skip_dirs = {".git", ".venv", "venv", "tests", "build", "dist",
+                 "__pycache__", "node_modules", ".worktrees"}
+    offenders = []
+    for path in repo_root.rglob("*.py"):
+        if any(part in skip_dirs for part in path.relative_to(repo_root).parts):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for i, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue  # a comment may explain the variant it does not use
+            if 'denominator="downside"' in line or "denominator='downside'" in line:
+                offenders.append(f"{path.relative_to(repo_root)}:{i}")
+    assert not offenders, (
+        "denominator=\"downside\" is the non-standard n_down convention "
+        "config-I7271 ruled against and config-I7618 removed from this repo. "
+        "Use denominator=\"full\". Offenders: " + ", ".join(offenders)
+    )
 
 
 def test_the_two_conventions_really_do_differ() -> None:
