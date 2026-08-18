@@ -44,6 +44,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._sibling_checkout import is_ci, resolve_sf_defs_dir
+
 _INFRA = Path(__file__).resolve().parent.parent / "infrastructure"
 _COMMON = _INFRA / "_spot_common.sh"
 
@@ -136,18 +138,42 @@ def test_every_spot_launcher_is_classified():
 
 def test_sf_wired_set_matches_live_step_function_json_when_reachable():
     """Best-effort cross-check against the live SF definition (sibling
-    nousergon-data checkout). Not present in CI (different repo) — skips
-    rather than failing, per the task's explicit fallback-to-explicit-list
-    instruction. When it IS reachable, every script this test claims is
-    SF-wired must actually appear in the JSON's `commands` blob, and every
-    script explicitly excluded as retired must NOT appear as a live
-    dispatch target."""
-    candidates = [
-        Path(__file__).resolve().parents[2] / "nousergon-data" / "infrastructure" / "step_function.json",
-    ]
-    sf_path = next((p for p in candidates if p.is_file()), None)
-    if sf_path is None:
-        pytest.skip("nousergon-data sibling checkout not reachable — static list stands")
+    nousergon-data checkout).
+
+    Resolution centralized in tests/_sibling_checkout.py (alpha-engine-
+    config-I7605 / I7619, mirroring crucible-dashboard's reference fix): CI
+    checks out nousergon-data (sparse) and sets ``SF_DEFS_DIR``; a dev
+    laptop uses ``~/Development/nousergon-data``. The prior resolution via
+    ``Path(__file__).resolve().parents[2]`` was itself an instance of the
+    class this issue guards against — it silently resolved to the WRONG
+    directory (one level too shallow) when this repo is checked out into a
+    nested worktree (e.g. ``~/Development/.worktrees/<repo>-<branch>/``),
+    always finding nothing and always taking the skip path with no signal
+    that the resolution itself was broken.
+
+    On CI a missing checkout is a broken guard, not an absent layout — hard
+    fails rather than skipping (see module docstring: `krepis.stage_coverage`
+    call sites are static-analysis guards only, but the invariant they
+    protect is real and must be exercised somewhere). On a dev laptop
+    without the nousergon-data sibling, skips with a named reason. When the
+    checkout IS reachable, every script this test claims is SF-wired must
+    actually appear in the JSON's `commands` blob, and every script
+    explicitly excluded as retired must NOT appear as a live dispatch
+    target."""
+    sf_defs_dir = resolve_sf_defs_dir()
+    sf_path = Path(sf_defs_dir) / "infrastructure" / "step_function.json"
+    if not sf_path.is_file():
+        message = (
+            f"{sf_path} not present. CI checks out nousergon-data and sets "
+            f"SF_DEFS_DIR; a dev laptop uses ~/Development/nousergon-data."
+        )
+        if is_ci():
+            pytest.fail(
+                f"{message} On CI this is a broken guard, not an absent "
+                "layout — skipping here would report a cross-repo "
+                "invariant as satisfied without ever evaluating it."
+            )
+        pytest.skip(message)
 
     blob = sf_path.read_text()
     for script in SF_WIRED_SINGLE_STAGE:
