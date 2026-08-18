@@ -1692,12 +1692,25 @@ def _run_factor_blend_optimizer(
 def _run_pillar_weight_opt(config: dict, df_base, freeze: bool) -> dict:
     """Run pillar_weight_optimizer compute + shadow-archive path (config#789 Phase 6).
 
-    SHADOW-ONLY: the recommend() sweep-then-rank never touches live config, and
-    apply() writes exclusively to the shadow-history prefix. ``freeze=True``
-    short-circuits apply() so ``--freeze`` runs produce zero S3 side effects.
-    The optimizer scores candidate pillar-weight vectors against the persisted
-    ``investment_thesis.composite_breakdown`` pillar contributions on df_base and
-    ranks by Sortino-on-skilled-risk under the alpha-floor constraint.
+    RETIRED 2026-08-18 (alpha-engine-config-I7637). ``recommend()`` now returns
+    ``status: "retired"`` before doing any work, so this stage costs one call
+    and writes nothing. The call site is KEPT rather than deleted, deliberately:
+    the retirement then appears in ``results["pillar_weight_opt"]`` on every
+    run, where the module tracker and the report already look, instead of a
+    stage silently vanishing from the surface that used to carry it.
+
+    Why retired: the optimizer scores from ``{pillar}_quant`` /
+    ``{pillar}_qual``, which came from ``investment_thesis.composite_breakdown``
+    — emitted by the six-team + CIO research graph retired 2026-07-12
+    (config#1580). Measured 2026-08-18: ``investment_thesis`` is present on 0 of
+    903 live signals, the per-name shape carries only a flat quant/qual pair,
+    and ``config/scoring_weights_shadow_history/`` is empty. ``apply()`` had
+    never fired since inception.
+
+    SHADOW-ONLY (unchanged, and still true): ``recommend()`` never touches live
+    config and ``apply()`` writes exclusively to the shadow-history prefix.
+    ``freeze=True`` short-circuits apply() so ``--freeze`` runs produce zero S3
+    side effects.
     """
     bucket = config.get("signals_bucket", "alpha-engine-research")
     current_weights = config.get("pillar_weight_optimizer", {}).get("current_weights")

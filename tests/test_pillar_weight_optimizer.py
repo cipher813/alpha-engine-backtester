@@ -1,5 +1,9 @@
 """Unit tests for optimizer.pillar_weight_optimizer (config#789 Phase 6).
 
+RETIRED 2026-08-18 (alpha-engine-config-I7637) — see the module docstring. The
+tests below now run against `_recommend_impl`, the preserved body; `recommend`
+itself returns `status: "retired"`.
+
 SHADOW-ONLY per-pillar weight optimizer. These tests pin the design intent:
   - Σ pillar weights == 1.0 sampling/normalization constraint.
   - alpha_floor hard constraint rejects alpha-negative candidates BEFORE ranking.
@@ -27,7 +31,17 @@ from optimizer.pillar_weight_optimizer import (
     apply,
     init_config,
     normalize_pillar_weights,
-    recommend,
+)
+
+# alpha-engine-config-I7637: `recommend()` is RETIRED and returns
+# `status: "retired"` before doing any work, so these tests exercise the
+# PRESERVED implementation. The composite-reconstruction and alpha-floor
+# arithmetic stays validated for a revival — a producer emitting the six
+# per-pillar quant/qual columns again should not also have to re-derive and
+# re-prove this. The retirement contract itself is covered by
+# tests/test_pillar_weight_optimizer_retired.py.
+from optimizer.pillar_weight_optimizer import (  # noqa: E402
+    _recommend_impl as recommend,
     sample_weight_vector,
     _sum_to_one_ok,
 )
