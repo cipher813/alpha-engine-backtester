@@ -1846,6 +1846,64 @@ def _run_executor_opt(config: dict, sweep_df, freeze: bool) -> dict:
     return result
 
 
+# ── Portfolio-excursion OHLCV wiring (config-I7600) ──────────────────────────
+
+
+def _load_ohlcv_for_excursion(config: dict, registry) -> tuple[dict | None, str | None]:
+    """Load the OHLCV series the backtester already persisted for this date's
+    simulation ("simulation_setup" phase, same S3 ``.phases/`` marker
+    namespace ``registry`` reads elsewhere in this file) — never re-fetches,
+    so there is exactly one source of truth for prices for both the
+    simulation and this analysis.
+
+    Returns ``(ohlc_by_ticker, None)`` on success, or ``(None, reason)``
+    where ``reason`` distinguishes a genuine upstream data gap (this date's
+    backtest run never persisted OHLCV, or persisted an empty set) from a
+    read/wiring defect on this side (marker unreadable, artifact key
+    present but the parquet failed to load) — config-I7600: a single
+    "no ohlc data" string covering both is what let this run dead for
+    months without anyone noticing it was a defect rather than a data gap.
+    """
+    from phase_artifacts import load_ohlcv_by_ticker
+
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    try:
+        marker = registry.load_marker("simulation_setup")
+    except Exception as e:
+        logger.error("portfolio_excursion: simulation_setup marker read failed: %s", e)
+        return None, f"defect:ohlc_marker_read_error: {e}"
+
+    if marker is None:
+        return None, (
+            "insufficient_data:ohlc_marker_missing: no simulation_setup phase "
+            "marker for this date — the backtest run predates config-I7600 or "
+            "the phase never ran"
+        )
+
+    keys = marker.get("artifact_keys") or []
+    matches = [k for k in keys if k.endswith("/ohlcv_by_ticker.parquet")]
+    if not matches:
+        logger.error(
+            "portfolio_excursion: simulation_setup marker present but carries "
+            "no ohlcv_by_ticker artifact key (artifact_keys=%s)", keys,
+        )
+        return None, "defect:ohlc_artifact_key_missing: simulation_setup marker has no ohlcv_by_ticker key"
+
+    try:
+        ohlc = load_ohlcv_by_ticker(bucket, matches[0], s3_client=registry.s3_client)
+    except Exception as e:
+        logger.error(
+            "portfolio_excursion: ohlcv_by_ticker load failed (key=%s): %s",
+            matches[0], e,
+        )
+        return None, f"defect:ohlc_load_error: {e}"
+
+    if not ohlc:
+        return None, "insufficient_data:no_ohlc_data: simulation_setup persisted an empty OHLCV set for this date"
+
+    return ohlc, None
+
+
 # ── Regression detection ─────────────────────────────────────────────────────
 
 
@@ -2436,8 +2494,14 @@ def _main_impl() -> None:
             team_lift_for_metrics = (
                 diagnostics.get("e2e_lift") or {}
             ).get("team_lift") or []
+            # config-I7600: config["_ohlcv_by_ticker"] was never written by
+            # anything in this repo — read unconditionally from S3 via the
+            # simulation_setup phase marker instead (the OHLCV backtest.py
+            # already loaded for the simulation itself, not a re-fetch).
             prices_for_metrics = config.get("_prices")
-            ohlc_for_metrics = config.get("_ohlcv_by_ticker")
+            ohlc_for_metrics, _ohlc_unavailable_reason = _load_ohlcv_for_excursion(
+                config, registry,
+            )
             spy_returns_for_metrics = None
             spy_prices_for_metrics = config.get("_spy_prices")
             if isinstance(spy_prices_for_metrics, pd.Series) and not spy_prices_for_metrics.empty:
@@ -2452,9 +2516,28 @@ def _main_impl() -> None:
                 horizon_days=10,
             )
             portfolio_calibration = compute_portfolio_calibration(df_base)
-            portfolio_excursion = compute_portfolio_excursion_summary(
-                df_base, ohlc_for_metrics, horizon_days=10,
-            )
+            if _ohlc_unavailable_reason is not None:
+                # Pre-empt compute_portfolio_excursion_summary's generic
+                # "no ohlc data" — surface WHY the OHLC is absent instead
+                # (config-I7600 deliverable 3).
+                if _ohlc_unavailable_reason.startswith("defect:"):
+                    logger.error(
+                        "portfolio_excursion: OHLC unavailable — %s",
+                        _ohlc_unavailable_reason,
+                    )
+                else:
+                    logger.warning(
+                        "portfolio_excursion: OHLC unavailable — %s",
+                        _ohlc_unavailable_reason,
+                    )
+                portfolio_excursion = {
+                    "status": "insufficient_data",
+                    "reason": _ohlc_unavailable_reason,
+                }
+            else:
+                portfolio_excursion = compute_portfolio_excursion_summary(
+                    df_base, ohlc_for_metrics, horizon_days=10,
+                )
 
             # Risk-ratio magnitude-certainty monitor (config#976, L4558): block-
             # bootstrap CIs for Sharpe/Sortino/Information Ratio over the same

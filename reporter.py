@@ -1342,6 +1342,16 @@ def all_orders_to_dataframe(all_orders: list[dict]) -> pd.DataFrame:
     return df.reindex(columns=columns)
 
 
+def _validate_signal_quality_artifact(signal_quality: dict) -> None:
+    """Producer-side schema validation for signal_quality.json (config-I7599,
+    M0 rule). Raises on violation — same pattern as
+    analysis/pit_stats_artifact.py::validate_pass_artifact."""
+    import jsonschema
+
+    schema_path = Path(__file__).resolve().parent / "contracts" / "signal_quality.schema.json"
+    jsonschema.validate(signal_quality, json.loads(schema_path.read_text()))
+
+
 def save(
     report_md: str,
     signal_quality: dict,
@@ -1467,6 +1477,26 @@ def save(
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
     logger.info("Wrote %s", out_dir / "metrics.json")
     _persist(out_dir / "metrics.json")
+
+    # Signal-quality JSON (config-I7599): a first-class artifact carrying the
+    # FULL `compute_accuracy` output — {status, overall, by_score_bucket,
+    # [by_conviction], rows_*_populated} — rather than continuing to make
+    # `by_score_bucket` reachable only by reconstructing `overall` from
+    # metrics.json by key-exclusion (crucible-evaluator's
+    # `_read_signal_quality`/`_METRICS_NON_OVERALL_KEYS`, which `by_score_bucket`
+    # structurally cannot survive since it is never flattened to metrics.json's
+    # top level). ALWAYS-EMIT, same convention as the structured analysis files
+    # below: absence of the S3 object means the diagnostic never ran, not that
+    # it ran and had nothing to say. Schema-validated at write time (M0 rule,
+    # same pattern as analysis/pit_stats_artifact.py::validate_pass_artifact) —
+    # a producer that ships a contract-breaking artifact must fail its own
+    # stage, not its consumer's.
+    _validate_signal_quality_artifact(signal_quality)
+    (out_dir / "signal_quality.json").write_text(
+        json.dumps(signal_quality, indent=2, default=str),
+    )
+    logger.info("Wrote %s", out_dir / "signal_quality.json")
+    _persist(out_dir / "signal_quality.json")
 
     # Param sweep CSV
     if sweep_df is not None and not sweep_df.empty:
