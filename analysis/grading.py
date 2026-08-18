@@ -941,11 +941,11 @@ def _grade_position_sizing(sizing_ab: dict | None) -> dict:
     # chosen (2026-04-08, 92569f83) against this system's own pre-fix numbers,
     # so they carry the old scale with them.
     #
-    # NOT re-derived, and it should be: `analysis/sizing_ab.py:89,92` thresholds
-    # the same `sharpe_diff` at +/-0.1 to set the `assessment` string this
-    # function also reads. That literal needs the same 0.830455 factor
-    # (0.1 -> 0.083) and is left untouched only because another change was in
-    # flight in that file — reported on config-I7598, not absorbed.
+    # The paired literal is now re-derived too: `analysis/sizing_ab.py`
+    # thresholds the same `sharpe_diff` to set the `assessment` string this
+    # function also reads, and its band moved 0.1 -> 0.083 by the same 0.830455
+    # factor (`sizing_ab._MIN_MATERIAL_SHARPE_DIFF`, config-I7598). The two must
+    # stay on one scale: this grade and that verdict describe the same number.
     sharpe_g = _lift_to_grade(sharpe_diff, floor=-0.249, ceiling=0.415) if sharpe_diff is not None else None
 
     # Alpha improvement
