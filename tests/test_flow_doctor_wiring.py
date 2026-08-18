@@ -398,8 +398,14 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "nousergon-lib must be pinned to a tag, not @main"
-        assert "@v0.124.5" in text, (
-            "nousergon-lib should pin to v0.124.5 (nousergon_lib.health enrichment "
+        assert "@v0.124.66" in text, (
+            "nousergon-lib should pin to v0.124.66, the first published "
+            "release carrying the producer_champion_audit contract "
+            "(nousergon-lib-PR325, alpha-engine-config-I7605). This repo's "
+            "test suite reads that schema from the installed library rather "
+            "than from a sibling checkout, so below this pin the contract "
+            "test cannot resolve it. Earlier: v0.124.5 "
+            "(nousergon_lib.health enrichment "
             "writer for config#1727 Phase C; lockstep with fleet at v0.124.5; bumped for nousergon_lib.quant.stats.trial_accumulator (config#2454)). "
             "Prior: v0.86.0 — flow-doctor>=0.8.0 notify_on_category for config#1695. "
             "(nousergon_lib.quant.horizons + the outcome_record contract, "

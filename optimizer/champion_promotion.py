@@ -143,8 +143,8 @@ with under I2518):**
     ``run_date`` is treated as unavailable (``leaderboard_stale_gt_8d``,
     a no-contest) rather than silently scored against stale evidence. The
     date actually used is threaded through to the audit record as
-    ``leaderboard_date_used`` (additive, contracts/producer_champion_audit
-    .schema.json) so the audit trail always shows which week's evidence
+    ``leaderboard_date_used`` (additive, nousergon_lib.contracts's
+    producer_champion_audit schema) so the audit trail always shows which week's evidence
     decided (or declined to decide) a flip.
 
     **EVIDENCE-CONFIDENCE gate (alpha-engine-config-I7549, 2026-08-17):**
@@ -939,8 +939,11 @@ def build_champion_audit(
     freeze: bool,
     error: str | None = None,
 ) -> dict:
-    """Build the weekly audit record (schema v2,
-    ``contracts/producer_champion_audit.schema.json`` — bumped from v1 under
+    """Build the weekly audit record (schema v2, published in
+    ``nousergon_lib.contracts`` as ``producer_champion_audit`` — moved out of
+    this repo's local ``contracts/`` dir under alpha-engine-config-I7605 so
+    the dashboard consumer reads the same resource this producer does,
+    instead of walking this repo's working tree. Bumped from v1 under
     alpha-engine-config-I2518: the HAC/hysteresis/cooldown fields
     (``challenger_matured_cohorts``, ``sn_lift_vs_champion``,
     ``consecutive_wins``, ``cooldown_until``) are retired in favor of
