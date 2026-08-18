@@ -5562,6 +5562,34 @@ def _run_simulation_pipeline(
                     # before JSON persistence — they are routed to the reporter
                     # for all_orders.csv (config#806), not into the stats blob.
                     sim_all_orders = portfolio_stats.pop("all_orders", None) or []
+                    # config-I7616: persist the deployed strategy's daily-return
+                    # series as its own parquet artifact. portfolio_stats.json is
+                    # written with json.dumps(default=str), which turns this
+                    # Series into its *repr* — a truncated "...\n" string, not
+                    # data. That is why evaluate.py's risk-ratio CI monitor was
+                    # wired to a sleeve rebuilt from e2e_lift.team_lift picks
+                    # instead of the series compute_risk_ratio_ci's own docstring
+                    # names; team_lift has been [] since 2026-07-17, so the
+                    # monitor published insufficient_data on every card. A
+                    # producer that only ships a repr of its headline series has
+                    # no consumer, so the series ships properly here.
+                    _daily_returns = portfolio_stats.get("daily_returns")
+                    if _daily_returns is not None and len(_daily_returns) > 0:
+                        from phase_artifacts import save_series as _save_series
+                        ctx.record_artifact(_save_series(
+                            bucket, args.date, "simulate", "portfolio_daily_returns",
+                            _daily_returns, s3_client=s3,
+                        ))
+                    else:
+                        # No swallow: an empty return series from an otherwise
+                        # successful simulation is a real anomaly, and the
+                        # downstream monitor must be able to tell it from a
+                        # missing artifact.
+                        logger.warning(
+                            "simulate: portfolio_stats carried no daily_returns "
+                            "series — risk_ratio_ci will report insufficient_data "
+                            "for %s", args.date,
+                        )
                     ctx.record_artifact(save_json(
                         bucket, args.date, "simulate", "portfolio_stats", portfolio_stats,
                         s3_client=s3,
