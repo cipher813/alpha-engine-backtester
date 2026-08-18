@@ -12,6 +12,8 @@ Min-data gate: requires >= 50 trades in simulation.
 import logging
 from copy import deepcopy
 
+from analysis.pit_parity import _config_without_runtime_handles
+
 logger = logging.getLogger(__name__)
 
 _MIN_TRADES = 50
@@ -33,11 +35,21 @@ def run_sizing_ab(
     Returns:
         dict with comparison results.
     """
+    # ``base_config`` is the live ``_run_simulation_pipeline`` config, which
+    # carries the ``_phase_registry`` runtime handle (PhaseRegistry.s3_client
+    # is a botocore S3Client with circular service-model references that
+    # blow the recursion stack under ``copy.deepcopy`` — same failure class
+    # as ``backtest.py::_build_merged_simulate_config`` (caught 2026-04-27)
+    # and ``analysis/pit_parity.py`` (re-bit 2026-05-17..24). Strip it before
+    # copying; sizing_ab needs no runtime handles, only data keys, so this is
+    # behaviour-neutral (config-I7209 follow-up).
+    safe_config = _config_without_runtime_handles(base_config)
+
     # Config A: current (production) sizing
-    config_a = deepcopy(base_config)
+    config_a = deepcopy(safe_config)
 
     # Config B: equal-weight (disable all sizing adjustments)
-    config_b = deepcopy(base_config)
+    config_b = deepcopy(safe_config)
     config_b["atr_sizing_enabled"] = False
     # confidence_sizing_enabled dropped 2026-08-17 (alpha-engine-config-I7525):
     # the executor's confidence factor is retired, so the flag no longer

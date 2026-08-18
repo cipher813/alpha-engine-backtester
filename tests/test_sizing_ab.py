@@ -139,6 +139,52 @@ def test_config_b_disables_sizing_knobs():
     assert config_b["upside_fail_adj"] == 1.0
 
 
+def test_run_sizing_ab_survives_cyclic_phase_registry_handle():
+    """Regression for config#7209 follow-up: RecursionError surfaced as
+    ``sizing_ab.json``'s ``status: "error"`` on real dates (e.g. 2026-08-14).
+
+    The live ``config`` passed into ``run_sizing_ab`` from
+    ``backtest.py::_run_simulation_pipeline`` carries ``_phase_registry``
+    (a ``PhaseRegistry`` whose ``.s3_client`` is a botocore ``S3Client``
+    with circular service-model backrefs). ``copy.deepcopy`` on that
+    recurses past the Python stack limit — same failure class already
+    fixed once in ``backtest.py::_build_merged_simulate_config``
+    (2026-04-27) and again in ``analysis/pit_parity.py`` (2026-05-17..24),
+    but never applied to ``sizing_ab.py``'s own ``deepcopy(base_config)``
+    calls. Pin the fix: a cyclic runtime handle must not blow up
+    ``run_sizing_ab``, and neither Config A nor Config B may leak it into
+    ``sim_fn`` (the runtime handle is a non-data object; a caller wanting
+    it can capture it via closure, as ``backtest.py``'s ``_sizing_sim_fn``
+    already does).
+    """
+    class _Cycle:
+        pass
+
+    cyclic = _Cycle()
+    cyclic.back = cyclic  # type: ignore[attr-defined]
+
+    seen_configs = []
+
+    def sim_fn(config):
+        seen_configs.append(config)
+        assert "_phase_registry" not in config
+        key = bool(config.get("atr_sizing_enabled"))
+        return {
+            True: {"total_trades": 100, "sharpe_ratio": 1.5, "total_return": 0.15,
+                   "total_alpha": 0.05, "max_drawdown": 0.1},
+            False: {"total_trades": 100, "sharpe_ratio": 1.2, "total_return": 0.12,
+                    "total_alpha": 0.03, "max_drawdown": 0.12},
+        }[key]
+
+    config = {**_base_config(), "_phase_registry": cyclic}
+
+    # Must not raise RecursionError.
+    result = run_sizing_ab(sim_fn, config)
+
+    assert result["status"] == "ok"
+    assert len(seen_configs) == 2
+
+
 def test_missing_alpha_diff_handled_gracefully():
     sim_fn = _make_sim_fn({
         True: {"total_trades": 100, "sharpe_ratio": 1.5, "total_return": 0.15, "total_alpha": None, "max_drawdown": 0.1},
