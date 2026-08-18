@@ -1414,49 +1414,6 @@ def write_optimizer_run_manifest(
     return key
 
 
-def _portfolio_daily_returns_from_team_lift(team_lift: list[dict], prices, horizon_days: int = 10):
-    """Portfolio-wide aligned daily-return series from the e2e team-lift picks.
-
-    ``risk_ratio_ci`` (config#976) needs a single portfolio-level daily-return
-    series (mirroring the ``pf_returns_aligned`` series ``backtest.py``'s
-    deployed-strategy headline computes via ``_simulate_and_measure`` — a
-    process-separate, JSON-only artifact that does not carry raw series back
-    to evaluate.py). Rather than re-simulate the MVO solver here, this
-    aggregates every team's picks (already loaded for ``compute_team_metrics``
-    a few lines above) into one equal-weight portfolio sleeve via the same
-    ``compute_team_daily_returns`` helper each team already uses, stamping a
-    single synthetic ``team_id="portfolio"`` across all picks.
-
-    Returns ``None`` when there are no usable picks (caller degrades to
-    ``risk_ratio_ci`` reporting ``insufficient_data``, matching the module's
-    own always-emit contract).
-    """
-    if not team_lift or prices is None or getattr(prices, "empty", True):
-        return None
-
-    from analysis.team_daily_returns import compute_team_daily_returns
-
-    all_picks: list[dict] = []
-    for team in team_lift:
-        for pick in team.get("picks") or []:
-            all_picks.append({**pick, "team_id": "portfolio"})
-    if not all_picks:
-        return None
-
-    picks_df = pd.DataFrame(all_picks)
-    try:
-        portfolio_returns = compute_team_daily_returns(
-            picks_df, prices, horizon_days=horizon_days,
-        )
-    except Exception as e:  # noqa: BLE001 — best-effort; risk_ratio_ci degrades gracefully
-        logger.warning("[risk_ratio_ci] portfolio daily-returns aggregation failed: %s", e)
-        return None
-    series = portfolio_returns.get("portfolio")
-    if series is None or series.empty:
-        return None
-    return series
-
-
 def _run_weight_opt(config: dict, df_base, freeze: bool) -> dict:
     bucket = config.get("signals_bucket", "alpha-engine-research")
     current_weights = _read_current_weights(config)
@@ -1902,6 +1859,159 @@ def _load_ohlcv_for_excursion(config: dict, registry) -> tuple[dict | None, str 
         return None, "insufficient_data:no_ohlc_data: simulation_setup persisted an empty OHLCV set for this date"
 
     return ohlc, None
+
+
+def _load_phase_artifact(
+    config: dict, registry, *, phase: str, suffix: str, loader, label: str,
+):
+    """Read one artifact this date's pipeline already persisted, by phase marker.
+
+    The generalization of ``_load_ohlcv_for_excursion`` (config-I7600) to the
+    other two dead keys config-I7616 found: ``_prices`` and ``_spy_prices``.
+    Same contract, same ``.phases/`` namespace, same rule — read what the run
+    already wrote, never re-fetch, so the analysis and the simulation cannot
+    disagree about what the prices were.
+
+    Returns ``(artifact, None)`` on success or ``(None, reason)``, where
+    ``reason`` is prefixed ``defect:`` when THIS side is broken (marker
+    unreadable, key present but the artifact would not load) and
+    ``insufficient_data:`` when the upstream genuinely has nothing for this
+    date. Collapsing those two into one string is what let three dead inputs
+    read as thin data for months (config-I7616).
+    """
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    try:
+        marker = registry.load_marker(phase)
+    except Exception as e:
+        logger.error("%s: %s marker read failed: %s", label, phase, e)
+        return None, f"defect:{label}_marker_read_error: {e}"
+
+    if marker is None:
+        return None, (
+            f"insufficient_data:{label}_marker_missing: no {phase} phase marker "
+            f"for this date — that stage never ran"
+        )
+
+    keys = marker.get("artifact_keys") or []
+    matches = [k for k in keys if k.endswith(suffix)]
+    if not matches:
+        logger.error(
+            "%s: %s marker present but carries no %s artifact key "
+            "(artifact_keys=%s)", label, phase, suffix, keys,
+        )
+        return None, f"defect:{label}_artifact_key_missing: {phase} marker has no {suffix} key"
+
+    try:
+        obj = loader(bucket, matches[0], s3_client=registry.s3_client)
+    except Exception as e:
+        logger.error("%s: load failed (key=%s): %s", label, matches[0], e)
+        return None, f"defect:{label}_load_error: {e}"
+
+    if obj is None or getattr(obj, "empty", False) or (
+        not hasattr(obj, "empty") and not obj
+    ):
+        return None, (
+            f"insufficient_data:{label}_empty: {phase} persisted an empty "
+            f"{suffix} for this date"
+        )
+
+    return obj, None
+
+
+def _load_price_matrix(config: dict, registry):
+    """The price matrix this date's simulation actually ran on (config-I7616).
+
+    ``config["_prices"]`` was read at ``evaluate.py`` and written by nothing —
+    one of the three dead keys. ``backtest._save_simulation_setup`` already
+    persists this exact frame; read it back rather than re-deriving prices from
+    ArcticDB, which would let the analysis and the simulation diverge silently.
+    """
+    from phase_artifacts import load_dataframe
+
+    return _load_phase_artifact(
+        config, registry, phase="simulation_setup",
+        suffix="/price_matrix.parquet", loader=load_dataframe, label="prices",
+    )
+
+
+def _load_spy_prices(config: dict, registry):
+    """SPY closes for this date's run (config-I7616).
+
+    ``config["_spy_prices"]`` was likewise never written. The series is already
+    persisted by ``backtest._save_predictor_data_prep``; it is the same SPY leg
+    ``vectorbt_bridge`` benchmarks the headline against, so reading it keeps the
+    benchmark on the report card identical to the benchmark in the simulation.
+    """
+    from phase_artifacts import load_series
+
+    return _load_phase_artifact(
+        config, registry, phase="predictor_data_prep",
+        suffix="/spy_prices.parquet", loader=load_series, label="spy_prices",
+    )
+
+
+def _load_portfolio_daily_returns(config: dict, registry):
+    """The deployed strategy's own daily-return series (config-I7616).
+
+    ``compute_risk_ratio_ci``'s docstring has always named its input as "the
+    ``pf_returns_aligned`` series emitted by
+    ``portfolio_optimizer_backtest._simulate_and_measure``". It never received
+    that: the call was wired to a sleeve rebuilt from ``e2e_lift.team_lift``
+    picks, because — in the words of the helper this replaces — the simulate
+    stage produced "a process-separate, JSON-only artifact that does not carry
+    raw series back to evaluate.py".
+
+    That is now false. ``backtest.py``'s simulate phase persists the series as
+    ``simulate/portfolio_daily_returns.parquet`` (config-I7616), so the monitor
+    reads the thing it always claimed to measure. This matters beyond tidiness:
+    ``team_lift`` has been ``[]`` on every card since 2026-07-17 (the six-team
+    research graph was retired 2026-07-12), so the old sleeve was empty on every
+    run and the CI published ``insufficient_data`` unconditionally.
+    """
+    from phase_artifacts import load_series
+
+    return _load_phase_artifact(
+        config, registry, phase="simulate",
+        suffix="/portfolio_daily_returns.parquet", loader=load_series,
+        label="portfolio_daily_returns",
+    )
+
+
+#: Holding-window horizon for every computation in the evaluator-revamp metric
+#: bundle. Was a hardcoded ``10`` in two places (config-I7616 deliverable 4).
+#: config-I7208 established that the producer never emitted a 10d horizon and
+#: that the fleet objective is per-cycle net-of-cost 21d log-alpha vs SPY, so a
+#: 10d excursion window measured a holding period the system does not trade.
+#: Sourced from the HorizonPolicy rather than re-typed as ``21``, so the next
+#: horizon change moves it here too instead of leaving another orphan literal.
+_METRIC_BUNDLE_HORIZON_DAYS = int(_HORIZON_POLICY.primary_horizon)
+
+
+#: Date the per-team skilled-risk bundle stopped being computed, and why.
+#: ``compute_team_metrics`` reads ``e2e_lift.team_lift``, the six-team research
+#: graph retired 2026-07-12 — empty on every card since 2026-07-17. config-I7210
+#: removed that graph's weights from the evaluator scorecard on 2026-08-18;
+#: config-I7616 retires the metric bundle that fed them. The artifact is still
+#: WRITTEN, carrying this declaration: a component that emits nothing is
+#: unobserved, not healthy, and "retired on a date, for a reason" is a fact a
+#: reader can act on where a permanent ``insufficient_data`` is not.
+TEAM_METRICS_RETIREMENT = {
+    "status": "retired",
+    "retired_on": "2026-08-18",
+    "reason": (
+        "team_metrics is computed from e2e_lift.team_lift, the six-team research "
+        "graph retired 2026-07-12. team_lift has been [] on every report card "
+        "since 2026-07-17, so every sub-metric was insufficient_data by "
+        "construction, not by data thinness."
+    ),
+    "tracker": "nousergon/alpha-engine-config#7616",
+    "superseded_by": (
+        "Per-team skilled-risk metrics have no producer. If a team-shaped "
+        "research topology returns, re-wire analysis.team_skill_metrics."
+        "compute_team_metrics — the maths is retained and tested, only the "
+        "call site is retired."
+    ),
+}
 
 
 # ── Regression detection ─────────────────────────────────────────────────────
@@ -2470,89 +2580,85 @@ def _main_impl() -> None:
             ),
         }
 
-        # Compute the evaluator-revamp metric bundles. Each piece
-        # graceful-degrades to insufficient_data when its inputs are
-        # missing, so calls are unconditional and the grading layer
-        # drops absent metrics from the composite.
+        # ── Evaluator-revamp metric bundle (config-I7616) ────────────────────
+        #
+        # NO bundle-wide try/except. The block this replaces wrapped every
+        # computation in a bare `except Exception` that logged a warning and
+        # left the pre-initialised `insufficient_data` defaults in place, while
+        # its own comment claimed it "only guards the aggregation step itself".
+        # It did not, and that is precisely what made three never-wired inputs
+        # (config["_prices"], config["_ohlcv_by_ticker"], config["_spy_prices"]
+        # — read here, written nowhere) indistinguishable from thin data for
+        # months. Each degrade below is now explicit and reasoned; anything
+        # genuinely unexpected raises, per the fleet fail-loud rule.
         from analysis.team_skill_metrics import (
             compute_portfolio_calibration,
             compute_portfolio_excursion_summary,
-            compute_team_metrics,
         )
 
-        team_metrics = {}
-        portfolio_calibration = {"status": "insufficient_data"}
-        portfolio_excursion = {"status": "insufficient_data"}
-        risk_ratio_ci_result = {
-            "status": "insufficient_data",
-            "n_samples": 0,
-            "ratios": {},
-            "all_magnitude_certain": False,
-            "note": "evaluator-revamp metric bundle did not run",
-        }
-        try:
-            team_lift_for_metrics = (
-                diagnostics.get("e2e_lift") or {}
-            ).get("team_lift") or []
-            # config-I7600: config["_ohlcv_by_ticker"] was never written by
-            # anything in this repo — read unconditionally from S3 via the
-            # simulation_setup phase marker instead (the OHLCV backtest.py
-            # already loaded for the simulation itself, not a re-fetch).
-            prices_for_metrics = config.get("_prices")
-            ohlc_for_metrics, _ohlc_unavailable_reason = _load_ohlcv_for_excursion(
-                config, registry,
-            )
-            spy_returns_for_metrics = None
-            spy_prices_for_metrics = config.get("_spy_prices")
-            if isinstance(spy_prices_for_metrics, pd.Series) and not spy_prices_for_metrics.empty:
-                spy_returns_for_metrics = spy_prices_for_metrics.pct_change().dropna()
+        # team_metrics: RETIRED 2026-08-18 — see TEAM_METRICS_RETIREMENT. Its
+        # only input is e2e_lift.team_lift, [] on every card since the six-team
+        # research graph was retired; config-I7210 removed the same graph's
+        # weights from the evaluator scorecard. The artifact still ships, now
+        # declaring the retirement instead of a perpetual insufficient_data.
+        team_metrics_result = dict(TEAM_METRICS_RETIREMENT)
 
-            team_metrics = compute_team_metrics(
-                team_lift=team_lift_for_metrics,
-                score_performance_df=df_base,
-                prices=prices_for_metrics,
-                spy_daily_returns=spy_returns_for_metrics,
-                ohlc=ohlc_for_metrics,
-                horizon_days=10,
+        # Inputs, each read from what this date's pipeline already persisted
+        # (phase markers in the same S3 .phases/ namespace) — never a re-fetch,
+        # so the analysis cannot disagree with the simulation about prices.
+        prices_for_metrics, _prices_reason = _load_price_matrix(config, registry)
+        ohlc_for_metrics, _ohlc_reason = _load_ohlcv_for_excursion(config, registry)
+        spy_prices_for_metrics, _spy_reason = _load_spy_prices(config, registry)
+        pf_returns_for_risk_ratio, _pf_returns_reason = _load_portfolio_daily_returns(
+            config, registry,
+        )
+        for _label, _reason in (
+            ("prices", _prices_reason), ("ohlc", _ohlc_reason),
+            ("spy_prices", _spy_reason),
+            ("portfolio_daily_returns", _pf_returns_reason),
+        ):
+            if _reason is None:
+                continue
+            # defect:* is OUR bug and pages; insufficient_data:* is a real
+            # upstream gap for this date. The split (config-I7600) is the whole
+            # point — a single string covering both is what hid this.
+            (logger.error if _reason.startswith("defect:") else logger.warning)(
+                "metric bundle: %s unavailable — %s", _label, _reason,
             )
-            portfolio_calibration = compute_portfolio_calibration(df_base)
-            if _ohlc_unavailable_reason is not None:
-                # Pre-empt compute_portfolio_excursion_summary's generic
-                # "no ohlc data" — surface WHY the OHLC is absent instead
-                # (config-I7600 deliverable 3).
-                if _ohlc_unavailable_reason.startswith("defect:"):
-                    logger.error(
-                        "portfolio_excursion: OHLC unavailable — %s",
-                        _ohlc_unavailable_reason,
-                    )
-                else:
-                    logger.warning(
-                        "portfolio_excursion: OHLC unavailable — %s",
-                        _ohlc_unavailable_reason,
-                    )
-                portfolio_excursion = {
-                    "status": "insufficient_data",
-                    "reason": _ohlc_unavailable_reason,
-                }
-            else:
-                portfolio_excursion = compute_portfolio_excursion_summary(
-                    df_base, ohlc_for_metrics, horizon_days=10,
-                )
 
-            # Risk-ratio magnitude-certainty monitor (config#976, L4558): block-
-            # bootstrap CIs for Sharpe/Sortino/Information Ratio over the same
-            # portfolio-wide daily-return sleeve derived from team_lift picks
-            # above (no new data read). ALWAYS-EMIT — compute_risk_ratio_ci's own
-            # insufficient_data/no_benchmark degrade paths handle thin data; this
-            # try/except only guards the aggregation step itself.
-            pf_returns_for_risk_ratio = _portfolio_daily_returns_from_team_lift(
-                team_lift_for_metrics, prices_for_metrics, horizon_days=10,
+        spy_returns_for_metrics = None
+        if spy_prices_for_metrics is not None and not spy_prices_for_metrics.empty:
+            spy_returns_for_metrics = spy_prices_for_metrics.pct_change().dropna()
+
+        portfolio_calibration = compute_portfolio_calibration(df_base)
+
+        if _ohlc_reason is not None:
+            # Pre-empt compute_portfolio_excursion_summary's generic
+            # "no ohlc data" — surface WHY the OHLC is absent instead
+            # (config-I7600 deliverable 3).
+            portfolio_excursion = {
+                "status": "insufficient_data",
+                "reason": _ohlc_reason,
+            }
+        else:
+            portfolio_excursion = compute_portfolio_excursion_summary(
+                df_base, ohlc_for_metrics, horizon_days=_METRIC_BUNDLE_HORIZON_DAYS,
             )
-            risk_ratio_ci_result = compute_risk_ratio_ci(
-                pf_returns_for_risk_ratio, spy_returns_for_metrics,
-            )
-        except Exception as e:
-            logger.warning("evaluator-revamp metric bundle failed: %s", e)
+
+        # Risk-ratio magnitude-certainty monitor (config#976, L4558):
+        # block-bootstrap CIs for Sharpe / Sortino / Information Ratio.
+        # REPOINTED (config-I7616) from a sleeve rebuilt out of team_lift picks
+        # — permanently empty since 2026-07-17 — onto the deployed strategy's
+        # own daily returns, which is what compute_risk_ratio_ci's docstring
+        # always said it took. ALWAYS-EMIT: compute_risk_ratio_ci owns its own
+        # insufficient_data / no_benchmark degrade paths, so it is called even
+        # when the series is absent, and the reason string is attached so a
+        # never-wired input can never again read as thin data.
+        risk_ratio_ci_result = compute_risk_ratio_ci(
+            pf_returns_for_risk_ratio, spy_returns_for_metrics,
+        )
+        if _pf_returns_reason is not None:
+            risk_ratio_ci_result["reason"] = _pf_returns_reason
 
         # Decision-stream entropy (config#1151 Batch C) — the executor-tile
         # action_entropy diagnostic. Computed over the finalized-signal frame's
@@ -2579,7 +2685,10 @@ def _main_impl() -> None:
             portfolio_stats=portfolio_stats,
             scanner_opt=opt_results.get("scanner_opt"),
             cio_opt=opt_results.get("cio_opt"),
-            team_metrics=team_metrics or None,
+            # RETIRED — see TEAM_METRICS_RETIREMENT (config-I7616). The
+            # scorecard's team component is already inert: it iterates
+            # e2e_lift.team_lift, which is [].
+            team_metrics=None,
             calibration_diagnostics=portfolio_calibration if portfolio_calibration.get("status") == "ok" else None,
             excursion_summary=portfolio_excursion if portfolio_excursion.get("status") == "ok" else None,
             # Decision-stream entropy off the finalized-signal stance/conviction
@@ -2831,7 +2940,7 @@ def _main_impl() -> None:
             score_calibration=diagnostics.get("score_calibration"),
             macro_eval=diagnostics.get("macro_eval"),
             attractiveness_eval=diagnostics.get("attractiveness_eval"),
-            team_metrics=team_metrics or None,
+            team_metrics=team_metrics_result,
             calibration_diagnostics=portfolio_calibration,
             excursion_summary=portfolio_excursion,
             # B1d — persist the optimizer/diagnostic inputs the evaluator report

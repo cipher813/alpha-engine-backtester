@@ -1566,8 +1566,12 @@ def save(
         # same rationale as the freshness-monitored artifacts above. The
         # consumer reads explicit nulls as N/A rather than fabricating 0%.
         ("coverage.json", measurement_coverage),
-        # team_metrics carries no status field; emit whenever populated (the
-        # evaluator passes `team_metrics or None`, so empty {} reaches here as None).
+        # team_metrics: RETIRED 2026-08-18 (config-I7616). evaluate.py now passes
+        # a declared retirement record ({status: "retired", retired_on, reason,
+        # tracker}) instead of a bundle whose every sub-metric was
+        # insufficient_data by construction. Still ALWAYS-EMIT: a reader has to
+        # be able to tell "retired on this date, for this reason" from "the
+        # producer stopped running", and an absent artifact says the second.
         ("team_metrics.json", team_metrics),
         # Optimizer / diagnostic inputs the evaluator's report card reads over S3
         # (Director plan B1d). Computed in evaluate.py but previously unpersisted,
