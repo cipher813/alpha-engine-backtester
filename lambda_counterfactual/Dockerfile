@@ -32,7 +32,7 @@ RUN microdnf install -y git && microdnf clean all
 # assertion that found nothing wrong (config-I7334). The floor is the only
 # thing making the assertion measurable in the deployed artifact.
 COPY lambda_counterfactual/requirements-counterfactual.txt requirements-counterfactual.txt
-RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@59a7e63e732fcbfb5b96e6ea1cccb2233f35a9de" "krepis>=0.59.4" && \
+RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.66" "krepis>=0.59.4" && \
     pip install --no-cache-dir -r requirements-counterfactual.txt && \
     rm -rf /root/.cache/pip
 
