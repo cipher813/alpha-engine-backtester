@@ -39,7 +39,10 @@ _COOLDOWN_WEEKS = 2  # mirrors optimizer.champion_promotion._COOLDOWN_WEEKS (gat
 
 
 def _build_bootstrap_audit(run_date: str, champion_before: str, champion_after: str) -> dict:
-    """Shaped to satisfy contracts/producer_champion_audit.schema.json (v1).
+    """Shaped to satisfy nousergon_lib.contracts's producer_champion_audit
+    schema (v2; moved out of this repo's contracts/ dir under
+    alpha-engine-config-I7605 so the dashboard consumer reads the same
+    published resource instead of a sibling checkout).
     ``promotion_source`` is not part of that frozen schema but the schema's
     additive-only contract requires consumers to tolerate unknown extra
     fields, so it rides along here for audit-trail clarity (mirrors the

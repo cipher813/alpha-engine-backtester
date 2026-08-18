@@ -30,11 +30,20 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # (config#1245 / #1172). Accept either spelling so the lockstep guard keeps
 # working across the crossing; the version-equality assertion below is the
 # load-bearing part.
+#
+# alpha-engine-config-I7605: also accepts a bare 40-hex commit SHA, not just
+# a vX.Y.Z tag. All four artifacts here provisionally pin nousergon-lib-PR325
+# (the producer_champion_audit contract, unmerged/untagged at PR-open time)
+# by its branch-tip commit — the branch is reachable regardless of merge
+# order, unlike a tag that doesn't exist yet. This is a documented interim
+# state, not a permanent convention: once PR325 merges and autobumps a real
+# tag, a follow-up commit moves all four pins to that tag and this SHA
+# alternative stops matching anything in this repo again.
 _REQUIREMENTS_PIN_RE = re.compile(
-    r"(?:alpha-engine-lib|nousergon-lib)\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
+    r"(?:alpha-engine-lib|nousergon-lib)\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+|[0-9a-f]{40})"
 )
 _DOCKERFILE_PIN_RE = re.compile(
-    r'"(?:alpha-engine-lib|nousergon-lib)\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"'
+    r'"(?:alpha-engine-lib|nousergon-lib)\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+|[0-9a-f]{40})"'
 )
 
 

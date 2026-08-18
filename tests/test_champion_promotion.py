@@ -28,6 +28,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nousergon_lib.contracts import load_schema as _load_contract_schema
+
 from optimizer.champion_promotion import (
     ARM_FEED_DEPENDENCIES,
     CONFIDENCE_INSUFFICIENT,
@@ -63,7 +65,11 @@ from optimizer.champion_promotion import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 POINTER_SCHEMA_PATH = REPO_ROOT / "contracts" / "producer_champion.schema.json"
-AUDIT_SCHEMA_PATH = REPO_ROOT / "contracts" / "producer_champion_audit.schema.json"
+# Moved to nousergon-lib (alpha-engine-config-I7605): the audit contract now
+# reaches both producer (here) and consumer (crucible-dashboard) via the SAME
+# published resource, rather than crucible-dashboard walking this repo's
+# working tree via a sibling checkout.
+AUDIT_SCHEMA = _load_contract_schema("producer_champion_audit")
 
 
 # ── HAC/Newey-West significance (retained utility, not gate-connected) ─────
@@ -591,7 +597,7 @@ class TestEvidenceConfidenceGate:
         assert audit["blocked_by"] == ["thinktank_coverage_thin_evidence"]
         jsonschema = pytest.importorskip("jsonschema", reason="jsonschema not installed")
         jsonschema.validate(
-            instance=audit, schema=json.loads(AUDIT_SCHEMA_PATH.read_text()),
+            instance=audit, schema=AUDIT_SCHEMA,
         )
 
     def test_declining_to_decide_is_logged_not_silent(self, caplog):
@@ -1419,9 +1425,13 @@ class TestRunWeeklyEvaluation:
 
 
 class TestSchemaConformance:
-    def _validate(self, schema_path, instance):
+    def _validate(self, schema_path_or_dict, instance):
         jsonschema = pytest.importorskip("jsonschema", reason="jsonschema not installed")
-        schema = json.loads(schema_path.read_text())
+        schema = (
+            schema_path_or_dict
+            if isinstance(schema_path_or_dict, dict)
+            else json.loads(schema_path_or_dict.read_text())
+        )
         jsonschema.validate(instance=instance, schema=schema)
 
     def test_pointer_conforms(self):
@@ -1458,7 +1468,7 @@ class TestSchemaConformance:
             champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
         )
         audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
-        self._validate(AUDIT_SCHEMA_PATH, audit)
+        self._validate(AUDIT_SCHEMA, audit)
 
     def test_no_contest_audit_conforms(self):
         arm_scores = {
@@ -1469,7 +1479,7 @@ class TestSchemaConformance:
             champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
         )
         audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
-        self._validate(AUDIT_SCHEMA_PATH, audit)
+        self._validate(AUDIT_SCHEMA, audit)
 
     def test_unchanged_winner_audit_conforms(self):
         arm_scores = {
@@ -1480,11 +1490,11 @@ class TestSchemaConformance:
             champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
         )
         audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
-        self._validate(AUDIT_SCHEMA_PATH, audit)
+        self._validate(AUDIT_SCHEMA, audit)
 
     def test_error_audit_conforms(self):
         audit = build_champion_audit("2026-07-18", None, freeze=False, error="boom")
-        self._validate(AUDIT_SCHEMA_PATH, audit)
+        self._validate(AUDIT_SCHEMA, audit)
 
     def test_legacy_v1_audit_shape_still_schema_valid_by_git_history(self):
         """v1 historical records are NOT expected to validate against the
@@ -1501,7 +1511,7 @@ class TestSchemaConformance:
             "consecutive_wins": 0, "cooldown_until": "2026-07-27", "blocked_by": None,
         }
         jsonschema = pytest.importorskip("jsonschema", reason="jsonschema not installed")
-        schema = json.loads(AUDIT_SCHEMA_PATH.read_text())
+        schema = AUDIT_SCHEMA
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate(instance=legacy_v1, schema=schema)
 
@@ -1529,7 +1539,7 @@ class TestSchemaConformance:
         audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
         assert audit["blocked_by"] == ["leaderboard_stale_gt_8d"]
         assert audit["leaderboard_date_used"] == "2026-07-09"
-        self._validate(AUDIT_SCHEMA_PATH, audit)
+        self._validate(AUDIT_SCHEMA, audit)
 
     def test_promoted_audit_carries_leaderboard_date_used_and_conforms(self):
         arm_scores = {
@@ -1542,20 +1552,20 @@ class TestSchemaConformance:
         )
         audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
         assert audit["leaderboard_date_used"] == "2026-07-11"
-        self._validate(AUDIT_SCHEMA_PATH, audit)
+        self._validate(AUDIT_SCHEMA, audit)
 
     def test_leaderboard_stale_gt_8d_slug_in_schema_enum(self):
-        schema = json.loads(AUDIT_SCHEMA_PATH.read_text())
+        schema = AUDIT_SCHEMA
         slugs = set(schema["properties"]["blocked_by"]["oneOf"][1]["items"]["enum"])
         assert "leaderboard_stale_gt_8d" in slugs
 
     def test_feed_producer_dead_slug_in_schema_enum(self):
-        schema = json.loads(AUDIT_SCHEMA_PATH.read_text())
+        schema = AUDIT_SCHEMA
         slugs = set(schema["properties"]["blocked_by"]["oneOf"][1]["items"]["enum"])
         assert "feed_producer_dead" in slugs
 
     def test_feed_dependencies_field_declared_in_schema(self):
-        schema = json.loads(AUDIT_SCHEMA_PATH.read_text())
+        schema = AUDIT_SCHEMA
         assert "feed_dependencies" in schema["properties"]
         assert "feed_dependencies" not in schema["required"]  # additive, optional
 
@@ -1575,7 +1585,7 @@ class TestSchemaConformance:
         assert audit["outcome"] == "promoted"
         assert audit["champion_after"] == "scanner_predictor_direct"
         assert audit["feed_dependencies"] == ["research_free_backfill"]
-        self._validate(AUDIT_SCHEMA_PATH, audit)
+        self._validate(AUDIT_SCHEMA, audit)
 
 
 # ── Promotion-time feed-dependency liveness gate (alpha-engine-config-I3165)
@@ -2005,7 +2015,7 @@ class TestChampionSideEvidenceFloor:
         assert audit["blocked_by"] == ["scanner_predictor_direct_thin_evidence"]
         jsonschema = pytest.importorskip("jsonschema", reason="jsonschema not installed")
         jsonschema.validate(
-            instance=audit, schema=json.loads(AUDIT_SCHEMA_PATH.read_text()),
+            instance=audit, schema=AUDIT_SCHEMA,
         )
 
     def test_both_arms_thin_names_both(self):
@@ -2024,7 +2034,7 @@ class TestChampionSideEvidenceFloor:
         ]
 
     def test_champion_side_slugs_are_registered_in_the_schema_enum(self):
-        schema = json.loads(AUDIT_SCHEMA_PATH.read_text())
+        schema = AUDIT_SCHEMA
         enum = set(schema["properties"]["blocked_by"]["oneOf"][1]["items"]["enum"])
         for slug in (
             "scanner_predictor_direct_thin_evidence",

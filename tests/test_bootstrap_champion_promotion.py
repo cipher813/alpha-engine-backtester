@@ -10,7 +10,8 @@ import bootstrap_champion_promotion as bootstrap
 
 def test_build_bootstrap_audit_shape():
     audit = bootstrap._build_bootstrap_audit("2026-07-13", "agentic", "scanner_predictor_direct")
-    # contracts/producer_champion_audit.schema.json (v1) required fields.
+    # nousergon_lib.contracts's producer_champion_audit schema (v1 historical
+    # shape this bootstrap record predates the v2 winner-take-all bump).
     for field in (
         "schema_version", "date", "outcome", "champion_before", "champion_after",
         "challenger_matured_cohorts", "sn_lift_vs_champion", "consecutive_wins",
