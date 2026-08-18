@@ -87,20 +87,23 @@ def _sortino(returns: pd.Series, target: float = 0.0) -> float | None:
     Returns ``None`` on insufficient data (< 2 obs) or zero downside
     deviation (all returns ≥ target — degenerate, no risk to scale by).
     Not annualized; the caller decides annualization scale. The maths is
-    ``nousergon_lib.quant.riskstats.sortino_ratio`` (config-I7597) — see the
-    ``denominator`` note below.
+    ``nousergon_lib.quant.riskstats.sortino_ratio`` (config-I7597) on the
+    config-I7271 fleet denominator.
     """
     returns = returns.dropna()
     if len(returns) < 2:
         return None
     excess = [float(x) - target for x in returns]
     # periods_per_year=1 => no annualization (the caller decides the scale).
-    # denominator="downside" => the downside RMS is over the COUNT OF LOSING
-    # ROWS, not the full sample. That is NOT the fleet n-denominator convention
-    # (config-I7271) and understates this Sortino by sqrt(n / n_down); it is
-    # named at the call rather than re-implemented so the divergence is visible
-    # (config-I7597 reports it).
-    v = riskstats.sortino_ratio(excess, periods_per_year=1, denominator="downside")
+    # denominator="full" => the sum of squared shortfalls is divided by ALL n,
+    # the config-I7271 fleet convention. Converted from "downside" (which
+    # divided by the count of losing rows only) under config-I7618: the
+    # sensitivity conclusions this feeds compare Sortino ACROSS blend weights,
+    # and the old denominator's sqrt(n / n_down) understatement varies per blend
+    # with its own count of losing rows, so it perturbed the comparison and not
+    # just the level. Degenerate behaviour is unchanged: an all-upside series is
+    # ``None`` either way.
+    v = riskstats.sortino_ratio(excess, periods_per_year=1, denominator="full")
     return None if v is None else float(v)
 
 
