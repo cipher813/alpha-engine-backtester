@@ -60,6 +60,18 @@ ARTIFACT_CONFIG_TYPES = ("executor_params",)
 DEFAULT_ACCURACY_DROP_PP = 5.0     # rollback if accuracy drops > 5 percentage points
 DEFAULT_SHARPE_DROP_PCT = 0.20     # rollback if Sharpe drops > 20% (OBSERVABILITY ONLY,
 #                                    no longer a rollback trigger — see 2026-05-16 arc)
+# Unchanged by config-I7236's sqrt(365)->sqrt(252) Sharpe rescale (config-I7598,
+# option (c)): this is a RELATIVE drop, so a constant positive rescale of both
+# sides cancels. The one case it does not cancel is a baseline SAVED before
+# 2026-08-13 compared against a post-fix current value — that reads a spurious
+# 16.95% drop from the convention change alone. Bounded and self-healing: the
+# Guard-3 age check (DEFAULT_BASELINE_MAX_AGE_DAYS = 21) refuses and refreshes
+# any baseline older than 21 days, so the window closes on 2026-09-03; and the
+# Sharpe leg only writes `details["sharpe_drop_pct"]`, it never sets
+# `regression_detected` (the primary gate is Sortino, whose annualization did
+# not change). No cutover constant is added here on purpose — the age guard was
+# chosen over one deliberately (see DEFAULT_BASELINE_MAX_AGE_DAYS below), and a
+# 16-day contaminated observability field does not justify reversing that.
 DEFAULT_SORTINO_DROP_PCT = 0.20    # rollback if Sortino drops > 20% (PRIMARY
 #                                    risk-adjusted gate post skilled-risk evaluator revamp)
 

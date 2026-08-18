@@ -169,25 +169,28 @@ def _compute_benchmark_leg(
 def _compute_sortino_ratio(daily_returns: pd.Series, target: float = 0.0) -> float:
     """Annualized Sortino ratio (target = 0 by default).
 
-    Definition: (mean(r) - target) / downside_deviation * sqrt(252), where
-    downside_deviation = sqrt(mean(min(r - target, 0)**2)) — i.e. RMS of
-    only the below-target excursions. Dropped NaN before compute.
+    The maths is `nousergon_lib.quant.riskstats.sortino_ratio` — the same
+    library, the same n-denominator downside deviation (config-I7271) and the
+    same sqrt(252) annualization the evaluator uses, exactly as line 360 already
+    does for Sharpe. This function no longer re-derives any of it (config-I7597);
+    what remains is the two things the library deliberately does not decide:
 
-    Returns 0.0 when there are no below-target days (no downside) or when
-    the input series has fewer than 2 valid observations. Sample-std-style
-    ddof=0 in the downside RMS to match the standard definition (Sortino
-    1991); this differs from the sample std used in Sharpe.
+    * `target` is a PER-PERIOD target, not the library's annual `risk_free_rate`,
+      so it is subtracted here and the excess series goes in with rf=0.
+    * this call site reports 0.0 rather than `None` for an undefined ratio
+      (fewer than 2 valid observations, or no below-target day). That sentinel
+      is load-bearing for the parquet round-trip into `sweep_df` and is
+      preserved verbatim — it is NOT the library's convention, which is `None`
+      for undefined (see the Sharpe note at line 360).
+
+    Dropped NaN before compute.
     """
     r = daily_returns.dropna().to_numpy(dtype=np.float64)
     if r.size < 2:
         return 0.0
-    excess = r - target
-    downside = np.minimum(excess, 0.0)
-    downside_var = float(np.mean(downside * downside))
-    if downside_var <= 0.0:
-        return 0.0
-    downside_dev = math.sqrt(downside_var)
-    return float(excess.mean() / downside_dev * math.sqrt(_TRADING_DAYS_PER_YEAR))
+    excess = [float(x) - target for x in r]
+    ratio = riskstats.sortino_ratio(excess, periods_per_year=_TRADING_DAYS_PER_YEAR)
+    return 0.0 if ratio is None else float(ratio)
 
 
 def _compute_cvar(daily_returns: pd.Series, q: float = 0.05) -> float:

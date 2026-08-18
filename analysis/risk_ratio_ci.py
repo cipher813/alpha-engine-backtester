@@ -39,6 +39,7 @@ import logging
 import math
 
 import numpy as np
+from nousergon_lib.quant import riskstats
 
 logger = logging.getLogger(__name__)
 
@@ -61,46 +62,61 @@ _Z = 1.96  # nominal, unused (we use empirical percentiles), kept for reference
 def _sharpe(returns: np.ndarray) -> float | None:
     """Annualized Sharpe — mean / std of daily returns, scaled by √252.
 
-    None on < 2 obs or zero volatility (degenerate — no risk to scale by).
+    Delegates to ``nousergon_lib.quant.riskstats.sharpe_ratio`` (config-I7597);
+    the library shares this function's ``None``-on-undefined convention, so the
+    only local work is coercing the array and rejecting a non-finite result
+    (which is what the old ``np.isfinite(sd)`` guard caught).
     """
     if returns.size < 2:
         return None
-    sd = returns.std(ddof=1)
-    if sd == 0 or not np.isfinite(sd):
+    v = riskstats.sharpe_ratio(
+        [float(x) for x in returns], periods_per_year=_TRADING_DAYS_PER_YEAR
+    )
+    if v is None or not math.isfinite(v):
         return None
-    return float(returns.mean() / sd * math.sqrt(_TRADING_DAYS_PER_YEAR))
+    return float(v)
 
 
 def _sortino(returns: np.ndarray, target: float = 0.0) -> float | None:
     """Annualized Sortino — mean excess / downside deviation, scaled by √252.
 
     None on < 2 obs, no downside (Sortino undefined), or zero downside dev.
-    Mirrors ``analysis.factor_blend_sensitivity._sortino`` (annualized here).
+
+    ``denominator="downside"`` — the downside RMS is taken over the COUNT OF
+    BELOW-TARGET DAYS, not the full sample. That is NOT the fleet convention
+    (config-I7271 pinned the n-denominator, which is what
+    ``vectorbt_bridge._compute_sortino_ratio`` and the evaluator use) and it
+    understates this Sortino by sqrt(n / n_down). The variant is named
+    explicitly rather than re-implemented so the divergence is visible at the
+    call site; changing it moves a published CI and is tracked separately
+    (config-I7597 reports it).
     """
     if returns.size < 2:
         return None
-    excess = returns - target
-    downside = excess[excess < 0]
-    if downside.size == 0:
+    excess = [float(x) - target for x in returns]
+    v = riskstats.sortino_ratio(
+        excess, periods_per_year=_TRADING_DAYS_PER_YEAR, denominator="downside"
+    )
+    if v is None or not math.isfinite(v):
         return None
-    downside_dev = math.sqrt((downside ** 2).mean())
-    if downside_dev == 0:
-        return None
-    return float(excess.mean() / downside_dev * math.sqrt(_TRADING_DAYS_PER_YEAR))
+    return float(v)
 
 
 def _information_ratio(active: np.ndarray) -> float | None:
     """Annualized Information Ratio — mean active return / tracking error.
 
-    ``active`` is the per-day (portfolio − benchmark) return series. None on
-    < 2 obs or zero tracking error.
+    ``active`` is the per-day (portfolio − benchmark) return series. IR is
+    Sharpe computed on the active-return series (rf = 0), so it is the same
+    library call (config-I7597). None on < 2 obs or zero tracking error.
     """
     if active.size < 2:
         return None
-    te = active.std(ddof=1)
-    if te == 0 or not np.isfinite(te):
+    v = riskstats.sharpe_ratio(
+        [float(x) for x in active], periods_per_year=_TRADING_DAYS_PER_YEAR
+    )
+    if v is None or not math.isfinite(v):
         return None
-    return float(active.mean() / te * math.sqrt(_TRADING_DAYS_PER_YEAR))
+    return float(v)
 
 
 def _moving_block_resample(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:

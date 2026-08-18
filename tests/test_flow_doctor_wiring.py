@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -388,6 +389,12 @@ class TestColdStartDeferral:
             )
 
 
+# The tag every deploy artifact must pin. `tests/test_lib_pin_lockstep.py`
+# asserts requirements.txt and the three Lambda Dockerfiles all carry the SAME
+# tag; this constant is what that tag must be.
+_EXPECTED_LIB_TAG = "v0.124.68"
+
+
 class TestLibVersionPin:
     """alpha-engine-lib must be pinned to a stable tag, not a floating
     branch. Drift = silent breakage class.
@@ -398,29 +405,37 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "nousergon-lib must be pinned to a tag, not @main"
-        assert "@v0.124.66" in text, (
-            "nousergon-lib should pin to v0.124.66, the first published "
-            "release carrying the producer_champion_audit contract "
-            "(nousergon-lib-PR325, alpha-engine-config-I7605). This repo's "
-            "test suite reads that schema from the installed library rather "
-            "than from a sibling checkout, so below this pin the contract "
-            "test cannot resolve it. Earlier: v0.124.5 "
-            "(nousergon_lib.health enrichment "
-            "writer for config#1727 Phase C; lockstep with fleet at v0.124.5; bumped for nousergon_lib.quant.stats.trial_accumulator (config#2454)). "
-            "Prior: v0.86.0 — flow-doctor>=0.8.0 notify_on_category for config#1695. "
-            "(nousergon_lib.quant.horizons + the outcome_record contract, "
-            "config#1483 Phase 1 / nousergon-lib#147) consumed by the "
-            "config#1528 optimizer cutover. "
-            "Prior: v0.72.0 — the cscv_pbo lift into "
-            "nousergon_lib.quant.stats.pbo (config#1318 / nousergon-lib#140), "
-            "which analysis/pbo.py now re-exports. "
-            "Prior: v0.70.0 — the lifted experiment config resolver crossing "
-            "(config#1157 / #396), which moved config/predictor.yaml resolution "
-            "into nousergon-lib's config resolver. "
-            "Prior: v0.60.2 — the alpha_engine_lib -> nousergon_lib rename "
-            "crossing (config#1245 / #1172), which migrated this repo's "
-            "'python -m alpha_engine_lib.<mod>' invocations to "
-            "'-m nousergon_lib.<mod>' (the old meta-path alias shim lacks "
-            "runpy's get_code, so '-m' dies under runpy on crossed boxes). "
+        # EXACT tag match, anchored on the URL. The previous form asserted the
+        # bare substring "@v0.124.5", which the then-current pin v0.124.57
+        # satisfied only by accident — that assertion admitted every tag from
+        # v0.124.5 through v0.124.59 and rejected v0.124.6, i.e. it had stopped
+        # testing the thing it names (config-I7597).
+        assert f"nousergon-lib@{_EXPECTED_LIB_TAG}\n" in text or (
+            f"nousergon-lib@{_EXPECTED_LIB_TAG}" in text
+            and not re.search(
+                rf"nousergon-lib@{re.escape(_EXPECTED_LIB_TAG)}[0-9.]", text
+            )
+        ), (
+            f"nousergon-lib should pin to {_EXPECTED_LIB_TAG} — bumped for "
+            "nousergon_lib.quant.riskstats.downside_deviation and the "
+            "`denominator` parameter on sortino_ratio (config-I7597: the "
+            "backtester's risk-ratio call sites and vectorbt_bridge's "
+            "Sortino now call the library instead of re-deriving it). This "
+            "tag is nousergon-lib-PR327's merge-time autobump from v0.124.66; "
+            "if that merge published a different patch, this is the one "
+            "line to correct. Prior: v0.124.66 — the first published release "
+            "carrying the producer_champion_audit contract (nousergon-lib-"
+            "PR325, alpha-engine-config-I7605); this repo's test suite reads "
+            "that schema from the installed library rather than from a "
+            "sibling checkout, so below that pin the contract test cannot "
+            "resolve it. Prior: v0.124.57. Prior: v0.124.5 (nousergon_lib."
+            "health enrichment writer, config#1727 Phase C; nousergon_lib."
+            "quant.stats.trial_accumulator, config#2454). "
+            "Prior: v0.86.0 — flow-doctor>=0.8.0 notify_on_category "
+            "(config#1695). Prior: v0.72.0 — cscv_pbo lift into "
+            "nousergon_lib.quant.stats.pbo (config#1318 / nousergon-lib#140). "
+            "Prior: v0.70.0 — lifted experiment config resolver "
+            "(config#1157 / #396). Prior: v0.60.2 — alpha_engine_lib -> "
+            "nousergon_lib rename crossing (config#1245 / #1172). "
             "Update this test if the pin moves further forward."
         )

@@ -927,8 +927,26 @@ def _grade_position_sizing(sizing_ab: dict | None) -> dict:
     alpha_diff = sizing_ab.get("alpha_diff")
     assessment = sizing_ab.get("assessment", "no_difference")
 
-    # Sharpe improvement: 0 → 50, +0.3 → 80, +0.5 → 95
-    sharpe_g = _lift_to_grade(sharpe_diff, floor=-0.3, ceiling=0.5) if sharpe_diff is not None else None
+    # Sharpe improvement: 0 → 50, +0.249 → 80, +0.415 → 95.
+    #
+    # Re-derived on the sqrt(252) scale (config-I7598). `sharpe_diff` is a
+    # DIFFERENCE of two Sharpes, so config-I7236's sqrt(365)->sqrt(252) change
+    # rescales it by sqrt(252/365) = 0.830455 — the anchors have to move with
+    # it or the same real sizing improvement silently grades lower:
+    #     floor:   -0.3 * 0.830455 = -0.249
+    #     ceiling:  0.5 * 0.830455 =  0.415
+    # A conversion is the right answer HERE, unlike the raw-Sharpe map in
+    # `_grade_portfolio` below, because there is no external convention for
+    # "a good Sharpe delta from a position-sizing scheme" — these anchors were
+    # chosen (2026-04-08, 92569f83) against this system's own pre-fix numbers,
+    # so they carry the old scale with them.
+    #
+    # NOT re-derived, and it should be: `analysis/sizing_ab.py:89,92` thresholds
+    # the same `sharpe_diff` at +/-0.1 to set the `assessment` string this
+    # function also reads. That literal needs the same 0.830455 factor
+    # (0.1 -> 0.083) and is left untouched only because another change was in
+    # flight in that file — reported on config-I7598, not absorbed.
+    sharpe_g = _lift_to_grade(sharpe_diff, floor=-0.249, ceiling=0.415) if sharpe_diff is not None else None
 
     # Alpha improvement
     alpha_g = _lift_to_grade(alpha_diff, floor=-2.0, ceiling=3.0) if alpha_diff is not None else None
@@ -985,6 +1003,24 @@ def _grade_portfolio(signal_quality: dict | None,
 
     # Legacy Sharpe → grade map kept for the fallback path + side-channel
     # display. Sharpe 0 → 30, 1.0 → 65, 2.0 → 95.
+    #
+    # Deliberately NOT rescaled by config-I7236's sqrt(365)->sqrt(252) change
+    # (config-I7598, option (c) — the old value is still correct). Unlike the
+    # `sharpe_diff` anchors in `_grade_position_sizing`, these anchor points are
+    # ABSOLUTE Sharpe levels borrowed from the universal convention — 1.0 is
+    # "good", 2.0 is "excellent" — and that convention is stated on the standard
+    # sqrt(252) annualization. Before config-I7236 this map was reading
+    # sqrt(365)-inflated Sharpes against sqrt(252) anchors, i.e. it was
+    # over-grading by 20%; the annualization fix made it correct for the first
+    # time. Multiplying the slope by 1.2039 to hold grades constant would
+    # re-introduce exactly that error and call it a re-derivation. Same-strategy
+    # grades from this fallback DO drop ~8 points versus pre-2026-08-13 cards;
+    # that is the correction landing, not a regression.
+    #
+    # Reach: the fallback fires only when `sortino_ratio`/`cvar_95` are absent
+    # from `portfolio_stats` (`use_new_stack` below). `vectorbt_bridge` has
+    # emitted both since the evaluator revamp, so this path is dormant for
+    # current producers and live only for replayed historical stats.
     sharpe_g = _clamp(30.0 + sharpe * 32.5) if sharpe is not None else None
     # Sortino: 0 → 30, 1.5 → 65, 3.0 → 95 (Sortino runs higher than Sharpe
     # because the denominator is smaller; calibrate the band accordingly).

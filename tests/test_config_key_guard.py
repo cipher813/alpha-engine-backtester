@@ -186,7 +186,9 @@ class TestExecutorByRankOverrideGuard:
         })
         assert executor_optimizer._resolve_min_baseline_magnitude("sortino_ratio") == 0.123
         # Metrics not named in the subset fall through to the code default.
-        assert executor_optimizer._resolve_min_baseline_magnitude("sharpe_ratio") == 0.05
+        # 0.05 * sqrt(252/365) — re-derived on the sqrt(252) Sharpe scale
+        # (config-I7598). Deliberately no longer equal to the sortino floor.
+        assert executor_optimizer._resolve_min_baseline_magnitude("sharpe_ratio") == 0.0415
 
 
 # ── evaluate._read_current_weights fallback path ─────────────────────────────
