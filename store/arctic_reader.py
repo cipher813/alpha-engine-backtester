@@ -139,6 +139,62 @@ def _verify_arctic_fresh(bucket: str, min_date: str | None = None) -> None:
             )
 
 
+def load_spy_close(bucket: str = DEFAULT_BUCKET) -> pd.Series | None:
+    """SPY's daily close series from the ArcticDB macro library.
+
+    alpha-engine-config-I7672. The benchmark leg of every simulation.
+    ``_setup_simulation`` builds a price matrix of ~904 EQUITIES and no macro
+    tickers, so both ``_run_simulation_loop`` call sites in
+    ``_run_simulation_pipeline`` ran with ``spy_prices=None`` and
+    ``vectorbt_bridge.portfolio_stats`` emitted ``spy_return`` and
+    ``total_alpha`` as null — measured on every weekly artifact back to at
+    least 2026-07-24. ``executor_optimizer``'s ``alpha_floor`` gate then read
+    ``NaN >= 0.0`` as False and reported *"All 60 valid combos backtested with
+    total_alpha < 0.0"*, which is a claim about a measurement that does not
+    exist.
+
+    Reads the SAME symbol and column ``_verify_arctic_fresh`` above already
+    asserts freshness on, so there is no new data dependency and no second
+    definition of "which series is the benchmark".
+
+    Returns ``None`` — never raises — when the macro library or the symbol is
+    unreachable. The caller passes ``None`` through to ``portfolio_stats``,
+    which records it in ``null_legs``; that is the honest degradation, and the
+    consumer-side fix in ``executor_optimizer`` is what makes it loud. Raising
+    here would let a macro-library hiccup kill a four-hour simulation whose
+    strategy-internal metrics are entirely computable without it.
+    """
+    from nousergon_lib.arcticdb import open_macro_lib
+
+    try:
+        _get_arctic(bucket)
+        df = open_macro_lib(bucket).read("SPY", columns=["Close"]).data
+    except Exception as exc:  # noqa: BLE001 — degrade to null, loudly
+        log.warning(
+            "load_spy_close: ArcticDB macro SPY unreadable (%s) — the run's "
+            "benchmark legs will emit null and be flagged in null_legs "
+            "(config-I7672).", exc,
+        )
+        return None
+
+    if df is None or df.empty or "Close" not in df.columns:
+        log.warning(
+            "load_spy_close: ArcticDB macro SPY returned no usable Close "
+            "column — benchmark legs will emit null (config-I7672).",
+        )
+        return None
+
+    series = df["Close"].dropna()
+    if series.empty:
+        log.warning("load_spy_close: SPY Close series is empty after dropna.")
+        return None
+    log.info(
+        "load_spy_close: SPY close loaded, %d rows, %s..%s",
+        len(series), series.index.min().date(), series.index.max().date(),
+    )
+    return series
+
+
 def load_universe_from_arctic(
     bucket: str = DEFAULT_BUCKET,
     tickers_allowlist: set[str] | None = None,

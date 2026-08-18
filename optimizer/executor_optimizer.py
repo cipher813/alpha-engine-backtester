@@ -49,6 +49,34 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 
+def _null_legs_summary(df) -> list[str]:
+    """The distinct benchmark legs the sweep itself reported as null.
+
+    ``vectorbt_bridge.portfolio_stats`` writes a ``null_legs`` list onto every
+    row naming the legs it could not compute. It has said
+    ``['spy_return', 'total_alpha']`` on every weekly sweep since at least
+    2026-07-24 and no consumer read it (alpha-engine-config-I7672). Reading it
+    here turns "alpha is missing" into "alpha is missing BECAUSE the benchmark
+    leg was not supplied", which is the difference between a strategy finding
+    and a plumbing one.
+
+    Tolerant of shape: the column round-trips through CSV as a string
+    repr, so this normalizes rather than assuming a list.
+    """
+    if "null_legs" not in getattr(df, "columns", []):
+        return []
+    seen: set[str] = set()
+    for value in df["null_legs"].dropna().tolist():
+        if isinstance(value, str):
+            seen.update(t.strip("[]'\" ") for t in value.replace(",", " ").split())
+        else:
+            try:
+                seen.update(str(v) for v in value)
+            except TypeError:
+                continue
+    return sorted(t for t in seen if t)
+
+
 def _safe_float(v) -> float | None:
     """Convert to float, returning None for NaN/None."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -461,18 +489,65 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     alpha_floor = _cfg.get("alpha_floor")
     if alpha_floor is not None and "total_alpha" in valid.columns:
         n_before = len(valid)
+
+        # UNMEASURED IS NOT FAILING (alpha-engine-config-I7672).
+        #
+        # `NaN >= alpha_floor` is False, so an all-null `total_alpha` column
+        # drops every combo and the branch below reports "All N valid combos
+        # backtested with total_alpha < 0.0" — a claim about a measurement that
+        # does not exist. That ran for SEVEN CONSECUTIVE WEEKS: the simulation
+        # pipeline never loaded SPY, so `vectorbt_bridge.portfolio_stats`
+        # emitted `spy_return` and `total_alpha` as null on every combo and
+        # recorded it in `null_legs`, which nothing here read.
+        #
+        # The tell was already in the message: `best in sweep: None`.
+        # `Series.max()` skips NaN, so None there means EVERY value is NaN —
+        # one measured combo would have printed a number. It escalated to the
+        # Director as "the optimization loop is broken" and to the weekly plan
+        # as a strategy finding, when the truthful reading was "the backtester
+        # has no benchmark".
+        n_measured = int(valid["total_alpha"].notna().sum())
+        if n_measured == 0:
+            null_legs = _null_legs_summary(valid)
+            return {
+                "status": "alpha_unmeasured",
+                "alpha_floor": float(alpha_floor),
+                "n_combos": n_before,
+                "n_measured": 0,
+                "null_legs": null_legs,
+                "note": (
+                    f"total_alpha is NULL on all {n_before} valid combos — the "
+                    f"alpha floor was NOT evaluated and no combo has been shown "
+                    f"to be alpha-negative. Refusing to promote and refusing to "
+                    f"call this a strategy result. "
+                    + (f"Sweep-reported null legs: {null_legs}. " if null_legs else "")
+                    + "Most likely the simulation ran without a benchmark "
+                      "(spy_prices not loaded) — see config-I7672."
+                ),
+            }
+
         alpha_pos = valid[valid["total_alpha"] >= alpha_floor].copy()
         n_dropped = n_before - len(alpha_pos)
         best_alpha_in_sweep = _safe_float(valid["total_alpha"].max())
+        if n_measured < n_before:
+            # Partial nulls silently narrow the ranked set. Say so rather than
+            # letting the surviving combos stand in for the whole sweep.
+            logger.warning(
+                "executor_optimizer: %d/%d combos carry NO total_alpha and are "
+                "excluded from the alpha floor — the ranked set is narrower "
+                "than the sweep (config-I7672).",
+                n_before - n_measured, n_before,
+            )
         if len(alpha_pos) == 0:
             return {
                 "status": "alpha_below_floor",
+                "n_measured": n_measured,
                 "alpha_floor": float(alpha_floor),
                 "n_combos_below_floor": int(n_dropped),
                 "best_alpha_in_sweep": best_alpha_in_sweep,
                 "note": (
-                    f"All {n_before} valid combos backtested with "
-                    f"total_alpha < {alpha_floor} (best in sweep: "
+                    f"All {n_measured} MEASURED combos (of {n_before} valid) "
+                    f"backtested with total_alpha < {alpha_floor} (best in sweep: "
                     f"{best_alpha_in_sweep}). Refusing to promote — per the "
                     f"canonical-alpha framework, alpha-positive is a hard "
                     f"constraint, not a side-output. Either signal quality "

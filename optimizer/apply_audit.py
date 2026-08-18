@@ -124,6 +124,16 @@ _EXECUTOR_STATUS = {
     "no_params": ("insufficient_data", None),
     "degraded": ("insufficient_data", None),
     "alpha_below_floor": ("blocked", ["alpha_floor"]),
+    # alpha-engine-config-I7672 — the constraint could not be EVALUATED
+    # because total_alpha was null on every combo (the simulation ran without
+    # a benchmark). Mapped to "error", deliberately, not to
+    # "insufficient_data": the consumer grades insufficient_data as HEALTHY,
+    # and a sweep that cannot measure its own hard constraint must be loud.
+    # It is also not "blocked" — nothing refused a recommendation; there was
+    # no measurement to refuse one on, and seven weeks of it reading as a
+    # guardrail block is what sent "the optimization loop is broken" to the
+    # Director instead of "the backtester has no benchmark".
+    "alpha_unmeasured": ("error", None),
     "insufficient_trades": ("blocked", ["min_trades_to_promote"]),
     "negative_sortino": ("blocked", ["negative_rank_metric"]),
     "negative_sharpe": ("blocked", ["negative_rank_metric"]),
