@@ -76,6 +76,34 @@ jobs:
           pip install -r requirements.txt
           pip install pytest hypothesis pytest-cov
 
+      # nous-ergon-ops-I738: krepis-PR95 (v0.59.15/0.59.16, merged
+      # 2026-08-18) added an in-process DLP scan hook to
+      # krepis.llm.LLMClient that shells out to `gitleaks` and fails
+      # closed (LLMError DLP_SCAN_ERROR) when the binary is missing from
+      # PATH. requirements.txt:155 pins `krepis[openai]>=0.55.0` with no
+      # ceiling, so this job's fresh `pip install -r requirements.txt`
+      # above resolves to 0.59.16. tests/test_replay_runner.py and
+      # tests/test_replay_comparison.py call the REAL
+      # krepis.llm.LLMClient.structured() (only the underlying transport
+      # client is mocked via the client_factory seam), which reaches the
+      # DLP scan before touching the mocked transport — so this job needs
+      # the gitleaks binary on PATH. Mirrors krepis's own working CI step
+      # (krepis .github/workflows/test.yml, commit 3488b0dc) exactly,
+      # including the pinned version/checksum.
+      - name: Install gitleaks (for session_dlp coverage — nous-ergon-ops-I738)
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION="8.30.1"
+          GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          curl -sSL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+          sudo mkdir -p /opt/groom-llm-routing
+          printf '[extend]\nuseDefault = true\n' | sudo tee /opt/groom-llm-routing/gitleaks-egress.toml > /dev/null
+
       # Undefined-name lint (config#1646 follow-on): `sim_all_orders` was
       # referenced in a function that never defined it — a NameError that only
       # detonated at report time on the live weekly (backtest.py, PR #404),
@@ -156,6 +184,24 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest hypothesis mutmut
+
+      # nous-ergon-ops-I738: same fresh-install exposure as the `test` job
+      # above (requirements.txt:155 `krepis[openai]>=0.55.0` resolves to
+      # 0.59.16) — mutmut re-runs tests/ per mutant, including the two
+      # test files that reach krepis.llm.LLMClient.structured()'s DLP scan.
+      - name: Install gitleaks (for session_dlp coverage — nous-ergon-ops-I738)
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION="8.30.1"
+          GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          curl -sSL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+          sudo mkdir -p /opt/groom-llm-routing
+          printf '[extend]\nuseDefault = true\n' | sudo tee /opt/groom-llm-routing/gitleaks-egress.toml > /dev/null
 
       - name: Run mutmut on apply-path modules (rollback / apply_audit / assembler)
         run: mutmut run --max-children 4 || true
