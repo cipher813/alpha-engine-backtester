@@ -18,6 +18,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # Pin secrets source BEFORE any test module imports a get_secret() caller.
 os.environ.setdefault("ALPHA_ENGINE_SECRETS_SOURCE", "env")
 
+# Put the crucible-executor sibling checkout (if resolvable) on sys.path
+# HERE, before any test module is collected (alpha-engine-config-I7619).
+# Several test_*.py files import from `executor.*` and previously did this
+# insert at their own module level — whether `executor` was importable when
+# test_actionable_signals_parity.py ran its `from executor.signal_reader
+# import get_actionable_signals` then depended on pytest's alphabetical
+# collection order (files starting after "a" inserted too late to help it).
+# conftest.py always loads first, so this ordering bug can't recur.
+from tests._sibling_checkout import ensure_executor_on_sys_path  # noqa: E402
+
+ensure_executor_on_sys_path()
+
 # Stub arcticdb by default for all unit tests — they must never hit real S3,
 # and CI (GitHub Actions) has no AWS credentials, so real arcticdb calls
 # would 403 (observed 2026-04-24 CI on PR #76). Integration tests that need

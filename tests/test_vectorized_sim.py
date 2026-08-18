@@ -20,17 +20,24 @@ Coverage:
 from __future__ import annotations
 
 import math
-import os
-import sys
 
 import numpy as np
 import pytest
 
 
 # Ensure executor on sys.path for SimulatedIBKRClient import
-_EXECUTOR_ROOT = os.path.expanduser("~/Development/alpha-engine")
-if os.path.isdir(_EXECUTOR_ROOT) and _EXECUTOR_ROOT not in sys.path:
-    sys.path.insert(0, _EXECUTOR_ROOT)
+# Resolution centralized in tests/_sibling_checkout.py (alpha-engine-config-
+# I7619): CI sets EXECUTOR_ROOT_DIR after checking crucible-executor out; a
+# missing checkout on CI hard-fails collection instead of silently skipping
+# forever, and only skips (per test, below) on a dev laptop.
+from tests._sibling_checkout import (
+    ensure_executor_on_sys_path,
+    executor_missing_reason,
+    executor_root_missing_hard_fail_on_ci,
+)
+
+_EXECUTOR_ROOT = ensure_executor_on_sys_path()
+_EXECUTOR_ROOT_MISSING = executor_root_missing_hard_fail_on_ci(_EXECUTOR_ROOT)
 
 
 from synthetic.vectorized_sim import VectorizedSimulator, _NO_ENTRY
@@ -326,8 +333,8 @@ class TestParityVsScalarSimulatedIBKRClient:
     independent scalar sim_clients."""
 
     @pytest.mark.skipif(
-        not os.path.isdir(_EXECUTOR_ROOT),
-        reason="alpha-engine sibling repo not present at ~/Development/alpha-engine",
+        _EXECUTOR_ROOT_MISSING,
+        reason=executor_missing_reason(_EXECUTOR_ROOT),
     )
     def test_nav_evolution_matches_scalar_after_random_orders(self):
         from executor.ibkr import SimulatedIBKRClient
@@ -441,8 +448,8 @@ class TestParityVsScalarSimulatedIBKRClient:
             )
 
     @pytest.mark.skipif(
-        not os.path.isdir(_EXECUTOR_ROOT),
-        reason="alpha-engine sibling repo not present",
+        _EXECUTOR_ROOT_MISSING,
+        reason=executor_missing_reason(_EXECUTOR_ROOT),
     )
     def test_cash_position_state_matches_scalar(self):
         """After a fixed sequence of orders, both representations of

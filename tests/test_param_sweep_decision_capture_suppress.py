@@ -25,21 +25,28 @@ This file pins all of the above EXCEPT the last (which lives in
 
 from __future__ import annotations
 
-import os
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 
-_EXECUTOR_ROOT = os.path.expanduser("~/Development/alpha-engine")
-if os.path.isdir(_EXECUTOR_ROOT) and _EXECUTOR_ROOT not in sys.path:
-    sys.path.insert(0, _EXECUTOR_ROOT)
+# Resolution centralized in tests/_sibling_checkout.py (alpha-engine-config-
+# I7619): CI sets EXECUTOR_ROOT_DIR after checking crucible-executor out; a
+# missing checkout on CI hard-fails collection instead of silently skipping
+# forever, and only skips (below) on a dev laptop.
+from tests._sibling_checkout import (
+    ensure_executor_on_sys_path,
+    executor_missing_reason,
+    executor_root_missing_hard_fail_on_ci,
+)
+
+_EXECUTOR_ROOT = ensure_executor_on_sys_path()
+_EXECUTOR_ROOT_MISSING = executor_root_missing_hard_fail_on_ci(_EXECUTOR_ROOT)
 
 
 pytestmark = pytest.mark.skipif(
-    not os.path.isdir(_EXECUTOR_ROOT),
-    reason="alpha-engine executor not available locally",
+    _EXECUTOR_ROOT_MISSING,
+    reason=executor_missing_reason(_EXECUTOR_ROOT),
 )
 
 

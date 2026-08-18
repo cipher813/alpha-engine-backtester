@@ -18,8 +18,6 @@ Run with USE_REAL_ARCTICDB=1 if you need to stress the integration path
 """
 from __future__ import annotations
 
-import os
-import sys
 
 import pandas as pd
 import pytest
@@ -27,9 +25,18 @@ import pytest
 
 # Ensure executor on sys.path before importing backtester functions
 # (the executor lives in a sibling repo at ~/Development/alpha-engine).
-_EXECUTOR_ROOT = os.path.expanduser("~/Development/alpha-engine")
-if os.path.isdir(_EXECUTOR_ROOT) and _EXECUTOR_ROOT not in sys.path:
-    sys.path.insert(0, _EXECUTOR_ROOT)
+# Resolution centralized in tests/_sibling_checkout.py (alpha-engine-config-
+# I7619): CI sets EXECUTOR_ROOT_DIR after checking crucible-executor out; a
+# missing checkout on CI hard-fails collection instead of silently skipping
+# forever, and only skips (per test, below) on a dev laptop.
+from tests._sibling_checkout import (
+    ensure_executor_on_sys_path,
+    executor_missing_reason,
+    executor_root_missing_hard_fail_on_ci,
+)
+
+_EXECUTOR_ROOT = ensure_executor_on_sys_path()
+_EXECUTOR_ROOT_MISSING = executor_root_missing_hard_fail_on_ci(_EXECUTOR_ROOT)
 
 
 def _df_history(n_bars: int = 100, base: float = 100.0) -> pd.DataFrame:
@@ -104,8 +111,8 @@ def _config():
 
 
 @pytest.mark.skipif(
-    not os.path.isdir(_EXECUTOR_ROOT),
-    reason="alpha-engine sibling repo not present at ~/Development/alpha-engine",
+    _EXECUTOR_ROOT_MISSING,
+    reason=executor_missing_reason(_EXECUTOR_ROOT),
 )
 class TestSimulateViaDecidersSmoke:
     def test_single_date_returns_orders(self):
@@ -232,8 +239,8 @@ class TestBuildMergedSimulateConfig:
         assert merged["init_cash"] == 100.0
 
     @pytest.mark.skipif(
-        not os.path.isdir(_EXECUTOR_ROOT),
-        reason="alpha-engine sibling repo not present at ~/Development/alpha-engine",
+        _EXECUTOR_ROOT_MISSING,
+        reason=executor_missing_reason(_EXECUTOR_ROOT),
     )
     def test_evaluate_exits_with_feature_lookup_matches_without(self):
         """Tier 3 Part C parity (2026-04-27): evaluate_exits called with
