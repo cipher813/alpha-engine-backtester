@@ -82,20 +82,32 @@ def _sortino(returns: np.ndarray, target: float = 0.0) -> float | None:
 
     None on < 2 obs, no downside (Sortino undefined), or zero downside dev.
 
-    ``denominator="downside"`` — the downside RMS is taken over the COUNT OF
-    BELOW-TARGET DAYS, not the full sample. That is NOT the fleet convention
-    (config-I7271 pinned the n-denominator, which is what
-    ``vectorbt_bridge._compute_sortino_ratio`` and the evaluator use) and it
-    understates this Sortino by sqrt(n / n_down). The variant is named
-    explicitly rather than re-implemented so the divergence is visible at the
-    call site; changing it moves a published CI and is tracked separately
-    (config-I7597 reports it).
+    ``denominator="full"`` — the fleet convention config-I7271 pinned, and the
+    same one ``vectorbt_bridge._compute_sortino_ratio`` and the evaluator use.
+    Converted from the non-standard ``"downside"`` variant (config-I7618): that
+    divided the sum of squared shortfalls by the COUNT OF BELOW-TARGET DAYS
+    instead of by all n, understating this Sortino by sqrt(n / n_down) — a bias
+    whose size varies with how many losing days the resample happens to contain,
+    which is precisely what a bootstrap CI is supposed to characterize.
+
+    THIS MOVES A PUBLISHED NUMBER. The Sortino point estimate and both CI bounds
+    rise by exactly sqrt(n / n_down) on any given draw. Two numbers labelled
+    "Sortino" on the same report card were computed on two definitions; they no
+    longer are. Nothing downstream diffs a post-change value against a stored
+    pre-change one — the CI is recomputed from the return sleeve on every
+    evaluate run and is not baselined (unlike ``optimizer.regression_monitor``,
+    which does persist baselines but reads Sharpe/Sortino from a different
+    producer).
+
+    Degenerate behaviour is unchanged: under ``"downside"`` an all-upside series
+    gave ``None`` (empty denominator); under ``"full"`` it gives a zero downside
+    deviation, which ``sortino_ratio`` also maps to ``None``.
     """
     if returns.size < 2:
         return None
     excess = [float(x) - target for x in returns]
     v = riskstats.sortino_ratio(
-        excess, periods_per_year=_TRADING_DAYS_PER_YEAR, denominator="downside"
+        excess, periods_per_year=_TRADING_DAYS_PER_YEAR, denominator="full"
     )
     if v is None or not math.isfinite(v):
         return None

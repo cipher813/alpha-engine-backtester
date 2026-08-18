@@ -254,20 +254,27 @@ def _candidate_return_stream(df: pd.DataFrame, vec: dict) -> pd.Series | None:
 def _sortino(returns: pd.Series, target: float = 0.0) -> float | None:
     """Sortino ratio — mean excess / downside deviation (not annualized).
 
-    The maths is ``nousergon_lib.quant.riskstats.sortino_ratio`` (config-I7597).
-    Same convention as ``analysis.factor_blend_sensitivity._sortino``:
-    ``denominator="downside"``, i.e. the RMS of below-target excursions divided
-    by the COUNT OF THOSE EXCURSIONS. It is NOT the same as
-    ``vectorbt_bridge._compute_sortino_ratio``, whose downside deviation runs
-    over the full sample (the config-I7271 convention) — the docstring that
-    claimed otherwise was wrong, and the two differ by sqrt(n / n_down).
-    ``None`` on < 2 obs or zero downside deviation.
+    The maths is ``nousergon_lib.quant.riskstats.sortino_ratio`` (config-I7597)
+    on ``denominator="full"`` — the config-I7271 fleet convention, the same one
+    ``vectorbt_bridge._compute_sortino_ratio`` uses.
+
+    Converted from ``"downside"`` under config-I7618. This is the OBJECTIVE a
+    weight sweep selects on, so the old denominator was not a display bias: it
+    divided by the count of losing dates, understating each candidate by
+    sqrt(n / n_down), and n_down differs BETWEEN candidates. A candidate with
+    fewer, deeper losses was flattered against one with more, shallower losses
+    independent of its actual risk-adjusted quality, so the ranking itself was
+    not consistent. Under ``"full"`` every candidate is divided by the same n and
+    the objective is monotone in the quantity it claims to measure.
+
+    ``None`` on < 2 obs or zero downside deviation (an all-upside candidate gave
+    ``None`` under ``"downside"`` too — unchanged).
     """
     returns = returns.dropna()
     if len(returns) < 2:
         return None
     excess = [float(x) - target for x in returns]
-    v = riskstats.sortino_ratio(excess, periods_per_year=1, denominator="downside")
+    v = riskstats.sortino_ratio(excess, periods_per_year=1, denominator="full")
     return None if v is None else float(v)
 
 
