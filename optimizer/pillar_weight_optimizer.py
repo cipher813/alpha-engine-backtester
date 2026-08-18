@@ -405,6 +405,38 @@ def recommend(
     alpha_floor = _cfg.get("alpha_floor")
     if alpha_floor is not None:
         n_before = len(valid)
+
+        # UNMEASURED IS NOT FAILING — the same guard as
+        # executor_optimizer.recommend (alpha-engine-config-I7672), applied
+        # here because this is the same code shape, not because it has
+        # misfired: `NaN >= floor` is False, so an all-null `total_alpha`
+        # empties the frame and the branch below asserts every candidate was
+        # alpha-negative. On the executor's copy that ran for seven weeks and
+        # reached the Director as a strategy finding.
+        #
+        # Also fixes a latent crash the executor's copy does not have:
+        # `float(NaN)` here is NaN and `f"{nan:.6f}"` renders "nan", so the
+        # message would have claimed a measured best of "nan".
+        #
+        # This optimizer has never fired (config-I7637 — it scores from six
+        # columns no producer writes), so this is not a live-defect fix. It is
+        # the class fix: whichever way I7637 is decided, the first run must not
+        # report an absent measurement as a negative one.
+        n_measured = int(valid["total_alpha"].notna().sum()) if "total_alpha" in valid.columns else 0
+        if n_measured == 0:
+            return {
+                "status": "alpha_unmeasured",
+                "alpha_floor": float(alpha_floor),
+                "n_candidates": int(n_before),
+                "n_measured": 0,
+                "note": (
+                    f"total_alpha is NULL on all {n_before} candidates — the "
+                    f"alpha floor was NOT evaluated and no candidate has been "
+                    f"shown to be alpha-negative. Refusing to recommend and "
+                    f"refusing to call this a strategy result (config-I7672)."
+                ),
+            }
+
         best_alpha_in_sweep = float(valid["total_alpha"].max())
         valid = valid[valid["total_alpha"] >= alpha_floor].copy()
         if valid.empty:
@@ -414,8 +446,9 @@ def recommend(
                 "n_combos_below_floor": int(n_before),
                 "best_alpha_in_sweep": round(best_alpha_in_sweep, 6),
                 "note": (
-                    f"All {n_before} candidates realized top-decile "
-                    f"total_alpha < {alpha_floor} (best: {best_alpha_in_sweep:.6f}). "
+                    f"All {n_measured} MEASURED candidates (of {n_before}) "
+                    f"realized top-decile total_alpha < {alpha_floor} "
+                    f"(best: {best_alpha_in_sweep:.6f}). "
                     f"Refusing to recommend — alpha-positive is a hard constraint."
                 ),
             }

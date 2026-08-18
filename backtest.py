@@ -5503,6 +5503,49 @@ def _run_simulation_pipeline(
                 exc,
             )
 
+    # ── Benchmark legs (alpha-engine-config-I7672) ────────────────────────
+    # THE DEFECT THIS RETIRES. `_setup_simulation` builds a price matrix of
+    # ~904 EQUITIES and no macro tickers, and nothing here loaded SPY, so every
+    # `_run_simulation_loop` call below ran with `spy_prices=None`. In
+    # `vectorbt_bridge.portfolio_stats` SPY is the `canonical=True` leg, so
+    # `spy_return` and `total_alpha` emitted as null and were recorded in
+    # `null_legs` — measured on every weekly artifact back to at least
+    # 2026-07-24, including the headline `portfolio_stats.json`.
+    #
+    # `executor_optimizer`'s alpha_floor gate then read `NaN >= 0.0` as False,
+    # dropped all 60 combos, and reported "All 60 valid combos backtested with
+    # total_alpha < 0.0" for seven consecutive weeks. The backtester was not
+    # measuring negative alpha. It was not measuring alpha.
+    #
+    # The EW baskets are the same defect one layer quieter: they are OPT-IN
+    # legs in `_emit_leg`, so an omitted kwarg is silently None and NOT flagged
+    # in `null_legs`. Four legs were missing; two were visible.
+    #
+    # Loaded ONCE here, beside the feature-map hoist and for the same reason,
+    # then passed to every sim_fn below — including holdout and twin, whose
+    # alpha was equally null. Both degrade to None rather than raising: a macro
+    # -library hiccup must not kill a four-hour simulation whose
+    # strategy-internal metrics are entirely computable without a benchmark.
+    # The consumer-side gate (executor_optimizer, same PR) is what makes that
+    # degradation loud instead of mislabelled.
+    spy_prices = None
+    ew_basket = None
+    if (
+        _sim_setup is not None
+        and _sim_setup[3] is not None  # price_matrix
+        and args.mode in ("simulate", "param-sweep", "all")
+    ):
+        from store.arctic_reader import load_spy_close
+        spy_prices = load_spy_close(config.get("signals_bucket", "alpha-engine-research"))
+        if spy_prices is None:
+            logger.error(
+                "BENCHMARK ABSENT: SPY close could not be loaded — spy_return "
+                "and total_alpha will emit null on every combo this run, and "
+                "executor_optimizer will return alpha_unmeasured "
+                "(config-I7672).",
+            )
+        ew_basket = _try_construct_ew_high_vol_basket(_sim_setup[3])
+
     # ── Simulate mode ─────────────────────────────────────────────────────
     # Includes "param-sweep": the baseline single-policy simulation produces
     # portfolio_stats, which the Evaluator REQUIRES (alongside sweep_df from the
@@ -5548,6 +5591,8 @@ def _run_simulation_pipeline(
                         portfolio_stats = _run_simulation_loop(
                             executor_run, SimulatedIBKRClient, dates, price_matrix, config,
                             ohlcv_by_ticker=ohlcv,
+                            spy_prices=spy_prices,
+                            ew_high_vol_basket_returns=ew_basket,
                             atr_by_ticker=atr_by_ticker,
                             vwap_series_by_ticker=vwap_series_by_ticker,
                             coverage_by_ticker=coverage_by_ticker,
@@ -5652,6 +5697,8 @@ def _run_simulation_pipeline(
                             return _run_simulation_loop(
                                 executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
                                 ohlcv_by_ticker=ohlcv,
+                                spy_prices=spy_prices,
+                                ew_high_vol_basket_returns=ew_basket,
                                 atr_by_ticker=atr_by_ticker,
                                 vwap_series_by_ticker=vwap_series_by_ticker,
                                 coverage_by_ticker=coverage_by_ticker,
@@ -5742,6 +5789,8 @@ def _run_simulation_pipeline(
                                 executor_run, SimulatedIBKRClient, dates,
                                 price_matrix, combo_config,
                                 ohlcv_by_ticker=ohlcv,
+                                spy_prices=spy_prices,
+                                ew_high_vol_basket_returns=ew_basket,
                                 atr_by_ticker=atr_by_ticker,
                                 vwap_series_by_ticker=vwap_series_by_ticker,
                                 coverage_by_ticker=coverage_by_ticker,
@@ -5792,6 +5841,8 @@ def _run_simulation_pipeline(
                                     dates if dates is not None else sim_dates,
                                     pm, combo_config,
                                     ohlcv_by_ticker=ohlcv_data,
+                                    spy_prices=spy_prices,
+                                    ew_high_vol_basket_returns=ew_basket,
                                     atr_by_ticker=atr_by_ticker,
                                     vwap_series_by_ticker=vwap_series_by_ticker,
                                     coverage_by_ticker=coverage_by_ticker,
@@ -5833,6 +5884,8 @@ def _run_simulation_pipeline(
                                 return _run_simulation_loop(
                                     executor_run_fn, SimClientCls, sim_dates, pm, cfg,
                                     ohlcv_by_ticker=ohlcv_data,
+                                    spy_prices=spy_prices,
+                                    ew_high_vol_basket_returns=ew_basket,
                                     atr_by_ticker=atr_by_ticker,
                                     vwap_series_by_ticker=vwap_series_by_ticker,
                                     coverage_by_ticker=coverage_by_ticker,
