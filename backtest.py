@@ -5590,6 +5590,25 @@ def _run_simulation_pipeline(
                             "series — risk_ratio_ci will report insufficient_data "
                             "for %s", args.date,
                         )
+                    # config-I7639: drop the two pandas Series OUT of
+                    # portfolio_stats before any JSON persistence. Both
+                    # `portfolio_stats.json` writers (this phase checkpoint and
+                    # `_export_simulation_artifacts`'s evaluator-facing copy)
+                    # use `json.dumps(..., default=str)`, which cannot encode a
+                    # Series and falls back to its `repr()` — a truncated
+                    # "...\n" string, not data (measured on
+                    # s3://alpha-engine-research/backtest/2026-08-14/
+                    # portfolio_stats.json: a 246-char daily_returns string
+                    # with a literal "..." in the middle). `daily_returns` is
+                    # already persisted properly above as
+                    # simulate/portfolio_daily_returns.parquet (config-I7616),
+                    # and no reader consumes daily_returns/daily_log_returns
+                    # from the JSON artifact (evaluate.py reads the parquet via
+                    # `_load_portfolio_daily_returns`) — dropping is
+                    # preferable to serializing correctly here, since two
+                    # representations of one series is how they drift.
+                    portfolio_stats.pop("daily_returns", None)
+                    portfolio_stats.pop("daily_log_returns", None)
                     ctx.record_artifact(save_json(
                         bucket, args.date, "simulate", "portfolio_stats", portfolio_stats,
                         s3_client=s3,
@@ -6000,6 +6019,16 @@ def _export_simulation_artifacts(
         exported.append("predictor_sweep_df.parquet")
 
     if portfolio_stats:
+        # config-I7639: belt-and-suspenders — the upstream simulate phase
+        # already pops these before this dict is built, but this is the
+        # evaluator-facing artifact the issue measured directly
+        # (s3://alpha-engine-research/backtest/{date}/portfolio_stats.json),
+        # so it does not rely solely on caller discipline. `default=str`
+        # would otherwise silently write a truncated pandas Series repr in
+        # their place; `daily_returns` is the real artifact at
+        # simulate/portfolio_daily_returns.parquet.
+        portfolio_stats.pop("daily_returns", None)
+        portfolio_stats.pop("daily_log_returns", None)
         s3.put_object(Bucket=bucket, Key=f"{prefix}/portfolio_stats.json", Body=json.dumps(portfolio_stats, indent=2, default=str).encode())
         exported.append("portfolio_stats.json")
 
