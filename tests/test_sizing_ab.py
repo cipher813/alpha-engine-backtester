@@ -4,7 +4,13 @@ from copy import deepcopy
 
 import pytest
 
-from analysis.sizing_ab import _MIN_TRADES, run_sizing_ab
+import math
+
+from analysis.sizing_ab import (
+    _MIN_MATERIAL_SHARPE_DIFF,
+    _MIN_TRADES,
+    run_sizing_ab,
+)
 
 
 def _base_config():
@@ -210,3 +216,58 @@ def test_zero_sharpe_no_difference_branch():
     assert result["status"] == "ok"
     assert result["assessment"] == "no_difference"
     assert result["detail"] == "Unable to compare"
+
+
+# ── config-I7598: the sqrt(252) materiality band ─────────────────────────────
+
+
+def test_material_sharpe_diff_band_is_on_the_sqrt252_scale():
+    """The band is the pre-fix 0.1 carried through config-I7236's rescale.
+
+    sqrt(252/365) = 0.8309097; round(0.1 * 0.8309097, 3) = 0.083. Pinning the
+    derivation rather than the literal is what makes a future annualization
+    change fail here instead of silently re-widening the band. Asserted at the
+    literal's own precision (3dp) rather than under a widened tolerance.
+    """
+    assert _MIN_MATERIAL_SHARPE_DIFF == round(0.1 * math.sqrt(252.0 / 365.0), 3)
+
+
+def test_diff_between_new_and_old_band_is_now_material():
+    """A 0.09 Sharpe delta: "no_difference" on the old 0.1 band, directional now.
+
+    This is the band's whole blast radius — the strip between 0.083 and 0.1 is
+    exactly the set of sizing improvements config-I7236 silently demoted.
+    """
+    sim_fn = _make_sim_fn({
+        True: {"total_trades": 100, "sharpe_ratio": 1.09, "total_return": 0.12, "total_alpha": 0.03, "max_drawdown": 0.10},
+        False: {"total_trades": 100, "sharpe_ratio": 1.00, "total_return": 0.11, "total_alpha": 0.02, "max_drawdown": 0.10},
+    })
+
+    result = run_sizing_ab(sim_fn, _base_config())
+
+    assert result["sharpe_diff"] == pytest.approx(0.09)
+    assert result["assessment"] == "sizing_helps"
+
+
+def test_below_band_stays_no_difference():
+    sim_fn = _make_sim_fn({
+        True: {"total_trades": 100, "sharpe_ratio": 1.08, "total_return": 0.12, "total_alpha": 0.03, "max_drawdown": 0.10},
+        False: {"total_trades": 100, "sharpe_ratio": 1.00, "total_return": 0.11, "total_alpha": 0.02, "max_drawdown": 0.10},
+    })
+
+    result = run_sizing_ab(sim_fn, _base_config())
+
+    assert result["sharpe_diff"] == pytest.approx(0.08)
+    assert result["assessment"] == "no_difference"
+
+
+def test_negative_band_is_symmetric():
+    sim_fn = _make_sim_fn({
+        True: {"total_trades": 100, "sharpe_ratio": 1.00, "total_return": 0.11, "total_alpha": 0.02, "max_drawdown": 0.10},
+        False: {"total_trades": 100, "sharpe_ratio": 1.09, "total_return": 0.12, "total_alpha": 0.03, "max_drawdown": 0.10},
+    })
+
+    result = run_sizing_ab(sim_fn, _base_config())
+
+    assert result["sharpe_diff"] == pytest.approx(-0.09)
+    assert result["assessment"] == "equal_weight_better"
