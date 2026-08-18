@@ -97,10 +97,44 @@ jobs:
       - name: Hermetic-vs-live marker lint
         run: python3 scripts/lint_hermetic_test_marker.py
 
+      # Several tests import live crucible-executor source (executor.ibkr,
+      # executor.deciders, executor.signal_reader, executor.strategies.
+      # exit_manager, …) as the scalar/live reference the vectorized
+      # backtester paths must match bit-for-bit — no JSON-Schema-able
+      # contract to lift, the import IS the parity target. Without this
+      # checkout the guard SKIPPED on every CI runner, forever, and the
+      # cross-repo wiring invariant was only ever exercised on a laptop
+      # that happened to have both repos cloned (alpha-engine-config-
+      # I7605 / I7619). Sparse: only the `executor` package is needed.
+      - name: Check out executor source (crucible-executor)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: nousergon/crucible-executor
+          ref: main
+          path: .executor-src
+          sparse-checkout: executor
+          sparse-checkout-cone-mode: false
+
+      # test_stage_coverage_assertion_wiring.py's live-definition cross-check
+      # reads nousergon-data's step_function.json — mirrors crucible-
+      # dashboard's reference fix (alpha-engine-config-I7605) exactly,
+      # including the SF_DEFS_DIR variable name.
+      - name: Check out SF definitions (nousergon-data)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: nousergon/nousergon-data
+          ref: main
+          path: .sf-defs
+          sparse-checkout: infrastructure
+          sparse-checkout-cone-mode: false
+
       # --cov-fail-under not passed explicitly: pytest-cov reads
       # [tool.coverage.report] fail_under from pyproject.toml automatically
       # once --cov is passed (config#2533 coverage ratchet).
       - name: Run tests
+        env:
+          EXECUTOR_ROOT_DIR: ${{ github.workspace }}/.executor-src
+          SF_DEFS_DIR: ${{ github.workspace }}/.sf-defs
         run: pytest tests/ -v --cov=. --cov-report=term-missing
 
       # Blocking (config#2530): flipped from continue-on-error: true to

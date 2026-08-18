@@ -37,7 +37,20 @@ from analysis.portfolio_optimizer_backtest import (
 )
 
 
-_ALPHA_ENGINE_PATH = os.path.expanduser("~/Development/alpha-engine")
+# Resolution centralized in tests/_sibling_checkout.py (alpha-engine-config-
+# I7619): CI sets EXECUTOR_ROOT_DIR after checking crucible-executor out; a
+# missing checkout on CI hard-fails collection instead of silently skipping
+# forever, and only skips (below) on a dev laptop.
+from tests._sibling_checkout import (
+    executor_missing_reason,
+    executor_root_missing_hard_fail_on_ci,
+    resolve_executor_root,
+)
+
+_ALPHA_ENGINE_PATH = resolve_executor_root()
+_ALPHA_ENGINE_MISSING = executor_root_missing_hard_fail_on_ci(
+    os.path.join(_ALPHA_ENGINE_PATH, "executor")
+)
 
 
 def _trading_dates(start: str = "2024-01-02", n_days: int = 260) -> pd.DatetimeIndex:
@@ -189,8 +202,8 @@ class TestCompareToLegacy:
 
 
 @pytest.mark.skipif(
-    not os.path.isdir(os.path.join(_ALPHA_ENGINE_PATH, "executor")),
-    reason="alpha-engine sibling checkout not present at ~/Development/alpha-engine",
+    _ALPHA_ENGINE_MISSING,
+    reason=executor_missing_reason(_ALPHA_ENGINE_PATH),
 )
 class TestEndToEndIntegration:
     def test_run_optimizer_backtest_produces_metrics_and_weights(self):
