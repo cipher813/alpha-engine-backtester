@@ -106,6 +106,77 @@ else
     --output json | python3 -c "import sys,json; d=json.load(sys.stdin); print('  FunctionArn:', d.get('FunctionArn','?'))"
 fi
 
+# ── Step 4b: Apply router addressing (merge, not replace) ───────────────────
+# Mirrors crucible-research/infrastructure/deploy.sh::_apply_router_env
+# (alpha-engine-config-I6373). Read-modify-write because
+# update-function-configuration --environment REPLACES the whole map, and
+# this Lambda's other env vars (ANTHROPIC_API_KEY, FMP_API_KEY, etc. — see
+# alpha-engine-config-I6377, the same uncodified-env gap on the sibling
+# research Lambda) are not owned by this script.
+_apply_router_env() {
+  local fn="$1"
+  echo "  Applying router addressing to $fn (merge, not replace)..."
+
+  # Lambda serializes updates per function; a configuration update issued
+  # while LastUpdateStatus=InProgress fails ResourceConflictException, which
+  # aborts the whole deploy under set -euo pipefail. Wait first.
+  aws lambda wait function-updated --function-name "$fn" --region "${AWS_REGION}" 2>/dev/null || sleep 5
+
+  local tmp_cur tmp_new
+  tmp_cur="$(mktemp)"; tmp_new="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp_cur' '$tmp_new'" RETURN
+
+  aws lambda get-function-configuration \
+    --function-name "$fn" --region "${AWS_REGION}" \
+    --query "Environment.Variables" --output json > "$tmp_cur" 2>/dev/null \
+    || echo '{}' > "$tmp_cur"
+
+  ROUTER_URL="${ROUTER_URL:-https://router.nousergon.ai:8443}" \
+  ROUTER_CREDENTIAL_SECRET="${ROUTER_CREDENTIAL_SECRET:-ROUTER_CONSUMER_REPLAY}" \
+  python3 - "$tmp_cur" "$tmp_new" <<'PYEOF'
+import json, os, sys
+
+cur_path, new_path = sys.argv[1], sys.argv[2]
+with open(cur_path) as fh:
+    variables = json.load(fh) or {}
+
+# exec_context names WHERE CODE RUNS (model-router-policy R28). The registry
+# declares `lambda` on NO model entry, deliberately -- a Lambda has no local
+# egress proxy and no private-network peer, so the router is its only path
+# and this call site FAILS CLOSED rather than reaching a provider unscanned.
+variables.update({
+    "KREPIS_EXEC_CONTEXT": "lambda",
+    "KREPIS_LITELLM_PROXY_URL": os.environ["ROUTER_URL"],
+    # Its OWN secret, not LITELLM_MASTER_KEY: the edge identifies a consumer
+    # BY its credential VALUE and krepis.secrets resolves SSM BEFORE
+    # os.environ, so a shared name collapses this Lambda into another
+    # consumer's identity at the edge however the environment is set.
+    "KREPIS_ROUTER_CREDENTIAL_SECRET": os.environ["ROUTER_CREDENTIAL_SECRET"],
+    # crucible-backtester is PUBLIC, so private-docs/LLM_MODEL_REGISTRY.yaml
+    # is correctly absent from the image. All three are required: krepis'
+    # AppConfig path is opt-in and SWALLOWS its own errors, falling through
+    # to a filesystem walk that finds nothing here.
+    "KREPIS_APPCONFIG_APPLICATION": "alpha-engine",
+    "KREPIS_APPCONFIG_CONFIG_PROFILE": "llm-model-registry",
+    "KREPIS_APPCONFIG_ENVIRONMENT": "production",
+})
+
+with open(new_path, "w") as fh:
+    json.dump({"Variables": variables}, fh)
+print(f"    merged 5 router variables into {len(variables)} total (values not shown)")
+PYEOF
+
+  aws lambda update-function-configuration \
+    --function-name "$fn" \
+    --environment "file://$tmp_new" \
+    --region "${AWS_REGION}" > /dev/null
+  aws lambda wait function-updated --function-name "$fn" --region "${AWS_REGION}" 2>/dev/null || sleep 5
+  echo "    router addressing applied."
+}
+
+_apply_router_env "${LAMBDA_FUNCTION}"
+
 # ── Step 5: Wait for update to complete ──────────────────────────────────────
 echo ""
 echo "==> Waiting for Lambda update to complete..."
