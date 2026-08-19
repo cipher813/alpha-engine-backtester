@@ -134,6 +134,58 @@ def verdict_is_pass(verdict: str | None) -> bool:
     return verdict == VERDICT_PASS
 
 
+class PitPassFailure(RuntimeError):
+    """Raised by :func:`_run_predictor_pass_isolated` when a pass subprocess
+    fails or times out.
+
+    Carries ``diagnostic_key`` — the S3 key (mirroring the ``_diagnostics``
+    phase-artifact convention ``backtest.py`` already uses for
+    ``param_sweep_traceback``, see ``phase_artifacts.artifact_key``) where
+    the child's FULL, untruncated stderr was persisted, or ``None`` if that
+    best-effort upload itself failed. ``write_failure_artifact`` reads this
+    attribute so the durable failure record carries a pointer to the full
+    traceback, not only the embedded 500-char tail (alpha-engine-config-I6036
+    deliverable 1 — the twice-truncated ``error_msg`` was why the recurring
+    walkforward ``rc=1`` crash went undiagnosed for two months: neither the
+    exception type nor the failing line was ever in any artifact).
+    """
+
+    def __init__(self, message: str, *, diagnostic_key: str | None = None):
+        super().__init__(message)
+        self.diagnostic_key = diagnostic_key
+
+
+def _persist_full_stderr(
+    bucket: str, run_date: str, which: str, stderr_text: str, *, reason: str,
+) -> str | None:
+    """Best-effort upload of a pass subprocess's FULL, untruncated stderr to
+    its own S3 object, under the same ``_diagnostics`` phase namespace
+    ``backtest.py``'s ``param_sweep`` except-handler already uses for its own
+    traceback persistence (mirrored per alpha-engine-config-I6036: "check
+    what key convention ... sibling diagnostic writers in this repo already
+    use"). Returns the S3 key on success, ``None`` on failure — never raises,
+    this is a secondary observability path and must not mask the primary
+    ``PitPassFailure`` it is called from.
+    """
+    try:
+        from phase_artifacts import save_json as _save_json
+        return _save_json(
+            bucket, run_date, "_diagnostics", f"pit_parity_{which}_stderr",
+            {
+                "which": which,
+                "reason": reason,
+                "run_date": run_date,
+                "stderr": stderr_text,
+            },
+        )
+    except Exception as persist_err:  # noqa: BLE001 — best-effort diag
+        logger.error(
+            "[pit_parity] failed to persist %s pass full stderr to S3: %s",
+            which, persist_err, exc_info=True,
+        )
+        return None
+
+
 def _run_predictor_pass_isolated(safe_config: dict, which: str, run_date: str) -> dict:
     """Run ONE pit_parity predictor pass in a fresh `backtest.py` subprocess and
     return its stats dict (L4487).
@@ -207,30 +259,44 @@ def _run_predictor_pass_isolated(safe_config: dict, which: str, run_date: str) -
         )
         with open(cfg_path, "w") as f:
             json.dump(safe_config, f)
+        bucket = safe_config.get("signals_bucket", "alpha-engine-research")
         try:
             proc = subprocess.run(
                 cmd, cwd=str(repo_root), stderr=subprocess.PIPE, text=True,
                 timeout=_PIT_PARITY_PASS_TIMEOUT,
             )
         except subprocess.TimeoutExpired as te:
-            tail = (te.stderr or b"").decode("utf-8", errors="replace").strip()[-2000:] if te.stderr else "(child produced no stderr before timeout)"
+            full_stderr = (te.stderr or b"").decode("utf-8", errors="replace") if te.stderr else ""
+            tail = full_stderr.strip()[-2000:] if full_stderr else "(child produced no stderr before timeout)"
             logger.error(
                 "[pit_parity] %s pass subprocess timed out after %.0fs; "
                 "child stderr tail:\n%s",
                 which, _PIT_PARITY_PASS_TIMEOUT, tail,
             )
-            raise RuntimeError(
+            diag_key = _persist_full_stderr(
+                bucket, run_date, which, full_stderr, reason="timeout",
+            )
+            diag_ref = f" full stderr: s3://{bucket}/{diag_key}" if diag_key else ""
+            raise PitPassFailure(
                 f"pit_parity {which} pass timed out after "
-                f"{_PIT_PARITY_PASS_TIMEOUT}s: {tail[-500:]}"
+                f"{_PIT_PARITY_PASS_TIMEOUT}s —{diag_ref} tail: {tail[-500:]}",
+                diagnostic_key=diag_key,
             ) from te
         if proc.returncode != 0:
-            tail = (proc.stderr or "").strip()[-2000:]
+            full_stderr = proc.stderr or ""
+            tail = full_stderr.strip()[-2000:]
             logger.error(
                 "[pit_parity] %s pass subprocess failed (rc=%s); child stderr tail:\n%s",
                 which, proc.returncode, tail,
             )
-            raise RuntimeError(
-                f"pit_parity {which} pass failed (rc={proc.returncode}): {tail[-500:]}"
+            diag_key = _persist_full_stderr(
+                bucket, run_date, which, full_stderr, reason=f"rc={proc.returncode}",
+            )
+            diag_ref = f" full stderr: s3://{bucket}/{diag_key}" if diag_key else ""
+            raise PitPassFailure(
+                f"pit_parity {which} pass failed (rc={proc.returncode}) —{diag_ref} "
+                f"tail: {tail[-500:]}",
+                diagnostic_key=diag_key,
             )
         with open(stats_path, "rb") as f:
             return pickle.load(f)
@@ -286,6 +352,13 @@ def write_failure_artifact(
         "timed_out": is_timeout_failure(type(exc).__name__, str(exc)),
         "error_class": type(exc).__name__,
         "error_msg": str(exc)[:1000],
+        # I6036 deliverable 1: the durable failure record must carry a
+        # pointer to the FULL, untruncated child stderr (not just the
+        # 500-char tail embedded in error_msg above) — None when the pass
+        # failed for a reason that never went through the isolated-subprocess
+        # path (e.g. RecursionError raised in the parent), or when the
+        # best-effort S3 upload itself failed.
+        "stderr_s3_key": getattr(exc, "diagnostic_key", None),
         "observational": True,
     }
     key = _write_artifact_to_s3(bucket, run_date, report)
@@ -375,12 +448,26 @@ def _write_artifact_to_s3(bucket: str, run_date: str, report: dict) -> str | Non
     key = f"backtest/{run_date}/pit_parity.json"
     try:
         import boto3
-        boto3.client("s3").put_object(
+        client = boto3.client("s3")
+        client.put_object(
             Bucket=bucket, Key=key,
             Body=json.dumps(report, indent=2, default=str),
             ContentType="application/json",
         )
         logger.info("[pit_parity] report → s3://%s/%s", bucket, key)
+        # I6036 deliverable 3: every report write (success, incomplete, AND
+        # failed — write_failure_artifact funnels through here too) refreshes
+        # the rolling success-rate snapshot. Wrapped separately from the
+        # primary put_object above: a health-computation problem must never
+        # be mistaken for (or mask the return value of) the primary artifact
+        # write, which already succeeded by this point.
+        try:
+            update_pit_parity_health(bucket, run_date, s3_client=client)
+        except Exception as health_err:  # noqa: BLE001 — secondary observability
+            logger.warning(
+                "[pit_parity] health snapshot update failed (best-effort): %s",
+                health_err,
+            )
         return key
     except Exception as e:
         logger.warning(
@@ -433,6 +520,124 @@ def read_prior_delta(bucket: str, run_date: str, s3_client=None) -> dict | None:
             logger.warning("[pit_parity] prior-delta probe failed at %s: %s", key, e)
             return None
     return None
+
+
+#: Default rolling window for the pit_parity success-rate snapshot
+#: (I6036 deliverable 3) — ~90 calendar days covers ~12-13 weekly runs, the
+#: same order of magnitude as the 10-run table the issue was filed from.
+_HEALTH_LOOKBACK_DAYS = 90
+
+#: Durable, single-key (NOT per-run-date) rolling health snapshot — the one
+#: place a human or a cross-repo consumer reads "how healthy has pit_parity
+#: been" without knowing a date, unlike ``backtest/{run_date}/pit_parity.json``.
+_HEALTH_S3_KEY = "backtest/pit_parity_health.json"
+
+
+def compute_pit_parity_success_rate(
+    bucket: str, run_date: str, s3_client=None,
+    lookback_days: int = _HEALTH_LOOKBACK_DAYS,
+) -> dict:
+    """Roll up the last ``lookback_days`` days of ``pit_parity.json`` reports
+    into a success rate (alpha-engine-config-I6036 deliverable 3).
+
+    80% failure over two months went unnoticed because nothing counted
+    outcomes across runs — each run only ever wrote its own artifact, and
+    "sometimes it works" stayed a mood, not a number anyone could see cross
+    a threshold. Probes backward day-by-day from ``run_date``, mirroring
+    :func:`read_prior_delta`'s idiom.
+
+    A run counts as a SUCCESS iff its artifact's ``status`` is ``"ok"`` (or
+    unset/``None`` — legacy reports predating config#7199's status field);
+    ``"incomplete"`` and ``"failed"`` both count as failures. Best-effort:
+    never raises. A read error on a given probe date is treated as "no run
+    that day" (skipped, not counted either way) rather than failing the
+    whole computation — mirrors ``read_prior_delta``'s tolerance.
+    """
+    try:
+        import boto3
+        from botocore.exceptions import ClientError
+    except ImportError:  # pragma: no cover - boto3 always available in prod
+        return {
+            "schema": "pit_parity_health-1.0.0",
+            "lookback_days": lookback_days,
+            "runs_considered": 0, "successes": 0, "failures": 0,
+            "success_rate": None, "runs": [],
+        }
+
+    s3 = s3_client or boto3.client("s3")
+    anchor = _dt.date.fromisoformat(run_date)
+    runs: list[dict] = []
+    for back in range(0, lookback_days):
+        probe_date = (anchor - _dt.timedelta(days=back)).isoformat()
+        key = f"backtest/{probe_date}/pit_parity.json"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            data = json.loads(obj["Body"].read())
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                continue
+            logger.warning("[pit_parity] success-rate probe failed at %s: %s", key, e)
+            continue
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[pit_parity] success-rate probe failed at %s: %s", key, e)
+            continue
+        status = data.get("status")
+        runs.append({
+            "run_date": probe_date, "status": status,
+            "success": status in (None, "ok"),
+        })
+
+    successes = sum(1 for r in runs if r["success"])
+    n = len(runs)
+    return {
+        "schema": "pit_parity_health-1.0.0",
+        "computed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "anchor_run_date": run_date,
+        "lookback_days": lookback_days,
+        "runs_considered": n,
+        "successes": successes,
+        "failures": n - successes,
+        "success_rate": (successes / n) if n > 0 else None,
+        "runs": sorted(runs, key=lambda r: r["run_date"]),
+    }
+
+
+def update_pit_parity_health(bucket: str, run_date: str, s3_client=None) -> str | None:
+    """Recompute the rolling success rate and publish it to the durable,
+    always-current health snapshot key ``_HEALTH_S3_KEY`` (I6036 deliverable
+    3). Called from :func:`_write_artifact_to_s3` after every report write —
+    success, incomplete, AND failed all funnel through there (
+    ``write_failure_artifact`` calls it too) — so the snapshot reflects the
+    outcome of every run, not only the successful ones.
+
+    Best-effort / never raises: this is a secondary observability surface,
+    same posture as the rest of this module. A cross-repo consumer (e.g.
+    crucible-evaluator's grading tiles picking this key up as a health tile)
+    is a natural follow-up and explicitly out of scope here — this function's
+    job is publishing the metric in a documented, stable shape.
+    """
+    try:
+        import boto3
+        client = s3_client or boto3.client("s3")
+        health = compute_pit_parity_success_rate(bucket, run_date, s3_client=client)
+        client.put_object(
+            Bucket=bucket, Key=_HEALTH_S3_KEY,
+            Body=json.dumps(health, indent=2, default=str),
+            ContentType="application/json",
+        )
+        logger.info(
+            "[pit_parity] health snapshot -> s3://%s/%s (%s/%s over last %sd, "
+            "rate=%s)",
+            bucket, _HEALTH_S3_KEY, health["successes"], health["runs_considered"],
+            health["lookback_days"], health["success_rate"],
+        )
+        return _HEALTH_S3_KEY
+    except Exception as e:  # noqa: BLE001 — best-effort, secondary observability
+        logger.warning(
+            "[pit_parity] health snapshot computation/upload failed "
+            "(best-effort): %s", e,
+        )
+        return None
 
 
 # The skilled-risk basket (plan §3 invariant 4). Sortino is primary; PSR is
@@ -908,6 +1113,15 @@ def build_contamination_report(
         "run_quality": {
             "walk_forward": wf_meta,   # fold count, cold-start exclusions…
             "n_configs_swept": n_cfg,
+            # I6043: how many trading dates each pass actually produced
+            # signals for — the smoke's own postcondition check reads this
+            # (a report can carry a "successful" delta computed over a
+            # degenerate zero-date window; this is the direct positive
+            # assertion the exit-code-only smoke was missing).
+            "n_trading_dates": {
+                "current_lookahead": len(cur_stats.get("signals_by_date") or {}),
+                "walk_forward_pit": len(pit_stats.get("signals_by_date") or {}),
+            },
             "note": (
                 "Δ on the basket is the contamination magnitude. A large "
                 "|ΔSortino| means the optimizer was ranking configs on "
@@ -1061,6 +1275,15 @@ def run_pit_parity(config: dict, predictor_stats: dict | None = None) -> dict:
                 "artifact_present": predictor_stats is not None,
                 "walk_forward_from_predictor_stats": pit_stats is predictor_stats,
                 "rejection_reason": reuse_reason,
+            },
+            # I6043: same n_trading_dates telemetry as the success-path
+            # report's run_quality block — a degraded pass (e.g. no-orders)
+            # still has SOME stats dict, so this is available even here.
+            "run_quality": {
+                "n_trading_dates": {
+                    "current_lookahead": len(cur_stats.get("signals_by_date") or {}),
+                    "walk_forward_pit": len(pit_stats.get("signals_by_date") or {}),
+                },
             },
             "observational": True,
         }

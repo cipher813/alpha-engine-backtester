@@ -15,6 +15,7 @@ flag flipped and never raises on an S3 upload failure.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sys
 import types
 
@@ -264,6 +265,10 @@ def test_run_pit_parity_incomplete_pass_yields_status_report(monkeypatch):
     captured: list[dict] = []
 
     class _RecordingS3:
+        def get_object(self, **kw):
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
         def put_object(self, **kw):
             captured.append(kw)
 
@@ -275,8 +280,11 @@ def test_run_pit_parity_incomplete_pass_yields_status_report(monkeypatch):
     assert rep["status"] == "incomplete"
     assert rep["observational"] is True
     assert rep["_s3_key"] == "backtest/2026-05-17/pit_parity.json"
-    assert len(captured) == 1
-    body = captured[0]["Body"]
+    # Primary report write + the rolling health snapshot refresh (I6036 d.3).
+    assert len(captured) == 2
+    primary = [c for c in captured if c["Key"] == "backtest/2026-05-17/pit_parity.json"]
+    assert len(primary) == 1
+    body = primary[0]["Body"]
     assert b'"status": "incomplete"' in body if isinstance(body, bytes) else \
         '"status": "incomplete"' in body
 
@@ -363,6 +371,10 @@ def test_write_failure_artifact_uploads_status_failed(monkeypatch):
     captured: list[dict] = []
 
     class _RecordingS3:
+        def get_object(self, **kw):
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
         def put_object(self, **kw):
             captured.append(kw)
 
@@ -376,8 +388,11 @@ def test_write_failure_artifact_uploads_status_failed(monkeypatch):
     assert rep["status"] == "failed"
     assert rep["error_class"] == "RecursionError"
     assert "recursion" in rep["error_msg"]
+    assert rep["stderr_s3_key"] is None
     assert rep["_s3_key"] == "backtest/2026-05-24/pit_parity.json"
-    assert len(captured) == 1
+    # Primary report write + the rolling health snapshot refresh (I6036 d.3).
+    assert len(captured) == 2
+    assert len([c for c in captured if c["Key"] == "backtest/2026-05-24/pit_parity.json"]) == 1
 
 
 def test_write_failure_artifact_swallows_upload_error(monkeypatch):
@@ -406,6 +421,10 @@ def _stub_s3(monkeypatch):
     """Install a no-op boto3 stub so write_failure_artifact's S3 upload
     inside handle_pit_parity_failure doesn't hit the network."""
     class _RecordingS3:
+        def get_object(self, **kw):
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
         def put_object(self, **kw):
             pass
 
@@ -454,6 +473,10 @@ def test_handle_pit_parity_failure_writes_status_failed_artifact(monkeypatch):
     captured: list[dict] = []
 
     class _RecordingS3:
+        def get_object(self, **kw):
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
         def put_object(self, **kw):
             captured.append(kw)
 
@@ -471,7 +494,9 @@ def test_handle_pit_parity_failure_writes_status_failed_artifact(monkeypatch):
     assert rep["status"] == "failed"
     assert rep["error_class"] == "RuntimeError"
     assert rep["_s3_key"] == "backtest/2026-07-17/pit_parity.json"
-    assert len(captured) == 1
+    # Primary report write + the rolling health snapshot refresh (I6036 d.3).
+    assert len(captured) == 2
+    assert len([c for c in captured if c["Key"] == "backtest/2026-07-17/pit_parity.json"]) == 1
 
 
 def test_handle_pit_parity_failure_never_raises_when_alert_publish_fails(monkeypatch):
@@ -694,10 +719,320 @@ def test_isolated_pass_surfaces_child_stderr_on_failure():
     import analysis.pit_parity as ppmod
     src = inspect.getsource(ppmod._run_predictor_pass_isolated)
     assert "stderr=subprocess.PIPE" in src, "child stderr must be captured"
-    assert "returncode" in src and "raise RuntimeError" in src, (
+    assert "returncode" in src and "raise PitPassFailure" in src, (
         "non-zero child exit must raise with the captured stderr tail"
     )
     assert "proc.stderr" in src, "the raised error/log must include the child's stderr"
+
+
+# ── I6036 deliverable 1: full (untruncated) stderr persisted to its own S3
+# object, not just the 500-char tail embedded in the RuntimeError message ──
+
+
+class _RecordingS3PutOnly:
+    def __init__(self):
+        self.puts: list[dict] = []
+
+    def put_object(self, **kw):
+        self.puts.append(kw)
+
+
+def _fake_completed_process(returncode: int, stderr: str):
+    class _FakeProc:
+        pass
+    p = _FakeProc()
+    p.returncode = returncode
+    p.stderr = stderr
+    return p
+
+
+def test_isolated_pass_persists_full_stderr_to_s3_on_rc_failure(monkeypatch, tmp_path):
+    """A non-zero child exit must persist the FULL, untruncated stderr to its
+    own S3 object under the `_diagnostics` phase namespace (mirroring
+    backtest.py's own param_sweep_traceback pattern) — the twice-truncated
+    500-char tail embedded in the exception is not the only copy."""
+    import subprocess as _subprocess
+    import analysis.pit_parity as ppmod
+    import phase_artifacts
+
+    long_stderr = "line of traceback context\n" * 200  # > 2000 chars
+    assert len(long_stderr) > 2000
+
+    def _fake_run(cmd, cwd=None, stderr=None, text=None, timeout=None):
+        # Write a fake stats.pkl-adjacent config the caller can ignore —
+        # the caller raises before ever reading stats_path on a failure.
+        return _fake_completed_process(1, long_stderr)
+
+    monkeypatch.setattr(_subprocess, "run", _fake_run)
+
+    captured_saves = []
+
+    def _fake_save_json(bucket, date, phase, name, obj, **kw):
+        captured_saves.append({
+            "bucket": bucket, "date": date, "phase": phase, "name": name, "obj": obj,
+        })
+        return f"backtest/{date}/.phases/{phase}/{name}.json"
+
+    monkeypatch.setattr(phase_artifacts, "save_json", _fake_save_json)
+
+    with pytest.raises(ppmod.PitPassFailure) as exc_info:
+        ppmod._run_predictor_pass_isolated(
+            {"signals_bucket": "b"}, "walkforward", "2026-08-13",
+        )
+
+    assert len(captured_saves) == 1
+    saved = captured_saves[0]
+    assert saved["phase"] == "_diagnostics"
+    assert saved["name"] == "pit_parity_walkforward_stderr"
+    assert saved["obj"]["stderr"] == long_stderr, (
+        "the FULL stderr must be persisted, not a truncated slice"
+    )
+    assert exc_info.value.diagnostic_key == (
+        "backtest/2026-08-13/.phases/_diagnostics/pit_parity_walkforward_stderr.json"
+    )
+    assert exc_info.value.diagnostic_key in str(exc_info.value), (
+        "the S3 key must appear in the short message too, as a pointer"
+    )
+
+
+def test_isolated_pass_persists_full_stderr_to_s3_on_timeout(monkeypatch):
+    """The TimeoutExpired path must persist full stderr the same way as the
+    rc!=0 path — the 2026-08-13 walkforward timeout is exactly this class."""
+    import subprocess as _subprocess
+    import analysis.pit_parity as ppmod
+    import phase_artifacts
+
+    long_stderr = ("py-spy-adjacent stack context\n" * 150).encode()
+    assert len(long_stderr) > 2000
+
+    def _fake_run(cmd, cwd=None, stderr=None, text=None, timeout=None):
+        raise _subprocess.TimeoutExpired(cmd, timeout, output=None, stderr=long_stderr)
+
+    monkeypatch.setattr(_subprocess, "run", _fake_run)
+
+    captured_saves = []
+
+    def _fake_save_json(bucket, date, phase, name, obj, **kw):
+        captured_saves.append(obj)
+        return f"backtest/{date}/.phases/{phase}/{name}.json"
+
+    monkeypatch.setattr(phase_artifacts, "save_json", _fake_save_json)
+
+    with pytest.raises(ppmod.PitPassFailure) as exc_info:
+        ppmod._run_predictor_pass_isolated(
+            {"signals_bucket": "b"}, "walkforward", "2026-08-13",
+        )
+
+    assert len(captured_saves) == 1
+    assert captured_saves[0]["stderr"] == long_stderr.decode("utf-8")
+    assert captured_saves[0]["reason"] == "timeout"
+    assert exc_info.value.diagnostic_key is not None
+
+
+def test_isolated_pass_diagnostic_key_none_when_persist_fails(monkeypatch):
+    """A best-effort persist failure must not mask the primary failure — the
+    pass still raises PitPassFailure, just with diagnostic_key=None."""
+    import subprocess as _subprocess
+    import analysis.pit_parity as ppmod
+    import phase_artifacts
+
+    def _fake_run(cmd, cwd=None, stderr=None, text=None, timeout=None):
+        return _fake_completed_process(1, "some stderr")
+
+    monkeypatch.setattr(_subprocess, "run", _fake_run)
+
+    def _boom_save_json(*a, **kw):
+        raise RuntimeError("S3 down")
+
+    monkeypatch.setattr(phase_artifacts, "save_json", _boom_save_json)
+
+    with pytest.raises(ppmod.PitPassFailure) as exc_info:
+        ppmod._run_predictor_pass_isolated(
+            {"signals_bucket": "b"}, "lookahead", "2026-08-13",
+        )
+    assert exc_info.value.diagnostic_key is None
+
+
+def test_write_failure_artifact_carries_stderr_s3_key(monkeypatch):
+    """The durable failure artifact must reference the full-stderr S3 key
+    when the raised exception carries one (I6036 deliverable 1)."""
+    import analysis.pit_parity as ppmod
+
+    class _RecordingS3:
+        def put_object(self, **kw):
+            pass
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: _RecordingS3()
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    exc = ppmod.PitPassFailure(
+        "pit_parity walkforward pass failed (rc=1)",
+        diagnostic_key="backtest/2026-08-13/.phases/_diagnostics/pit_parity_walkforward_stderr.json",
+    )
+    rep = ppmod.write_failure_artifact({"signals_bucket": "b", "_run_date": "2026-08-13"}, exc)
+    assert rep["stderr_s3_key"] == (
+        "backtest/2026-08-13/.phases/_diagnostics/pit_parity_walkforward_stderr.json"
+    )
+
+
+def test_write_failure_artifact_stderr_key_none_for_non_pass_exceptions(monkeypatch):
+    """A crash that never went through the isolated-subprocess path (e.g. a
+    RecursionError raised in the parent) has no diagnostic_key — must not
+    error, must record None rather than fabricating a key."""
+    import analysis.pit_parity as ppmod
+
+    class _RecordingS3:
+        def put_object(self, **kw):
+            pass
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: _RecordingS3()
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    rep = ppmod.write_failure_artifact(
+        {"signals_bucket": "b", "_run_date": "2026-08-13"},
+        RecursionError("maximum recursion depth exceeded"),
+    )
+    assert rep["stderr_s3_key"] is None
+
+
+# ── I6036 deliverable 3: rolling pit_parity success-rate metric ─────────────
+
+
+class _RecordingHealthS3:
+    """In-memory S3 stub: pre-seeded GET responses by key + records every
+    put_object call, for asserting the health snapshot's shape and key."""
+
+    def __init__(self, objects: dict[str, dict]):
+        self._objects = objects
+        self.puts: list[dict] = []
+
+    def get_object(self, Bucket, Key):
+        import io
+        if Key not in self._objects:
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        return {"Body": io.BytesIO(json.dumps(self._objects[Key]).encode())}
+
+    def put_object(self, **kw):
+        self.puts.append(kw)
+
+
+def test_compute_pit_parity_success_rate_counts_ok_vs_failed_incomplete(monkeypatch):
+    import analysis.pit_parity as ppmod
+
+    objects = {
+        "backtest/2026-08-13/pit_parity.json": {"status": "failed"},
+        "backtest/2026-08-06/pit_parity.json": {"status": "ok"},
+        "backtest/2026-07-30/pit_parity.json": {"status": "incomplete"},
+        "backtest/2026-07-23/pit_parity.json": {"status": "ok"},
+    }
+    s3 = _RecordingHealthS3(objects)
+    health = ppmod.compute_pit_parity_success_rate(
+        "b", "2026-08-13", s3_client=s3, lookback_days=30,
+    )
+    assert health["runs_considered"] == 4
+    assert health["successes"] == 2
+    assert health["failures"] == 2
+    assert health["success_rate"] == 0.5
+
+
+def test_compute_pit_parity_success_rate_legacy_status_none_counts_as_success(monkeypatch):
+    """A report predating config#7199's status field (status unset) must not
+    be miscounted as a failure — matches write_failure_artifact's own
+    "None/ok are the only clean readings" contract."""
+    import analysis.pit_parity as ppmod
+
+    objects = {"backtest/2026-08-13/pit_parity.json": {"verdict": "PASS"}}
+    s3 = _RecordingHealthS3(objects)
+    health = ppmod.compute_pit_parity_success_rate("b", "2026-08-13", s3_client=s3)
+    assert health["successes"] == 1
+    assert health["success_rate"] == 1.0
+
+
+def test_compute_pit_parity_success_rate_no_runs_yields_none_not_zero(monkeypatch):
+    """Zero runs in the window is honestly None, never a fabricated 0% or
+    100% — matches this module's own "absence of evidence is never a pass"
+    discipline (VERDICT_UNKNOWN)."""
+    import analysis.pit_parity as ppmod
+
+    s3 = _RecordingHealthS3({})
+    health = ppmod.compute_pit_parity_success_rate("b", "2026-08-13", s3_client=s3)
+    assert health["runs_considered"] == 0
+    assert health["success_rate"] is None
+
+
+def test_update_pit_parity_health_writes_to_stable_key(monkeypatch):
+    import analysis.pit_parity as ppmod
+
+    objects = {"backtest/2026-08-13/pit_parity.json": {"status": "ok"}}
+    s3 = _RecordingHealthS3(objects)
+    key = ppmod.update_pit_parity_health("b", "2026-08-13", s3_client=s3)
+    assert key == "backtest/pit_parity_health.json"
+    assert len(s3.puts) == 1
+    put = s3.puts[0]
+    assert put["Key"] == "backtest/pit_parity_health.json"
+    assert put["Bucket"] == "b"
+    body = json.loads(put["Body"])
+    assert body["success_rate"] == 1.0
+
+
+def test_write_artifact_to_s3_refreshes_health_snapshot(monkeypatch):
+    """Every report write — success, incomplete, or failed (via
+    write_failure_artifact) — funnels through _write_artifact_to_s3, which
+    must refresh the rolling health snapshot as a side effect."""
+    import analysis.pit_parity as ppmod
+
+    class _RecordingS3Full:
+        def __init__(self):
+            self.puts: list[dict] = []
+
+        def get_object(self, Bucket, Key):
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
+        def put_object(self, **kw):
+            self.puts.append(kw)
+
+    fake_client = _RecordingS3Full()
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: fake_client
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    key = ppmod._write_artifact_to_s3(
+        "b", "2026-08-13", {"schema": ppmod.SCHEMA, "status": "ok"},
+    )
+    assert key == "backtest/2026-08-13/pit_parity.json"
+    put_keys = [p["Key"] for p in fake_client.puts]
+    assert "backtest/2026-08-13/pit_parity.json" in put_keys
+    assert "backtest/pit_parity_health.json" in put_keys, (
+        "health snapshot must be refreshed on every artifact write"
+    )
+
+
+def test_write_artifact_to_s3_health_failure_does_not_mask_success(monkeypatch):
+    """A health-snapshot computation failure must not make the primary write
+    look like it failed — the primary artifact write already succeeded."""
+    import analysis.pit_parity as ppmod
+
+    class _PrimaryOkHealthBoom:
+        def get_object(self, Bucket, Key):
+            raise RuntimeError("health computation exploded")
+
+        def put_object(self, **kw):
+            pass  # primary artifact write succeeds
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: _PrimaryOkHealthBoom()
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    key = ppmod._write_artifact_to_s3(
+        "b", "2026-08-13", {"schema": ppmod.SCHEMA, "status": "ok"},
+    )
+    assert key == "backtest/2026-08-13/pit_parity.json", (
+        "primary write must still report success despite health snapshot failing"
+    )
 
 
 # ── config#2449: prior_delta plumbing so step-change alarms aren't inert ─────

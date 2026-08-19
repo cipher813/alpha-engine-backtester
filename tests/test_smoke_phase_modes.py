@@ -399,3 +399,181 @@ def test_timing_budget_file_has_entry_for_every_smoke_mode():
             f"Smoke mode {mode!r} missing from timing_budget.yaml. "
             f"Add an entry so regressions fail CI instead of warn silently."
         )
+
+
+# ── I6043: output-postcondition assertions, not just exit-code/budget ───────
+#
+# smoke-simulate / smoke-param-sweep route through classify_simulation_
+# outcome; smoke-predictor-backtest / smoke-phase4 / smoke-predictor-
+# param-sweep route through assert_predictor_backtest_deliverable. Both
+# tolerate a degenerate (EMPTY / non-"ok") outcome in PRODUCTION — a
+# legitimate no-op week. The smoke path must NOT: a smoke fixture producing
+# nothing means the fixture or the code broke, not a real market week.
+
+
+def test_smoke_positive_simulation_outcome_fails_loud_on_empty_when_smoke():
+    import pandas as pd
+    from backtest import classify_simulation_outcome
+
+    outcome = classify_simulation_outcome(
+        "param-sweep", portfolio_stats={"sharpe_ratio": 0.0}, sweep_df=pd.DataFrame(),
+    )
+    assert outcome.is_empty  # sanity: this really is the EMPTY case
+    with pytest.raises(SystemExit, match="I6043"):
+        backtest._assert_smoke_positive_simulation_outcome(True, outcome)
+
+
+def test_smoke_positive_simulation_outcome_tolerates_empty_when_not_smoke():
+    """Production posture (is_smoke=False) must be completely unchanged —
+    EMPTY stays a valid no-op there, per classify_simulation_outcome's own
+    docstring / ARCHITECTURE.md §22."""
+    import pandas as pd
+    from backtest import classify_simulation_outcome
+
+    outcome = classify_simulation_outcome(
+        "param-sweep", portfolio_stats={"sharpe_ratio": 0.0}, sweep_df=pd.DataFrame(),
+    )
+    backtest._assert_smoke_positive_simulation_outcome(False, outcome)  # must not raise
+
+
+def test_smoke_positive_simulation_outcome_tolerates_success():
+    import pandas as pd
+    from backtest import classify_simulation_outcome
+
+    outcome = classify_simulation_outcome(
+        "param-sweep", portfolio_stats={"sharpe_ratio": 1.0},
+        sweep_df=pd.DataFrame({"sharpe_ratio": [1.0]}),
+    )
+    assert not outcome.is_empty and not outcome.is_failure
+    backtest._assert_smoke_positive_simulation_outcome(True, outcome)  # must not raise
+
+
+def test_smoke_positive_predictor_outcome_fails_loud_on_degenerate_status_when_smoke():
+    with pytest.raises(SystemExit, match="I6043"):
+        backtest._assert_smoke_positive_predictor_outcome(
+            True, {"status": "no_orders"},
+        )
+
+
+def test_smoke_positive_predictor_outcome_tolerates_degenerate_status_when_not_smoke():
+    """Production posture unchanged: assert_predictor_backtest_deliverable
+    already tolerates non-"error" degeneracies; this helper must not add a
+    NEW failure mode outside the smoke path."""
+    backtest._assert_smoke_positive_predictor_outcome(
+        False, {"status": "no_orders"},
+    )  # must not raise
+
+
+def test_smoke_positive_predictor_outcome_tolerates_ok_and_none_status():
+    backtest._assert_smoke_positive_predictor_outcome(True, {"status": "ok"})
+    backtest._assert_smoke_positive_predictor_outcome(True, {})
+    backtest._assert_smoke_positive_predictor_outcome(True, None)
+
+
+# ── I6043 closes-when: smoke-pit-parity FAILS on a forced zero-signal
+# walk-forward pass and PASSES on a normal one — as an actual test, not a
+# manual demonstration. _assert_smoke_pit_parity_postconditions IS that
+# postcondition check (wired into backtest.py's `if args.pit_parity:`
+# branch, gated on _is_smoke_phase); these exercise it directly against
+# both report shapes run_pit_parity can actually produce.
+
+
+def test_smoke_pit_parity_postcondition_fails_on_forced_zero_signal_report():
+    """The exact live incident (watch-rerun-2026-08-01-4): a walk-forward
+    pass returns no-orders, run_pit_parity emits status="incomplete" with
+    zero n_trading_dates — this must fail loud, not pass green."""
+    zero_signal_report = {
+        "schema": "pit_parity-1.0.0",
+        "status": "incomplete",
+        "verdict": "UNKNOWN",
+        "current_status": "ok",
+        "pit_status": "no-orders",
+        "run_quality": {
+            "n_trading_dates": {"current_lookahead": 12, "walk_forward_pit": 0},
+        },
+    }
+    with pytest.raises(SystemExit, match="I6043"):
+        backtest._assert_smoke_pit_parity_postconditions(zero_signal_report)
+
+
+def test_smoke_pit_parity_postcondition_fails_when_run_pit_parity_raised():
+    """report=None means run_pit_parity raised (the except branch ran) —
+    must fail loud, not silently return."""
+    with pytest.raises(SystemExit, match="I6043"):
+        backtest._assert_smoke_pit_parity_postconditions(None)
+
+
+def test_smoke_pit_parity_postcondition_fails_without_delta_pit_minus_current():
+    """A report missing the actual contamination delta must fail even if
+    status looks clean — the smoke's whole point is proving a real delta
+    was computed."""
+    report = {
+        "schema": "pit_parity-1.0.0",
+        "run_quality": {
+            "n_trading_dates": {"current_lookahead": 12, "walk_forward_pit": 12},
+        },
+    }
+    with pytest.raises(SystemExit, match="delta_pit_minus_current"):
+        backtest._assert_smoke_pit_parity_postconditions(report)
+
+
+def test_smoke_pit_parity_postcondition_passes_on_a_normal_report():
+    """A real, healthy report (both passes ok, real trading dates, a
+    delta_pit_minus_current key present) must PASS — the postcondition
+    check must not be so strict it fails a healthy run."""
+    healthy_report = {
+        "schema": "pit_parity-1.0.0",
+        "verdict": "PASS",
+        "delta_pit_minus_current": {"sortino_ratio": 0.02},
+        "headline_log_alpha_delta": 0.001,
+        "run_quality": {
+            "n_trading_dates": {"current_lookahead": 24, "walk_forward_pit": 24},
+        },
+    }
+    backtest._assert_smoke_pit_parity_postconditions(healthy_report)  # must not raise
+
+
+def test_smoke_pit_parity_postcondition_end_to_end_forced_zero_signal_vs_normal(monkeypatch):
+    """End-to-end version of the closes-when demonstration: drive the REAL
+    run_pit_parity (not a hand-built report dict) with a forced zero-signal
+    walk-forward pass, then with a normal one, and assert the postcondition
+    check fails the first and passes the second."""
+    import types as _types
+    from analysis import pit_parity as pp
+
+    fake_boto3 = _types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: _types.SimpleNamespace(
+        put_object=lambda **kw: None,
+        get_object=lambda **kw: (_ for _ in ()).throw(Exception("no prior")),
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(pp, "read_prior_delta", lambda *a, **k: None)
+
+    def _zero_signal_walkforward(safe_config, which, run_date):
+        if which == "walkforward":
+            return {"status": "no-orders", "signals_by_date": {}}
+        return {
+            "status": "ok", "signals_by_date": {"2026-08-01": {}},
+            "daily_log_returns": [0.001] * 10, "sortino_ratio": 1.0,
+            "psr": 0.9, "cvar_95": -0.02, "max_drawdown": -0.05,
+        }
+
+    monkeypatch.setattr(pp, "_run_predictor_pass_isolated", _zero_signal_walkforward)
+    zero_signal_report = pp.run_pit_parity(
+        {"signals_bucket": "b", "_run_date": "2026-08-01"},
+    )
+    with pytest.raises(SystemExit, match="I6043"):
+        backtest._assert_smoke_pit_parity_postconditions(zero_signal_report)
+
+    def _normal_pass(safe_config, which, run_date):
+        return {
+            "status": "ok", "signals_by_date": {"2026-08-01": {}, "2026-08-02": {}},
+            "daily_log_returns": [0.001] * 10, "sortino_ratio": 1.0,
+            "psr": 0.9, "cvar_95": -0.02, "max_drawdown": -0.05,
+        }
+
+    monkeypatch.setattr(pp, "_run_predictor_pass_isolated", _normal_pass)
+    normal_report = pp.run_pit_parity(
+        {"signals_bucket": "b", "_run_date": "2026-08-01"},
+    )
+    backtest._assert_smoke_pit_parity_postconditions(normal_report)  # must not raise
