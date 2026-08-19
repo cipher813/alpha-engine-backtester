@@ -67,7 +67,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # analysis/grade_history.py deleted RC v3 T1 (config-I7474, 2026-08-16) —
     # the v1 composite-grade history writer; grader retired as a rendered
     # surface. s3://.../backtest/grade_history.json is retained, unwritten.
-    "analysis/pit_parity.py": 1,
+    # +1 (1->2) 2026-08-19: config-I6036 deliverable 3 — a rolling
+    # backtest/pit_parity_health.json snapshot (fixed key, overwritten every
+    # run) tracking the run success rate nothing previously counted. Best-effort
+    # secondary write wrapped in its own try/except so a health-computation
+    # failure never masks the primary pit_parity.json write's return value.
+    # Grandfathered, NOT freshness-SLA registered: its absence does not break
+    # trading or block any downstream consumer, it only makes a known reliability
+    # problem visible on a surface someone reads — the same rationale as
+    # analysis/attribution_persistence.py above.
+    "analysis/pit_parity.py": 2,
     # alpha-engine-config#6030: per-pass pit_stats artifacts
     # (parity/{run_date}/pit_stats_{pass}.json) + the compare's
     # pit_parity.json write — one strict _put_json chokepoint. Registry

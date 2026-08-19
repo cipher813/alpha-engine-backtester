@@ -42,6 +42,8 @@ from pathlib import Path
 _SCRIPT = (
     Path(__file__).resolve().parent.parent / "infrastructure" / "spot_backtest.sh"
 )
+_BACKTEST_PY = Path(__file__).resolve().parent.parent / "backtest.py"
+_EVALUATE_PY = Path(__file__).resolve().parent.parent / "evaluate.py"
 
 
 def _read_script() -> str:
@@ -124,6 +126,92 @@ def test_every_known_stage_has_a_smoke_marker_in_the_script():
 
 # ── Test for the test: prove the assertion logic itself would catch a ───────
 # ── missing smoke, not just pass vacuously on the current script. ───────────
+
+
+# ── alpha-engine-config-I6043: every _KNOWN_STAGES smoke must declare an
+# ── OUTPUT-postcondition assertion, not just prove a smoke marker exists.
+# ── (exit code + budget were the only checks — `_smoke_run_mode` never
+# ── inspected output, and `run_pit_parity` never raises on a degraded
+# ── result, so smoke-pit-parity passed GREEN on the exact zero-signal
+# ── condition that degraded the live 2026-08-01 run.)
+#
+# Each stage's postcondition marker is deliberately specific (a real
+# function/call-site name, not the bare word "assert") so a marker for an
+# unrelated check can't accidentally satisfy this test. A stage with a
+# marker missing here is exactly the "fix-not-propagated-to-analogous-
+# sites" gap I6043 describes.
+_STAGE_POSTCONDITION_MARKERS: dict[str, tuple[Path, list[str]]] = {
+    # smoke-simulate / smoke-param-sweep (classify_simulation_outcome path)
+    # AND smoke-predictor-backtest / smoke-phase4 / smoke-predictor-param-
+    # sweep (assert_predictor_backtest_deliverable path) all route through
+    # backtest.py — both production-tolerated-degeneracy chokepoints are
+    # tightened to a hard smoke-side fail.
+    "backtest": (
+        _BACKTEST_PY,
+        [
+            r"_assert_smoke_positive_simulation_outcome\(_is_smoke_phase",
+            r"_assert_smoke_positive_predictor_outcome\(_is_smoke_phase",
+        ],
+    ),
+    # smoke-pit-parity: the I6043 finding itself. run_pit_parity's own
+    # degrade-not-fail contract is untouched; the postcondition check is
+    # a separate smoke-side-only function called from the pit_parity
+    # branch, gated on _is_smoke_phase.
+    "pit_parity": (
+        _BACKTEST_PY,
+        [r"_assert_smoke_pit_parity_postconditions\(report\)"],
+    ),
+    # smoke-parity: `pytest --collect-only` is ALREADY a real positive
+    # postcondition, not exit-code-only-in-the-I6043-sense — pytest itself
+    # exits 5 ("no tests collected") on zero collected items, so a broken
+    # test-file glob or a marker matching nothing fails loud without any
+    # extra code needed here.
+    "parity": (
+        _SCRIPT,
+        [r"pytest tests/test_parity_replay\.py -m parity --collect-only"],
+    ),
+    # smoke-evaluator: `_smoke_probe_s3` performs a REAL S3 read and raises
+    # on failure — same reasoning as smoke-parity, the exit code already
+    # reflects a genuine check, not a swallowed no-op.
+    "evaluator": (
+        _EVALUATE_PY,
+        [r"_smoke_probe_s3\(config\)"],
+    ),
+}
+
+
+def test_every_known_stage_declares_an_output_postcondition_assertion():
+    """alpha-engine-config-I6043: every _KNOWN_STAGES entry must declare a
+    postcondition marker above, and that marker must actually be present in
+    the named source file — proving smokes assert something about their
+    OUTPUT, not merely that a smoke marker/invocation exists (that weaker
+    property is what test_every_known_stage_has_a_smoke_marker_in_the_
+    script already covers, and covered it even while I6043's gap was live)."""
+    stages = _known_stages()
+    mapped = set(_STAGE_POSTCONDITION_MARKERS.keys())
+    missing = set(stages) - mapped
+    assert not missing, (
+        f"_KNOWN_STAGES contains stage(s) with no output-postcondition "
+        f"marker declared: {sorted(missing)}. Add a positive-outcome "
+        f"assertion for the new stage's smoke (alpha-engine-config-I6043) "
+        f"and register its marker here."
+    )
+    for stage, (src_path, patterns) in _STAGE_POSTCONDITION_MARKERS.items():
+        if stage not in stages:
+            continue  # stale entry — covered by the reverse check below
+        src = src_path.read_text()
+        for pattern in patterns:
+            assert re.search(pattern, src), (
+                f"stage={stage!r}: postcondition marker {pattern!r} not "
+                f"found in {src_path.name} — the smoke for this stage "
+                f"asserts exit-code/budget only, not its OUTPUT "
+                f"(alpha-engine-config-I6043)."
+            )
+    stale = mapped - set(stages)
+    assert not stale, (
+        f"_STAGE_POSTCONDITION_MARKERS has entries for stage(s) no longer "
+        f"in _KNOWN_STAGES: {sorted(stale)}. Remove the stale mapping."
+    )
 
 
 def test_assertion_logic_would_catch_a_stage_added_without_a_smoke():

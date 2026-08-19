@@ -5040,6 +5040,136 @@ def _assert_smoke_within_budget(
     )
 
 
+def _assert_smoke_pit_parity_postconditions(report: dict | None) -> None:
+    """alpha-engine-config-I6043: smoke-pit-parity must assert a POSITIVE
+    postcondition on the run's OUTPUT, not just that backtest.py exited 0.
+
+    `_smoke_run_mode` (infrastructure/spot_backtest.sh) previously asserted
+    only exit code + wall-clock budget, and `run_pit_parity` never raises on
+    a degraded pass (by design — see the module docstring: pit_parity is
+    observational and must never fail the weekly SF). Composed, that meant
+    smoke-pit-parity passed GREEN on exactly the zero-signal condition that
+    degraded the live 2026-08-01 run (`watch-rerun-2026-08-01-4`): a
+    walk-forward pass returning `no-orders` / zero trading dates, the report
+    degrading to `status: "incomplete"`, and `backtest.py` exiting 0 anyway.
+
+    This function is smoke-side ONLY — it is called from exactly one call
+    site, inside `if _is_smoke_phase:` in the `args.pit_parity` branch of
+    `_main_impl`. `run_pit_parity` itself is untouched and keeps its
+    degrade-not-fail contract for the real Parity SF stage
+    (alpha-engine-config-I6025). Fails loud via SystemExit (non-zero,
+    matching `_assert_smoke_within_budget`'s idiom) when any of:
+
+    - the report's own `status` is not `None`/`"ok"` (an "incomplete" or
+      "failed" report never reads as a pass);
+    - either pass's `current_status`/`pit_status` leg is set to something
+      other than `None`/`"ok"` (covers the incomplete-report shape
+      specifically, where these two fields carry the per-pass verdict);
+    - `delta_pit_minus_current` is absent from the report — the smoke's
+      whole point is proving a REAL contamination delta was computed, not
+      just that some JSON was uploaded;
+    - either pass's `n_trading_dates` (run_quality block) is zero — the
+      exact 5-ticker/30-60-day fixture is the one MOST prone to producing
+      few or zero signals, so this is the direct positive check for the
+      "ran, but over nothing" failure mode exit-code-only missed.
+    """
+    failures: list[str] = []
+    if report is None:
+        failures.append(
+            "run_pit_parity raised (no report was produced) — see the "
+            "exception logged just above"
+        )
+    else:
+        status = report.get("status")
+        if status not in (None, "ok"):
+            failures.append(f"report status={status!r} (expected None or 'ok')")
+        for leg in ("current_status", "pit_status"):
+            leg_status = report.get(leg)
+            if leg_status not in (None, "ok"):
+                failures.append(f"{leg}={leg_status!r} (expected None or 'ok')")
+        if "delta_pit_minus_current" not in report:
+            failures.append(
+                "report carries no 'delta_pit_minus_current' key — no real "
+                "contamination delta was computed"
+            )
+        n_trading = (
+            (report.get("run_quality") or {}).get("n_trading_dates") or {}
+        )
+        for leg, n in n_trading.items():
+            if not n:
+                failures.append(
+                    f"run_quality.n_trading_dates.{leg}={n!r} — the pass "
+                    f"produced signals for zero trading dates"
+                )
+        if not n_trading:
+            failures.append(
+                "report carries no run_quality.n_trading_dates block at all "
+                "(expected on both the incomplete and success report shapes)"
+            )
+    if failures:
+        msg = (
+            "smoke-pit-parity FAILED postcondition check "
+            "(alpha-engine-config-I6043): " + "; ".join(failures)
+        )
+        logger.error("[smoke-pit-parity] %s", msg)
+        raise SystemExit(msg)
+    logger.info(
+        "[smoke-pit-parity] postcondition check PASSED — both passes ok, "
+        "n_trading_dates=%s, real delta computed.",
+        (report.get("run_quality") or {}).get("n_trading_dates"),
+    )
+
+
+def _assert_smoke_positive_simulation_outcome(is_smoke: bool, outcome) -> None:
+    """alpha-engine-config-I6043 sibling sweep: smoke-simulate / smoke-
+    param-sweep / smoke-phase4-adjacent modes routing through
+    `classify_simulation_outcome` must fail loud on an EMPTY outcome (ran,
+    no admissible combo), not just log+alert.
+
+    Production deliberately tolerates EMPTY as a legitimate no-op week (see
+    `classify_simulation_outcome`'s own docstring / ARCHITECTURE.md §22) —
+    that posture is UNCHANGED here; this only tightens the SMOKE path.
+    The tiny fixture (`_SMOKE_FIXTURE_TICKERS`) is deliberately small, so
+    it is at least as likely as pit_parity's fixture to produce zero
+    admissible orders by chance/rot — and exit-code-only previously passed
+    that green, same class of gap as I6043's pit_parity finding.
+    """
+    if is_smoke and outcome.is_empty:
+        raise SystemExit(
+            f"Smoke FAILED postcondition check (alpha-engine-config-I6043): "
+            f"simulation outcome EMPTY — {outcome.reason} Production "
+            f"tolerates this as a legitimate no-op week; a smoke fixture "
+            f"producing zero admissible orders means the fixture or the "
+            f"code is broken, not a real market degeneracy."
+        )
+
+
+def _assert_smoke_positive_predictor_outcome(
+    is_smoke: bool, predictor_stats: dict | None,
+) -> None:
+    """alpha-engine-config-I6043 sibling sweep: smoke-predictor-backtest /
+    smoke-phase4 / smoke-predictor-param-sweep (all route to mode=
+    predictor-backtest) must fail loud on ANY degenerate predictor_stats
+    status, not just `status == "error"`.
+
+    `assert_predictor_backtest_deliverable` deliberately tolerates
+    `no_orders` / low-coverage in PRODUCTION (a legitimate no-admissible-
+    entry week, alpha-engine-config#7252) — that posture is UNCHANGED here.
+    The smoke's whole point is proving the tiny fixture produces a REAL
+    predictor_stats artifact; a degenerate one there means the fixture (or
+    the code) is broken, not a real market week.
+    """
+    status = (predictor_stats or {}).get("status")
+    if is_smoke and status not in (None, "ok"):
+        raise SystemExit(
+            f"Smoke FAILED postcondition check (alpha-engine-config-I6043): "
+            f"predictor_stats status={status!r} (expected None or 'ok'). "
+            f"Production tolerates this degeneracy as a legitimate no-op "
+            f"week; a smoke fixture producing a degenerate status means "
+            f"the fixture or the code is broken."
+        )
+
+
 def _runtime_smoke(config: dict) -> None:
     """End-to-end smoke test with minimal data.
 
@@ -6678,6 +6808,7 @@ def _main_impl() -> None:
                     config.get("signals_bucket", "alpha-engine-research"),
                     args.predictor_stats_key, e,
                 )
+        report: dict | None = None
         try:
             report = run_pit_parity(config, predictor_stats=predictor_stats)
             print(json.dumps(
@@ -6722,6 +6853,12 @@ def _main_impl() -> None:
                 "budget-breach extrapolation)", elapsed,
             )
             _assert_smoke_within_budget(_original_mode, elapsed, registry=registry)
+            # I6043: exit-code + budget alone let this smoke pass green on a
+            # zero-signal/degraded run (the exact 2026-08-01 incident) —
+            # assert a positive postcondition on what the run actually
+            # produced. Smoke-side only; run_pit_parity's own degrade-not-
+            # fail contract for the real Parity SF stage is untouched.
+            _assert_smoke_pit_parity_postconditions(report)
         return
 
     _init_pipeline(args, config)
@@ -7033,6 +7170,9 @@ def _main_impl() -> None:
                     )
                 except Exception:  # noqa: BLE001 — alert is best-effort observability
                     pass
+                # I6043 sibling sweep: smoke-side only — tighten the
+                # production WARN-and-continue into a hard fail.
+                _assert_smoke_positive_simulation_outcome(_is_smoke_phase, outcome)
 
         # predictor-backtest is exempt from the guard above because it produces
         # neither portfolio_stats nor sweep_df — but it was left with NO
@@ -7072,6 +7212,11 @@ def _main_impl() -> None:
         # no-admissible-entry week.
         if args.mode == "predictor-backtest":
             assert_predictor_backtest_deliverable(predictor_stats, args.date)
+            # I6043 sibling sweep: smoke-predictor-backtest / smoke-phase4 /
+            # smoke-predictor-param-sweep all route here — smoke-side only,
+            # tighten the production tolerate-degenerate-status posture into
+            # a hard fail so the smoke proves a REAL artifact was produced.
+            _assert_smoke_positive_predictor_outcome(_is_smoke_phase, predictor_stats)
 
     # ── Report, upload, email, and instance stop ──────────────────────────
     # Wrapped in try/finally so --stop-instance ALWAYS runs.
