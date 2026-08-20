@@ -392,7 +392,7 @@ class TestColdStartDeferral:
 # The tag every deploy artifact must pin. `tests/test_lib_pin_lockstep.py`
 # asserts requirements.txt and the three Lambda Dockerfiles all carry the SAME
 # tag; this constant is what that tag must be.
-_EXPECTED_LIB_TAG = "v0.124.70"
+_EXPECTED_LIB_TAG = "v0.124.75"
 
 
 class TestLibVersionPin:
@@ -416,8 +416,21 @@ class TestLibVersionPin:
                 rf"nousergon-lib@{re.escape(_EXPECTED_LIB_TAG)}[0-9.]", text
             )
         ), (
-            f"nousergon-lib should pin to {_EXPECTED_LIB_TAG} — bumped to "
-            "restore CO-INSTALL PARITY with crucible-predictor / "
+            f"nousergon-lib should pin to {_EXPECTED_LIB_TAG} — bumped "
+            "fleet-wide (alpha-engine-config-I7835) to the tag carrying "
+            "nousergon-lib-PR336 (producer_champion_audit gains "
+            "outcome=held_shadow_only, blocked_by=shadow_only_arm, and "
+            "counterfactual_winner; additive, no schema_version bump), "
+            "consumed by crucible-backtester-PR712's shadow-only ruling "
+            "(alpha-engine-config-I2515). The lib bump was deliberately NOT "
+            "bundled with PR712 to keep the weekly SF's `LibPinDriftGate` "
+            "co-install-parity check (crucible-backtester == "
+            "crucible-predictor) meeting in one lockstep move rather than a "
+            "single-repo pin. Bumped in lockstep with crucible-predictor "
+            "(both -> v0.124.75); nousergon-data and crucible-research moved "
+            "for currency in the same arc though the gate's floor-only check "
+            "does not require them to match exactly. Prior: v0.124.70 — "
+            "restored CO-INSTALL PARITY with crucible-predictor / "
             "nousergon-data / crucible-research, which all moved to v0.124.70 "
             "on 2026-08-18 (nousergon-lib-PR329, the run-scope registry entry "
             "for alpha-engine-config-I7620). This repo stayed at v0.124.69, "
