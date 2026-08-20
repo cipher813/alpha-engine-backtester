@@ -63,7 +63,7 @@ from typing import Any, Optional
 
 import boto3
 
-from replay.runner import replay_artifact
+from replay.runner import replay_artifact, resolve_target_spec
 
 logger = logging.getLogger(__name__)
 
@@ -345,7 +345,6 @@ def compute_and_emit_concordance(
     s3_client: Optional[Any] = None,
     cloudwatch_client: Optional[Any] = None,
     client_factory: Optional[Any] = None,
-    api_key: Optional[str] = None,
     emit_metrics: bool = True,
     persist_per_replay: bool = False,
     dry_run: bool = False,
@@ -356,12 +355,15 @@ def compute_and_emit_concordance(
     CloudWatch metrics, and persist a per-target-model batch summary.
 
     Args:
-        target_models: list of OpenRouter model ids to replay against
-            (alpha-engine-config-I2997, 2026-07-19 — was an Anthropic
-            model name pre-migration). Common shape:
-            ``["deepseek/deepseek-v4-flash"]`` — the default
-            ReplayConcordance dispatches (see
-            ``lambda_concordance/handler.py``).
+        target_models: list of REGISTRY ENTRY IDS to replay against
+            (alpha-engine-config-I7878, 2026-08-20 — was an OpenRouter
+            slug pre-migration). Common shape: ``["deepseek-v4-flash"]``
+            — the default ReplayConcordance dispatches (see
+            ``lambda_concordance/handler.py``). Each is resolved through
+            the krepis router ONCE, before any artifact is replayed; a
+            router that will not admit this process raises here rather
+            than producing one identical failure per artifact, and never
+            falls back to a direct provider endpoint.
         end_time: window ends at this UTC instant (defaults to now).
         window_days: trailing window — default 8 weeks (56 days).
         agent_filter: list of base agent_ids to include. None = all
@@ -435,6 +437,59 @@ def compute_and_emit_concordance(
     )
 
     if dry_run:
+        # A dry run RESOLVES every target, and never raises doing it.
+        #
+        # This is the deploy canary's only reachable path. `deploy_concordance.
+        # sh` invokes `{"dry_run": true, "window_days": 14}` against the newly
+        # published version and promotes the `live` alias only if the status
+        # comes back OK/PARTIAL — so whatever the dry run does NOT exercise is
+        # not covered by the one gate standing between a merge and the weekly
+        # SF. Before alpha-engine-config-I7878 that was fine: the dry run's
+        # only untested surface was the model call itself. It is not fine now.
+        # The target is a REGISTRY ID resolved through the router, so a
+        # mistyped id, a retired registry entry, an unreachable edge or a
+        # missing per-consumer credential are all deploy-time facts that the
+        # dry run was silently stepping over — and the first thing to notice
+        # would have been Saturday's weekly run, with the whole stage lost.
+        #
+        # Resolution costs no tokens: a registry read plus one health probe.
+        #
+        # It records rather than raises, because the dry run has a SECOND
+        # consumer with the opposite need — an operator listing the corpus
+        # while diagnosing a router outage. Both are served: `would_replay` is
+        # always present, and `target_resolution` says, per target, whether the
+        # routed path is actually usable. The handler turns any failure here
+        # into a non-OK status, which is what fails the canary and leaves the
+        # `live` alias on the prior good version.
+        target_resolution: list[dict[str, Any]] = []
+        for target_model in target_models:
+            try:
+                _, route = resolve_target_spec(target_model)
+            except Exception as exc:  # noqa: BLE001 — recorded, see above
+                logger.error(
+                    "[batch_replay] dry run: target=%s did NOT resolve (%s: %s)",
+                    target_model, type(exc).__name__, exc,
+                )
+                target_resolution.append({
+                    "target_model": target_model,
+                    "resolved": False,
+                    "error": f"{type(exc).__name__}: {exc}"[:500],
+                })
+                continue
+            logger.info(
+                "[batch_replay] dry run: target=%s resolved model=%s route=%s "
+                "exec_context=%s",
+                target_model, route.get("deployment_id"), route.get("route"),
+                route.get("exec_context"),
+            )
+            target_resolution.append({
+                "target_model": target_model,
+                "resolved": True,
+                "deployment_id": route.get("deployment_id"),
+                "route": route.get("route"),
+                "exec_context": route.get("exec_context"),
+            })
+
         return {
             "dry_run": True,
             "window_start": window_start.isoformat(),
@@ -443,12 +498,42 @@ def compute_and_emit_concordance(
             "agent_filter": agent_filter,
             "would_replay": len(keys),
             "would_replay_keys": keys[:50],  # trim for log/return ergonomics
+            "target_resolution": target_resolution,
         }
+
+    # Deferred like every other krepis import in this package — the Lambda
+    # image imports this module during cold start before secrets load.
+    from krepis.router import route_is_degraded
 
     # Outer summary collects per-target-model results.
     per_target_summary: list[dict[str, Any]] = []
 
     for target_model in target_models:
+        # Resolve the target ONCE, before touching the corpus.
+        #
+        # Fail loud and fail early (model-router-policy R20, and the fleet's
+        # no-silent-swallows rule). A router edge that will not admit this
+        # process, or a target_model that is not a registry entry id, is a
+        # PRECONDITION failure: it is identical for every artifact, it is not
+        # the divergence this module measures, and letting it fall into the
+        # per-item handler below would report a router outage as N
+        # low-concordance observations and a PARTIAL status nobody reads.
+        # Raising surfaces it as a failed ReplayConcordance stage on the
+        # weekly SF, which is the honest shape.
+        #
+        # There is deliberately NO direct-provider fallback here. A pinned
+        # model has no registry-declared substitute, so the only reachable
+        # alternative would be a DLP-unscanned direct call — the linkage
+        # Brian's 2026-08-03 ruling removed (alpha-engine-config-I6367).
+        target_spec, target_route = resolve_target_spec(target_model)
+        logger.info(
+            "[batch_replay] target=%s resolved model=%s route=%s "
+            "exec_context=%s degraded=%s",
+            target_model, target_route.get("deployment_id"),
+            target_route.get("route"), target_route.get("exec_context"),
+            route_is_degraded(target_route),
+        )
+
         # Group observations by agent_id_base.
         observations_by_agent: dict[str, list[float]] = defaultdict(list)
         cost_total = {"input_tokens": 0, "output_tokens": 0}
@@ -491,7 +576,7 @@ def compute_and_emit_concordance(
                     replay_prefix=replay_prefix,
                     s3_client=s3,
                     client_factory=client_factory,
-                    api_key=api_key,
+                    model_spec=target_spec,
                     persist=persist_per_replay,
                 )
             except Exception as exc:  # noqa: BLE001 — never abort a batch

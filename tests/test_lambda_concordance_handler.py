@@ -129,9 +129,17 @@ class TestEventPayloadThreading:
                    side_effect=fake_compute):
             handler_mod.handler({}, context=None)
 
-        # alpha-engine-config-I2997 (2026-07-19): default target model
-        # migrated off direct Anthropic to OpenRouter/DeepSeek V4 Flash.
-        assert captured["target_models"] == ["deepseek/deepseek-v4-flash"]
+        # alpha-engine-config-I7878 (2026-08-20): the default is a REGISTRY
+        # ENTRY ID, not a provider slug. `deepseek-v4-flash` is deliberately
+        # kept `active` and out of every model_groups chain so it stays
+        # callable by name (alpha-engine-config-I6908) — which is exactly
+        # what a concordance harness needs: a NAMED model, not a tier whose
+        # chain could vary the thing being measured between runs.
+        assert captured["target_models"] == ["deepseek-v4-flash"]
+        assert "/" not in captured["target_models"][0], (
+            "a provider slug here is the pre-I7878 shape; the router refuses "
+            "it and names the addressable registry ids"
+        )
 
     def test_csv_string_target_models_split(self, handler_mod):
         captured = {}
@@ -385,3 +393,78 @@ class TestCostSinkFlush:
             "return paths and a flush on one of them is the bug I7423 fixed"
         )
         assert "flush_default_sink" in wrapper
+
+
+# ── The deploy canary must fail on an unusable route (config-I7878) ───────
+
+
+class TestDryRunResolutionGatesTheDeploy:
+    """`deploy_concordance.sh` invokes `{"dry_run": true, "window_days": 14}`
+    against the newly published version and promotes the `live` alias ONLY on
+    an OK/PARTIAL status. That makes this envelope the single gate between a
+    merge and Saturday's weekly SF.
+
+    Before alpha-engine-config-I7878 the dry run's only untested surface was
+    the model call itself, which was an acceptable blind spot. It stopped
+    being acceptable when the target became a registry id resolved through the
+    router: a mistyped id, a retired registry entry, an unreachable edge and a
+    missing per-consumer credential are all DEPLOY-TIME facts, and the first
+    thing to notice any of them would have been the weekly run.
+    """
+
+    def test_an_unresolved_target_makes_the_dry_run_ERROR(self, handler_mod):
+        summary = {
+            "dry_run": True,
+            "would_replay": 12,
+            "target_resolution": [{
+                "target_model": "deepseek/deepseek-v4-flash",
+                "resolved": False,
+                "error": "ValueError: Model id 'deepseek/deepseek-v4-flash' "
+                         "is not in the registry.",
+            }],
+        }
+
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.batch.compute_and_emit_concordance",
+                   return_value=summary):
+            result = handler_mod.handler({"dry_run": True}, context=None)
+
+        assert result["status"] == "ERROR", (
+            "an OK here promotes the live alias onto a version whose target "
+            "model cannot be reached"
+        )
+        assert "not in the registry" in result["error"]
+        assert result["summary"] is summary
+
+    def test_a_resolved_dry_run_is_OK(self, handler_mod):
+        summary = {
+            "dry_run": True,
+            "would_replay": 12,
+            "target_resolution": [{
+                "target_model": "deepseek-v4-flash",
+                "resolved": True,
+                "deployment_id": "deepseek-v4-flash",
+                "route": "litellm_proxy",
+                "exec_context": "lambda",
+            }],
+        }
+
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.batch.compute_and_emit_concordance",
+                   return_value=summary):
+            result = handler_mod.handler({"dry_run": True}, context=None)
+
+        assert result["status"] == "OK"
+
+    def test_a_summary_without_the_field_is_not_treated_as_failure(
+        self, handler_mod
+    ):
+        """A real (non-dry) run carries no `target_resolution` — resolution
+        already raised there if it was going to. Absence must not read as
+        failure, or every weekly run reports ERROR."""
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.batch.compute_and_emit_concordance",
+                   return_value=_ok_summary()):
+            result = handler_mod.handler({}, context=None)
+
+        assert result["status"] == "OK"
