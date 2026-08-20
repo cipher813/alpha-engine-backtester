@@ -558,3 +558,126 @@ class TestReplaySkipsCountedSeparately:
         # The skipped artifact contributes no concordance observation.
         assert target["agents_analyzed"] == 1
         assert target["per_agent"][0]["n"] == 3
+
+
+# ── Router resolution is a precondition, not a per-item outcome ───────────
+
+
+class TestTargetResolutionIsAPrecondition:
+    """alpha-engine-config-I7878. The target model is resolved through the
+    krepis router ONCE per target, before the corpus is touched.
+
+    The failure isolation this module is otherwise built around ("never
+    abort a batch", tested above) is exactly wrong for a resolution fault:
+    it is identical for every artifact, it is not the divergence this
+    module measures, and letting it fall into the per-item handler would
+    report a router outage as N low-concordance observations under a
+    PARTIAL status. Fail loud, and fail before any spend.
+    """
+
+    def _corpus(self):
+        end = datetime(2026, 5, 9, tzinfo=timezone.utc)
+        artifacts = {
+            f"decision_artifacts/2026/05/09/sector_quant:tech/r{i}.json":
+                _make_artifact("sector_quant:tech", f"r{i}")
+            for i in range(5)
+        }
+        return end, _build_s3_stub_with_artifacts(artifacts)
+
+    def test_resolves_once_per_target_not_once_per_artifact(self):
+        from replay import batch as batch_mod
+
+        end, s3 = self._corpus()
+        calls = []
+
+        def _spy(model_id, *, max_tokens=8192):
+            calls.append(model_id)
+            return object(), {"route": "litellm_proxy", "deployment_id": model_id,
+                              "exec_context": "lambda"}
+
+        with patch.object(batch_mod, "resolve_target_spec", _spy), \
+             patch.object(batch_mod, "replay_artifact") as mock_replay:
+            mock_replay.return_value = _stub_replay(agreement_score=0.9)
+            batch_mod.compute_and_emit_concordance(
+                target_models=["deepseek-v4-flash", "claude-haiku-4-5"],
+                end_time=end, window_days=1,
+                s3_client=s3, emit_metrics=False,
+            )
+
+        assert calls == ["deepseek-v4-flash", "claude-haiku-4-5"]
+        assert mock_replay.call_count == 10, (
+            "5 artifacts x 2 targets — the resolution count must not scale "
+            "with the corpus"
+        )
+
+    def test_the_resolved_spec_is_handed_to_every_replay(self):
+        from replay import batch as batch_mod
+
+        end, s3 = self._corpus()
+        sentinel = object()
+
+        with patch.object(
+            batch_mod, "resolve_target_spec",
+            lambda mid, **kw: (sentinel, {"route": "litellm_proxy",
+                                          "deployment_id": mid}),
+        ), patch.object(batch_mod, "replay_artifact") as mock_replay:
+            mock_replay.return_value = _stub_replay(agreement_score=0.9)
+            batch_mod.compute_and_emit_concordance(
+                target_models=["deepseek-v4-flash"],
+                end_time=end, window_days=1,
+                s3_client=s3, emit_metrics=False,
+            )
+
+        assert mock_replay.call_count == 5
+        for call in mock_replay.call_args_list:
+            assert call.kwargs["model_spec"] is sentinel
+            assert "api_key" not in call.kwargs, (
+                "a provider key at this boundary is the pre-I7878 shape"
+            )
+
+    def test_an_unreachable_router_raises_before_any_replay(self):
+        from replay import batch as batch_mod
+
+        end, s3 = self._corpus()
+
+        def _edge_down(model_id, *, max_tokens=8192):
+            raise RuntimeError(
+                "Router edge at https://router.test:8443 did not admit this "
+                "process: LITELLM_MASTER_KEY not resolvable. Refusing to fall "
+                "through to a direct provider endpoint."
+            )
+
+        with patch.object(batch_mod, "resolve_target_spec", _edge_down), \
+             patch.object(batch_mod, "replay_artifact") as mock_replay:
+            with pytest.raises(RuntimeError) as exc:
+                batch_mod.compute_and_emit_concordance(
+                    target_models=["deepseek-v4-flash"],
+                    end_time=end, window_days=1,
+                    s3_client=s3, emit_metrics=False,
+                )
+
+        assert "did not admit this process" in str(exc.value)
+        assert "direct provider" in str(exc.value)
+        mock_replay.assert_not_called()
+        s3.put_object.assert_not_called()
+
+    def test_a_dry_run_never_resolves_at_all(self):
+        """Dry run costs nothing and touches no model — it must not need a
+        healthy router either, or the cheapest safety valve stops working
+        exactly when the router is the thing being diagnosed."""
+        from replay import batch as batch_mod
+
+        end, s3 = self._corpus()
+
+        def _boom(model_id, **kw):
+            raise AssertionError("dry run must not resolve a target model")
+
+        with patch.object(batch_mod, "resolve_target_spec", _boom):
+            summary = batch_mod.compute_and_emit_concordance(
+                target_models=["deepseek-v4-flash"],
+                end_time=end, window_days=1,
+                s3_client=s3, dry_run=True,
+            )
+
+        assert summary["dry_run"] is True
+        assert summary["would_replay"] == 5

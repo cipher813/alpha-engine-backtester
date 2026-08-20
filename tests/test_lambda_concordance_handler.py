@@ -129,9 +129,17 @@ class TestEventPayloadThreading:
                    side_effect=fake_compute):
             handler_mod.handler({}, context=None)
 
-        # alpha-engine-config-I2997 (2026-07-19): default target model
-        # migrated off direct Anthropic to OpenRouter/DeepSeek V4 Flash.
-        assert captured["target_models"] == ["deepseek/deepseek-v4-flash"]
+        # alpha-engine-config-I7878 (2026-08-20): the default is a REGISTRY
+        # ENTRY ID, not a provider slug. `deepseek-v4-flash` is deliberately
+        # kept `active` and out of every model_groups chain so it stays
+        # callable by name (alpha-engine-config-I6908) — which is exactly
+        # what a concordance harness needs: a NAMED model, not a tier whose
+        # chain could vary the thing being measured between runs.
+        assert captured["target_models"] == ["deepseek-v4-flash"]
+        assert "/" not in captured["target_models"][0], (
+            "a provider slug here is the pre-I7878 shape; the router refuses "
+            "it and names the addressable registry ids"
+        )
 
     def test_csv_string_target_models_split(self, handler_mod):
         captured = {}

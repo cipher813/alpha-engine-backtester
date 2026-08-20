@@ -185,7 +185,20 @@ psutil>=7.2.2
 # carrying `krepis.cost_sink.flush_default_sink()`, which lambda_concordance's
 # handler now calls in a `finally`. Without it the emitted rows never leave the
 # in-process buffer, so 0.59.7's four contract columns are correct and unwritten.
-krepis[openai]>=0.59.18
+#
+# Raised to >=0.59.20 (alpha-engine-config-I7878, krepis-PR172): the first
+# published krepis carrying `krepis.router.resolve_model_spec` — the
+# supported way to address ONE registered model through the router edge,
+# which is what replay/runner.py's target-model call now uses instead of
+# building a provider client itself. The same release also makes
+# `served_model_for_deployment` resolve a BARE registry id, without which
+# every pinned call raises the alias-masquerade error in krepis.llm on an
+# otherwise successful response. Both halves are required: a resolve below
+# 0.59.20 fails at import (no such attribute) rather than degrading, which
+# is the intended shape — this floor is a hard dependency, not a preference.
+# MERGE ORDER: krepis-PR172 merges and publishes FIRST; this repo's CI
+# cannot install until it does.
+krepis[openai]>=0.59.20
 # Bumped to >=0.24.1 on main (2026-07-29). krepis 0.23.0 added callsite_id
 # as a REQUIRED keyword-only argument to LLMClient.__init__ (a breaking change
 # with no default) — replay/runner.py's _invoke_target_with_schema passes

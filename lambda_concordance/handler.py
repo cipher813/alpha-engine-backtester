@@ -2,26 +2,40 @@
 
 Wraps ``replay.batch.compute_and_emit_concordance`` for the Saturday SF
 weekly run. Iterates the trailing-window decision_artifacts corpus,
-replays each artifact under the configured target model(s) via
-``krepis.llm.LLMClient``'s OpenRouter transport + the canonical Pydantic
-schema, aggregates agreement_score per (agent_id_base, target_model),
-emits the ``agent_cheap_model_concordance`` CloudWatch metric, persists
-per-target summary JSON to S3.
+replays each artifact under the configured target model(s) through the
+krepis router edge + the canonical Pydantic schema, aggregates
+agreement_score per (agent_id_base, target_model), emits the
+``agent_cheap_model_concordance`` CloudWatch metric, persists per-target
+summary JSON to S3.
+
+**alpha-engine-config-I7878 (2026-08-20):** migrated off DIRECT provider
+linkage onto ``krepis.router.resolve_model_spec`` — see
+``replay/runner.py``'s module docstring for the full rationale, including
+what the migration does to cross-run comparability of
+``agent_cheap_model_concordance`` (it is a level shift, and the
+CloudWatch ``target_model`` dimension changes so the break is visible).
+``target_models`` is now a list of REGISTRY ENTRY IDS from
+``alpha-engine-config/private-docs/LLM_MODEL_REGISTRY.yaml``, not
+provider slugs.
+
+This function is already provisioned for the router (measured
+2026-08-20): ``KREPIS_EXEC_CONTEXT=lambda``,
+``KREPIS_LITELLM_PROXY_URL`` naming the TLS edge, and its own
+per-consumer credential via ``KREPIS_ROUTER_CREDENTIAL_SECRET``. No
+provider key is read any more.
 
 **alpha-engine-config-I2997 (2026-07-19):** migrated off direct Anthropic
-(``langchain_anthropic.ChatAnthropic``) to OpenRouter — see
-``replay/runner.py``'s module docstring for the full rationale.
-``target_models`` is now a list of OpenRouter model ids, not Anthropic
-model names.
+(``langchain_anthropic.ChatAnthropic``).
 
 **alpha-engine-config#3003 (2026-07-30):** migrated remaining plaintext
 Lambda env-vars to SSM resolution via ``nousergon_lib.secrets.get_secret()``
 at cold-start init. Secrets are loaded once and set in ``os.environ`` so
 library consumers (krepis, flow-doctor, langchain) find them through
-standard env-var paths. OPENROUTER_API_KEY was already migrated to SSM by
-I2997 (see ``replay/runner.py:_resolve_openrouter_api_key``).
-ANTHROPIC_API_KEY is deliberately excluded — this Lambda no longer calls
-Anthropic directly after the OpenRouter migration.
+standard env-var paths. No PROVIDER key appears in ``_SECRET_NAMES`` —
+after alpha-engine-config-I7878 this Lambda authenticates to the router
+edge with its own per-consumer credential, which krepis resolves, and a
+provider key present in the process would be a standing liability with
+no call able to use it.
 
 Per ROADMAP P0 "Replay harness + agent-justification gate" (Model-
 Agnostic Capability Upgrade deliverable #7 — agent-justification gate
@@ -33,7 +47,7 @@ Lambda configuration:
 Event shape (all fields optional):
 
     {
-      "target_models": ["deepseek/deepseek-v4-flash"],  # default shown
+      "target_models": ["deepseek-v4-flash"],   # registry ids, default shown
       "end_time_iso":  "2026-05-09T00:00:00Z", # default: now UTC
       "window_days":   56,                      # default: 8 weeks
       "agents":        ["sector_quant", "ic_cio"],  # default: all 6 canonical
@@ -49,8 +63,8 @@ Returns:
     }
 
 Cost note: every replay invocation costs target-model tokens. DeepSeek V4
-Flash via OpenRouter is materially cheaper per-token than the pre-migration
-Haiku baseline. The ``max_artifacts`` cap is also a runtime cap — at
+Flash is materially cheaper per-token than the pre-migration Haiku
+baseline. The ``max_artifacts`` cap is also a runtime cap — at
 ~3-5 sec / replay call, 150 artifacts fits comfortably under the 900s
 Lambda timeout.
 
@@ -104,9 +118,11 @@ logger = logging.getLogger(__name__)
 
 
 # ── Secrets migrated from plaintext Lambda env vars to SSM (config#3003) ────
-# OPENROUTER_API_KEY was already migrated by I2997 (see replay/runner.py).
-# ANTHROPIC_API_KEY is intentionally excluded — this Lambda no longer calls
-# Anthropic directly after the OpenRouter migration. Non-secret config
+# No PROVIDER key is listed. The direct-Anthropic key was dropped by I2997; the
+# direct-provider key this module used after it was dropped by I7878, when
+# the target-model call moved onto the router edge and started
+# authenticating with this function's own per-consumer credential (krepis
+# resolves it from KREPIS_ROUTER_CREDENTIAL_SECRET). Non-secret config
 # (S3_BUCKET, EMAIL_SENDER, EMAIL_RECIPIENTS) stays as Lambda env vars.
 _SECRET_NAMES: tuple[str, ...] = (
     "GITHUB_TOKEN",
@@ -124,8 +140,7 @@ def _load_secrets_from_ssm() -> None:
     """Load secrets from SSM into ``os.environ`` at cold-start init.
 
     Each secret name ``X`` maps to the SSM parameter
-    ``/alpha-engine/<X>`` (the fleet standard prefix, matching the
-    existing OPENROUTER_API_KEY pattern in ``replay/runner.py``). Loaded
+    ``/alpha-engine/<X>`` (the fleet standard prefix). Loaded
     only when NOT already present in the environment (during the
     transition period where the Lambda env vars are still configured;
     after the plaintext vars are removed from the Lambda configuration,
@@ -272,18 +287,22 @@ def _run(event: dict, context) -> dict:
     # above have already run for real (the keystone's whole point —
     # exercise bootstrap/import/lib-pin/transport). Return a benign
     # success BEFORE the replay.batch scan (decision_artifacts S3
-    # discovery), BEFORE any OpenRouter / target-model call, and BEFORE
+    # discovery), BEFORE any router / target-model call, and BEFORE
     # any CloudWatch metric emit or S3 summary persist.
     if is_shell_run_dry(event):
         logger.info(
             "[lambda_concordance] shell-run dry path: boot+imports OK, "
-            "skipping replay scan + Anthropic + S3/CW writes"
+            "skipping replay scan + router calls + S3/CW writes"
         )
         return shell_run_dry_response("lambda_concordance", t0)
 
     bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
 
-    target_models = event.get("target_models") or ["deepseek/deepseek-v4-flash"]
+    # A REGISTRY ENTRY ID, not a provider slug (alpha-engine-config-I7878).
+    # `deepseek-v4-flash` is deliberately kept `active` and out of every
+    # model_groups chain precisely so it stays callable by name; the router
+    # refuses an unknown id and names what IS addressable.
+    target_models = event.get("target_models") or ["deepseek-v4-flash"]
     if isinstance(target_models, str):
         # Convenience: accept comma-separated string from SF parameters.
         target_models = [m.strip() for m in target_models.split(",") if m.strip()]
