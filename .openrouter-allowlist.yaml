@@ -1,0 +1,29 @@
+# .openrouter-allowlist.yaml — pre-cleared OpenRouter-literal matches
+# (alpha-engine-config-I7864, wiring the fleet-wide guard). Schema:
+# nousergon-lib scripts/openrouter_guard.py::load_allowlist.
+schema_version: 1
+entries:
+  - path: lambda_concordance/handler.py
+    pattern: env_key
+    reason: >-
+      Weekly-SF ReplayConcordance Lambda still resolves OPENROUTER_API_KEY directly and constructs ModelSpec(provider="openrouter", ...) via replay/runner.py — this repo was never migrated under I6367/I6559 the way sibling call sites (crucible-research/producers/single_agent.py, crucible-evaluator/director/agent.py) were. Genuine unmigrated violation, not historical prose.
+    expires: "2026-09-19"
+    tracking: alpha-engine-config-I7878
+  - path: replay/runner.py
+    pattern: env_key
+    reason: >-
+      Same violation as lambda_concordance/handler.py above — _resolve_openrouter_api_key resolves OPENROUTER_API_KEY directly. Fix needs krepis.router to support pinning a caller-specified model id (this module intentionally varies target_model for concordance comparison), which is why it is filed rather than fixed inline.
+    expires: "2026-09-19"
+    tracking: alpha-engine-config-I7878
+  - path: replay/runner.py
+    pattern: provider_literal
+    reason: >-
+      Same violation as above — _invoke_target_model constructs ModelSpec(provider="openrouter", model=target_model, ...) directly.
+    expires: "2026-09-19"
+    tracking: alpha-engine-config-I7878
+  - path: tests/test_replay_runner.py
+    pattern: env_key
+    reason: >-
+      Historical/test prose describing the direct-OpenRouter class this guard exists to catch (comment, docstring, or a test asserting the literal's ABSENCE) — not a live call site. Baseline sweep for alpha-engine-config-I7864.
+    expires: "2026-11-18"
+    tracking: alpha-engine-config-I7864
