@@ -43,6 +43,37 @@ longer reads or honors):**
     consecutive-week hysteresis, no cooldown — "whichever performs best in
     a given week is promoted at that time" (Brian's ruling, verbatim).
 
+**SHADOW-ONLY ARMS (Brian's ruling, 2026-08-20, recorded on
+alpha-engine-config-I2515) — NARROWLY supersedes the 2026-07-14 ruling
+above:**
+
+    "research should now be think tank in shadow mode only with the main
+    research process skipped by passing a scanner top 20 to predictor"
+    (Brian, verbatim)
+
+``thinktank_coverage`` is MEASURED, not promotable. It keeps scoring every
+week, keeps its leaderboard row, and this gate keeps recording who WOULD
+have won — but it may never take the live pointer by winning. Promoting it
+requires its own separate ruling, which is a ONE-LINE data change here
+(remove it from ``SHADOW_ONLY_ARMS`` below) plus that ruling.
+
+This supersedes 2026-07-14 on exactly ONE question — whether a shadow-only
+arm may take the live pointer. Everything else the 2026-07-14 ruling
+established is unchanged: both arms are scored weekly on the same yardstick
+(champion-challenger-policy.md §3, measurement is unconditional), the
+leaderboard is unchanged, ties still favour the incumbent, and a NON-shadow
+challenger that outscores the champion still promotes immediately with no
+significance test, hysteresis or cooldown.
+
+Shadow-only-ness is a PROPERTY OF AN ARM, declared once in
+``SHADOW_ONLY_ARMS`` — never a hard-coded string at the veto site — so a
+future arm added in shadow mode inherits the protection automatically. It
+is enforced at TWO layers: ``evaluate_gates`` (the POLICY — degrades a
+shadow-only arm's win to ``outcome="held_shadow_only"`` with
+``blocked_by=["shadow_only_arm"]``, never reaching the writer) and
+``write_champion_pointer`` (the INVARIANT — raises, so a future caller that
+bypasses the gate entirely still cannot flip the pointer onto a shadow arm).
+
 **Validity guards (definitional NO-CONTEST, not a statistical gate) —
 ``evaluate_gates`` below:** a week where either arm's realized-lift score
 is unavailable (no valid ``thinktank_coverage`` selections this week, no
@@ -254,21 +285,21 @@ with under I2518):**
   ``sector_neutral_mean_alpha_21d`` instead). It may still be worth doing
   for the evaluator tile's own accuracy, independent of this gate.
 
-  **KNOWN, TRACKED GAP as of 2026-07-20 (filed
-  alpha-engine-config-I2519, unaffected by this redesign):**
-  ``thinktank_coverage`` is NOT YET registered in crucible-research's
-  ``producers/registry.py::RESEARCH_PRODUCERS`` / ``challenger_producers()``
-  — PR427's own commit message explicitly deferred that wiring ("Not
-  registered in producers/registry.py ... being decided separately per
-  config#1683's fail-hard challenger-gap doctrine"). Until that
-  registration lands, ``research/producer_leaderboard/{date}.json``'s
-  ``specs`` list will NEVER contain a ``"thinktank_coverage"`` row, so
-  ``_score_thinktank_coverage`` below will correctly and honestly return
-  ``blocked_by=["thinktank_coverage_not_in_leaderboard"]`` (a NO-CONTEST)
-  every week until it does — this is expected, not a bug in this module,
-  and is now fully independent of whether a champion producer is
-  registered (I2998 decoupled the two concerns). See the filed issue for
-  the concrete unblock.
+  **REGISTRATION — CLOSED (was alpha-engine-config-I2519; corrected here
+  2026-08-20):** this docstring previously carried I2519 as an open
+  "KNOWN, TRACKED GAP" — ``thinktank_coverage`` not yet registered in
+  crucible-research's ``producers/registry.py::RESEARCH_PRODUCERS`` /
+  ``challenger_producers()``, so its leaderboard row could never exist and
+  ``_score_thinktank_coverage`` would return
+  ``blocked_by=["thinktank_coverage_not_in_leaderboard"]`` forever. That
+  claim is STALE and has been removed rather than tolerated: the arm has
+  been registered and scoring since 2026-08-14, whose evaluation was the
+  first week with a real ``thinktank_coverage`` score
+  (``scanner_predictor_direct`` -0.00203 vs ``thinktank_coverage``
+  -0.060751, outcome ``unchanged_winner_already_champion``). The
+  ``thinktank_coverage_not_in_leaderboard`` slug is RETAINED and still
+  correct — it now means a genuine regression (the row disappeared), not
+  an expected steady state, and is a NO-CONTEST either way.
 
 ``hac_significance`` (Newey-West/HAC overlap-aware significance) is
 RETAINED below, unchanged and still independently unit-tested — it is no
@@ -339,7 +370,58 @@ VALID_CHAMPIONS = ("scanner_predictor_direct", "thinktank_coverage")
 # VALID_CHAMPIONS, so write_champion_pointer raises on it).
 _LEGACY_CHAMPIONS = ("agentic",)
 
-OUTCOMES = ("promoted", "no_contest", "unchanged_winner_already_champion", "error")
+# ── Shadow-only arms — the single source of truth for "measured, never
+# promoted" (Brian's ruling, 2026-08-20, recorded on
+# alpha-engine-config-I2515) ──────────────────────────────────────────────
+#
+#     "research should now be think tank in shadow mode only with the main
+#     research process skipped by passing a scanner top 20 to predictor"
+#                                                     — Brian, 2026-08-20
+#
+# An arm listed here is scored every week exactly like any other arm
+# (champion-challenger-policy.md §3: measurement is unconditional and is
+# NOT what promotion governs), keeps its leaderboard row, and this gate
+# keeps recording that it WOULD have won — but it may never take the live
+# `config/producer_champion.json` pointer by winning on score. Promoting a
+# shadow-only arm requires its own separate ruling from Brian; executing
+# that ruling is a ONE-LINE data change (remove the arm from this
+# frozenset) and nothing else.
+#
+# Shadow-only-ness is deliberately a PROPERTY OF AN ARM declared once here,
+# not a string literal at the veto site: a future arm introduced in shadow
+# mode inherits the protection by being added to this set, at both
+# enforcement layers (evaluate_gates, the policy; write_champion_pointer,
+# the invariant) simultaneously. Membership here is INDEPENDENT of
+# VALID_CHAMPIONS — a shadow-only arm is a legal pointer VALUE to read
+# (the executor has a live consumer for it, executor/champion.py::
+# _apply_thinktank_coverage) and a legal arm to score; it is simply not a
+# legal arm for this engine to promote.
+SHADOW_ONLY_ARMS: frozenset[str] = frozenset({"thinktank_coverage"})
+
+
+def is_shadow_only(arm: str | None) -> bool:
+    """True when ``arm`` is declared shadow-only (measured, never promoted).
+    The ONLY way any code in this module asks that question — see
+    ``SHADOW_ONLY_ARMS`` for the ruling and the one-line unblock."""
+    return arm in SHADOW_ONLY_ARMS
+
+
+OUTCOMES = (
+    "promoted",
+    "no_contest",
+    "unchanged_winner_already_champion",
+    # alpha-engine-config-I2515 (2026-08-20 shadow-only ruling): the winner
+    # on score alone was a shadow-only arm, so the pointer was deliberately
+    # held. Deliberately NOT reused from the existing vocabulary:
+    # "no_contest" asserts the week produced no comparable evidence, which
+    # would be false — there WAS a contest and the shadow arm won it; and
+    # "unchanged_winner_already_champion" asserts the incumbent scored
+    # highest, which would also be false. Both would erase the very
+    # counterfactual shadow mode exists to measure. The record carries
+    # `counterfactual_winner` naming who actually won.
+    "held_shadow_only",
+    "error",
+)
 
 # blocked_by slugs — union of the current winner-take-all vocabulary and two
 # retired vocabularies kept for read-tolerance of historical audit records:
@@ -371,6 +453,11 @@ _BLOCKED_BY_SLUGS = (
     "leaderboard_horizon_mismatch",
     "arm_score_unavailable",
     "feed_producer_dead",
+    # alpha-engine-config-I2515 (2026-08-20 shadow-only ruling): the arm
+    # that won on score is declared in SHADOW_ONLY_ARMS — measured, never
+    # promoted. Paired with outcome="held_shadow_only" and the record's
+    # `counterfactual_winner` field.
+    "shadow_only_arm",
     "frozen",
     "unclassified_error",
     # retired (pre-I2518 HAC/hysteresis/cooldown engine) — historical read-only
@@ -752,9 +839,35 @@ def evaluate_gates(
     which is already a definitional no-contest holding the pointer in BOTH
     directions, so no flip becomes possible that was not possible before.
 
+    **Shadow-only veto (Brian's ruling, 2026-08-20, alpha-engine-config
+    -I2515)** — symmetric with ``feed_blocked_slug`` above and applied on
+    the same win path: when the arm that won on score is declared in
+    ``SHADOW_ONLY_ARMS`` and is not already the champion, the would-be
+    promotion is degraded to ``outcome="held_shadow_only"`` with
+    ``blocked_by=["shadow_only_arm"]`` and ``champion_after`` left at
+    ``champion_before`` — ``run_weekly_evaluation`` therefore never reaches
+    ``write_champion_pointer``. The MEASUREMENT is untouched: both scores
+    are still computed, still recorded, and ``counterfactual_winner`` names
+    the arm that would have taken the pointer, so a shadow arm's wins
+    remain visible in the durable weekly audit trail rather than being
+    erased into a hold that looks like a defended incumbency. Checked
+    BEFORE ``feed_blocked_slug`` and before ``--freeze``: a shadow-only
+    hold is a standing policy decision, not a per-week validity guard or a
+    suppression, so it is the true and stable reason the pointer did not
+    move (and the feed probe is I/O the caller can skip entirely for a
+    shadow-only challenger).
+
+    ``counterfactual_winner`` (additive, alpha-engine-config-I2515) is on
+    EVERY outcome: the arm with the strictly higher score this week, or
+    ``None`` when no comparison was possible (a no-contest). On an ordinary
+    promotion it equals ``champion_after``; on a defended incumbency it
+    equals ``champion_before``; on ``held_shadow_only`` it is the shadow
+    arm — the one case where it differs from the pointer's destination, and
+    the reason the field exists.
+
     Returns a dict with keys: outcome, champion_before, champion_after,
     challenger, champion_score, challenger_score, blocked_by,
-    leaderboard_date_used, arm_confidence.
+    leaderboard_date_used, arm_confidence, counterfactual_winner.
     """
     challenger = _other_champion(champion_before)
     scores = arm_scores.get("scores", {})
@@ -773,6 +886,10 @@ def evaluate_gates(
         # alpha-engine-config-I7549 — carried on EVERY outcome, so the audit
         # trail names the evidence that decided, or declined to decide.
         "arm_confidence": arm_scores.get("arm_confidence") or None,
+        # alpha-engine-config-I2515 (2026-08-20) — who WOULD have taken the
+        # pointer on score alone. Populated below once both scores are
+        # known; stays None on a no-contest, where no comparison happened.
+        "counterfactual_winner": None,
     }
 
     if champ_score is None or chall_score is None:
@@ -786,9 +903,41 @@ def evaluate_gates(
         return record
 
     winner = challenger if chall_score > champ_score else champion_before
+    record["counterfactual_winner"] = winner
 
     if winner == champion_before:
         record["outcome"] = "unchanged_winner_already_champion"
+        return record
+
+    # ── Shadow-only veto (Brian's ruling 2026-08-20, alpha-engine-config
+    # -I2515) ────────────────────────────────────────────────────────────
+    # The challenger won on score, but a SHADOW-ONLY arm is measured, never
+    # promoted: it may not take the live pointer by winning. Checked first
+    # on the win path — ahead of the feed probe and --freeze — because it
+    # is a standing policy decision rather than a per-week validity guard
+    # or a suppression, so it is the TRUE and stable reason the pointer did
+    # not move, and the audit record must say that rather than attribute
+    # the hold to a transient feed or a freeze flag.
+    #
+    # The measurement is untouched: champion_score, challenger_score,
+    # arm_confidence and counterfactual_winner are all already on the
+    # record above, so this week's "the shadow arm would have won" is
+    # durable in config/apply_audit/producer_champion/{date}.json. Removing
+    # the arm from SHADOW_ONLY_ARMS (with Brian's ruling) restores the
+    # ordinary promotion path with no other change here.
+    if is_shadow_only(winner):
+        record["outcome"] = "held_shadow_only"
+        record["blocked_by"] = ["shadow_only_arm"]
+        logger.warning(
+            "champion_promotion: %r outscored the champion %r this week "
+            "(%s > %s) but is declared SHADOW-ONLY (alpha-engine-config"
+            "-I2515, Brian's 2026-08-20 ruling) — the live pointer is HELD "
+            "at %r. This is the designed outcome, not a defect: the win is "
+            "recorded as counterfactual_winner in the weekly audit record. "
+            "Promoting this arm needs its own ruling plus removing it from "
+            "SHADOW_ONLY_ARMS.",
+            winner, champion_before, chall_score, champ_score, champion_before,
+        )
         return record
 
     # Challenger wins this week on score alone — but a promotion-time feed
@@ -840,6 +989,20 @@ def write_champion_pointer(
     (e.g. ``agentic``): raises ValueError for anything else, including every
     ``_LEGACY_CHAMPIONS`` value.
 
+    ``champion`` MUST ALSO NOT be in ``SHADOW_ONLY_ARMS`` (Brian's ruling,
+    2026-08-20, alpha-engine-config-I2515) — raises ValueError. This is
+    DEFENCE IN DEPTH, deliberately duplicating the ``evaluate_gates`` veto
+    one layer down: the gate is the POLICY (it decides, and records why the
+    pointer was held), this writer is the INVARIANT (nothing that reaches
+    S3 can violate it). A future caller that bypasses ``evaluate_gates``
+    entirely — a new operator bootstrap, a backfill, a repair script —
+    still cannot flip the live pointer onto a shadow-only arm. Note the
+    asymmetry with reads: ``read_champion_pointer`` and
+    ``_normalize_champion_before`` remain fully tolerant of a shadow-only
+    value, since the executor has a live consumer for one
+    (``executor/champion.py::_apply_thinktank_coverage``) and a historical
+    or hand-inspected pointer must never crash this engine.
+
     Idempotent / bidirectional-safe: callers only invoke this when a gate
     decision has already determined the pointer SHOULD move (a no-contest or
     unchanged week must never call this).
@@ -850,6 +1013,20 @@ def write_champion_pointer(
     if champion not in VALID_CHAMPIONS:
         raise ValueError(
             f"write_champion_pointer: champion={champion!r} not in {VALID_CHAMPIONS}"
+        )
+    if is_shadow_only(champion):
+        # Fail LOUD (module posture: no silent swallows on a writer). A
+        # caller reaching here has already bypassed the evaluate_gates
+        # veto, so degrading quietly would reproduce exactly the defect
+        # this guard exists to prevent — a live pointer moved onto an arm
+        # Brian ruled measure-only.
+        raise ValueError(
+            f"write_champion_pointer: champion={champion!r} is declared "
+            f"SHADOW-ONLY ({sorted(SHADOW_ONLY_ARMS)}) — measured, never "
+            "promoted (Brian's ruling 2026-08-20, alpha-engine-config"
+            "-I2515). The live config/producer_champion.json pointer may "
+            "not be moved onto it. Promoting it requires its own ruling "
+            "plus removing it from SHADOW_ONLY_ARMS."
         )
     pointer = {
         "schema_version": SCHEMA_VERSION,
@@ -962,6 +1139,16 @@ def build_champion_audit(
     on every outcome including ``error``, so the audit trail is never
     silent about which week's evidence decided a flip.
 
+    ``counterfactual_winner`` (additive, alpha-engine-config-I2515,
+    2026-08-20) is the arm with the strictly higher weekly score — who
+    WOULD have taken the pointer on score alone — or None when no
+    comparison was possible (no_contest / error). It equals
+    ``champion_after`` on an ordinary promotion and ``champion_before`` on
+    a defended incumbency; the case it exists for is
+    ``outcome="held_shadow_only"``, where it names the shadow-only arm that
+    won and was deliberately not promoted. This is what keeps shadow-mode
+    measurement legible in the durable weekly record.
+
     ``feed_dependencies`` (additive, alpha-engine-config-I3165, 2026-07-23)
     is ``ARM_FEED_DEPENDENCIES.get(champion_after)`` — the live-trade feed
     artifact_id(s) the record's ``champion_after`` arm declares, or ``None``
@@ -999,6 +1186,7 @@ def build_champion_audit(
             "detail": error or "gate evaluation did not run",
             "leaderboard_date_used": None,
             "feed_dependencies": None,
+            "counterfactual_winner": None,
             "arm_confidence": None,
         }
     return {
@@ -1015,6 +1203,13 @@ def build_champion_audit(
         "freeze": freeze,
         "leaderboard_date_used": gate_result.get("leaderboard_date_used"),
         "feed_dependencies": ARM_FEED_DEPENDENCIES.get(gate_result["champion_after"]) or None,
+        # alpha-engine-config-I2515 (2026-08-20 shadow-only ruling): the arm
+        # that won on score this week, which on outcome="held_shadow_only"
+        # is NOT champion_after. Without it the audit record could not
+        # express "the shadow arm would have won", and a shadow arm that
+        # silently stops being visible in the record defeats the whole
+        # point of shadow mode (champion-challenger-policy.md §3).
+        "counterfactual_winner": gate_result.get("counterfactual_winner"),
         "arm_confidence": gate_result.get("arm_confidence"),
     }
 
@@ -1388,8 +1583,11 @@ def run_weekly_evaluation(
          {date}.json + latest.json) — ALWAYS written, any outcome.
       2. The champion pointer (config/producer_champion.json) — written ONLY
          on outcome="promoted" AND not freeze. A no-contest,
-         unchanged-winner-already-champion, or frozen run never touches the
-         pointer — idempotent, bidirectional-safe.
+         unchanged-winner-already-champion, held_shadow_only, or frozen run
+         never touches the pointer — idempotent, bidirectional-safe.
+         ``held_shadow_only`` (alpha-engine-config-I2515, Brian's 2026-08-20
+         ruling) is a shadow-only arm winning on score: the pointer is held
+         and the win is recorded as ``counterfactual_winner``.
 
     ``e2e_lift`` is the ``diagnostics["e2e_lift"]`` dict already computed
     earlier in the same evaluate.py run (scanner_predictor_direct's
@@ -1446,11 +1644,15 @@ def run_weekly_evaluation(
             and scores.get(challenger) is not None
             and scores[challenger] > scores[champion_before]
         )
+        # alpha-engine-config-I2515: a shadow-only challenger's win is
+        # vetoed by evaluate_gates regardless of feed liveness, so the
+        # probe's S3 read + parquet parse could not change the outcome —
+        # skipped for the same reason a non-winning challenger's is.
         feed_blocked_slug = (
             check_feed_dependencies_live(
                 challenger, bucket=bucket, run_date=run_date, s3_client=s3_client,
             )
-            if challenger_would_win else None
+            if challenger_would_win and not is_shadow_only(challenger) else None
         )
         gate_result = evaluate_gates(
             champion_before=champion_before,
