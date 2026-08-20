@@ -43,7 +43,7 @@ plotly<6
 pandas~=2.2
 boto3~=1.43
 pyyaml~=6.0
-yfinance~=1.5.2
+yfinance~=1.6.0
 pyarrow~=25.0
 ib_insync~=0.9.86
 # setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
