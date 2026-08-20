@@ -186,7 +186,7 @@ psutil>=7.2.2
 # handler now calls in a `finally`. Without it the emitted rows never leave the
 # in-process buffer, so 0.59.7's four contract columns are correct and unwritten.
 #
-# Raised to >=0.59.20 (alpha-engine-config-I7878, krepis-PR172): the first
+# Raised to >=0.59.21 (alpha-engine-config-I7878, krepis-PR172): the first
 # published krepis carrying `krepis.router.resolve_model_spec` — the
 # supported way to address ONE registered model through the router edge,
 # which is what replay/runner.py's target-model call now uses instead of
@@ -198,7 +198,15 @@ psutil>=7.2.2
 # is the intended shape — this floor is a hard dependency, not a preference.
 # MERGE ORDER: krepis-PR172 merges and publishes FIRST; this repo's CI
 # cannot install until it does.
-krepis[openai]>=0.59.20
+#
+# The number is derived, not guessed: krepis bumps the PATCH on every merge
+# to main that touched src/ (auto-version-bump.yml), and the last published
+# release is 0.59.20 (krepis-PR171, merged while PR172 was in review — which
+# is exactly why this floor is 0.59.21 and not 0.59.20: a floor naming an
+# already-published release would be silently satisfied by a krepis that does
+# NOT carry resolve_model_spec). If a third krepis PR merges before PR172,
+# raise this line to match the release PR172 actually produces.
+krepis[openai]>=0.59.21
 # Bumped to >=0.24.1 on main (2026-07-29). krepis 0.23.0 added callsite_id
 # as a REQUIRED keyword-only argument to LLMClient.__init__ (a breaking change
 # with no default) — replay/runner.py's _invoke_target_with_schema passes
