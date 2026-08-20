@@ -1,0 +1,91 @@
+name: Lib Pin Cross-Repo Parity Guard
+
+# alpha-engine-config-I7835. The weekly SF's `LibPinDriftGate`
+# (crucible-predictor's `inference/lib_pin_drift.py::check_lib_pin_drift`)
+# hard-fails when `crucible-backtester`'s nousergon-lib pin != `crucible-predictor`'s
+# — the two are co-installed into one venv by `spot_backtest.sh` (backtester
+# first, predictor second), so a lagging pin silently downgrades the library.
+#
+# 2026-08-20: this repo and crucible-predictor each moved to v0.124.75 in a
+# correctly-executed lockstep PR pair (crucible-backtester#713 /
+# crucible-predictor#529). Minutes later, crucible-predictor#530 bumped
+# predictor ALONE to v0.124.76 — a single-repo pin PR that this repo's own
+# `tests/test_lib_pin_lockstep.py` cannot see, because that test only
+# compares this repo's FOUR deploy artifacts against EACH OTHER, never
+# against the sibling repo's pin. Nothing at merge time stopped it, and the
+# weekly SF's `LibPinDriftGate` was the first thing to notice — a scheduled
+# gate finding what a PR-time check should have caught.
+#
+# This workflow closes that gap one merge earlier, in both directions: mirrors
+# nousergon-data's `sf-stage-consumer-guard.yml` shape (check out the sibling
+# repo's main and compare against THIS PR's candidate state, rather than
+# growing a second implementation of the parity check that can drift from
+# `check_lib_pin_drift`). A companion workflow of the same name lives in
+# crucible-predictor and checks the opposite direction.
+#
+# NOT a full reimplementation of check_lib_pin_drift() — that function fetches
+# both repos at the SAME branch name, which only works for the deployed
+# `main` vs `main` comparison the weekly SF runs. A PR branch only exists in
+# ONE of the two repos, so a PR-time guard fetches the sibling's `main` pin
+# and compares it to THIS PR's own (checked-out) candidate pin instead.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'requirements.txt'
+      - 'lambda_health/Dockerfile'
+      - 'lambda_concordance/Dockerfile'
+      - 'lambda_counterfactual/Dockerfile'
+      - '.github/workflows/lib-pin-cross-repo-guard.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lib-pin-cross-repo-guard-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parity-guard:
+    name: crucible-predictor co-install parity vs candidate pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out this PR's candidate state
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Check out crucible-predictor (main — the co-install partner)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: nousergon/crucible-predictor
+          ref: main
+          path: .predictor-sibling
+
+      - name: Compare co-install pins
+        run: |
+          set -euo pipefail
+          PIN_RE='(alpha-engine-lib|nousergon-lib)\[[^]]*\][[:space:]]*@[[:space:]]*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)'
+
+          own_pin=$(grep -oE "$PIN_RE" requirements.txt | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          sibling_pin=$(grep -oE "$PIN_RE" .predictor-sibling/requirements.txt | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+          if [ -z "$own_pin" ]; then
+            echo "::error::could not parse a nousergon-lib pin from this repo's requirements.txt"
+            exit 1
+          fi
+          if [ -z "$sibling_pin" ]; then
+            echo "::error::could not parse a nousergon-lib pin from crucible-predictor@main's requirements.txt"
+            exit 1
+          fi
+
+          echo "crucible-backtester (this PR): $own_pin"
+          echo "crucible-predictor (main):     $sibling_pin"
+
+          if [ "$own_pin" != "$sibling_pin" ]; then
+            echo "::error::co-install parity break: this PR would pin crucible-backtester to $own_pin while crucible-predictor@main is pinned to $sibling_pin. spot_backtest.sh co-installs both into one venv (alpha-engine-config-I7835) — they must match exactly, or bump crucible-predictor in the SAME lockstep arc first."
+            exit 1
+          fi
+
+          echo "co-install parity OK: both pin $own_pin"
