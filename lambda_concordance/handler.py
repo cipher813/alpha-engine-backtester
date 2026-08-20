@@ -364,6 +364,40 @@ def _run(event: dict, context) -> dict:
     # observability — partial signal is preferable to abort.
     has_failures = False
     incomplete = False
+
+    # A DRY RUN that could not resolve a target is a FAILED dry run.
+    #
+    # This is what makes the deploy canary cover the routed path. Every
+    # `dry_run: true` invocation now resolves each target through the router
+    # (replay.batch, alpha-engine-config-I7878), and `deploy_concordance.sh`
+    # promotes the `live` alias only on an OK/PARTIAL status — so a mistyped
+    # registry id, a retired registry entry, an unreachable router edge or a
+    # missing per-consumer credential fails the deploy and leaves `live` on
+    # the prior good version, instead of surfacing on Saturday as a lost
+    # weekly-SF stage.
+    unresolved = [
+        r for r in summary.get("target_resolution", [])
+        if not r.get("resolved")
+    ]
+    if unresolved:
+        for r in unresolved:
+            logger.error(
+                "[lambda_concordance] target %s did not resolve: %s",
+                r.get("target_model"), r.get("error"),
+            )
+        return {
+            "status": "ERROR",
+            "error": (
+                "target model(s) did not resolve through the router: "
+                + "; ".join(
+                    f"{r.get('target_model')}: {r.get('error')}"
+                    for r in unresolved
+                )
+            ),
+            "duration_seconds": round(time.time() - t0, 1),
+            "summary": summary,
+        }
+
     if not dry_run:
         for target_summary in summary.get("per_target_model", []):
             if target_summary.get("replay_failures"):

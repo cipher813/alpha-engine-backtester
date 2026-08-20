@@ -145,6 +145,14 @@ def _stage_coverage_absent_unless_stubbed(monkeypatch):
 # ROUTER EDGE, never a provider, so a test can assert the property the
 # migration exists to guarantee.
 
+#: Env var the stubbed spec names as its credential source. Deliberately NOT
+#: a real credential variable: this is the FIRST leg of krepis' credential
+#: chain (`os.environ[spec.api_key_env]`), so setting it keeps the routed path
+#: hermetic — no on-disk credentials, no SSM, no dependence on what the
+#: machine happens to hold.
+_TEST_ROUTER_CREDENTIAL_ENV = "KREPIS_TEST_ROUTER_CREDENTIAL"
+
+
 @pytest.fixture
 def real_router_resolution():
     """Opt out of `_stub_router_resolution` for a test that patches
@@ -262,16 +270,34 @@ def _stub_router_resolution(monkeypatch, request, tmp_path_factory):
     reg.write_text(_TEST_REGISTRY_YAML, encoding="utf-8")
     monkeypatch.setenv("LLM_MODEL_REGISTRY_PATH", str(reg))
 
+    # `LLMClient._transport_client()` resolves the credential BEFORE it calls
+    # `client_factory`, so a test double for the transport does not remove the
+    # need for one. On the router-edge provider krepis resolves it on the full
+    # chain — environment, then an on-disk credentials file, then SSM — and a developer
+    # laptop has the second while CI has none of the three. That asymmetry is
+    # what made these tests pass locally and fail on the runner with `no
+    # router-edge credential`, pre-empting every assertion about validation
+    # errors, transport errors, persistence and usage extraction with a
+    # credential error (alpha-engine-config-I7878).
+    #
+    # So the credential is INJECTED, at the boundary the routed client reads:
+    # the spec names a test-only variable and this fixture sets it. Naming a
+    # real credential variable would leave the suite resolving whatever the
+    # machine happens to hold — which is how the laptop/CI split arose — and
+    # reaching SSM would put a network call inside a unit test. Spec and
+    # environment are set from the SAME constant, so the two cannot drift.
+    monkeypatch.setenv(_TEST_ROUTER_CREDENTIAL_ENV, "not-a-real-credential")
+
     def _fake(model_id, *, max_tokens=8192):
         # A REAL ModelSpec, shaped exactly as `resolve_model_spec` returns
         # one: the router edge as a custom OpenAI-compatible endpoint, the
-        # registry id as the wire model, and the router credential — never a
-        # provider name, URL or key.
+        # registry id as the wire model, and a router-edge credential — never
+        # a provider name, URL or key.
         spec = ModelSpec(
             provider=ROUTER_EDGE_PROVIDER,
             model=model_id,
             base_url="https://router.test:8443",
-            api_key_env="LITELLM_MASTER_KEY",
+            api_key_env=_TEST_ROUTER_CREDENTIAL_ENV,
             max_tokens=max_tokens,
             structured_outputs=False,
             reasoning={"exclude": True},

@@ -498,7 +498,27 @@ def _usage_dict_from_llm_usage(
     ``LLMResult.served_provider`` at the call site. ``None`` on the
     exhausted-retry error path (``LLMError`` carries no result object to
     read it from) — that's an accepted gap, not a bug: a failed call's
-    provider identity isn't load-bearing for the jurisdiction check."""
+    provider identity isn't load-bearing for the jurisdiction check.
+
+    **The DICT SHAPE is unchanged by the I7878 router migration** — same six
+    keys, same types, same values for the same usage object, verified by
+    running this function on both sides of the change. What DOES change is how
+    often ``served_provider`` is populated: it is ``resp.provider``, a
+    non-standard top-level field OpenRouter emits and nothing else does. The
+    pre-migration call went to OpenRouter, so it arrived; a routed call to
+    ``deepseek-v4-flash`` reaches the DeepSeek first-party API server-side of
+    the edge, which does not emit it. Expect ``served_provider: null`` and an
+    EMPTY ``served_providers_seen`` in the batch summary for that target —
+    already handled as informational absence by ``replay.batch``, and covered
+    by ``test_served_providers_seen_empty_when_none_reported``.
+
+    That is a real loss of one observability field, and it is the right trade:
+    config#3006 wanted this for a jurisdiction/compliance check, and the
+    routed path answers that question at a better place — the registry's
+    ``upstream_host`` for the addressed entry, plus the router edge's own
+    per-request telemetry — rather than by trusting a field the response
+    happens to carry. A pinned entry has no chain, so which upstream served it
+    is a registry fact, not a discovery."""
     if usage is None:
         return {}
     return {

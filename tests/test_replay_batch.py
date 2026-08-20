@@ -661,18 +661,35 @@ class TestTargetResolutionIsAPrecondition:
         mock_replay.assert_not_called()
         s3.put_object.assert_not_called()
 
-    def test_a_dry_run_never_resolves_at_all(self):
-        """Dry run costs nothing and touches no model — it must not need a
-        healthy router either, or the cheapest safety valve stops working
-        exactly when the router is the thing being diagnosed."""
+    def test_a_dry_run_resolves_but_never_raises(self):
+        """The deploy canary's only reachable path.
+
+        `deploy_concordance.sh` invokes `{"dry_run": true}` against the newly
+        published version and promotes the `live` alias only on an OK/PARTIAL
+        status. So whatever the dry run does not exercise is not covered by
+        the one gate between a merge and Saturday's weekly SF — and after the
+        target became a registry id resolved through the router, that gate was
+        stepping over a mistyped id, a retired entry, an unreachable edge and
+        a missing credential alike.
+
+        It RECORDS rather than raises, because the dry run also serves an
+        operator listing the corpus while diagnosing a router outage. Both get
+        what they need: `would_replay` is always present, `target_resolution`
+        says whether the routed path is usable, and the handler turns a
+        failure into the non-OK status that fails the canary.
+        """
         from replay import batch as batch_mod
 
         end, s3 = self._corpus()
+        seen = []
 
-        def _boom(model_id, **kw):
-            raise AssertionError("dry run must not resolve a target model")
+        def _spy(model_id, *, max_tokens=8192):
+            seen.append(model_id)
+            return object(), {"route": "litellm_proxy", "deployment_id": model_id,
+                              "exec_context": "lambda"}
 
-        with patch.object(batch_mod, "resolve_target_spec", _boom):
+        with patch.object(batch_mod, "resolve_target_spec", _spy), \
+             patch.object(batch_mod, "replay_artifact") as mock_replay:
             summary = batch_mod.compute_and_emit_concordance(
                 target_models=["deepseek-v4-flash"],
                 end_time=end, window_days=1,
@@ -681,3 +698,41 @@ class TestTargetResolutionIsAPrecondition:
 
         assert summary["dry_run"] is True
         assert summary["would_replay"] == 5
+        assert seen == ["deepseek-v4-flash"]
+        assert summary["target_resolution"] == [{
+            "target_model": "deepseek-v4-flash",
+            "resolved": True,
+            "deployment_id": "deepseek-v4-flash",
+            "route": "litellm_proxy",
+            "exec_context": "lambda",
+        }]
+        # Still no spend: resolution is a registry read plus a health probe.
+        mock_replay.assert_not_called()
+        s3.put_object.assert_not_called()
+
+    def test_a_dry_run_records_a_resolution_failure_instead_of_raising(self):
+        """The corpus listing survives a dead router — an operator diagnosing
+        the router must not be blocked by the router. The failure is reported,
+        not swallowed: it lands in `target_resolution` with its cause, which is
+        what the handler reads to fail the canary."""
+        from replay import batch as batch_mod
+
+        end, s3 = self._corpus()
+
+        def _edge_down(model_id, *, max_tokens=8192):
+            raise RuntimeError("edge did not admit this process")
+
+        with patch.object(batch_mod, "resolve_target_spec", _edge_down):
+            summary = batch_mod.compute_and_emit_concordance(
+                target_models=["deepseek-v4-flash"],
+                end_time=end, window_days=1,
+                s3_client=s3, dry_run=True,
+            )
+
+        assert summary["would_replay"] == 5, (
+            "the corpus listing is the half that must survive a router outage"
+        )
+        row = summary["target_resolution"][0]
+        assert row["resolved"] is False
+        assert "did not admit this process" in row["error"]
+        s3.put_object.assert_not_called()

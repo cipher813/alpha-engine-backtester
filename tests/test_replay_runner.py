@@ -857,3 +857,82 @@ class TestPlaceholderPromptSkip:
 
         assert replay.replay_output_kind == "skipped"
         factory.assert_not_called()
+
+
+# ── The routed path must not depend on this machine ──────────────────────
+
+
+class TestRoutedPathIsHermetic:
+    """The regression that made this suite green on a laptop and red in CI.
+
+    `LLMClient._transport_client()` resolves the router-edge credential
+    BEFORE it calls `client_factory`, so injecting a transport double does
+    not remove the need for one. krepis resolves that credential on its full
+    chain — environment, then an on-disk credentials file, then SSM — and a
+    developer machine has the second while a CI runner has none of the three.
+    Every routed test therefore passed locally and failed on the runner with
+    `no router-edge credential`, which pre-empted the assertions about
+    validation errors, transport errors, persistence and usage extraction
+    with a credential error that had nothing to do with their subjects.
+
+    `conftest.py` fixes it by naming a test-only variable as the spec's
+    credential source and setting it. This asserts that fix holds: with the
+    rest of the chain returning nothing, a replay still completes. A future
+    change that reintroduces a dependency on ambient credentials fails HERE,
+    on a laptop, instead of on the runner.
+    """
+
+    def test_a_replay_completes_with_the_credential_chain_empty(self):
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
+        from replay.runner import replay_artifact
+
+        artifact = _make_captured_artifact()
+        s3 = _make_s3_stub(artifact)
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
+            prompt_tokens=200, completion_tokens=80,
+        )
+
+        import krepis.router as krepis_router
+
+        with patch.object(
+            krepis_router, "resolve_router_credential", lambda name=None: None
+        ):
+            replay = replay_artifact(
+                artifact_key="k.json",
+                target_model="deepseek-v4-flash",
+                s3_client=s3, client_factory=factory,
+                persist=False,
+            )
+
+        assert replay.replay_error is None, replay.replay_error
+        assert replay.replay_output_kind == "structured"
+        assert replay.replay_cost["input_tokens"] == 200
+
+    def test_the_usage_dict_shape_is_what_the_batch_layer_reads(self):
+        """The I7878 migration did NOT change the persisted `replay_cost`
+        shape — the CI `KeyError: 'input_tokens'` failures were the credential
+        error above, which makes `_invoke_target_with_schema` return an empty
+        usage dict on ANY exception. Pinning the shape here means a real
+        change to what concordance records has to be a deliberate test edit
+        rather than something a failure mode can counterfeit."""
+        import types
+
+        from replay.runner import _usage_dict_from_llm_usage
+
+        usage = types.SimpleNamespace(
+            input_tokens=200, output_tokens=80, cache_read_tokens=0,
+            cache_create_tokens=0, cache_create_1h_tokens=0,
+            cost_usd=0.00123, provider_cost_usd=0.00119,
+        )
+        assert set(_usage_dict_from_llm_usage(usage)) == {
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "provider_cost_usd",
+            "served_provider",
+        }
+        # Absence stays absence: an empty dict, not a zero-filled one that
+        # would read as a measured zero on the cost surface.
+        assert _usage_dict_from_llm_usage(None) == {}

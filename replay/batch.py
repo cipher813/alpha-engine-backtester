@@ -437,6 +437,59 @@ def compute_and_emit_concordance(
     )
 
     if dry_run:
+        # A dry run RESOLVES every target, and never raises doing it.
+        #
+        # This is the deploy canary's only reachable path. `deploy_concordance.
+        # sh` invokes `{"dry_run": true, "window_days": 14}` against the newly
+        # published version and promotes the `live` alias only if the status
+        # comes back OK/PARTIAL — so whatever the dry run does NOT exercise is
+        # not covered by the one gate standing between a merge and the weekly
+        # SF. Before alpha-engine-config-I7878 that was fine: the dry run's
+        # only untested surface was the model call itself. It is not fine now.
+        # The target is a REGISTRY ID resolved through the router, so a
+        # mistyped id, a retired registry entry, an unreachable edge or a
+        # missing per-consumer credential are all deploy-time facts that the
+        # dry run was silently stepping over — and the first thing to notice
+        # would have been Saturday's weekly run, with the whole stage lost.
+        #
+        # Resolution costs no tokens: a registry read plus one health probe.
+        #
+        # It records rather than raises, because the dry run has a SECOND
+        # consumer with the opposite need — an operator listing the corpus
+        # while diagnosing a router outage. Both are served: `would_replay` is
+        # always present, and `target_resolution` says, per target, whether the
+        # routed path is actually usable. The handler turns any failure here
+        # into a non-OK status, which is what fails the canary and leaves the
+        # `live` alias on the prior good version.
+        target_resolution: list[dict[str, Any]] = []
+        for target_model in target_models:
+            try:
+                _, route = resolve_target_spec(target_model)
+            except Exception as exc:  # noqa: BLE001 — recorded, see above
+                logger.error(
+                    "[batch_replay] dry run: target=%s did NOT resolve (%s: %s)",
+                    target_model, type(exc).__name__, exc,
+                )
+                target_resolution.append({
+                    "target_model": target_model,
+                    "resolved": False,
+                    "error": f"{type(exc).__name__}: {exc}"[:500],
+                })
+                continue
+            logger.info(
+                "[batch_replay] dry run: target=%s resolved model=%s route=%s "
+                "exec_context=%s",
+                target_model, route.get("deployment_id"), route.get("route"),
+                route.get("exec_context"),
+            )
+            target_resolution.append({
+                "target_model": target_model,
+                "resolved": True,
+                "deployment_id": route.get("deployment_id"),
+                "route": route.get("route"),
+                "exec_context": route.get("exec_context"),
+            })
+
         return {
             "dry_run": True,
             "window_start": window_start.isoformat(),
@@ -445,6 +498,7 @@ def compute_and_emit_concordance(
             "agent_filter": agent_filter,
             "would_replay": len(keys),
             "would_replay_keys": keys[:50],  # trim for log/return ergonomics
+            "target_resolution": target_resolution,
         }
 
     # Deferred like every other krepis import in this package — the Lambda
