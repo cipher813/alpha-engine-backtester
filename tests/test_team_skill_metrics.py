@@ -86,8 +86,15 @@ class TestGracefulDegrade:
             assert bundle["ic"]["status"] in ("ok", "insufficient_data", "no_variance")
             assert bundle["expectancy"]["status"] in ("ok", "insufficient_data",
                                                        "no_wins", "no_losses")
-            # Excursion / risk-matched alpha → insufficient_data.
-            assert bundle["excursion"]["status"] == "insufficient_data"
+            # Excursion: ohlc was NOT passed at all → config-I7600 calls that
+            # a wiring defect, not thin data. This assertion used to read
+            # `== "insufficient_data"`, i.e. it pinned the exact conflation
+            # that let `portfolio_excursion.json` sit dead for months.
+            assert bundle["excursion"]["status"] == "error"
+            assert bundle["excursion"]["reason"].startswith(
+                "defect:ohlc_not_wired",
+            )
+            # risk-matched alpha still degrades on absent prices.
             assert bundle["alpha_vs_ew_high_vol"]["status"] == "insufficient_data"
             assert bundle["alpha_vs_beta_spy"]["status"] == "insufficient_data"
 
@@ -154,11 +161,89 @@ class TestPortfolioCalibration:
         assert result["status"] == "insufficient_data"
 
 
+def _realistic_ohlc(tickers, *, periods: int = 60, seed: int = 7) -> dict:
+    """OHLCV in the exact shape the live artifact carries.
+
+    Measured against
+    ``s3://alpha-engine-research/backtest/2026-08-14/.phases/simulation_setup/
+    ohlcv_by_ticker.parquet`` on 2026-08-21 (903 tickers, 2 514 rows each,
+    2016-08-15 → 2026-08-14): ``dict[str, pd.DataFrame]``, business-day
+    ``DatetimeIndex``, lowercase ``open/high/low/close``. The pre-config-I7600
+    coverage used one-row frames, which is why it stayed green for months
+    while this analysis had never once produced a number in production.
+    """
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2026-01-05", periods=periods, freq="B")
+    out = {}
+    for t in tickers:
+        close = 100.0 * np.cumprod(1.0 + rng.normal(0.0005, 0.015, periods))
+        out[t] = pd.DataFrame(
+            {
+                "open": close * (1 + rng.normal(0, 0.002, periods)),
+                "high": close * (1 + abs(rng.normal(0.01, 0.004, periods))),
+                "low": close * (1 - abs(rng.normal(0.01, 0.004, periods))),
+                "close": close,
+            },
+            index=idx,
+        )
+    return out
+
+
 class TestPortfolioExcursion:
-    def test_no_ohlc_returns_insufficient(self):
+    def test_unwired_ohlc_is_a_defect_not_thin_data(self):
+        """config-I7600 deliverable 3.
+
+        ``ohlc=None`` is the caller never wiring the input; ``ohlc={}`` is a
+        date whose OHLCV artifact is genuinely empty. Both used to return
+        ``insufficient_data`` / ``"no ohlc data"`` — one string covering a
+        permanent defect and a transient gap, which is precisely why nobody
+        read `portfolio_excursion.json` as broken.
+        """
         sp = _make_score_perf()
-        result = compute_portfolio_excursion_summary(sp, ohlc=None)
-        assert result["status"] == "insufficient_data"
+
+        unwired = compute_portfolio_excursion_summary(sp, ohlc=None)
+        assert unwired["status"] == "error"
+        assert unwired["reason"] == "defect:ohlc_not_wired: caller passed ohlc=None"
+
+        empty = compute_portfolio_excursion_summary(sp, ohlc={})
+        assert empty["status"] == "insufficient_data"
+        assert empty["reason"].startswith("insufficient_data:no_ohlc_data")
+
+        assert unwired["reason"] != empty["reason"]
+
+    def test_realistic_ohlc_shape_produces_ok(self):
+        """config-I7600 deliverable 4.
+
+        The whole point of the wiring: given the OHLCV shape the pipeline
+        actually persists, this analysis produces a graded result rather than
+        an N/A. Cross-checked against the live 2026-08-14 artifact on
+        2026-08-21 — 40 tickers x 3 eval dates yielded status ok, n=120,
+        mean_mfe_mae_ratio 2.36.
+        """
+        tickers = [f"T{i:02d}" for i in range(12)]
+        ohlc = _realistic_ohlc(tickers)
+        idx = ohlc[tickers[0]].index
+        rows = [
+            {"symbol": t, "score_date": d, "score": 72, "beat_spy_10d": 1}
+            for t in tickers
+            for d in (idx[5], idx[15], idx[25])
+        ]
+        result = compute_portfolio_excursion_summary(
+            pd.DataFrame(rows), ohlc=ohlc, horizon_days=10,
+        )
+        assert result["status"] == "ok", result
+        assert result["n"] == len(rows)
+        assert result["mean_mfe_mae_ratio"] is not None
+
+    def test_computation_failure_is_error_not_insufficient(self):
+        """config-I7600: a raise inside the excursion maths must not be
+        rendered in the same slot as a thin date."""
+        sp = _make_score_perf()
+        # ``ohlc`` is a non-empty dict, so the wiring guards pass; the value
+        # is not a DataFrame, so compute_per_pick_excursion raises.
+        result = compute_portfolio_excursion_summary(sp, ohlc={"TE0": object()})
+        assert result["status"] == "error"
+        assert result["reason"].startswith("defect:excursion_compute_error")
 
     def test_filters_by_score_threshold(self):
         # All scores < 60 → should return insufficient (no picks pass).
