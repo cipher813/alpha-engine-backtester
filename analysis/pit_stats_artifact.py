@@ -248,7 +248,7 @@ def _alert(message: str, *, dedup_key: str) -> None:
         _publish(
             message,
             severity="warning",
-            source="alpha-engine-backtester/pit_stats_artifact",
+            source="alpha-engine-backtester/pit_parity",
             dedup_key=dedup_key,
             dedup_window_min=720,
         )
