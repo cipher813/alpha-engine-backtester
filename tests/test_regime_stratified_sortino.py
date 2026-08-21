@@ -31,6 +31,8 @@ from analysis.regime_stratified_sortino import (
     _annualized_sharpe_from_log_alphas,
     _annualized_sortino_from_log_alphas,
     _arithmetic_to_log_alpha,
+    InputWindow,
+    ReturnUnits,
     assemble_t2_eval_payload,
     compute_regime_spread,
     load_with_subscores_and_regime,
@@ -85,6 +87,9 @@ def _create_score_perf_db(
         conn.close()
 
 
+_FRACTION = ReturnUnits.FRACTION
+
+
 class TestLoadWithSubscoresAndRegime:
     def test_loads_regime_column(self, tmp_path):
         db = tmp_path / "t.db"
@@ -115,7 +120,7 @@ class TestLoadWithSubscoresAndRegime:
 class TestArithmeticToLogAlpha:
     def test_zero_return_zero_spy_returns_zero(self):
         log_alpha = _arithmetic_to_log_alpha(
-            pd.Series([0.0]), pd.Series([0.0]),
+            pd.Series([0.0]), pd.Series([0.0]), units=_FRACTION,
         )
         assert log_alpha.iloc[0] == pytest.approx(0.0)
 
@@ -125,7 +130,7 @@ class TestArithmeticToLogAlpha:
         systematic bias at the small-return regime."""
         ret = pd.Series([0.01, 0.005])    # 1%, 0.5%
         spy = pd.Series([0.003, 0.002])   # 0.3%, 0.2%
-        log_alpha = _arithmetic_to_log_alpha(ret, spy)
+        log_alpha = _arithmetic_to_log_alpha(ret, spy, units=_FRACTION)
         arithmetic_alpha = ret - spy
         for la, aa in zip(log_alpha, arithmetic_alpha):
             assert abs(la - aa) < 0.001  # very close at small returns
@@ -135,7 +140,7 @@ class TestArithmeticToLogAlpha:
         log formula gives a different value (not silently aliasing
         to arithmetic)."""
         log_alpha = _arithmetic_to_log_alpha(
-            pd.Series([0.50]), pd.Series([0.10]),
+            pd.Series([0.50]), pd.Series([0.10]), units=_FRACTION,
         )
         # log(1.50) - log(1.10) ≈ 0.4055 - 0.0953 = 0.3102
         expected = math.log(1.50) - math.log(1.10)
@@ -148,7 +153,7 @@ class TestArithmeticToLogAlpha:
         """A losing pick — return -20% on a stock vs +5% SPY → strongly
         negative log alpha."""
         log_alpha = _arithmetic_to_log_alpha(
-            pd.Series([-0.20]), pd.Series([0.05]),
+            pd.Series([-0.20]), pd.Series([0.05]), units=_FRACTION,
         )
         # log(0.80) - log(1.05) ≈ -0.2231 - 0.0488 = -0.2719
         expected = math.log(0.80) - math.log(1.05)
@@ -248,20 +253,20 @@ def _synthetic_stratified_df(
     rows: list[dict] = []
     for regime, mean_alpha in [("bull", 0.02), ("neutral", 0.0), ("bear", -0.02)]:
         for i in range(n_per_regime):
-            alpha_10d = rng.normal(mean_alpha, 0.04)
-            alpha_30d = rng.normal(mean_alpha * 1.5, 0.06)
-            spy_10d = rng.normal(0.005, 0.02)
-            spy_30d = rng.normal(0.015, 0.04)
+            alpha_21d = rng.normal(mean_alpha, 0.04)
+            alpha_5d = rng.normal(mean_alpha * 1.5, 0.06)
+            spy_21d = rng.normal(0.005, 0.02)
+            spy_5d = rng.normal(0.015, 0.04)
             rows.append({
                 "ticker": f"T{i}_{regime}",
                 "score_date": "2026-01-01",
                 "market_regime": regime,
-                "return_10d": spy_10d + alpha_10d,
-                "spy_10d_return": spy_10d,
-                "return_30d": spy_30d + alpha_30d,
-                "spy_30d_return": spy_30d,
-                "beat_spy_10d": int(alpha_10d > 0),
-                "beat_spy_30d": int(alpha_30d > 0),
+                "return_21d": spy_21d + alpha_21d,
+                "spy_21d_return": spy_21d,
+                "return_5d": spy_5d + alpha_5d,
+                "spy_5d_return": spy_5d,
+                "beat_spy_21d": int(alpha_21d > 0),
+                "beat_spy_5d": int(alpha_5d > 0),
             })
     return pd.DataFrame(rows)
 
@@ -269,32 +274,32 @@ def _synthetic_stratified_df(
 class TestStratifiedSortinoByRegime:
     def test_returns_strata_per_regime_per_horizon(self):
         df = _synthetic_stratified_df()
-        strata = stratified_sortino_by_regime(df)
+        strata = stratified_sortino_by_regime(df, units=_FRACTION)
         # 3 regimes × 2 horizons = 6 strata
         assert len(strata) == 6
         keys = {(s.market_regime, s.horizon_days) for s in strata}
         for regime in ("bull", "neutral", "bear"):
-            for horizon in (10, 30):
+            for horizon in (21, 5):
                 assert (regime, horizon) in keys
 
     def test_bull_sortino_higher_than_bear_on_synthetic(self):
         """On synthetic data with +0.02 mean alpha in bull and -0.02 in
         bear, the bull stratum's Sortino should be materially higher."""
         df = _synthetic_stratified_df()
-        strata = stratified_sortino_by_regime(df)
+        strata = stratified_sortino_by_regime(df, units=_FRACTION)
         by_key = {(s.market_regime, s.horizon_days): s for s in strata}
-        bull_10d = by_key[("bull", 10)].annualized_sortino
-        bear_10d = by_key[("bear", 10)].annualized_sortino
-        assert bull_10d is not None and bear_10d is not None
-        assert bull_10d > bear_10d
+        bull_21d = by_key[("bull", 21)].annualized_sortino
+        bear_21d = by_key[("bear", 21)].annualized_sortino
+        assert bull_21d is not None and bear_21d is not None
+        assert bull_21d > bear_21d
         # Magnitudes should differ enough to be detectable above sampling noise
-        assert bull_10d - bear_10d > 1.0
+        assert bull_21d - bear_21d > 1.0
 
     def test_both_sortino_and_sharpe_reported(self):
         """Every populated stratum reports both Sortino (headline) and
         Sharpe (secondary diagnostic)."""
         df = _synthetic_stratified_df()
-        strata = stratified_sortino_by_regime(df)
+        strata = stratified_sortino_by_regime(df, units=_FRACTION)
         for s in strata:
             if s.n_picks >= DEFAULT_MIN_PICKS_PER_STRATUM:
                 assert s.annualized_sortino is not None
@@ -305,17 +310,17 @@ class TestStratifiedSortinoByRegime:
         downside_std_log_alpha so the Sortino denominator is
         auditable independently of the ratio."""
         df = _synthetic_stratified_df()
-        strata = stratified_sortino_by_regime(df)
-        bull_10d = next(s for s in strata if s.market_regime == "bull" and s.horizon_days == 10)
-        assert bull_10d.mean_log_alpha is not None
-        assert bull_10d.std_log_alpha is not None
-        assert bull_10d.downside_std_log_alpha is not None
+        strata = stratified_sortino_by_regime(df, units=_FRACTION)
+        bull_21d = next(s for s in strata if s.market_regime == "bull" and s.horizon_days == 21)
+        assert bull_21d.mean_log_alpha is not None
+        assert bull_21d.std_log_alpha is not None
+        assert bull_21d.downside_std_log_alpha is not None
         # Downside std ≤ full std by construction
-        assert bull_10d.downside_std_log_alpha <= bull_10d.std_log_alpha
+        assert bull_21d.downside_std_log_alpha <= bull_21d.std_log_alpha
 
     def test_min_picks_gate_returns_none_metrics(self):
         df = _synthetic_stratified_df(n_per_regime=10)
-        strata = stratified_sortino_by_regime(df, min_picks_per_stratum=20)
+        strata = stratified_sortino_by_regime(df, units=_FRACTION, min_picks_per_stratum=20)
         for s in strata:
             assert s.n_picks == 10
             assert s.annualized_sortino is None
@@ -324,30 +329,30 @@ class TestStratifiedSortinoByRegime:
 
     def test_skips_rows_with_null_regime(self):
         df = pd.DataFrame([
-            {"market_regime": "bull", "return_10d": 0.05, "spy_10d_return": 0.02,
-             "return_30d": 0.08, "spy_30d_return": 0.03, "beat_spy_10d": 1, "beat_spy_30d": 1},
-            {"market_regime": None, "return_10d": 0.03, "spy_10d_return": 0.02,
-             "return_30d": 0.04, "spy_30d_return": 0.03, "beat_spy_10d": 1, "beat_spy_30d": 1},
+            {"market_regime": "bull", "return_21d": 0.05, "spy_21d_return": 0.02,
+             "return_5d": 0.08, "spy_5d_return": 0.03, "beat_spy_21d": 1, "beat_spy_5d": 1},
+            {"market_regime": None, "return_21d": 0.03, "spy_21d_return": 0.02,
+             "return_5d": 0.04, "spy_5d_return": 0.03, "beat_spy_21d": 1, "beat_spy_5d": 1},
         ])
-        strata = stratified_sortino_by_regime(df, min_picks_per_stratum=1)
+        strata = stratified_sortino_by_regime(df, units=_FRACTION, min_picks_per_stratum=1)
         regimes = {s.market_regime for s in strata}
         assert regimes == {"bull"}
 
     def test_no_market_regime_column_returns_empty(self):
-        df = pd.DataFrame({"return_10d": [0.05], "spy_10d_return": [0.02]})
-        strata = stratified_sortino_by_regime(df)
+        df = pd.DataFrame({"return_21d": [0.05], "spy_21d_return": [0.02]})
+        strata = stratified_sortino_by_regime(df, units=_FRACTION)
         assert strata == []
 
     def test_hit_rate_computed_when_beat_col_populated(self):
         df = _synthetic_stratified_df()
-        strata = stratified_sortino_by_regime(df)
+        strata = stratified_sortino_by_regime(df, units=_FRACTION)
         for s in strata:
             if s.n_picks >= DEFAULT_MIN_PICKS_PER_STRATUM:
                 assert s.hit_rate is not None
                 assert 0.0 <= s.hit_rate <= 1.0
         by_key = {(s.market_regime, s.horizon_days): s for s in strata}
-        bull_hit = by_key[("bull", 10)].hit_rate
-        bear_hit = by_key[("bear", 10)].hit_rate
+        bull_hit = by_key[("bull", 21)].hit_rate
+        bear_hit = by_key[("bear", 21)].hit_rate
         assert bull_hit > bear_hit
 
 
@@ -458,22 +463,25 @@ class TestAssembleT2EvalPayload:
             _stratum("bull", 10, 30, sortino=1.5, sharpe=1.0),
             _stratum("bear", 10, 30, sortino=-0.8, sharpe=-0.5),
         ]
-        spread_10d = compute_regime_spread(strata, horizon_days=10)
-        spread_30d = {"horizon_days": 30, "spread_bull_minus_bear_sortino": None,
-                      "interpretation": "insufficient_sample"}
+        spread_primary = compute_regime_spread(strata, horizon_days=10)
+        spread_diag = {"horizon_days": 5, "spread_bull_minus_bear_sortino": None,
+                       "interpretation": "insufficient_sample"}
         payload = assemble_t2_eval_payload(
             strata=strata,
-            spread_10d=spread_10d,
-            spread_30d=spread_30d,
+            spread_primary=spread_primary,
+            spread_diagnostic=spread_diag,
             run_id="2605170230",
             calendar_date="2026-05-17",
             trading_day="2026-05-15",
+            window=InputWindow("2026-04-01", "2026-05-01", 60),
         )
         assert payload["calendar_date"] == "2026-05-17"
         assert payload["run_id"] == "2605170230"
         assert payload["eval_tier"] == "T2_downstream_stratified_sortino"
-        assert payload["spread_10d"]["interpretation"] == "regime_signal_useful"
-        assert payload["spread_30d"]["interpretation"] == "insufficient_sample"
+        assert payload["spread_21d"]["interpretation"] == "regime_signal_useful"
+        assert payload["spread_5d"]["interpretation"] == "insufficient_sample"
+        assert payload["horizons"] == [21, 5]
+        assert payload["status"] == "ok"
         # Method metadata pins the canonical-alpha framework conventions
         md = payload["method_metadata"]
         assert "log(1+return" in md["alpha_definition"]
@@ -485,8 +493,9 @@ class TestAssembleT2EvalPayload:
         strata = [_stratum("bull", 10, 30, sortino=1.5, sharpe=1.0)]
         payload = assemble_t2_eval_payload(
             strata=strata,
-            spread_10d={}, spread_30d={},
+            spread_primary={}, spread_diagnostic={},
             run_id="X", calendar_date="2026-05-17", trading_day="2026-05-15",
+            window=InputWindow(None, None, 0),
         )
         s = payload["strata"][0]
         assert s["annualized_sortino"] == pytest.approx(1.5)
@@ -505,4 +514,4 @@ class TestDefaultsPins:
         assert DEFAULT_MIN_PICKS_PER_STRATUM == 20
 
     def test_supported_horizons(self):
-        assert SUPPORTED_HORIZONS == (10, 30)
+        assert SUPPORTED_HORIZONS == (21, 5)  # alpha-engine-config-I7661
