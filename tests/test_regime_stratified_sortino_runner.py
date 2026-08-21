@@ -11,13 +11,11 @@ graceful handling of empty / pre-migration DBs, and the dry-run path.
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 
 
 from analysis.regime_stratified_sortino_runner import (
@@ -46,27 +44,30 @@ def _create_score_perf_db(path: Path, rows: list[dict]) -> None:
     """Create a synthetic score_performance table populated with rows."""
     conn = sqlite3.connect(path)
     try:
+        # Policy horizons (21 primary / 5 diagnostic), and returns in the
+        # PERCENT-point convention attach_outcomes emits — the units the
+        # runner declares (alpha-engine-config-I7661).
         conn.execute("""
             CREATE TABLE score_performance (
                 id INTEGER PRIMARY KEY,
                 ticker TEXT,
                 score_date TEXT,
-                eval_date_10d TEXT,
-                eval_date_30d TEXT,
+                eval_date_21d TEXT,
+                eval_date_5d TEXT,
                 market_regime TEXT,
-                return_10d REAL,
-                return_30d REAL,
-                spy_10d_return REAL,
-                spy_30d_return REAL,
-                beat_spy_10d INTEGER,
-                beat_spy_30d INTEGER
+                return_21d REAL,
+                return_5d REAL,
+                spy_21d_return REAL,
+                spy_5d_return REAL,
+                beat_spy_21d INTEGER,
+                beat_spy_5d INTEGER
             )
         """)
         cols = [
-            "ticker", "score_date", "eval_date_10d", "eval_date_30d",
-            "market_regime", "return_10d", "return_30d",
-            "spy_10d_return", "spy_30d_return",
-            "beat_spy_10d", "beat_spy_30d",
+            "ticker", "score_date", "eval_date_21d", "eval_date_5d",
+            "market_regime", "return_21d", "return_5d",
+            "spy_21d_return", "spy_5d_return",
+            "beat_spy_21d", "beat_spy_5d",
         ]
         placeholders = ",".join(["?"] * len(cols))
         for r in rows:
@@ -79,38 +80,42 @@ def _create_score_perf_db(path: Path, rows: list[dict]) -> None:
         conn.close()
 
 
-def _seed_well_populated_rows() -> list[dict]:
-    """Enough rows to clear DEFAULT_MIN_PICKS_PER_STRATUM in bull + bear."""
+def _seed_well_populated_rows(*, end: str = "2026-07-13") -> list[dict]:
+    """Enough rows to clear DEFAULT_MIN_PICKS_PER_STRATUM in bull + bear.
+
+    Values are PERCENT POINTS — the convention ``attach_outcomes`` reproduces
+    from the long store and the one the runner declares. Seeding fractions
+    here would make every test pass against a runner that lies about its units.
+    """
     rows: list[dict] = []
-    base_dates = pd.date_range("2025-01-06", periods=80, freq="W-MON")  # 80 weeks
-    # 40 bull + 40 bear; bull-picks beat SPY, bear-picks lag SPY
+    base_dates = pd.date_range(end=pd.Timestamp(end), periods=80, freq="W-MON")
     for i, d in enumerate(base_dates[:40]):
         rows.append({
             "ticker": f"BU{i}",
             "score_date": d.date().isoformat(),
-            "eval_date_10d": (d + pd.Timedelta(days=10)).date().isoformat(),
-            "eval_date_30d": (d + pd.Timedelta(days=30)).date().isoformat(),
+            "eval_date_21d": (d + pd.Timedelta(days=21)).date().isoformat(),
+            "eval_date_5d": (d + pd.Timedelta(days=5)).date().isoformat(),
             "market_regime": "bull",
-            "return_10d": 0.04 + (i % 7) * 0.002,
-            "return_30d": 0.10 + (i % 7) * 0.004,
-            "spy_10d_return": 0.015,
-            "spy_30d_return": 0.04,
-            "beat_spy_10d": 1,
-            "beat_spy_30d": 1,
+            "return_21d": round(4.0 + (i % 7) * 0.2, 2),
+            "return_5d": round(1.0 + (i % 7) * 0.1, 2),
+            "spy_21d_return": 1.5,
+            "spy_5d_return": 0.4,
+            "beat_spy_21d": 1,
+            "beat_spy_5d": 1,
         })
     for i, d in enumerate(base_dates[40:]):
         rows.append({
             "ticker": f"BE{i}",
             "score_date": d.date().isoformat(),
-            "eval_date_10d": (d + pd.Timedelta(days=10)).date().isoformat(),
-            "eval_date_30d": (d + pd.Timedelta(days=30)).date().isoformat(),
+            "eval_date_21d": (d + pd.Timedelta(days=21)).date().isoformat(),
+            "eval_date_5d": (d + pd.Timedelta(days=5)).date().isoformat(),
             "market_regime": "bear",
-            "return_10d": -0.03 + (i % 5) * 0.002,
-            "return_30d": -0.08 + (i % 5) * 0.004,
-            "spy_10d_return": -0.01,
-            "spy_30d_return": -0.03,
-            "beat_spy_10d": 0,
-            "beat_spy_30d": 0,
+            "return_21d": round(-3.0 + (i % 5) * 0.2, 2),
+            "return_5d": round(-0.8 + (i % 5) * 0.1, 2),
+            "spy_21d_return": -1.0,
+            "spy_5d_return": -0.3,
+            "beat_spy_21d": 0,
+            "beat_spy_5d": 0,
         })
     return rows
 
@@ -155,10 +160,19 @@ class TestRunRegimeStratifiedSortino:
         payload = result["payload"]
         assert payload["schema_version"] == 1
         assert payload["eval_tier"] == "T2_downstream_stratified_sortino"
-        assert "spread_10d" in payload
-        assert "spread_30d" in payload
+        # Policy-derived spread keys (alpha-engine-config-I7661) — the names
+        # crucible-dashboard's views/15_Regime.py has always read.
+        assert "spread_21d" in payload
+        assert "spread_5d" in payload
+        assert "spread_10d" not in payload
+        assert "spread_30d" not in payload
+        assert payload["horizons"] == [21, 5]
         assert "strata" in payload
         assert "method_metadata" in payload
+        # Freshness is recorded on the INPUTS, not the write time.
+        assert "input_window" in payload
+        assert payload["input_window"]["n_rows"] > 0
+        assert payload["method_metadata"]["return_units"] == "percent"
 
     def test_artifact_body_matches_latest_sidecar(self, tmp_path):
         """T2's sidecar mirrors the artifact body — small enough that
@@ -226,12 +240,21 @@ class TestRunRegimeStratifiedSortino:
             result = run_regime_stratified_sortino(
                 db_path=str(db), s3_bucket="test-bucket",
             )
-        assert result["status"] == "ok"
+        # An empty DB measured NOTHING. Reporting "ok" here is the defect
+        # alpha-engine-config-I7661 closes: a well-formed artifact containing
+        # no measurement must not render as an empty success
+        # (champion-challenger-policy §7.2).
+        assert result["status"] == "unmeasurable"
+        assert "nothing was measured" in result["status_reason"]
+        assert result["payload"]["status"] == "unmeasurable"
         assert result["wrote"] is True
         assert result["n_strata"] == 0
+        assert result["input_window"] == {
+            "min_score_date": None, "max_score_date": None, "n_rows": 0,
+        }
         # Spread is "insufficient_sample" with no strata
-        assert result["spread_10d_interpretation"] == "insufficient_sample"
-        assert result["spread_30d_interpretation"] == "insufficient_sample"
+        assert result["spread_21d_interpretation"] == "insufficient_sample"
+        assert result["spread_5d_interpretation"] == "insufficient_sample"
 
     def test_prefix_constant_is_canonical(self):
         """The prefix anchors the dashboard reader + judge auditor; pin

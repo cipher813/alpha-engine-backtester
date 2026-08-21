@@ -27,7 +27,12 @@ from analysis.outcome_store import attach_outcomes
 # Pure metric core — implementation + unit tests live in the lib.
 from nousergon_lib.quant.stats.regime_sortino import (
     DEFAULT_MIN_PICKS_PER_STRATUM,
+    STATUS_OK,
+    STATUS_UNMEASURABLE,
     SUPPORTED_HORIZONS,
+    InputWindow,
+    ReturnUnits,
+    ReturnUnitsError,
     StratumMetrics,
     _annualization_factor,
     _annualized_sharpe_from_log_alphas,
@@ -39,7 +44,9 @@ from nousergon_lib.quant.stats.regime_sortino import (
     _stratum_metrics,
     _TRADING_DAYS_PER_YEAR,
     assemble_t2_eval_payload,
+    assess_input_freshness,
     compute_regime_spread,
+    input_window,
     stratified_sortino_by_regime,
 )
 
@@ -54,7 +61,10 @@ def load_with_subscores_and_regime(db_path: str) -> pd.DataFrame:
     The per-horizon outcome columns (arithmetic stock/SPY returns + beat-SPY
     flags, named by ``HorizonPolicy.outcome_columns``) are re-sourced from the
     long-format score_performance_outcomes store (config#1529). Values are
-    byte-identical to the legacy wide read (percent, 2dp).
+    byte-identical to the legacy wide read (PERCENT, 2dp) — which is why every
+    consumer of this frame must declare ``ReturnUnits.PERCENT``; the canonical
+    ``log_alpha_{h}d`` column it also attaches for the primary horizon stays
+    DECIMAL (alpha-engine-config-I7661).
 
     Returns a DataFrame with at minimum the market_regime column (str | NaN for
     pre-migration rows) plus the HorizonPolicy per-horizon stock/SPY returns and
@@ -96,11 +106,18 @@ __all__ = [
     "load_with_subscores_and_regime",
     # Re-exported pure core (from nousergon_lib.quant.stats.regime_sortino)
     "DEFAULT_MIN_PICKS_PER_STRATUM",
+    "STATUS_OK",
+    "STATUS_UNMEASURABLE",
     "SUPPORTED_HORIZONS",
+    "InputWindow",
+    "ReturnUnits",
+    "ReturnUnitsError",
     "StratumMetrics",
     "stratified_sortino_by_regime",
     "compute_regime_spread",
     "assemble_t2_eval_payload",
+    "assess_input_freshness",
+    "input_window",
     "_arithmetic_to_log_alpha",
     "_annualization_factor",
     "_annualized_sortino_from_log_alphas",
