@@ -82,10 +82,21 @@ def fake_s3(monkeypatch):
 @pytest.fixture(autouse=True)
 def _mute_alerts(monkeypatch):
     """Never let a test page. ``_alert`` imports nousergon_lib.alerts inside
-    the function — stub the module."""
-    sent: list[str] = []
+    the function — stub the module. ``sent`` carries just the messages (most
+    tests only care that an alert fired); ``sent.calls`` carries the full
+    kwargs for tests that assert on ``source`` etc."""
+    class _Sent(list):
+        calls: list[dict] = []
+
+    sent = _Sent()
+    sent.calls = []
+
+    def _fake_publish(msg, **kw):
+        sent.append(msg)
+        sent.calls.append(kw)
+
     fake_alerts = types.ModuleType("nousergon_lib.alerts")
-    fake_alerts.publish = lambda msg, **kw: sent.append(msg)
+    fake_alerts.publish = _fake_publish
     monkeypatch.setitem(sys.modules, "nousergon_lib.alerts", fake_alerts)
     return sent
 
@@ -449,6 +460,30 @@ def test_publish_pass_artifact_crash_writes_failed_artifact_and_returns_false(
     assert written["status"] == "failed"
     assert written["error_class"] == "RuntimeError"
     assert any("UNKNOWN" in m for m in _mute_alerts)
+
+
+def test_publish_pass_artifact_crash_alert_source_matches_registry(
+        monkeypatch, fake_s3, _mute_alerts):
+    """alpha-engine-config-I7740 (operator ruling 2026-08-21): the fleet
+    alert-class registry (nousergon-data
+    infrastructure/overseer/playbooks.yaml, class ``backtester_pit_parity``)
+    declares ``alpha-engine-backtester/pit_parity`` as the ONLY valid
+    ``detail.source`` for this alert class. This emitter previously
+    published ``alpha-engine-backtester/pit_stats_artifact``, a string the
+    registry does not declare — untriageable by construction. Pin the
+    emitted source to the registry-declared value so this cannot drift
+    again silently."""
+    def _boom(cfg, which, run_date):
+        raise RuntimeError("child exploded")
+
+    monkeypatch.setattr(psa, "_run_predictor_pass_isolated", _boom)
+    ok = psa.publish_pass_artifact(_cfg(), "walkforward")
+    assert ok is False
+    assert _mute_alerts.calls  # type: ignore[attr-defined]
+    assert all(
+        call["source"] == "alpha-engine-backtester/pit_parity"
+        for call in _mute_alerts.calls  # type: ignore[attr-defined]
+    )
 
 
 def test_publish_pass_artifact_strict_upload_failure_is_loud(monkeypatch):
