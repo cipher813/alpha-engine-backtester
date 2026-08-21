@@ -9,6 +9,29 @@ Data sources:
   - executor_shadow_book in trades.db (blocked entries)
   - trades in trades.db (executed entries)
   - universe_returns in research.db (forward returns for blocked stocks)
+
+UNITS — read this before touching any threshold below
+-----------------------------------------------------
+``universe_returns.return_5d`` is a **DECIMAL FRACTION** (0.05 = +5%).
+Measured against live ``s3://alpha-engine-research/research.db``
+(2026-08-21, 2,012,661 non-null rows, eval_date 2025-12-08..2026-08-10):
+median 0.0004, p99 0.3023, min -0.9944. The producer is
+``nousergon-data/collectors/universe_returns.py``, which writes
+``round(close_end / close_start - 1.0, 4)``.
+
+A column named ``return_5d`` ALSO exists in ``score_performance`` in the same
+database, in **2dp PERCENT POINTS** — measured range [-20.42, 22.70], median
+-0.02, against the same quantity in the long-format
+``score_performance_outcomes`` store at [-0.2042, 0.2270]: exactly 100x.
+Two columns, one name, opposite conventions
+(``alpha-engine-config-I7936``; sibling of ``alpha-engine-config-I7661``,
+where percent points fed into ``log(1 + r)`` and every published Sortino
+measured nothing).
+
+So this module DECLARES which convention it reads and RAISES when the values
+contradict the declaration. It does not coerce: a reader that cannot tell
+which convention it received has no safe default, and a wrong guess produces
+plausible numbers rather than an error.
 """
 
 from __future__ import annotations
@@ -17,9 +40,104 @@ import logging
 import sqlite3
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
+from analysis.regime_stratified_sortino import ReturnUnits, ReturnUnitsError
+
 logger = logging.getLogger(__name__)
+
+
+# The convention this module reads. Not a guess — see the module docstring for
+# the live measurement behind it.
+UNIVERSE_RETURNS_UNITS: ReturnUnits = ReturnUnits.FRACTION
+
+# Units tripwire on the declared column. A percent-point column mislabelled as
+# a fraction has a MEDIAN absolute value of a few units; a genuine per-pick 5d
+# decimal return has a median of a few thousandths. The median is the
+# discriminating test — the max alone is not, because a real universe carries
+# legitimate extremes (see _MAX_TRADEABLE_ABS_RETURN below). Mirrors the bound
+# nousergon_lib.quant.stats.regime_sortino uses for the same decision
+# (alpha-engine-config-I7661); lift to the lib on the third adoption per
+# policy-shared-code -- tracked as alpha-engine-config-I7936 residue.
+_MAX_PLAUSIBLE_MEDIAN_FRACTION: float = 0.5
+_MEDIAN_CHECK_MIN_ROWS: int = 10
+
+# Rows beyond this |return| are not tradeable 5-day equity outcomes. The live
+# universe carries Nasdaq TEST SECURITIES (ZWZZT, ZVZZT, ZJZZT, ...) whose
+# synthetic prices produce arithmetically-correct nonsense: ZWZZT closed at
+# 19.44 on 2026-03-30 and 129,998.70 five sessions later, so
+# return_5d = 129998.70 / 19.44 - 1 = 6686.1759 -- the live max of the column,
+# and the anchor observation on alpha-engine-config-I7936. It is NOT a units
+# error. Those rows contribute 70% of the universe-wide mean 5d return
+# (0.004758 with them, 0.001418 without). Excluding them here keeps this
+# module honest while the producer-side exclusion lands
+# (nousergon-data, alpha-engine-config-I7936).
+_MAX_TRADEABLE_ABS_RETURN: float = 5.0
+
+# Material difference between the mean 5-day forward return of traded vs
+# blocked entries, in the SAME decimal-fraction units as the column
+# (0.01 = 100 bps). This was ``0.5`` -- 50 percentage points -- which is a
+# threshold written for percent points and applied to a decimal column: the
+# `appropriate` and `too_tight` branches were unreachable, so every run this
+# module has ever published reported ``assessment: "neutral"`` regardless of
+# what the guard did. Same root class as the column-name ambiguity above; the
+# rename would not have caught it, only stating the units does
+# (alpha-engine-config-I7936).
+_GUARD_LIFT_MATERIAL: float = 0.01
+
+
+def _assert_declared_units(values: pd.Series, *, column: str) -> None:
+    """Raise if ``column`` contradicts :data:`UNIVERSE_RETURNS_UNITS`.
+
+    Fails LOUD rather than coercing. The failure this guards is not
+    hypothetical: the fleet stores this quantity both ways, and a source swap
+    that silently changed which one reached this module would change what
+    every ``guard_lift`` below means by two orders of magnitude without
+    changing a single line of code (alpha-engine-config-I7936 / I7661).
+    """
+    finite = values.astype("float64")
+    finite = finite[np.isfinite(finite.to_numpy())]
+    if finite.size < _MEDIAN_CHECK_MIN_ROWS:
+        return
+    # The MEDIAN, over every finite row -- deliberately NOT pre-filtered by
+    # _MAX_TRADEABLE_ABS_RETURN. A median is already robust to the handful of
+    # test-security rows, and trimming first would discard exactly the large
+    # values that make a percent-point column recognisable.
+    median_abs = float(np.median(np.abs(finite.to_numpy())))
+    if median_abs > _MAX_PLAUSIBLE_MEDIAN_FRACTION:
+        raise ReturnUnitsError(
+            f"{column}: declared {UNIVERSE_RETURNS_UNITS.value!r} but the MEDIAN "
+            f"absolute value over {finite.size} rows is "
+            f"{median_abs:.6g} -- a typical stock moving {median_abs:.0%} over "
+            f"5 sessions is not a return distribution this module sees. The "
+            f"source is most likely percent points, i.e. score_performance's "
+            f"return_5d rather than universe_returns' "
+            f"(alpha-engine-config-I7936)."
+        )
+
+
+def _drop_untradeable(ur: pd.DataFrame, *, column: str = "return_5d") -> pd.DataFrame:
+    """Drop rows whose return is outside any tradeable 5-day equity outcome.
+
+    See :data:`_MAX_TRADEABLE_ABS_RETURN`. Logged at WARNING with the offending
+    tickers so the exclusion is never silent -- a filter nobody can see is how
+    the universe came to carry test securities unnoticed in the first place.
+    """
+    if column not in ur.columns or ur.empty:
+        return ur
+    vals = ur[column].astype("float64").to_numpy()
+    bad = np.isfinite(vals) & (np.abs(vals) > _MAX_TRADEABLE_ABS_RETURN)
+    if not bad.any():
+        return ur
+    offenders = sorted(set(ur.loc[bad, "ticker"])) if "ticker" in ur.columns else []
+    logger.warning(
+        "shadow_book: dropped %d universe_returns row(s) with |%s| > %g "
+        "(not tradeable 5-day outcomes; tickers=%s) -- "
+        "alpha-engine-config-I7936",
+        int(bad.sum()), column, _MAX_TRADEABLE_ABS_RETURN, offenders[:20],
+    )
+    return ur.loc[~bad].copy()
 
 
 def compute_shadow_book_analysis(
@@ -121,6 +239,14 @@ def compute_shadow_book_analysis(
             )
             rconn.close()
 
+            # DECLARE, then verify. The units check runs before any mean is
+            # taken, and its ReturnUnitsError is deliberately re-raised past
+            # the fail-soft handler below (see the `except` clause) -- a
+            # forward-return enrichment that silently degrades is acceptable,
+            # one that silently changes what the numbers MEAN is not.
+            _assert_declared_units(ur["return_5d"], column="universe_returns.return_5d")
+            ur = _drop_untradeable(ur, column="return_5d")
+
             if not ur.empty:
                 # Blocked stock returns
                 blocked_merged = shadow.merge(
@@ -141,6 +267,13 @@ def compute_shadow_book_analysis(
                 )
                 if not traded_merged.empty:
                     traded_returns = traded_merged
+        except ReturnUnitsError:
+            # NOT fail-soft. ReturnUnitsError subclasses ValueError, so without
+            # this clause the broad handler below would swallow the one error
+            # this module raises on purpose -- the exact silent-swallow the
+            # fail-loud rule forbids on a units boundary
+            # (alpha-engine-config-I7936).
+            raise
         except (sqlite3.Error, pd.errors.DatabaseError, pd.errors.MergeError, KeyError, ValueError) as e:
             # Fail-soft: forward-return enrichment is optional. Narrowed to the
             # real failure surface here — sqlite/read_sql errors (missing
@@ -175,9 +308,9 @@ def compute_shadow_book_analysis(
         guard_lift = round(traded_avg - blocked_avg, 4)
         result["guard_lift"] = guard_lift
 
-        if guard_lift > 0.5:
+        if guard_lift > _GUARD_LIFT_MATERIAL:
             result["assessment"] = "appropriate"
-        elif guard_lift < -0.5:
+        elif guard_lift < -_GUARD_LIFT_MATERIAL:
             result["assessment"] = "too_tight"
         else:
             result["assessment"] = "neutral"
