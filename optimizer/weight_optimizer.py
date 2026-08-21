@@ -8,7 +8,14 @@ Suggests revised weights and applies them to S3 if guardrails pass.
 Horizon separation: Research uses quant + qual only (6–12 month fundamental
 attractiveness). Technical analysis is handled by Predictor (GBM) and Executor.
 
-Current default weights: quant=0.50, qual=0.50
+Configured fallback prior (used only when BOTH sub-scores have a producer):
+quant=0.50, qual=0.50. This is NOT the live composite — since the six-team +
+CIO research graph was retired 2026-07-12 (config#1580) no producer emits a
+``qual_score``, so the running composite is quant-only. A sub-score that is
+null on every row is refused admission here (status ``subscore_absent``)
+rather than having a weight fitted for it, and the audit's ``current`` field
+reports the EFFECTIVE vector, not the configured one
+(alpha-engine-config-I7678).
 """
 
 import json
@@ -28,6 +35,7 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 SUB_SCORES = ["quant", "qual"]
+_SUBSCORE_COLS = [f"{s}_score" for s in SUB_SCORES]
 S3_WEIGHTS_KEY = "config/scoring_weights.json"
 S3_SHADOW_WEIGHTS_PREFIX = "config/scoring_weights_shadow_history"
 
@@ -267,9 +275,40 @@ def load_with_subscores(
                 merged = merged.drop(columns=[s3_col])
     else:
         merged = df.merge(sub_df, on=["symbol", "score_date"], how="left")
-    filled = merged[["quant_score", "qual_score"]].notna().any(axis=1).sum()
-    logger.info("Sub-scores matched for %d/%d score_performance rows", filled, len(merged))
+    # PER-COLUMN coverage, not `.any(axis=1)` (alpha-engine-config-I7678).
+    # The row-wise `.any()` counted a row as "matched" when EITHER sub-score
+    # was present, so a sub-score that had lost its producer entirely was
+    # invisible here — qual_score was null on 903/903 live rows for nine
+    # consecutive weeks while this line logged full coverage.
+    coverage = {c: int(merged[c].notna().sum()) for c in _SUBSCORE_COLS if c in merged.columns}
+    logger.info(
+        "Sub-score coverage over %d score_performance rows: %s",
+        len(merged),
+        ", ".join(f"{c}={v}" for c, v in coverage.items()) or "none",
+    )
+    for col, v in coverage.items():
+        if v == 0:
+            logger.warning(
+                "weight_optimizer: sub-score column %r is null on ALL %d rows — "
+                "its producer is absent, so no weight can be fitted for it "
+                "(alpha-engine-config-I7678).", col, len(merged),
+            )
     return merged
+
+
+def _effective_weights(configured: dict, coverage: dict[str, int]) -> dict:
+    """Renormalise ``configured`` over the sub-scores that are actually populated.
+
+    An absent sub-score contributes nothing rather than dragging every score
+    toward zero — which is what the live composite already does, and what the
+    declared vector had stopped describing. Returns ``0.0`` for every absent
+    sub-score so the shape stays keyed by ``SUB_SCORES``.
+    """
+    live = {s: configured.get(s, 0.0) for s in SUB_SCORES if coverage.get(s, 0) > 0}
+    total = sum(live.values())
+    if total <= 0.0:
+        return {s: 0.0 for s in SUB_SCORES}
+    return {s: round(live.get(s, 0.0) / total, 3) for s in SUB_SCORES}
 
 
 def _validate_and_split(
@@ -314,8 +353,24 @@ def _validate_and_split(
             ),
         }
 
-    sub_cols = {s: f"{s}_score" for s in SUB_SCORES if f"{s}_score" in populated.columns}
-    if not sub_cols:
+    # A sub-score column that EXISTS but is entirely null is not a sub-score
+    # this loop can fit — and until alpha-engine-config-I7678 it was treated as
+    # one. `qual_score` had been null on 903/903 live rows since the six-team +
+    # CIO research graph was retired 2026-07-12 (config#1580), yet a qual weight
+    # was still proposed every week and measured against a 0.50 baseline. The
+    # loop was arithmetically correct and strategically empty: whatever it
+    # proposed for `qual` could not move a single score.
+    #
+    # Coverage, not mere presence, is the admission test.
+    coverage = {
+        s: int(populated[f"{s}_score"].notna().sum())
+        for s in SUB_SCORES
+        if f"{s}_score" in populated.columns
+    }
+    absent = sorted(s for s, v in coverage.items() if v == 0)
+    sub_cols = {s: f"{s}_score" for s, v in coverage.items() if v > 0}
+
+    if not coverage:
         return {
             "status": "no_subscores",
             "n_samples": n,
@@ -325,6 +380,41 @@ def _validate_and_split(
                 "Run load_with_subscores() before compute_weights()."
             ),
         }
+    if len(sub_cols) < 2:
+        # Nothing to blend. Report this as a BY-DESIGN-OFF loop rather than a
+        # data-starvation or guardrail block, so the apply audit stops
+        # accruing a `blocked` streak against a proposal that cannot matter,
+        # and so the reason is named on the surface the Director reads.
+        # Report the EFFECTIVE vector as `current`, not the configured one.
+        # The apply audit's `current` field is the only rendering of the live
+        # weights the Director sees; publishing the configured 0.50/0.50 there
+        # while the running composite is 1.0/0.0 is the whole defect. The
+        # configured block is kept alongside so the divergence is legible
+        # rather than merely corrected.
+        effective = _effective_weights(current_weights, coverage)
+        return {
+            "status": "subscore_absent",
+            "n_samples": n,
+            "current_weights": effective,
+            "configured_weights": current_weights,
+            "subscore_coverage": coverage,
+            "absent_subscores": absent,
+            "note": (
+                "Sub-score(s) "
+                + ", ".join(absent)
+                + f" null on all {n} resolved-outcome rows — no producer emits "
+                "them. A blend cannot be fitted over a single populated "
+                "sub-score, and any weight proposed for an absent one cannot "
+                "change a live score. Restore the producer, then re-arm the "
+                "blend explicitly (alpha-engine-config-I7678)."
+            ),
+        }
+    if absent:
+        logger.warning(
+            "weight_optimizer: fitting over %s only — %s null on all %d "
+            "resolved-outcome rows (alpha-engine-config-I7678).",
+            sorted(sub_cols), absent, n,
+        )
 
     populated = populated.sort_values("score_date")
     split_idx = int(len(populated) * 0.7)
@@ -462,7 +552,8 @@ def compute_weights(
 
     Returns:
         {
-            "status": "ok" | "insufficient_data" | "no_subscores",
+            "status": "ok" | "insufficient_data" | "no_subscores"
+                      | "subscore_absent",
             "n_samples": int,
             "confidence": "low" | "medium" | "high",
             "current_weights": {"quant": 0.50, "qual": 0.50},
