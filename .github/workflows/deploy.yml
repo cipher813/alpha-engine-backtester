@@ -81,12 +81,20 @@ jobs:
       # converge alpha-engine-replay-concordance / -counterfactual's
       # environment against a denied-key set — that subcommand doesn't
       # exist before 0.59.23.
+      #
+      # Raised to >=0.59.24 (alpha-engine-config-I8030, krepis-PR176):
+      # 0.59.23's remove-lambda-env enumerated Lambda aliases
+      # unconditionally, including under --defer-publish (which both
+      # deploy_*.sh scripts pass), and github-actions-lambda-deploy holds no
+      # lambda:ListAliases — the image was pushed and $LATEST updated, then
+      # this raised, so publish-version and the alias move never ran: a
+      # PARTIAL deploy. 0.59.24 skips the enumeration under --defer-publish.
       - name: Set up Python for canary-rollback alert publish
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: '3.12'
       - name: Install krepis for deploy_*.sh alerts + env-convergence calls
-        run: pip install "krepis>=0.59.23"
+        run: pip install "krepis>=0.59.24"
 
       # Each deploy_*.sh builds its lambda_*/Dockerfile (which COPYs the fixed
       # sources + pins the lib primitives), pushes to ECR, publishes a
