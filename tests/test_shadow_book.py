@@ -142,6 +142,12 @@ def test_compute_shadow_book_no_research_db_falls_back_to_alpha(tmp_path):
     assert "traded_avg_alpha" in result
 
 
+# NOTE (alpha-engine-config-I7936): every fixture below writes return_5d as a
+# DECIMAL FRACTION, which is what nousergon-data's universe_returns collector
+# actually stores (live median 0.0004, p99 0.3023). They previously used
+# -1.0 / 2.0 / 0.4 -- percent points, i.e. -100% and +200% five-day returns --
+# which is the same units confusion the module code carried, mirrored into the
+# suite that was supposed to catch it.
 def test_compute_shadow_book_classifies_appropriate_when_guard_helps(tmp_path):
     db = tmp_path / "trades.db"
     research = tmp_path / "research.db"
@@ -150,8 +156,8 @@ def test_compute_shadow_book_classifies_appropriate_when_guard_helps(tmp_path):
     shadow = [_shadow_row(f"B{i}", "2026-04-01", "low_score") for i in range(4)]
     trades = [_trade_row(f"T{i}", "2026-04-01", alpha=2.0) for i in range(4)]
     universe = (
-        [_univ(f"B{i}", "2026-04-01", return_5d=-1.0, beat=0) for i in range(4)] +
-        [_univ(f"T{i}", "2026-04-01", return_5d=2.0, beat=1) for i in range(4)]
+        [_univ(f"B{i}", "2026-04-01", return_5d=-0.01, beat=0) for i in range(4)] +
+        [_univ(f"T{i}", "2026-04-01", return_5d=0.02, beat=1) for i in range(4)]
     )
 
     _build_trades_db(db, shadow, trades)
@@ -160,9 +166,9 @@ def test_compute_shadow_book_classifies_appropriate_when_guard_helps(tmp_path):
     result = compute_shadow_book_analysis(str(db), str(research))
 
     assert result["status"] == "ok"
-    assert result["blocked_avg_return_5d"] == pytest.approx(-1.0)
-    assert result["traded_avg_return_5d"] == pytest.approx(2.0)
-    assert result["guard_lift"] == pytest.approx(3.0)
+    assert result["blocked_avg_return_5d"] == pytest.approx(-0.01)
+    assert result["traded_avg_return_5d"] == pytest.approx(0.02)
+    assert result["guard_lift"] == pytest.approx(0.03)
     assert result["assessment"] == "appropriate"
     # classification dict should be populated when beat_spy_5d is non-null on both sides
     assert "classification" in result
@@ -179,8 +185,8 @@ def test_compute_shadow_book_classifies_too_tight_when_blocked_outperformed(tmp_
     shadow = [_shadow_row(f"B{i}", "2026-04-01", "low_score") for i in range(4)]
     trades = [_trade_row(f"T{i}", "2026-04-01") for i in range(4)]
     universe = (
-        [_univ(f"B{i}", "2026-04-01", return_5d=2.0, beat=1) for i in range(4)] +
-        [_univ(f"T{i}", "2026-04-01", return_5d=-1.0, beat=0) for i in range(4)]
+        [_univ(f"B{i}", "2026-04-01", return_5d=0.02, beat=1) for i in range(4)] +
+        [_univ(f"T{i}", "2026-04-01", return_5d=-0.01, beat=0) for i in range(4)]
     )
 
     _build_trades_db(db, shadow, trades)
@@ -189,7 +195,7 @@ def test_compute_shadow_book_classifies_too_tight_when_blocked_outperformed(tmp_
     result = compute_shadow_book_analysis(str(db), str(research))
 
     assert result["status"] == "ok"
-    assert result["guard_lift"] == pytest.approx(-3.0)
+    assert result["guard_lift"] == pytest.approx(-0.03)
     assert result["assessment"] == "too_tight"
 
 
@@ -200,8 +206,8 @@ def test_compute_shadow_book_neutral_when_diff_small(tmp_path):
     shadow = [_shadow_row(f"B{i}", "2026-04-01", "low_score") for i in range(4)]
     trades = [_trade_row(f"T{i}", "2026-04-01") for i in range(4)]
     universe = (
-        [_univ(f"B{i}", "2026-04-01", return_5d=0.4, beat=0) for i in range(4)] +
-        [_univ(f"T{i}", "2026-04-01", return_5d=0.5, beat=1) for i in range(4)]
+        [_univ(f"B{i}", "2026-04-01", return_5d=0.004, beat=0) for i in range(4)] +
+        [_univ(f"T{i}", "2026-04-01", return_5d=0.005, beat=1) for i in range(4)]
     )
 
     _build_trades_db(db, shadow, trades)
@@ -210,7 +216,7 @@ def test_compute_shadow_book_neutral_when_diff_small(tmp_path):
     result = compute_shadow_book_analysis(str(db), str(research))
 
     assert result["status"] == "ok"
-    assert abs(result["guard_lift"]) < 0.5
+    assert abs(result["guard_lift"]) < 0.01
     assert result["assessment"] == "neutral"
 
 
