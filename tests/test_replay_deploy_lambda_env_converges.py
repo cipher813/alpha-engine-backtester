@@ -137,7 +137,55 @@ def test_deploy_workflow_runner_install_matches_the_floor() -> None:
         Path(__file__).resolve().parents[1] / ".github" / "workflows" / "deploy.yml"
     )
     code = workflow.read_text(encoding="utf-8")
-    assert 'pip install "krepis>=0.59.23"' in code, (
-        "the runner-side krepis install step must float to at least 0.59.23 "
+    assert 'pip install "krepis>=0.59.24"' in code, (
+        "the runner-side krepis install step must float to at least 0.59.24 "
         "or remove-lambda-env is unavailable when deploy_*.sh calls it"
+    )
+
+
+def test_krepis_floor_does_not_need_the_deploy_role_to_list_aliases() -> None:
+    """krepis 0.59.23's `remove_lambda_environment_keys` enumerated Lambda
+    aliases unconditionally, including under `--defer-publish` — which both
+    deploy_concordance.sh and deploy_counterfactual.sh pass. The
+    github-actions-lambda-deploy role does not hold `lambda:ListAliases`.
+    The failure lands after the image is pushed and $LATEST is updated, and
+    before `publish-version` and the alias move: a PARTIAL deploy, with the
+    `live` alias serving a stale image while main has moved on — the SHA
+    drift the preopen `DeployDriftGate` halts on (alpha-engine-config-I8030,
+    mirroring crucible-predictor's fix for I7925/deploy run 32509752554).
+
+    krepis 0.59.24 skips the enumeration under `defer_publish` (krepis#176).
+    Both carriers — requirements.txt's floor (used by the spot/backtest
+    scripts, not this call site, but kept in lockstep per repo convention)
+    and deploy.yml's runner-side install (the ACTUAL gate for
+    remove-lambda-env here) — must float to at least 0.59.24, or the deploy
+    fails on lambda:ListAliases and leaves a PARTIAL deploy.
+    """
+    req = Path(__file__).resolve().parents[1] / "requirements.txt"
+    line = next(
+        ln
+        for ln in req.read_text(encoding="utf-8").splitlines()
+        if ln.startswith("krepis[")
+    )
+    version = line.split(">=", 1)[1].split()[0].strip()
+    parts = tuple(int(p) for p in version.split("."))
+    assert parts >= (0, 59, 24), (
+        f"requirements.txt's krepis floor is {version}; --defer-publish "
+        f"needs >= 0.59.24 (alpha-engine-config-I8030)"
+    )
+
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "deploy.yml"
+    )
+    code = workflow.read_text(encoding="utf-8")
+    wf_line = next(
+        ln for ln in code.splitlines() if 'pip install "krepis>=' in ln
+    )
+    wf_version = wf_line.split(">=", 1)[1].split('"', 1)[0].strip()
+    wf_parts = tuple(int(p) for p in wf_version.split("."))
+    assert wf_parts >= (0, 59, 24), (
+        f"deploy.yml installs krepis>={wf_version} on the runner; "
+        f"--defer-publish needs >= 0.59.24 or the deploy fails on "
+        f"lambda:ListAliases and leaves a PARTIAL deploy "
+        f"(alpha-engine-config-I8030)"
     )

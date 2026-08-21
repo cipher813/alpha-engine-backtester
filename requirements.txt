@@ -206,7 +206,7 @@ psutil>=7.2.2
 # already-published release would be silently satisfied by a krepis that does
 # NOT carry resolve_model_spec). If a third krepis PR merges before PR172,
 # raise this line to match the release PR172 actually produces.
-krepis[openai]>=0.59.23
+krepis[openai]>=0.59.24
 # Raised to >=0.59.23 (alpha-engine-config-I7925, krepis-PR175): the first
 # published krepis carrying `krepis.aws remove-lambda-env`, the removal
 # counterpart to merge-lambda-env — deploy_concordance.sh / deploy_
@@ -214,6 +214,12 @@ krepis[openai]>=0.59.23
 # deploy_*.sh alerts call" workflow step) to converge alpha-engine-replay-
 # concordance / -counterfactual's environment against a denied-key set.
 # MERGE ORDER: krepis-PR175 merges and publishes FIRST.
+# Raised to >=0.59.24 (alpha-engine-config-I8030, krepis-PR176): 0.59.23's
+# remove-lambda-env enumerated Lambda aliases unconditionally, including
+# under --defer-publish (which both deploy_*.sh scripts pass), and the
+# github-actions-lambda-deploy role holds no lambda:ListAliases — a partial
+# deploy (image pushed, alias never moved). 0.59.24 skips the enumeration
+# under --defer-publish.
 # Bumped to >=0.24.1 on main (2026-07-29). krepis 0.23.0 added callsite_id
 # as a REQUIRED keyword-only argument to LLMClient.__init__ (a breaking change
 # with no default) — replay/runner.py's _invoke_target_with_schema passes
