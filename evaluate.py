@@ -2452,7 +2452,21 @@ def _main_impl() -> None:
 
     # ── Champion promotion engine (weekly winner-take-all, alpha-engine-
     # config-I2518 / epic I2515, 2026-07-14 ruling — supersedes the prior
-    # HAC-significance/hysteresis/cooldown gate, config#2364/#2367) ────────
+    # HAC-significance/hysteresis/cooldown gate, config#2364/#2367;
+    # NARROWED by Brian's 2026-08-20 shadow-only ruling, alpha-engine-config
+    # -I2515) ─────────────────────────────────────────────────────────────
+    #
+    # 2026-08-20 (Brian, verbatim): "research should now be think tank in
+    # shadow mode only with the main research process skipped by passing a
+    # scanner top 20 to predictor". thinktank_coverage is MEASURED, never
+    # promoted — declared in optimizer/champion_promotion.py::
+    # SHADOW_ONLY_ARMS and enforced at two layers there (evaluate_gates
+    # degrades its win to outcome="held_shadow_only"; write_champion_pointer
+    # raises). This stage's wiring is UNCHANGED: it still runs weekly, still
+    # scores both arms, still writes the audit record unconditionally, and
+    # still promotes a non-shadow challenger that outscores the champion.
+    # Only the pointer-move onto a shadow arm is withheld, and the audit
+    # record's counterfactual_winner names who would have taken it.
     # Weekly evaluation of config/producer_champion.json — the pointer the
     # alpha-engine executor reads to choose its live entry-candidate
     # producer arm (scanner_predictor_direct vs thinktank_coverage). Runs

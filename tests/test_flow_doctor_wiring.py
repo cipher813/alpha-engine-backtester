@@ -392,7 +392,7 @@ class TestColdStartDeferral:
 # The tag every deploy artifact must pin. `tests/test_lib_pin_lockstep.py`
 # asserts requirements.txt and the three Lambda Dockerfiles all carry the SAME
 # tag; this constant is what that tag must be.
-_EXPECTED_LIB_TAG = "v0.124.70"
+_EXPECTED_LIB_TAG = "v0.124.77"
 
 
 class TestLibVersionPin:
@@ -416,8 +416,34 @@ class TestLibVersionPin:
                 rf"nousergon-lib@{re.escape(_EXPECTED_LIB_TAG)}[0-9.]", text
             )
         ), (
-            f"nousergon-lib should pin to {_EXPECTED_LIB_TAG} — bumped to "
-            "restore CO-INSTALL PARITY with crucible-predictor / "
+            f"nousergon-lib should pin to {_EXPECTED_LIB_TAG} — restored CO-INSTALL "
+            "PARITY with crucible-predictor at the latest tag "
+            "(alpha-engine-config-I7835). Two independent single-repo bumps "
+            "landed minutes apart after the v0.124.75 lockstep move: "
+            "crucible-predictor#530 took predictor alone to v0.124.76, and "
+            "crucible-research#683 took research alone to v0.124.77 (a "
+            "floor-only repo, so that one did not break parity by itself). "
+            "Neither repo's lockstep guard caught it — each only checks its "
+            "OWN deploy artifacts against each other, not against the "
+            "sibling repo's pin — so the weekly SF's `LibPinDriftGate` "
+            "hard-failed co-install parity (measured: backtester=v0.124.75 "
+            "!= predictor=v0.124.76) ahead of Saturday's scheduled run. "
+            "Realigned on v0.124.77, the latest tag, rather than dragging "
+            "predictor back to 75. Bumped in lockstep with crucible-predictor "
+            "(both -> v0.124.77); nousergon-data moved too for fleet "
+            "currency, though the gate's floor-only check does not require "
+            "it to match exactly. A cross-repo parity guard "
+            "(lib-pin-cross-repo-guard.yml) now runs on every PR touching a "
+            "pin site in either repo, checking THIS repo's candidate pin "
+            "against the sibling's live main pin, so a single-repo bump "
+            "cannot silently break parity again. Prior: v0.124.75 — bumped "
+            "fleet-wide (alpha-engine-config-I7835) to the tag carrying "
+            "nousergon-lib-PR336 (producer_champion_audit gains "
+            "outcome=held_shadow_only, blocked_by=shadow_only_arm, and "
+            "counterfactual_winner; additive, no schema_version bump), "
+            "consumed by crucible-backtester-PR712's shadow-only ruling "
+            "(alpha-engine-config-I2515). Prior: v0.124.70 — "
+            "restored CO-INSTALL PARITY with crucible-predictor / "
             "nousergon-data / crucible-research, which all moved to v0.124.70 "
             "on 2026-08-18 (nousergon-lib-PR329, the run-scope registry entry "
             "for alpha-engine-config-I7620). This repo stayed at v0.124.69, "

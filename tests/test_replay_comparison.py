@@ -384,8 +384,8 @@ class TestRunnerIntegration:
         )
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            artifact_key="k.json", target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
 
@@ -422,8 +422,8 @@ class TestRunnerIntegration:
         factory, _ = _make_krepis_factory(raise_on_create=RuntimeError("API down"))
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            artifact_key="k.json", target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
 

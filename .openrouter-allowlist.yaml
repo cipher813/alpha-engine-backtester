@@ -1,0 +1,11 @@
+# .openrouter-allowlist.yaml — pre-cleared OpenRouter-literal matches
+# (alpha-engine-config-I7864, wiring the fleet-wide guard). Schema:
+# nousergon-lib scripts/openrouter_guard.py::load_allowlist.
+#
+# EMPTY, deliberately. The four entries this file was created with all
+# covered `replay/runner.py` / `lambda_concordance/handler.py`, and
+# alpha-engine-config-I7878 migrated those call sites onto the krepis router
+# edge rather than letting the entries age out. An allowlist that outlives
+# what it covers silently widens, so the entries went with the linkage.
+schema_version: 1
+entries: []

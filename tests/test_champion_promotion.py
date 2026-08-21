@@ -43,6 +43,7 @@ from optimizer.champion_promotion import (
     GATE_HORIZON_DAYS,
     LEADERBOARD_STALENESS_DAYS,
     OUTCOMES,
+    SHADOW_ONLY_ARMS,
     VALID_CHAMPIONS,
     build_champion_audit,
     build_leaderboard_artifact,
@@ -51,6 +52,7 @@ from optimizer.champion_promotion import (
     evaluate_gates,
     find_latest_research_producer_leaderboard_date,
     hac_significance,
+    is_shadow_only,
     leaderboard_entry_from_e2e_lift,
     leaderboard_gate_inputs,
     leaderboard_row_confidence,
@@ -714,18 +716,26 @@ class TestEvaluateGates:
         assert "agentic" not in VALID_CHAMPIONS
 
     def test_challenger_wins_promotes(self):
+        """A NON-shadow challenger outscoring the champion still promotes
+        immediately -- winner-take-all is unchanged by the 2026-08-20
+        shadow-only ruling for every arm not in SHADOW_ONLY_ARMS. Seats are
+        reversed here (thinktank_coverage incumbent, scanner_predictor_direct
+        challenging) precisely because the forward direction now has a
+        shadow-only arm in the challenger seat -- see
+        TestShadowOnlyArms."""
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "scores": {"scanner_predictor_direct": 0.03, "thinktank_coverage": 0.01},
             "unavailable_reasons": {},
         }
         result = evaluate_gates(
-            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+            champion_before="thinktank_coverage", arm_scores=arm_scores, freeze=False,
         )
         assert result["outcome"] == "promoted"
-        assert result["champion_after"] == "thinktank_coverage"
+        assert result["champion_after"] == "scanner_predictor_direct"
         assert result["champion_score"] == 0.01
         assert result["challenger_score"] == 0.03
         assert result["blocked_by"] is None
+        assert result["counterfactual_winner"] == "scanner_predictor_direct"
 
     def test_champion_still_winning_stays_champion(self):
         arm_scores = {
@@ -797,16 +807,19 @@ class TestEvaluateGates:
         assert result["blocked_by"] == ["arm_score_unavailable", "arm_score_unavailable"]
 
     def test_freeze_suppresses_pointer_move_but_reports_would_be_outcome(self):
+        # Non-shadow winner (seats reversed) -- --freeze semantics are
+        # unchanged by the shadow-only ruling; a shadow-only winner never
+        # reaches the freeze branch at all (see TestShadowOnlyArms).
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "scores": {"scanner_predictor_direct": 0.03, "thinktank_coverage": 0.01},
             "unavailable_reasons": {},
         }
         result = evaluate_gates(
-            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=True,
+            champion_before="thinktank_coverage", arm_scores=arm_scores, freeze=True,
         )
         assert result["outcome"] == "promoted"
         assert result["blocked_by"] == ["frozen"]
-        assert result["champion_after"] == "scanner_predictor_direct"  # NOT advanced under freeze
+        assert result["champion_after"] == "thinktank_coverage"  # NOT advanced under freeze
 
 
 # ── Pointer writer (single writer, dual promotion_source caller) ───────────
@@ -829,13 +842,31 @@ class TestWriteChampionPointer:
         body = json.loads(call.kwargs["Body"])
         assert body == pointer
 
-    def test_writes_thinktank_coverage(self):
+    def test_refuses_shadow_only_arm(self):
+        """alpha-engine-config-I2515 (Brian's 2026-08-20 ruling) -- DEFENCE
+        IN DEPTH at the writer. thinktank_coverage remains a VALID_CHAMPIONS
+        value (read-tolerated; the executor has a live consumer for it) but
+        the single writer refuses to move the live pointer onto it, so a
+        future caller that bypasses evaluate_gates entirely -- a new
+        bootstrap, a backfill, a repair script -- still cannot flip it."""
         s3 = MagicMock()
-        pointer = write_champion_pointer(
-            "bucket", "thinktank_coverage",
-            promotion_source="gate_engine", upload=True, s3_client=s3,
-        )
-        assert pointer["champion"] == "thinktank_coverage"
+        with pytest.raises(ValueError, match="SHADOW-ONLY"):
+            write_champion_pointer(
+                "bucket", "thinktank_coverage",
+                promotion_source="gate_engine", upload=True, s3_client=s3,
+            )
+        s3.put_object.assert_not_called()
+
+    def test_refuses_shadow_only_arm_even_with_upload_false(self):
+        """The refusal is about the VALUE, not about whether S3 is touched
+        -- a dry run that "would have" set a shadow arm live must fail just
+        as loudly, or a --freeze rehearsal would report a promotion the real
+        run can never perform."""
+        with pytest.raises(ValueError, match="SHADOW-ONLY"):
+            write_champion_pointer(
+                "bucket", "thinktank_coverage",
+                promotion_source="operator_bootstrap", upload=False,
+            )
 
     def test_upload_false_skips_s3(self):
         s3 = MagicMock()
@@ -1177,12 +1208,12 @@ class TestBuildChampionAudit:
         (not only no_contest) -- the audit trail must show which week's
         evidence decided a flip."""
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "scores": {"scanner_predictor_direct": 0.03, "thinktank_coverage": 0.01},
             "unavailable_reasons": {},
             "leaderboard_date_used": "2026-07-11",
         }
         gate_result = evaluate_gates(
-            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+            champion_before="thinktank_coverage", arm_scores=arm_scores, freeze=False,
         )
         audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
         assert audit["outcome"] == "promoted"
@@ -1190,8 +1221,11 @@ class TestBuildChampionAudit:
 
     @pytest.mark.parametrize("outcome", OUTCOMES)
     def test_all_outcomes_are_in_frozen_vocabulary(self, outcome):
+        # held_shadow_only added alpha-engine-config-I2515 (2026-08-20) --
+        # additive to the v2 contract, no schema_version bump.
         assert outcome in (
-            "promoted", "no_contest", "unchanged_winner_already_champion", "error",
+            "promoted", "no_contest", "unchanged_winner_already_champion",
+            "held_shadow_only", "error",
         )
 
 
@@ -1203,18 +1237,33 @@ class TestRunWeeklyEvaluation:
 
     def test_challenger_wins_promotes_and_writes_pointer(self):
         s3 = _FakeS3()
+        # Seats reversed (alpha-engine-config-I2515): thinktank_coverage is
+        # SHADOW-ONLY and can no longer take the pointer by winning, so the
+        # ordinary promotion path is exercised in the only direction it can
+        # still fire -- scanner_predictor_direct challenging and winning.
+        # Its declared feed (research_free_backfill) must be live or the
+        # I3165 feed guard would block for an unrelated reason.
+        s3.put_object(
+            Bucket=self.BUCKET, Key="config/producer_champion.json",
+            Body=json.dumps({
+                "schema_version": 1, "champion": "thinktank_coverage",
+                "promoted_at": "2026-07-13T00:00:00Z",
+                "promotion_source": "gate_engine",
+            }).encode(),
+        )
+        _put_research_free_backfill_parquet(s3, self.BUCKET, newest_prediction_date="2026-07-16")
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
-            e2e_lift=_e2e_lift_ok(sn_lift=0.01),
-            tt_leaderboard=_tt_leaderboard_ok(run_date="2026-07-18", mean=0.03),
+            e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+            tt_leaderboard=_tt_leaderboard_ok(run_date="2026-07-18", mean=0.01),
             tt_leaderboard_date_used="2026-07-18",
             freeze=False, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "promoted"
-        assert result["champion_after"] == "thinktank_coverage"
+        assert result["champion_after"] == "scanner_predictor_direct"
         assert result["leaderboard_date_used"] == "2026-07-18"
         pointer = json.loads(s3.store[f"{self.BUCKET}/config/producer_champion.json"])
-        assert pointer["champion"] == "thinktank_coverage"
+        assert pointer["champion"] == "scanner_predictor_direct"
         assert pointer["promotion_source"] == "gate_engine"
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/latest.json" in s3.store
@@ -1228,10 +1277,25 @@ class TestRunWeeklyEvaluation:
         landed yet) -- leaderboard_date_used must record the OLDER date
         actually consulted, not run_date."""
         s3 = _FakeS3()
+        # Seats reversed (alpha-engine-config-I2515): thinktank_coverage is
+        # SHADOW-ONLY and can no longer take the pointer by winning, so the
+        # ordinary promotion path is exercised in the only direction it can
+        # still fire -- scanner_predictor_direct challenging and winning.
+        # Its declared feed (research_free_backfill) must be live or the
+        # I3165 feed guard would block for an unrelated reason.
+        s3.put_object(
+            Bucket=self.BUCKET, Key="config/producer_champion.json",
+            Body=json.dumps({
+                "schema_version": 1, "champion": "thinktank_coverage",
+                "promoted_at": "2026-07-13T00:00:00Z",
+                "promotion_source": "gate_engine",
+            }).encode(),
+        )
+        _put_research_free_backfill_parquet(s3, self.BUCKET, newest_prediction_date="2026-07-16")
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
-            e2e_lift=_e2e_lift_ok(sn_lift=0.01),
-            tt_leaderboard=_tt_leaderboard_ok(run_date="2026-07-11", mean=0.03),
+            e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+            tt_leaderboard=_tt_leaderboard_ok(run_date="2026-07-11", mean=0.01),
             tt_leaderboard_date_used="2026-07-11",
             freeze=False, upload=True, s3_client=s3,
         )
@@ -1307,16 +1371,33 @@ class TestRunWeeklyEvaluation:
 
     def test_freeze_suppresses_pointer_write_but_audit_always_written(self):
         s3 = _FakeS3()
+        # Seats reversed (alpha-engine-config-I2515): thinktank_coverage is
+        # SHADOW-ONLY and can no longer take the pointer by winning, so the
+        # ordinary promotion path is exercised in the only direction it can
+        # still fire -- scanner_predictor_direct challenging and winning.
+        # Its declared feed (research_free_backfill) must be live or the
+        # I3165 feed guard would block for an unrelated reason.
+        s3.put_object(
+            Bucket=self.BUCKET, Key="config/producer_champion.json",
+            Body=json.dumps({
+                "schema_version": 1, "champion": "thinktank_coverage",
+                "promoted_at": "2026-07-13T00:00:00Z",
+                "promotion_source": "gate_engine",
+            }).encode(),
+        )
+        _put_research_free_backfill_parquet(s3, self.BUCKET, newest_prediction_date="2026-07-16")
+        pointer_key = f"{self.BUCKET}/config/producer_champion.json"
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
-            e2e_lift=_e2e_lift_ok(sn_lift=0.01),
-            tt_leaderboard=_tt_leaderboard_ok(run_date="2026-07-18", mean=0.03),
+            e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+            tt_leaderboard=_tt_leaderboard_ok(run_date="2026-07-18", mean=0.01),
             tt_leaderboard_date_used="2026-07-18",
             freeze=True, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "promoted"
         assert result["blocked_by"] == ["frozen"]
-        assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
+        # Pointer untouched -- still the seeded value, never advanced.
+        assert json.loads(s3.store[pointer_key])["champion"] == "thinktank_coverage"
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
 
     def test_legacy_agentic_pointer_normalizes_without_crashing(self):
@@ -1442,9 +1523,18 @@ class TestSchemaConformance:
         self._validate(POINTER_SCHEMA_PATH, pointer)
 
     def test_pointer_conforms_thinktank_coverage(self):
-        pointer = write_champion_pointer(
-            "bucket", "thinktank_coverage", promotion_source="gate_engine", upload=False,
-        )
+        """alpha-engine-config-I2515: thinktank_coverage remains a schema
+        -VALID pointer value (the executor has a live consumer for it and
+        a historical pointer must stay readable) even though the writer now
+        refuses to produce one -- so the shape is asserted directly rather
+        than via write_champion_pointer, which raises. The refusal itself is
+        pinned by TestWriteChampionPointer::test_refuses_shadow_only_arm."""
+        pointer = {
+            "schema_version": 1,
+            "champion": "thinktank_coverage",
+            "promoted_at": "2026-07-13T22:07:09Z",
+            "promotion_source": "gate_engine",
+        }
         self._validate(POINTER_SCHEMA_PATH, pointer)
 
     def test_legacy_agentic_pointer_shape_is_schema_valid(self):
@@ -1460,12 +1550,14 @@ class TestSchemaConformance:
         self._validate(POINTER_SCHEMA_PATH, legacy)
 
     def test_promoted_audit_conforms(self):
+        # Non-shadow winner (seats reversed, alpha-engine-config-I2515):
+        # thinktank_coverage can no longer produce a "promoted" record.
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "scores": {"scanner_predictor_direct": 0.03, "thinktank_coverage": 0.01},
             "unavailable_reasons": {},
         }
         gate_result = evaluate_gates(
-            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+            champion_before="thinktank_coverage", arm_scores=arm_scores, freeze=False,
         )
         audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
         self._validate(AUDIT_SCHEMA, audit)
@@ -1542,13 +1634,14 @@ class TestSchemaConformance:
         self._validate(AUDIT_SCHEMA, audit)
 
     def test_promoted_audit_carries_leaderboard_date_used_and_conforms(self):
+        # Non-shadow winner (seats reversed, alpha-engine-config-I2515).
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "scores": {"scanner_predictor_direct": 0.03, "thinktank_coverage": 0.01},
             "unavailable_reasons": {},
             "leaderboard_date_used": "2026-07-11",
         }
         gate_result = evaluate_gates(
-            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+            champion_before="thinktank_coverage", arm_scores=arm_scores, freeze=False,
         )
         audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
         assert audit["leaderboard_date_used"] == "2026-07-11"
@@ -1558,6 +1651,22 @@ class TestSchemaConformance:
         schema = AUDIT_SCHEMA
         slugs = set(schema["properties"]["blocked_by"]["oneOf"][1]["items"]["enum"])
         assert "leaderboard_stale_gt_8d" in slugs
+
+    def test_shadow_only_arm_slug_in_schema_enum(self):
+        """Self-clearing (alpha-engine-config-I2515): the slug ships in
+        nousergon-lib-PR336 and this repo's pin cannot move ahead of it
+        independently (weekly-SF LibPinDriftGate co-install parity). Skips
+        loudly until the pin moves, then enforces — see
+        TestShadowOnlyEndToEnd::test_shadow_hold_audit_conforms_to_the
+        _frozen_contract for the same sequencing note in full."""
+        slugs = set(AUDIT_SCHEMA["properties"]["blocked_by"]["oneOf"][1]["items"]["enum"])
+        if "held_shadow_only" not in AUDIT_SCHEMA["properties"]["outcome"]["enum"]:
+            pytest.skip(
+                "pinned nousergon-lib predates PR336 (held_shadow_only / "
+                "shadow_only_arm contract additions) — self-clears on pin bump"
+            )
+        assert "shadow_only_arm" in slugs
+        assert "counterfactual_winner" in AUDIT_SCHEMA["properties"]
 
     def test_feed_producer_dead_slug_in_schema_enum(self):
         schema = AUDIT_SCHEMA
@@ -1693,24 +1802,30 @@ class TestCheckFeedDependenciesLive:
 
 
 class TestEvaluateGatesFeedLiveness:
+    """Seats are reversed throughout (thinktank_coverage incumbent,
+    scanner_predictor_direct challenging): alpha-engine-config-I2515 makes
+    thinktank_coverage shadow-only, so its win is vetoed BEFORE the feed
+    guard is ever consulted and this guard is only reachable in the other
+    direction. TestShadowOnlyArms pins that precedence explicitly."""
+
     def test_feed_blocked_slug_degrades_would_be_promotion_to_no_contest(self):
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "scores": {"scanner_predictor_direct": 0.03, "thinktank_coverage": 0.01},
             "unavailable_reasons": {},
         }
         result = evaluate_gates(
-            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+            champion_before="thinktank_coverage", arm_scores=arm_scores, freeze=False,
             feed_blocked_slug=None,
         )
         assert result["outcome"] == "promoted"  # sanity: unblocked path still promotes
 
         blocked = evaluate_gates(
-            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+            champion_before="thinktank_coverage", arm_scores=arm_scores, freeze=False,
             feed_blocked_slug="feed_producer_dead",
         )
         assert blocked["outcome"] == "no_contest"
         assert blocked["blocked_by"] == ["feed_producer_dead"]
-        assert blocked["champion_after"] == "scanner_predictor_direct"  # pointer never moves
+        assert blocked["champion_after"] == "thinktank_coverage"  # pointer never moves
 
     def test_feed_blocked_slug_irrelevant_when_challenger_does_not_win(self):
         """The feed check only matters on the WIN path -- an incumbent that
@@ -1731,11 +1846,11 @@ class TestEvaluateGatesFeedLiveness:
         the audit trail should show the TRUE validity-guard reason, not a
         suppression that implies the promotion was otherwise valid."""
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "scores": {"scanner_predictor_direct": 0.03, "thinktank_coverage": 0.01},
             "unavailable_reasons": {},
         }
         result = evaluate_gates(
-            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=True,
+            champion_before="thinktank_coverage", arm_scores=arm_scores, freeze=True,
             feed_blocked_slug="feed_producer_dead",
         )
         assert result["outcome"] == "no_contest"
@@ -1862,31 +1977,32 @@ class TestRunWeeklyEvaluationFeedLiveness:
         pointer_key = f"{self.BUCKET}/config/producer_champion.json"
         assert json.loads(s3.store[pointer_key])["champion"] == "thinktank_coverage"
 
-    def test_champion_defending_own_seat_is_unaffected_by_challenger_feed_liveness(self):
-        """A no-op week (incumbent defends, or the challenger loses on
-        score) must not be perturbed by this gate at all -- feed liveness
-        of a NON-winning challenger is irrelevant since the pointer would
-        not move either way. No research_free_backfill artifact is written
-        (feed looks dead) but scanner_predictor_direct challenges and LOSES
-        on score, so the outcome must be the ordinary unchanged path, not
-        a feed-liveness no_contest."""
+    def test_shadow_only_winner_never_pays_for_the_feed_probe(self):
+        """Was ``test_champion_defending_own_seat_is_unaffected_by_
+        challenger_feed_liveness`` -- it asserted that thinktank_coverage
+        winning promotes without a feed check, which alpha-engine-config
+        -I2515 (Brian's 2026-08-20 shadow-only ruling) forbids outright.
+
+        Rewritten to pin the surviving property: no research_free_backfill
+        artifact is written (that feed looks DEAD) and thinktank_coverage
+        wins on score, yet the record must name the SHADOW-ONLY hold, not
+        feed_producer_dead. Two things at once -- the shadow veto precedes
+        the feed guard, and run_weekly_evaluation skips the probe's S3 read
+        entirely for a shadow-only challenger because its result could not
+        change the outcome."""
         s3 = _FakeS3()
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date=self.RUN_DATE,
             e2e_lift=_e2e_lift_ok(sn_lift=0.01),           # scanner_predictor_direct loses
-            tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=0.05),  # thinktank_coverage's score N/A (it's champion_before here... )
+            tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=0.05),
             tt_leaderboard_date_used=self.RUN_DATE,
             freeze=False, upload=True, s3_client=s3,
         )
-        # champion_before defaults to scanner_predictor_direct (pre
-        # -bootstrap base case) since no pointer was seeded; challenger is
-        # thinktank_coverage, which wins here (0.05 > 0.01) -- a genuine
-        # promotion onto thinktank_coverage, which declares NO feed
-        # dependency, so the missing research_free_backfill artifact must
-        # not block it.
-        assert result["outcome"] == "promoted"
-        assert result["champion_after"] == "thinktank_coverage"
-        assert result["blocked_by"] is None
+        assert result["outcome"] == "held_shadow_only"
+        assert result["blocked_by"] == ["shadow_only_arm"]
+        assert result["champion_after"] == "scanner_predictor_direct"
+        assert result["counterfactual_winner"] == "thinktank_coverage"
+        assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
 
 
 # ── Champion-side evidence floor (alpha-engine-config-I7549, second half) ──
@@ -2042,3 +2158,274 @@ class TestChampionSideEvidenceFloor:
         ):
             assert slug in _BLOCKED_BY_SLUGS
             assert slug in enum
+
+
+# ── Shadow-only arms (Brian's ruling 2026-08-20, alpha-engine-config-I2515) ─
+
+
+class TestShadowOnlyArms:
+    """THE regression bar for the 2026-08-20 shadow-only ruling:
+
+        "research should now be think tank in shadow mode only with the main
+        research process skipped by passing a scanner top 20 to predictor"
+
+    Think Tank is MEASURED; it does not become the live selection by winning.
+    Before this change the gate would have flipped
+    config/producer_champion.json to thinktank_coverage the first week TT
+    outscored the champion -- and crucible-executor's
+    executor/champion.py::_apply_thinktank_coverage is a LIVE consumer of
+    that value, so the ruling would have been violated by a real trading
+    behaviour change on a weekly-firing path. 2026-08-14 was the first week
+    TT produced a real score and it LOST (-0.060751 vs -0.00203); that loss,
+    not any guard, is the only reason the pointer had not already moved.
+    """
+
+    def test_registry_is_the_single_source_of_truth(self):
+        """The class-level fix: shadow-only-ness is a declared PROPERTY OF
+        AN ARM, not a string literal at the veto site. A future arm added in
+        shadow mode inherits the protection at BOTH enforcement layers by
+        joining this frozenset, and a future promotion is a one-line data
+        change plus Brian's ruling."""
+        assert SHADOW_ONLY_ARMS == frozenset({"thinktank_coverage"})
+        assert is_shadow_only("thinktank_coverage") is True
+        assert is_shadow_only("scanner_predictor_direct") is False
+        assert is_shadow_only(None) is False
+
+    def test_veto_site_does_not_hard_code_the_arm_name(self):
+        """Fix the CLASS, not the instance: the module may name
+        thinktank_coverage in the registry declaration, the docstrings and
+        the scoring paths (which are arm-specific by nature), but the gate's
+        veto and the writer's guard must both ask SHADOW_ONLY_ARMS. Pinned
+        by source inspection because a hard-coded second copy would pass
+        every behavioural test in this file while silently not covering the
+        next shadow arm."""
+        import ast
+        import inspect
+        import textwrap
+
+        from optimizer import champion_promotion as cp
+
+        for fn in (cp.evaluate_gates, cp.write_champion_pointer):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            node = tree.body[0]
+            # Drop the docstring and every comment (comments are not in the
+            # AST at all): only EXECUTABLE code is inspected, so prose may
+            # name the arm -- and must, to be readable -- while the logic
+            # may not.
+            stmts = node.body
+            if (stmts and isinstance(stmts[0], ast.Expr)
+                    and isinstance(stmts[0].value, ast.Constant)
+                    and isinstance(stmts[0].value.value, str)):
+                stmts = stmts[1:]
+            code = "\n".join(ast.unparse(st) for st in stmts)
+            assert "is_shadow_only(" in code, fn.__name__
+            assert "thinktank_coverage" not in code, fn.__name__
+
+    def test_shadow_arm_winning_holds_the_pointer(self):
+        """Deliverable: TT wins on score -> NOT promoted, explicit slug, and
+        the counterfactual winner is recorded."""
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "unavailable_reasons": {},
+        }
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+        assert result["outcome"] == "held_shadow_only"
+        assert result["blocked_by"] == ["shadow_only_arm"]
+        assert result["champion_after"] == "scanner_predictor_direct"
+        # The MEASUREMENT is untouched -- both scores and the would-be
+        # winner survive into the record.
+        assert result["champion_score"] == 0.01
+        assert result["challenger_score"] == 0.03
+        assert result["counterfactual_winner"] == "thinktank_coverage"
+
+    def test_shadow_arm_losing_is_byte_identical_to_before(self):
+        """TT loses -> the ordinary defended-incumbency path, unchanged.
+        This is the 2026-08-14 shape (champion -0.00203 vs TT -0.060751),
+        the state production is actually in today."""
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": -0.00203, "thinktank_coverage": -0.060751},
+            "unavailable_reasons": {},
+        }
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+        assert result["outcome"] == "unchanged_winner_already_champion"
+        assert result["blocked_by"] is None
+        assert result["champion_after"] == "scanner_predictor_direct"
+        assert result["counterfactual_winner"] == "scanner_predictor_direct"
+
+    def test_non_shadow_challenger_winning_still_promotes(self):
+        """The ruling is narrow: it removes ONE arm's promotability, not
+        winner-take-all itself. A non-shadow challenger that outscores the
+        champion still promotes immediately -- no significance test, no
+        hysteresis, no cooldown."""
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": 0.04, "thinktank_coverage": 0.01},
+            "unavailable_reasons": {},
+        }
+        result = evaluate_gates(
+            champion_before="thinktank_coverage", arm_scores=arm_scores, freeze=False,
+        )
+        assert result["outcome"] == "promoted"
+        assert result["champion_after"] == "scanner_predictor_direct"
+        assert result["blocked_by"] is None
+
+    def test_shadow_veto_precedes_freeze(self):
+        """--freeze is a suppression of an otherwise-valid promotion; a
+        shadow hold is a standing policy decision. The record must name the
+        TRUE, stable reason the pointer did not move, or a --freeze run
+        would imply the promotion becomes valid once the flag is dropped."""
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "unavailable_reasons": {},
+        }
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=True,
+        )
+        assert result["outcome"] == "held_shadow_only"
+        assert result["blocked_by"] == ["shadow_only_arm"]
+
+    def test_shadow_veto_precedes_the_feed_guard(self):
+        """Same reasoning against a transient guard: feed_producer_dead
+        would suggest the pointer moves once the feed recovers."""
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "unavailable_reasons": {},
+        }
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+            feed_blocked_slug="feed_producer_dead",
+        )
+        assert result["outcome"] == "held_shadow_only"
+        assert result["blocked_by"] == ["shadow_only_arm"]
+
+    def test_no_contest_still_records_no_counterfactual_winner(self):
+        """A week with no comparable evidence has no winner to record --
+        counterfactual_winner must stay None rather than defaulting to
+        either arm (the module's standing "a no-contest NEVER defaults a win
+        to either side" posture)."""
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": None},
+            "unavailable_reasons": {"thinktank_coverage": "thinktank_coverage_not_in_leaderboard"},
+        }
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+        assert result["outcome"] == "no_contest"
+        assert result["counterfactual_winner"] is None
+
+
+class TestShadowOnlyEndToEnd:
+    """run_weekly_evaluation -- the wiring evaluate.py actually calls in the
+    weekly SF's EvaluatorOptimize stage."""
+
+    BUCKET = "test-bucket"
+    RUN_DATE = "2026-08-22"  # the next weekly SF firing after the ruling
+
+    def test_shadow_arm_win_writes_audit_but_never_the_pointer(self):
+        s3 = _FakeS3()
+        result = run_weekly_evaluation(
+            bucket=self.BUCKET, run_date=self.RUN_DATE,
+            e2e_lift=_e2e_lift_ok(sn_lift=0.01),
+            tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=0.03),
+            tt_leaderboard_date_used=self.RUN_DATE,
+            freeze=False, upload=True, s3_client=s3,
+        )
+        assert result["outcome"] == "held_shadow_only"
+        assert result["blocked_by"] == ["shadow_only_arm"]
+        # THE deliverable: the live pointer object is never created/moved.
+        assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
+        # The audit record is still written (liveness proxy, config#2054)
+        # and carries the counterfactual.
+        audit = json.loads(
+            s3.store[f"{self.BUCKET}/config/apply_audit/producer_champion/{self.RUN_DATE}.json"]
+        )
+        assert audit["outcome"] == "held_shadow_only"
+        assert audit["counterfactual_winner"] == "thinktank_coverage"
+        assert audit["champion_after"] == "scanner_predictor_direct"
+        assert audit["champion_score"] == 0.01
+        assert audit["challenger_score"] == 0.03
+
+    def test_shadow_hold_audit_conforms_to_the_frozen_contract(self):
+        """A record the contract cannot express is a record nothing
+        downstream can read -- the dashboard validates against this same
+        published schema.
+
+        SEQUENCING (alpha-engine-config-I2515): `outcome` and `blocked_by`
+        are CLOSED enums in the published contract, which since I7605 lives
+        in nousergon-lib, not this repo. The additions this record needs
+        (held_shadow_only / shadow_only_arm) ship in nousergon-lib-PR336.
+        This repo's pin CANNOT move ahead of them independently -- the
+        weekly SF's LibPinDriftGate hard-fails on co-install parity across
+        crucible-predictor / nousergon-data / crucible-research, so a lib
+        bump is a coordinated fleet operation, not a line in this PR (that
+        gate killed a manual weekly execution 90s in on 2026-08-18).
+
+        So this assertion SKIPS -- loudly, naming why -- while the pinned
+        lib predates PR336, and starts enforcing itself the moment the pin
+        moves. It is not a permanent tolerance and needs no follow-up edit
+        to become real. The live-risk half of this change (the pointer is
+        never written onto a shadow arm) is pinned by tests that do not
+        depend on the contract at all and run today.
+        """
+        import jsonschema
+
+        if "held_shadow_only" not in AUDIT_SCHEMA["properties"]["outcome"]["enum"]:
+            pytest.skip(
+                "pinned nousergon-lib predates PR336 (the held_shadow_only / "
+                "shadow_only_arm contract additions, alpha-engine-config"
+                "-I2515) — this assertion self-clears when the lib pin moves"
+            )
+
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": -0.00203, "thinktank_coverage": 0.041},
+            "unavailable_reasons": {},
+            "leaderboard_date_used": "2026-08-15",
+        }
+        gate_result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+        audit = build_champion_audit("2026-08-22", gate_result, freeze=False)
+        jsonschema.validate(audit, AUDIT_SCHEMA)
+        assert audit["outcome"] == "held_shadow_only"
+        assert audit["counterfactual_winner"] == "thinktank_coverage"
+
+    def test_shadow_arm_loss_is_unchanged_behaviour(self):
+        """The 2026-08-14 production shape: TT scored and lost. Byte
+        -identical to the pre-change behaviour -- unchanged outcome, no
+        pointer write, no shadow slug."""
+        s3 = _FakeS3()
+        result = run_weekly_evaluation(
+            bucket=self.BUCKET, run_date=self.RUN_DATE,
+            e2e_lift=_e2e_lift_ok(sn_lift=-0.00203),
+            tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=-0.060751),
+            tt_leaderboard_date_used=self.RUN_DATE,
+            freeze=False, upload=True, s3_client=s3,
+        )
+        assert result["outcome"] == "unchanged_winner_already_champion"
+        assert result["blocked_by"] is None
+        assert result["counterfactual_winner"] == "scanner_predictor_direct"
+        assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
+
+    def test_measurement_continues_every_week(self):
+        """champion-challenger-policy.md section 3: measurement is
+        unconditional. A shadow arm that silently stops being scored defeats
+        the point of shadow mode -- so BOTH scores must be present in the
+        durable record on a held week, not just the champion's."""
+        s3 = _FakeS3()
+        run_weekly_evaluation(
+            bucket=self.BUCKET, run_date=self.RUN_DATE,
+            e2e_lift=_e2e_lift_ok(sn_lift=0.01),
+            tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=0.03),
+            tt_leaderboard_date_used=self.RUN_DATE,
+            freeze=False, upload=True, s3_client=s3,
+        )
+        audit = json.loads(
+            s3.store[f"{self.BUCKET}/config/apply_audit/producer_champion/{self.RUN_DATE}.json"]
+        )
+        assert audit["champion_score"] is not None
+        assert audit["challenger_score"] is not None
+        assert audit["leaderboard_date_used"] == self.RUN_DATE
+        assert audit["arm_confidence"]["thinktank_coverage"] == "ok"

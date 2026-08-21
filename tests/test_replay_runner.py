@@ -14,19 +14,26 @@ Covers:
 - Unknown agent_id family → skipped with marker.
 - ``client_factory`` injection point exercised end-to-end.
 
+alpha-engine-config-I7878 (2026-08-20): the target-model call moved onto
+the krepis router edge (``krepis.router.resolve_model_spec``), so
+``target_model`` is now a REGISTRY ENTRY ID and no provider key is passed
+anywhere in this file. ``conftest.py``'s autouse
+``_stub_router_resolution`` fixture supplies a deterministic fake
+resolution naming the edge — a test that wants the real one, or a failing
+one, patches ``replay.runner.resolve_target_spec`` itself.
+
 alpha-engine-config-I2997 (2026-07-19): migrated off direct Anthropic
-(``langchain_anthropic.ChatAnthropic``) to ``krepis.llm.LLMClient``'s
-OpenRouter transport (see ``replay/runner.py``'s module docstring). Mocks
-now build a fake ``openai``-shaped transport client via the
-``client_factory`` seam (``(spec, api_key) -> client`` exposing
-``chat.completions.create``) instead of a fake ``ChatAnthropic``.
+(``langchain_anthropic.ChatAnthropic``) to ``krepis.llm.LLMClient``. Mocks
+build a fake ``openai``-shaped transport client via the ``client_factory``
+seam (``(spec, api_key) -> client`` exposing ``chat.completions.create``)
+instead of a fake ``ChatAnthropic``.
 """
 
 from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
@@ -78,7 +85,7 @@ def _make_s3_stub(artifact: dict) -> MagicMock:
 def _make_krepis_factory(
     *,
     content: str | None = None,
-    model: str = "deepseek/deepseek-v4-flash",
+    model: str = "deepseek-v4-flash",
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     cost: float | None = None,
@@ -148,17 +155,17 @@ class TestStructuredReplay:
 
         replay = replay_artifact(
             artifact_key="decision_artifacts/2026/05/03/x/run-abc.json",
-            target_model="deepseek/deepseek-v4-flash",
+            target_model="deepseek-v4-flash",
             s3_client=s3,
             client_factory=factory,
-            api_key="sk-or-test",
         )
 
+        assert replay.replay_error is None, replay.replay_error
         assert replay.replay_output_kind == "structured"
         assert replay.replay_output["ranked_picks"][0]["ticker"] == "AAPL"
         assert replay.replay_error is None
         assert replay.original_model == "claude-sonnet-4-6"
-        assert replay.replay_model == "deepseek/deepseek-v4-flash"
+        assert replay.replay_model == "deepseek-v4-flash"
 
     def test_factory_called_with_target_model_and_max_tokens(self):
         from nousergon_lib.agent_schemas import QuantAnalystOutput
@@ -172,24 +179,29 @@ class TestStructuredReplay:
 
         replay_artifact(
             artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
+            target_model="deepseek-v4-flash",
             max_tokens=4096,
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            s3_client=s3, client_factory=factory,
         )
 
         # client_factory receives (spec, api_key) — spec carries the
-        # resolved model/max_tokens/provider, not bare kwargs.
+        # RESOLVED route, not bare kwargs. After
+        # alpha-engine-config-I7878 the spec names the router edge and the
+        # model is the registry entry id; no provider name, no provider URL
+        # and no provider key appear at this call site any more.
         factory.assert_called_once()
         spec = factory.call_args.args[0]
-        assert spec.provider == "openrouter"
-        assert spec.model == "deepseek/deepseek-v4-flash"
+        assert spec.provider != "openrouter"
+        assert spec.base_url == "https://router.test:8443"
+        assert spec.model == "deepseek-v4-flash"
         assert spec.max_tokens == 4096
-        assert factory.call_args.args[1] == "sk-or-test"
 
-    def test_structured_outputs_false_and_reasoning_excluded(self):
+    def test_structured_outputs_false_is_requested_of_the_resolver(self):
         """REQUIRED, not incidental — see runner.py's module docstring:
-        live-verified 2026-07-19 that strict response_format=json_schema
-        is unreliable for DeepSeek-family models on OpenRouter."""
+        live-verified 2026-07-19 that strict response_format=json_schema is
+        unreliable for the DeepSeek family. It is a statement about how this
+        harness INVOKES, so it stays an explicit override at the call site;
+        `reasoning` moved the other way and is now a registry fact."""
         from nousergon_lib.agent_schemas import QuantAnalystOutput
         from replay.runner import replay_artifact
 
@@ -201,14 +213,13 @@ class TestStructuredReplay:
 
         replay_artifact(
             artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
 
         spec = factory.call_args.args[0]
         assert spec.structured_outputs is False
-        assert spec.reasoning == {"exclude": True}
 
     def test_resolves_canonical_schema_and_round_trips_it(self):
         """Replay must validate against the schema RESOLVED FROM THE
@@ -249,8 +260,8 @@ class TestStructuredReplay:
 
             replay = replay_artifact(
                 artifact_key="k.json",
-                target_model="deepseek/deepseek-v4-flash",
-                s3_client=s3, client_factory=factory, api_key="sk-or-test",
+                target_model="deepseek-v4-flash",
+                s3_client=s3, client_factory=factory,
                 persist=False,
             )
 
@@ -271,8 +282,8 @@ class TestStructuredReplay:
 
         replay_artifact(
             artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
 
@@ -312,8 +323,8 @@ class TestSchemaValidationError:
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
 
@@ -330,8 +341,8 @@ class TestSchemaValidationError:
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
 
@@ -354,33 +365,77 @@ class TestErrorHandling:
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
         )
 
         assert replay.replay_output_kind == "error"
         assert "OpenRouter 500" in (replay.replay_error or "")
         assert s3.put_object.called
 
-    def test_missing_api_key_captured_not_raised(self):
-        """No api_key arg + no resolvable OPENROUTER_API_KEY (env-isolated
-        by conftest's autouse secrets fixture) → captured as replay_error,
-        never propagated. Replay is offline analysis; one bad config
-        should never abort a batch."""
-        from replay.runner import replay_artifact
+    def test_router_unreachable_raises_and_never_reaches_a_provider(self):
+        """FAIL CLOSED (model-router-policy R20/R26). A router edge that will
+        not admit this process is a PRECONDITION failure, not a per-artifact
+        replay error: it is identical for every artifact and is not the
+        divergence this module measures. It propagates, so the batch layer
+        stops the target instead of recording N identical failures — and
+        there is deliberately no direct-provider fallback, because a pinned
+        model has no registry-declared substitute and the only reachable
+        alternative would be the DLP-unscanned direct call
+        alpha-engine-config-I6367 removed."""
+        import pytest
+
+        from replay import runner as runner_mod
 
         artifact = _make_captured_artifact()
         s3 = _make_s3_stub(artifact)
 
-        replay = replay_artifact(
-            artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, api_key=None,
-            persist=False,
-        )
+        def _edge_down(model_id, *, max_tokens=8192):
+            raise RuntimeError(
+                "Router edge at https://router.test:8443 did not admit this "
+                "process: LITELLM_MASTER_KEY not resolvable"
+            )
 
-        assert replay.replay_output_kind == "error"
-        assert "OpenRouter API key" in (replay.replay_error or "")
+        with patch.object(runner_mod, "resolve_target_spec", _edge_down):
+            with pytest.raises(RuntimeError) as exc:
+                runner_mod.replay_artifact(
+                    artifact_key="k.json",
+                    target_model="deepseek-v4-flash",
+                    s3_client=s3,
+                    persist=False,
+                )
+
+        assert "did not admit this process" in str(exc.value)
+        # Nothing was written: the failure is before any spend or any PUT.
+        s3.put_object.assert_not_called()
+
+    def test_an_unknown_target_model_id_propagates(self):
+        """A provider slug is not a registry entry id. The router refuses it
+        and names what IS addressable — a hand-written model id silently
+        killed a live fleet consumer on 2026-07-15, so this must be loud."""
+        import pytest
+
+        from replay import runner as runner_mod
+
+        artifact = _make_captured_artifact()
+        s3 = _make_s3_stub(artifact)
+
+        def _unknown(model_id, *, max_tokens=8192):
+            raise ValueError(
+                f"Model id {model_id!r} is not in the registry. "
+                "Addressable ids: ['deepseek-v4-flash']"
+            )
+
+        with patch.object(runner_mod, "resolve_target_spec", _unknown):
+            with pytest.raises(ValueError) as exc:
+                runner_mod.replay_artifact(
+                    artifact_key="k.json",
+                    target_model="deepseek/deepseek-v4-flash",
+                    s3_client=s3,
+                    persist=False,
+                )
+
+        assert "not in the registry" in str(exc.value)
 
 
 # ── Unknown agent_id family ──────────────────────────────────────────────
@@ -400,8 +455,8 @@ class TestUnknownAgentSkip:
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
 
@@ -457,8 +512,8 @@ class TestDeterministicArtifactSkip:
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
 
@@ -484,8 +539,8 @@ class TestDeterministicArtifactSkip:
         # Must not raise.
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
         assert replay is not None
@@ -508,8 +563,8 @@ class TestPersistence:
         )
 
         replay_artifact(
-            artifact_key="src.json", target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            artifact_key="src.json", target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
         )
 
         # Canonical eval_artifacts layout: a flat dated key
@@ -528,10 +583,12 @@ class TestPersistence:
         # Flat — exactly one path segment after the prefix, no run-xyz dir.
         assert key.startswith("decision_artifacts/_replay/")
         assert "run-xyz/" not in key
-        # target_model's "/" is sanitized to "-" the same as ":" — an
-        # OpenRouter-shaped id (deepseek/deepseek-v4-flash) must not
-        # fracture the S3 key into extra path segments.
-        assert key.endswith("_claude-sonnet-4-6_vs_deepseek-deepseek-v4-flash.json")
+        # A registry entry id carries no "/" (alpha-engine-config-I7878),
+        # so the key is the id verbatim. The "/"->"-" sanitization is kept
+        # as defence — see test_slash_in_target_is_sanitized below — because
+        # a key that fractures into extra path segments breaks the flat
+        # layout `analysis/agent_justification.py` parses.
+        assert key.endswith("_claude-sonnet-4-6_vs_deepseek-v4-flash.json")
         basename = key.rsplit("/", 1)[-1]
         assert basename.count("/") == 0
         run_id = basename.split("_", 1)[0]
@@ -554,8 +611,8 @@ class TestPersistence:
         )
 
         replay_artifact(
-            artifact_key="src.json", target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            artifact_key="src.json", target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
         )
 
         bodies_by_key = {
@@ -584,8 +641,8 @@ class TestPersistence:
         )
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            artifact_key="k.json", target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
 
@@ -604,8 +661,8 @@ class TestPersistence:
         )
 
         replay_artifact(
-            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            artifact_key="k.json", target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
         )
 
         dated = [
@@ -632,8 +689,8 @@ class TestUsageExtraction:
         )
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            artifact_key="k.json", target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
         )
 
         assert replay.replay_cost["input_tokens"] == 1234
@@ -656,8 +713,8 @@ class TestUsageExtraction:
         )
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            artifact_key="k.json", target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
         )
 
         assert replay.replay_cost["served_provider"] == "DeepInfra"
@@ -676,8 +733,8 @@ class TestUsageExtraction:
         )
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            artifact_key="k.json", target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
         )
 
         assert replay.replay_cost.get("served_provider") is None
@@ -693,8 +750,8 @@ class TestUsageExtraction:
         )
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            artifact_key="k.json", target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
         )
 
         assert replay.replay_cost["input_tokens"] == 0
@@ -770,8 +827,8 @@ class TestPlaceholderPromptSkip:
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
 
@@ -793,10 +850,89 @@ class TestPlaceholderPromptSkip:
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="deepseek/deepseek-v4-flash",
-            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            target_model="deepseek-v4-flash",
+            s3_client=s3, client_factory=factory,
             persist=False,
         )
 
         assert replay.replay_output_kind == "skipped"
         factory.assert_not_called()
+
+
+# ── The routed path must not depend on this machine ──────────────────────
+
+
+class TestRoutedPathIsHermetic:
+    """The regression that made this suite green on a laptop and red in CI.
+
+    `LLMClient._transport_client()` resolves the router-edge credential
+    BEFORE it calls `client_factory`, so injecting a transport double does
+    not remove the need for one. krepis resolves that credential on its full
+    chain — environment, then an on-disk credentials file, then SSM — and a
+    developer machine has the second while a CI runner has none of the three.
+    Every routed test therefore passed locally and failed on the runner with
+    `no router-edge credential`, which pre-empted the assertions about
+    validation errors, transport errors, persistence and usage extraction
+    with a credential error that had nothing to do with their subjects.
+
+    `conftest.py` fixes it by naming a test-only variable as the spec's
+    credential source and setting it. This asserts that fix holds: with the
+    rest of the chain returning nothing, a replay still completes. A future
+    change that reintroduces a dependency on ambient credentials fails HERE,
+    on a laptop, instead of on the runner.
+    """
+
+    def test_a_replay_completes_with_the_credential_chain_empty(self):
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
+        from replay.runner import replay_artifact
+
+        artifact = _make_captured_artifact()
+        s3 = _make_s3_stub(artifact)
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
+            prompt_tokens=200, completion_tokens=80,
+        )
+
+        import krepis.router as krepis_router
+
+        with patch.object(
+            krepis_router, "resolve_router_credential", lambda name=None: None
+        ):
+            replay = replay_artifact(
+                artifact_key="k.json",
+                target_model="deepseek-v4-flash",
+                s3_client=s3, client_factory=factory,
+                persist=False,
+            )
+
+        assert replay.replay_error is None, replay.replay_error
+        assert replay.replay_output_kind == "structured"
+        assert replay.replay_cost["input_tokens"] == 200
+
+    def test_the_usage_dict_shape_is_what_the_batch_layer_reads(self):
+        """The I7878 migration did NOT change the persisted `replay_cost`
+        shape — the CI `KeyError: 'input_tokens'` failures were the credential
+        error above, which makes `_invoke_target_with_schema` return an empty
+        usage dict on ANY exception. Pinning the shape here means a real
+        change to what concordance records has to be a deliberate test edit
+        rather than something a failure mode can counterfeit."""
+        import types
+
+        from replay.runner import _usage_dict_from_llm_usage
+
+        usage = types.SimpleNamespace(
+            input_tokens=200, output_tokens=80, cache_read_tokens=0,
+            cache_create_tokens=0, cache_create_1h_tokens=0,
+            cost_usd=0.00123, provider_cost_usd=0.00119,
+        )
+        assert set(_usage_dict_from_llm_usage(usage)) == {
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "provider_cost_usd",
+            "served_provider",
+        }
+        # Absence stays absence: an empty dict, not a zero-filled one that
+        # would read as a measured zero on the cost surface.
+        assert _usage_dict_from_llm_usage(None) == {}
