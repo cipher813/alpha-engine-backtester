@@ -114,7 +114,31 @@ def compute_team_metrics(
                                           "reason": "no picks"}
 
         # ── Excursion: needs OHLC per ticker over the holding window.
-        if picks and ohlc:
+        if not picks:
+            team_bundle["excursion"] = {
+                "status": "insufficient_data",
+                "reason": "insufficient_data:no_picks: this team made no picks "
+                          "in the window",
+            }
+        elif ohlc is None:
+            # config-I7600, same split as compute_portfolio_excursion_summary
+            # below: a None input is the caller failing to wire it, an empty
+            # dict is a date with no prices. One string for both is the defect.
+            logger.error(
+                "team %s excursion: ohlc input NOT WIRED — caller passed None",
+                team_id,
+            )
+            team_bundle["excursion"] = {
+                "status": "error",
+                "reason": "defect:ohlc_not_wired: caller passed ohlc=None",
+            }
+        elif not ohlc:
+            team_bundle["excursion"] = {
+                "status": "insufficient_data",
+                "reason": "insufficient_data:no_ohlc_data: the OHLCV series "
+                          "for this date is empty",
+            }
+        else:
             picks_df = pd.DataFrame(picks)
             try:
                 records: list[ExcursionRecord] = compute_per_pick_excursion(
@@ -122,12 +146,19 @@ def compute_team_metrics(
                 )
                 team_bundle["excursion"] = summarize_excursions(records)
             except Exception as e:
-                logger.warning("team %s excursion failed: %s", team_id, e)
-                team_bundle["excursion"] = {"status": "insufficient_data",
-                                            "reason": str(e)}
-        else:
-            team_bundle["excursion"] = {"status": "insufficient_data",
-                                         "reason": "no ohlc data"}
+                # config-I7600: was insufficient_data — see the rationale on
+                # compute_portfolio_excursion_summary's handler below. Same
+                # (a)/(b)/(c): any excursion failure, the rest of the bundle
+                # still composes, recorded in the log with the stack and in the
+                # emitted sub-result with the exception type.
+                logger.error(
+                    "team %s excursion failed: %s", team_id, e, exc_info=True,
+                )
+                team_bundle["excursion"] = {
+                    "status": "error",
+                    "reason": f"defect:excursion_compute_error: "
+                              f"{type(e).__name__}: {e}",
+                }
 
         # ── Risk-matched alpha vs both benchmarks: needs prices + SPY.
         if picks and prices is not None and not prices.empty:
@@ -292,8 +323,34 @@ def compute_portfolio_excursion_summary(
     """
     if score_performance_df is None or score_performance_df.empty:
         return {"status": "insufficient_data", "reason": "no score_performance"}
-    if ohlc is None or not ohlc:
-        return {"status": "insufficient_data", "reason": "no ohlc data"}
+    if ohlc is None:
+        # config-I7600. ``ohlc is None`` means the CALLER never supplied the
+        # input; ``ohlc == {}`` means this date's OHLCV artifact is genuinely
+        # empty. Those are a defect and a data gap, and one shared
+        # ``insufficient_data: "no ohlc data"`` string covered both — which is
+        # exactly why `portfolio_excursion.json` read as a plausible transient
+        # for months while `config["_ohlcv_by_ticker"]` was a key nothing wrote.
+        #
+        # evaluate.py now pre-empts this branch with a specific reason
+        # (`_load_ohlcv_for_excursion`), but the distinction belongs HERE, at
+        # the producer, not in one caller: every other caller of this function
+        # inherits the ambiguity otherwise.
+        logger.error(
+            "portfolio excursion: ohlc input NOT WIRED — the caller passed "
+            "None rather than the OHLCV series its pipeline already persisted. "
+            "This is a defect on the calling side, not a thin-data date; "
+            "returning status=error so no reader can mistake it for one.",
+        )
+        return {
+            "status": "error",
+            "reason": "defect:ohlc_not_wired: caller passed ohlc=None",
+        }
+    if not ohlc:
+        return {
+            "status": "insufficient_data",
+            "reason": "insufficient_data:no_ohlc_data: the OHLCV series for "
+                      "this date is empty",
+        }
 
     df = score_performance_df[score_performance_df["score"] >= score_threshold]
     if df.empty:
@@ -307,5 +364,20 @@ def compute_portfolio_excursion_summary(
         records = compute_per_pick_excursion(picks_df, ohlc, horizon_days=horizon_days)
         return summarize_excursions(records)
     except Exception as e:
-        logger.warning("portfolio excursion failed: %s", e)
-        return {"status": "insufficient_data", "reason": str(e)}
+        # config-I7600. This was `insufficient_data` + `str(e)`: a genuine
+        # computation failure was rendered in the same taxonomy slot as "this
+        # date is thin", so the report card's N/A copy told the reader to wait
+        # for more data while the analysis was actually broken.
+        # (a) swallowed: any failure inside compute_per_pick_excursion /
+        #     summarize_excursions; (b) the evaluator's primary deliverables are
+        #     already computed and this tile feeds no order, promotion or NAV,
+        #     so it must not abort the weekly run; (c) recorded on BOTH surfaces
+        #     — the log carries the stack, the returned dict IS the persisted
+        #     `portfolio_excursion.json` and carries status=error plus the type.
+        logger.error(
+            "portfolio excursion computation failed: %s", e, exc_info=True,
+        )
+        return {
+            "status": "error",
+            "reason": f"defect:excursion_compute_error: {type(e).__name__}: {e}",
+        }
