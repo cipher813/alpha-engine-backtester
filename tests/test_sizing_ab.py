@@ -1,5 +1,6 @@
 """Tests for analysis.sizing_ab — A/B comparison of current sizing vs equal-weight."""
 
+import logging
 from copy import deepcopy
 
 import pytest
@@ -101,14 +102,27 @@ def test_insufficient_data_below_min_trades():
     assert result["min_required"] == _MIN_TRADES
 
 
-def test_sim_fn_exception_returns_error():
+def test_sim_fn_exception_returns_error(caplog):
+    """config-I7596: the swallow must leave a stack AND name the type.
+
+    Pre-fix this handler recorded nothing at all — the artifact carried only
+    ``str(e)``, which is how ``"maximum recursion depth exceeded"`` reached
+    S3 on every run with no traceback anywhere to diagnose it from.
+    """
     def failing_sim(config):
         raise RuntimeError("simulator blew up")
 
-    result = run_sizing_ab(failing_sim, _base_config())
+    with caplog.at_level(logging.ERROR, logger="analysis.sizing_ab"):
+        result = run_sizing_ab(failing_sim, _base_config())
 
     assert result["status"] == "error"
     assert "simulator blew up" in result["error"]
+    # The artifact names the class, not only the message.
+    assert result["error_type"] == "RuntimeError"
+    # The stack survives on the log surface.
+    records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert records, "sizing A/B failure must be logged at ERROR"
+    assert records[0].exc_info is not None, "the traceback must be captured"
 
 
 def test_empty_stats_returns_error():
