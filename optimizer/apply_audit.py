@@ -100,6 +100,14 @@ BLOCKED_BY_SLUGS = (
 _WEIGHT_STATUS = {
     "insufficient_data": ("insufficient_data", None),
     "no_subscores": ("insufficient_data", None),
+    # A sub-score exists as a column but is null on every row — its producer
+    # is gone (qual_score, retired with the six-team + CIO research graph on
+    # 2026-07-12, config#1580). A by-design-off loop, not a data-starved or
+    # guardrail-blocked one: no blend can be fitted and no weight proposed for
+    # an absent sub-score could change a live score. Maps to "disabled" like
+    # research_params' "retired", so the consecutive_blocked_weeks streak
+    # neither increments nor resets on it (alpha-engine-config-I7678).
+    "subscore_absent": ("disabled", None),
 }
 _VETO_STATUS = {
     "insufficient_data": ("insufficient_data", None),
