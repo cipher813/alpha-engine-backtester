@@ -41,11 +41,18 @@ from nousergon_lib.eval_artifacts import (
     new_eval_run_id,
 )
 
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
 from analysis.regime_stratified_sortino import (
     DEFAULT_MIN_PICKS_PER_STRATUM,
+    STATUS_UNMEASURABLE,
     SUPPORTED_HORIZONS,
+    InputWindow,
+    ReturnUnits,
     assemble_t2_eval_payload,
+    assess_input_freshness,
     compute_regime_spread,
+    input_window,
     load_with_subscores_and_regime,
     stratified_sortino_by_regime,
 )
@@ -54,6 +61,14 @@ from analysis.regime_stratified_sortino import (
 logger = logging.getLogger(__name__)
 
 REGIME_STRATIFIED_SORTINO_PREFIX = "regime/stratified_sortino"
+
+# ``attach_outcomes`` reproduces the legacy wide-column convention exactly —
+# ``round(decimal * 100, 2)`` — so the arithmetic return columns this runner
+# hands to the metric core are PERCENT POINTS, not fractions. Declaring it is
+# mandatory (alpha-engine-config-I7661): the metric core has no default and
+# raises rather than guessing. The primary horizon does not use this at all —
+# it resolves the canonical decimal ``log_alpha_21d`` the store publishes.
+OUTCOME_RETURN_UNITS = ReturnUnits.PERCENT
 
 
 def run_regime_stratified_sortino(
@@ -72,6 +87,9 @@ def run_regime_stratified_sortino(
     evaluator's tracker.run_module can report it as a partial-success
     rather than crash the whole Saturday eval pipeline.
     """
+    primary_horizon = DEFAULT_POLICY.primary_horizon
+    diagnostic_horizon = DEFAULT_POLICY.diagnostic_horizons[0]
+
     df = load_with_subscores_and_regime(db_path)
     if df.empty:
         logger.info(
@@ -79,47 +97,66 @@ def run_regime_stratified_sortino(
             "with n_strata=0"
         )
         strata: list = []
+        window = InputWindow(None, None, 0)
     else:
         strata = stratified_sortino_by_regime(
-            df, min_picks_per_stratum=min_picks_per_stratum,
+            df,
+            units=OUTCOME_RETURN_UNITS,
+            min_picks_per_stratum=min_picks_per_stratum,
             horizons=SUPPORTED_HORIZONS,
         )
+        window = input_window(df)
 
-    spread_10d = compute_regime_spread(strata, horizon_days=10)
-    spread_30d = compute_regime_spread(strata, horizon_days=30)
+    spread_primary = compute_regime_spread(strata, horizon_days=primary_horizon)
+    spread_diagnostic = compute_regime_spread(strata, horizon_days=diagnostic_horizon)
 
     dual = now_dual()
     run_id = new_eval_run_id()
+
+    # Freshness is a property of the INPUTS, not of the write time
+    # (alpha-engine-config-I7661). Four consecutive weekly artifacts computed
+    # off rows frozen in March, and every write-time check the fleet has read
+    # them as healthy.
+    status, status_reason = assess_input_freshness(
+        window, trading_day=str(dual.trading_day), horizon_days=primary_horizon,
+    )
+    if status == STATUS_UNMEASURABLE:
+        logger.error(
+            "[T2] regime_stratified_sortino is UNMEASURABLE: %s", status_reason,
+        )
+
     payload = assemble_t2_eval_payload(
         strata=strata,
-        spread_10d=spread_10d,
-        spread_30d=spread_30d,
+        spread_primary=spread_primary,
+        spread_diagnostic=spread_diagnostic,
         run_id=run_id,
         calendar_date=str(dual.calendar_date),
         trading_day=str(dual.trading_day),
+        window=window,
+        status=status,
+        status_reason=status_reason,
+        units=OUTCOME_RETURN_UNITS,
         min_picks_per_stratum=min_picks_per_stratum,
+        policy=DEFAULT_POLICY,
     )
 
-    if not write or not s3_bucket:
-        return {
-            "status": "ok",
-            "wrote": False,
-            "payload": payload,
-            "n_strata": len(strata),
-            "spread_10d_interpretation": spread_10d.get("interpretation"),
-            "spread_30d_interpretation": spread_30d.get("interpretation"),
-        }
-
-    keys = _write_t2_eval_artifact(payload, bucket=s3_bucket)
-    return {
-        "status": "ok",
-        "wrote": True,
+    summary = {
+        # The artifact's own verdict, not a blanket "ok". A run whose inputs
+        # could not support a measurement says so on the surface the tracker
+        # and the dashboard read.
+        "status": status,
+        "status_reason": status_reason,
         "payload": payload,
         "n_strata": len(strata),
-        "spread_10d_interpretation": spread_10d.get("interpretation"),
-        "spread_30d_interpretation": spread_30d.get("interpretation"),
-        **keys,
+        "input_window": window.as_dict(),
+        f"spread_{primary_horizon}d_interpretation": spread_primary.get("interpretation"),
+        f"spread_{diagnostic_horizon}d_interpretation": spread_diagnostic.get("interpretation"),
     }
+    if not write or not s3_bucket:
+        return {**summary, "wrote": False}
+
+    keys = _write_t2_eval_artifact(payload, bucket=s3_bucket)
+    return {**summary, "wrote": True, **keys}
 
 
 def _write_t2_eval_artifact(
@@ -136,7 +173,8 @@ def _write_t2_eval_artifact(
 
     Sidecar payload mirrors the artifact body for T2 — the headline
     summary fields are already at the top level of the assembled payload
-    (spread_10d / spread_30d are first-class blocks), so writing the
+    (spread_21d / spread_5d are first-class blocks — policy-derived names
+    since alpha-engine-config-I7661), so writing the
     same body to both keys keeps consumers simple. T1 splits a slimmer
     sidecar from the full artifact because its body is heavier
     (per-week pairings). T2's body is small (~K strata × 2 horizons +
@@ -156,11 +194,17 @@ def _write_t2_eval_artifact(
         Bucket=bucket, Key=latest_key, Body=body,
         ContentType="application/json",
     )
+    primary = DEFAULT_POLICY.primary_horizon
+    diagnostic = DEFAULT_POLICY.diagnostic_horizons[0]
     logger.info(
-        "[T2] wrote run_id=%s → s3://%s/%s (latest=%s) | "
-        "interpretation_10d=%s | interpretation_30d=%s",
+        "[T2] wrote run_id=%s → s3://%s/%s (latest=%s) | status=%s | "
+        "inputs=%s..%s (n=%s) | interpretation_%sd=%s | interpretation_%sd=%s",
         run_id, bucket, artifact_key, latest_key,
-        payload["spread_10d"].get("interpretation"),
-        payload["spread_30d"].get("interpretation"),
+        payload.get("status"),
+        (payload.get("input_window") or {}).get("min_score_date"),
+        (payload.get("input_window") or {}).get("max_score_date"),
+        (payload.get("input_window") or {}).get("n_rows"),
+        primary, (payload.get(f"spread_{primary}d") or {}).get("interpretation"),
+        diagnostic, (payload.get(f"spread_{diagnostic}d") or {}).get("interpretation"),
     )
     return {"artifact_key": artifact_key, "latest_key": latest_key}
