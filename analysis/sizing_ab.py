@@ -101,7 +101,31 @@ def run_sizing_ab(
         stats_a = sim_fn(config_a)
         stats_b = sim_fn(config_b)
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        # config-I7596. This handler used to record NOTHING: no log line, no
+        # stack, no exception type — only ``str(e)`` on a dict. That is how
+        # ``{"status": "error", "error": "maximum recursion depth exceeded"}``
+        # reached `backtest/{date}/sizing_ab.json` on every run from PR#655
+        # onward with no traceback anywhere on the box, and why the cause had
+        # to be reproduced by hand months later. It also pre-empts the caller's
+        # own fail-loud handler (`backtest.py`'s sizing_ab except, which does
+        # log ``exc_info=True`` and reports to flow-doctor) by never letting
+        # the exception escape.
+        #
+        # Deviation from the RAISE default, per the fleet fail-loud rule:
+        #   (a) swallowed: any failure raised by ``sim_fn`` for either arm;
+        #   (b) the backtest's primary deliverables (portfolio_stats, sweep_df,
+        #       executor params) are already computed when this runs, and this
+        #       output feeds no order, no promotion and no NAV — the ALWAYS-EMIT
+        #       artifact contract requires a status here rather than an abort;
+        #   (c) recorded on BOTH durable surfaces — the log carries the full
+        #       stack, and the returned dict IS the persisted artifact and now
+        #       names the exception type as well as its message.
+        logger.error("sizing A/B simulation failed: %s", e, exc_info=True)
+        return {
+            "status": "error",
+            "error": str(e),
+            "error_type": type(e).__name__,
+        }
 
     if not stats_a or not stats_b:
         return {"status": "error", "error": "One or both simulations returned empty results"}
