@@ -196,6 +196,46 @@ echo ""
 echo "==> Merging cost-sink environment onto ${LAMBDA_FUNCTION}..."
 python3 -m krepis.aws merge-lambda-env --function-name alpha-engine-replay-concordance --set KREPIS_COST_SINK_BUCKET=alpha-engine-research --set KREPIS_COST_SINK_PREFIX=decision_artifacts/_cost_raw --region "${AWS_REGION}"
 
+# ── Step 5c: Converge the Lambda environment (alpha-engine-config-I7925) ────
+# ${LAMBDA_FUNCTION} was one of eleven fleet-wide Lambdas carrying a
+# GITHUB_TOKEN set by hand and refreshed by nothing — no repo, IaC file or
+# script anywhere wrote this function's environment. The environment
+# carried a STALE COPY of the credential — set from an older SSM
+# parameter version and never re-derived on deploy — that GitHub rejected
+# while the SSM parameter's own value remained valid the whole time
+# (alpha-engine-config-I7968 tracks the mis-attribution). On 2026-08-21
+# a first-party dependency picked that stale copy up out of site-packages,
+# sent it to GitHub, got a 401, and halted the preopen
+# trading pipeline (alpha-engine-config-I7924). alpha-engine-predictor-
+# inference (crucible-predictor) was the one of eleven that broke and was
+# fixed first (crucible-predictor-PR535) — this mirrors that convergence.
+#
+# DENY-LIST, deliberately, not an allow-list: this function carries
+# operator-set flags and provider keys codified nowhere (KREPIS_ROUTER_
+# CREDENTIAL_SECRET's resolved value, etc.), and asserting a complete key
+# set would delete them. The allow-list end state is tracked separately
+# (alpha-engine-config-I7958).
+#
+# Read-modify-write via the shared krepis.aws remove-lambda-env CLI — a
+# bare aws lambda update-function-configuration --environment REPLACES the
+# whole variable map.
+#
+# --defer-publish: this function is alias-pinned (Step 8 below promotes
+# 'live' only on canary success) and Step 6 immediately below snapshots
+# $LATEST into the published version — so the removal must land on
+# $LATEST before that publish, same as the cost-sink merge just above.
+# Placed after publish-version it would mutate $LATEST only and be a
+# silent no-op on the alias (L4497). --missing-ok: every deploy after the
+# first finds the key already gone.
+LAMBDA_ENV_DENIED_KEYS=(GITHUB_TOKEN)
+
+echo ""
+echo "==> Converging Lambda environment on ${LAMBDA_FUNCTION} (removing denied keys)..."
+python3 -m krepis.aws remove-lambda-env \
+  --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" \
+  --defer-publish --missing-ok \
+  "${LAMBDA_ENV_DENIED_KEYS[@]/#/--unset=}"
+
 # ── Step 6: Publish version (do NOT promote 'live' yet) ──────────────────────
 echo ""
 echo "==> Publishing Lambda version..."

@@ -71,14 +71,22 @@ jobs:
       # silently, with no CI red. Previously only deploy_health.sh had this
       # wired in; deploy_counterfactual.sh/deploy_concordance.sh assumed
       # operator-only invocation, which no longer holds once they run in this
-      # same matrixed GHA job. Pin matches requirements.txt's `krepis>=0.4.0`
-      # floor.
+      # same matrixed GHA job. Pin matches requirements.txt's `krepis[openai]`
+      # floor (corrected 2026-08-21 — the comment here had drifted to a stale
+      # >=0.4.0 while requirements.txt had already moved to >=0.59.21).
+      #
+      # Raised to >=0.59.23 (alpha-engine-config-I7925, krepis-PR175):
+      # deploy_concordance.sh / deploy_counterfactual.sh now ALSO call
+      # `python3 -m krepis.aws remove-lambda-env` on this same runner, to
+      # converge alpha-engine-replay-concordance / -counterfactual's
+      # environment against a denied-key set — that subcommand doesn't
+      # exist before 0.59.23.
       - name: Set up Python for canary-rollback alert publish
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: '3.12'
-      - name: Install krepis for deploy_*.sh alerts call
-        run: pip install "krepis>=0.4.0"
+      - name: Install krepis for deploy_*.sh alerts + env-convergence calls
+        run: pip install "krepis>=0.59.23"
 
       # Each deploy_*.sh builds its lambda_*/Dockerfile (which COPYs the fixed
       # sources + pins the lib primitives), pushes to ECR, publishes a
