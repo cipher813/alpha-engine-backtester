@@ -33,7 +33,6 @@ import datetime as _dt
 import gc
 import json
 import logging
-import math
 import os
 import subprocess
 import sys
@@ -49,6 +48,7 @@ import pandas as pd
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+import deadline_budget as _budget
 from synthetic.signal_generator import predictions_to_signals
 
 logger = logging.getLogger(__name__)
@@ -982,84 +982,52 @@ WF_FIRST_FOLD_ESTIMATE_S = float(
 #: into the config JSON the isolated pass child reads, so the child inherits
 #: the parent's subprocess timeout instead of discovering it as a SIGKILL.
 #: Epoch (not a duration) so it survives the process boundary unambiguously.
-DEADLINE_EPOCH_CONFIG_KEY = "_pass_deadline_epoch"
+#:
+#: Re-exported from :mod:`deadline_budget`, which owns the ONE implementation
+#: of the self-deadlining loop primitive (lifted there on its second adoption
+#: in this repo — see that module's header and ``policy-shared-code``).
+DEADLINE_EPOCH_CONFIG_KEY = _budget.DEADLINE_EPOCH_CONFIG_KEY
+
+#: Log tag distinguishing this loop's budget lines from the param-sweep combo
+#: loop's when both run inside one isolated pit_parity pass.
+_WF_BUDGET_TAG = "[walk_forward]"
 
 
 def _deadline_remaining_s(config: dict) -> "Callable[[], float] | None":
-    """Build the remaining-seconds callable from the config's deadline, or
-    ``None`` when no deadline was handed down (every caller that is not an
-    isolated pit_parity pass — the CLI, the phase, tests — behaves exactly as
-    before)."""
-    deadline = config.get(DEADLINE_EPOCH_CONFIG_KEY)
-    if deadline is None:
-        return None
-    try:
-        deadline = float(deadline)
-    except (TypeError, ValueError):
-        logger.error(
-            "[walk_forward] %s=%r is not a number — ignoring the deadline "
-            "rather than truncating on a value nobody can read.",
-            DEADLINE_EPOCH_CONFIG_KEY, deadline,
-        )
-        return None
-    logger.info(
-        "[walk_forward] fold loop is self-deadlining: %.0fs of budget remain "
-        "(reserve %.0fs held back for simulation + artifact write).",
-        deadline - time.time(), WF_BUDGET_RESERVE_S,
+    """The fold loop's remaining-seconds callable, or ``None`` when no
+    deadline was handed down. Thin binding of
+    :func:`deadline_budget.deadline_remaining_s` to this loop's tag +
+    reserve — kept as a module-level name because it is the surface the
+    fold loop and its tests already address."""
+    return _budget.deadline_remaining_s(
+        config, tag=_WF_BUDGET_TAG, reserve_s=WF_BUDGET_RESERVE_S,
     )
-    return lambda: deadline - time.time()
 
 
 def _safe_remaining(remaining_s) -> float:
-    """Evaluate a remaining-seconds callable without ever raising.
-
-    A budget probe that throws must not take the pass down with it — an
-    unreadable clock means "unbounded", which degrades to today's behaviour
-    (run every fold) rather than to a silent truncation nobody asked for.
-    """
-    try:
-        return float(remaining_s())
-    except Exception as exc:  # noqa: BLE001 — see docstring; the log IS the surface
-        logger.error(
-            "[walk_forward] remaining-budget probe failed (%s: %s) — treating the "
-            "budget as unbounded for this fold.", type(exc).__name__, exc,
-        )
-        return float("inf")
+    """Evaluate a remaining-seconds callable without ever raising — see
+    :func:`deadline_budget.safe_remaining`."""
+    return _budget.safe_remaining(remaining_s, tag=_WF_BUDGET_TAG)
 
 
 def _p90(samples: list[float]) -> float:
-    """p90 of the observed per-fold durations.
-
-    p90 and not p50 deliberately: the concordance incident (crucible-backtester
-    #633) sized a budget on a mean and the slow tail ran 30x it, so the cap could
-    never bind. The budget must be sized on the fold that might come next, not on
-    the typical one.
-    """
-    ordered = sorted(samples)
-    if not ordered:
-        return WF_FIRST_FOLD_ESTIMATE_S
-    # Rounds UP rather than nearest-rank, so with few samples the estimate walks
-    # toward the observed MAX. That is the safe direction for a deadline: an
-    # over-estimate costs one fold of coverage, an under-estimate costs the
-    # whole artifact. Nearest-rank on ten samples returns the 9th of nine fast
-    # folds and ignores the one 100x outlier entirely — the concordance mistake.
-    idx = min(len(ordered) - 1, int(math.ceil(0.9 * len(ordered))))
-    return ordered[idx]
+    """p90 of the observed per-fold durations — see
+    :func:`deadline_budget.p90`. Falls back to
+    :data:`WF_FIRST_FOLD_ESTIMATE_S` before any fold has been measured."""
+    return _budget.p90(samples, default=WF_FIRST_FOLD_ESTIMATE_S)
 
 
 def _next_fold_affordable(
     remaining_s, fold_seconds: list[float], *, reserve_s: float,
 ) -> bool:
-    """True iff another fold plausibly fits before the deadline.
-
-    ``remaining - reserve >= p90(observed folds)``. Before any fold has been
-    measured the estimate is :data:`WF_FIRST_FOLD_ESTIMATE_S` — so a pass handed
-    a budget it has ALREADY blown (the deadline arrived during feature
-    computation) scores zero folds and returns coverage 0 rather than starting
-    work it cannot finish. Coverage 0 is UNKNOWN downstream, not PARTIAL and
-    never a pass.
-    """
-    return (_safe_remaining(remaining_s) - reserve_s) >= _p90(fold_seconds)
+    """True iff another fold plausibly fits before the deadline — see
+    :func:`deadline_budget.next_unit_affordable`."""
+    return _budget.next_unit_affordable(
+        remaining_s, fold_seconds,
+        reserve_s=reserve_s,
+        first_unit_estimate_s=WF_FIRST_FOLD_ESTIMATE_S,
+        tag=_WF_BUDGET_TAG,
+    )
 
 
 # Canonical Layer-1A momentum feature set — the raw inputs the deterministic
@@ -1147,7 +1115,10 @@ def run_walk_forward_inference(
     but a future dated-artifact PIT leg would resolve them via
     :mod:`synthetic.pit_weights` again.
     """
-    from synthetic.pit_folds import build_walk_forward_folds
+    from synthetic.pit_folds import (
+        build_walk_forward_folds,
+        min_trading_dates_for_one_fold,
+    )
 
     if predictor_path not in sys.path:
         sys.path.insert(0, predictor_path)
@@ -1175,6 +1146,47 @@ def run_walk_forward_inference(
         p["test_window"], p["min_train"], p["purge"], p["embargo"],
         p["train_mode"],
     )
+
+    # ── Zero folds is an ABORT, not an empty result (config-I7309) ──────────
+    # The guard further down ("folds built but ZERO test dates scored") is
+    # gated on ``folds`` being non-empty, so the zero-fold case was the one
+    # path through this function that said nothing at all: it returned ``{}``,
+    # ``build_signals_by_date`` iterated an empty date list, the simulation
+    # loop had nothing to run, and ``_run_simulation_loop`` reported
+    # ``no_orders``. That is indistinguishable from a walk-forward pass that
+    # ran properly and declined every entry — and it was read as exactly that
+    # for three weeks (config-I7309 blocker 2: "the walk-forward pass places
+    # ZERO orders"). The truth was arithmetic: ``smoke-pit-parity`` caps the
+    # axis at 60 trading days and the canonical ``min_train`` is 504, so
+    # ``build_walk_forward_folds``'s ``while fold_start_idx < n`` never ran.
+    #
+    # A PIT pass that cannot build a single fold has not measured anything, so
+    # per the fleet fail-loud rule it raises rather than returning a shape that
+    # reads as a measurement. The message carries the axis length it GOT, the
+    # parameters, and the length it NEEDS — derived from the builder itself,
+    # so it cannot drift from the fold scheme.
+    if not folds:
+        needed = min_trading_dates_for_one_fold(
+            test_window=p["test_window"], min_train=p["min_train"],
+            purge=p["purge"], embargo=p["embargo"], train_mode=p["train_mode"],
+        )
+        raise RuntimeError(
+            f"[walk_forward] ZERO folds over {len(trading_dates)} trading "
+            f"date(s) with test_window={p['test_window']} "
+            f"min_train={p['min_train']} purge={p['purge']} "
+            f"embargo={p['embargo']} mode={p['train_mode']} — this pass can "
+            f"produce no point-in-time predictions at all. "
+            + (
+                f"At least {needed} trading date(s) are required to place the "
+                f"first fold; either widen the date axis "
+                f"(predictor_backtest.max_trading_days) or lower "
+                f"predictor_backtest.walk_forward_params.min_train."
+                if needed is not None else
+                "No axis length up to the probe limit places a fold — these "
+                "fold-scheme parameters are unusable for any realistic date "
+                "axis (check walk_forward_params.min_train)."
+            )
+        )
 
     # One deterministic scorer + one tensor for every fold — no per-fold archive
     # resolution, no booster download, no cold-start-from-missing-weights.

@@ -19,13 +19,52 @@ from __future__ import annotations
 import itertools
 import logging
 import math
+import os
 import random
 from copy import deepcopy
 from typing import Any, Callable
 
 import pandas as pd
 
+import deadline_budget as _budget
+
 logger = logging.getLogger(__name__)
+
+# ── config-I7309: the self-deadlining combo loop ────────────────────────────
+# The pit_parity walk-forward pass runs TWO nested loops inside one 2700 s
+# subprocess ceiling: the walk-forward FOLD loop (already self-deadlining since
+# config#7199) and — when ``pit_parity_sweep`` is set — THIS combo loop, one
+# full simulation per combo. Measured on watch-rerun-2026-07-31 (recorded in
+# ``backtest/2026-07-31/pit_parity.json``):
+#
+#     Sweep combo 5/60 done in 272.5s (sweep elapsed 2144.1s)
+#
+# 60 combos x 272.5 s is ~16,350 s of work under a 2700 s ceiling. The pass was
+# SIGKILLed at the wall with five completed combos discarded, three Saturdays
+# running. This loop now asks the same question the fold loop asks — does the
+# NEXT unit still fit? — and returns the combos it finished, labelled PARTIAL,
+# instead of losing all of them.
+#
+# The budget is the deadline the pass ALREADY carries
+# (``_pass_deadline_epoch``, injected by
+# ``analysis.pit_parity._run_predictor_pass_isolated``). No new config surface,
+# and every non-pit_parity caller — the weekly ``run_param_sweep``, the CLI,
+# the tests — hands down no deadline and is completely unchanged.
+_SWEEP_BUDGET_TAG = "[param_sweep]"
+
+#: Seconds held back from the deadline for the work that follows the sweep
+#: inside the same pass — ``_build_pit_parity_cscv_matrix``'s per-block
+#: re-simulations, stats assembly, and the pickle/S3 write. Being killed at the
+#: wall discards the whole pass; over-reserving costs at most one combo.
+SWEEP_BUDGET_RESERVE_S = float(os.environ.get("PARAM_SWEEP_RESERVE_S", "600"))
+
+#: Assumed cost of the FIRST combo, before this run has measured anything.
+#: Seeded at the measured 2026-07-31 per-combo cost (272.5 s) rounded up — an
+#: over-estimate costs one combo of coverage, an under-estimate costs the whole
+#: artifact, so the first-unit guess deliberately errs high.
+SWEEP_FIRST_COMBO_ESTIMATE_S = float(
+    os.environ.get("PARAM_SWEEP_FIRST_COMBO_ESTIMATE_S", "300")
+)
 
 
 def _deepcopy_safe_config(base: dict) -> dict:
@@ -303,12 +342,47 @@ def _run_combos(
     run_simulation_fn: Callable[[dict], dict],
     base_config: dict,
 ) -> pd.DataFrame:
-    """Run simulation for each parameter combination and return results DataFrame."""
+    """Run simulation for each parameter combination and return results DataFrame.
+
+    Self-deadlining (config-I7309): when ``base_config`` carries a
+    ``_pass_deadline_epoch``, the loop stops before starting a combo it cannot
+    finish and returns the combos that DID complete, tagging
+    ``df.attrs["sweep_budget_stopped"]``. Without a deadline the behaviour is
+    exactly as before — every combo runs.
+    """
     import time as _time
     rows = []
     n = len(combinations)
     t_sweep_start = _time.monotonic()
+    remaining_s = _budget.deadline_remaining_s(
+        base_config, tag=_SWEEP_BUDGET_TAG, reserve_s=SWEEP_BUDGET_RESERVE_S,
+    )
+    combo_seconds: list[float] = []
+    n_combos_stopped_for_budget = 0
     for i, params in enumerate(combinations, 1):
+        if not _budget.next_unit_affordable(
+            remaining_s, combo_seconds,
+            reserve_s=SWEEP_BUDGET_RESERVE_S,
+            first_unit_estimate_s=SWEEP_FIRST_COMBO_ESTIMATE_S,
+            tag=_SWEEP_BUDGET_TAG,
+        ):
+            n_combos_stopped_for_budget = n - i + 1
+            # LOUD: a truncated sweep is a real coverage loss and the number
+            # that says whether the budget is sized right. Silently returning
+            # a short frame would make an under-budgeted pass look like a
+            # small grid.
+            logger.error(
+                "%s stopping early on budget: %d of %d combo(s) not run "
+                "(p90 per-combo %.1fs, %.0fs of budget left, reserve %.0fs). "
+                "The completed combos are returned as a PARTIAL sweep — this "
+                "is the config-I7309 shape, not a silent short run.",
+                _SWEEP_BUDGET_TAG, n_combos_stopped_for_budget, n,
+                _budget.p90(combo_seconds, default=SWEEP_FIRST_COMBO_ESTIMATE_S),
+                _budget.safe_remaining(remaining_s, tag=_SWEEP_BUDGET_TAG)
+                if remaining_s is not None else float("inf"),
+                SWEEP_BUDGET_RESERVE_S,
+            )
+            break
         # Per-combo progress at INFO so the sweep never goes silent. Each
         # combo is a full simulation (~30-90s); without this, 60 combos
         # run in complete silence at default INFO level and look like a
@@ -347,12 +421,27 @@ def _run_combos(
         except Exception as e:
             logger.warning("Simulation failed for params %s: %s", params, e)
             rows.append({**params, "error": str(e)})
+        combo_seconds.append(_time.monotonic() - t_combo)
         logger.info(
             "Sweep combo %d/%d done in %.1fs (sweep elapsed %.1fs)",
-            i, n, _time.monotonic() - t_combo, _time.monotonic() - t_sweep_start,
+            i, n, combo_seconds[-1], _time.monotonic() - t_sweep_start,
         )
 
     df = pd.DataFrame(rows)
+    # The measurement that says whether the bound is right. `combo_p90_s` is
+    # what the next run's budget arithmetic uses; `n_combos_run` vs
+    # `n_combos_planned` is the coverage actually achieved. A pass that is
+    # persistently short needs a BIGGER BUDGET, not a bigger ceiling — and
+    # that is only decidable if both numbers reach the artifact instead of
+    # only the log (config-I7309).
+    df.attrs["n_combos_planned"] = n
+    df.attrs["n_combos_run"] = len(rows)
+    df.attrs["n_combos_skipped_for_budget"] = n_combos_stopped_for_budget
+    df.attrs["sweep_budget_stopped"] = bool(n_combos_stopped_for_budget)
+    df.attrs["combo_p90_s"] = (
+        round(_budget.p90(combo_seconds, default=SWEEP_FIRST_COMBO_ESTIMATE_S), 1)
+        if combo_seconds else None
+    )
     # Sort by sortino_ratio (primary — skilled-risk basket per
     # [[anchor_gates_on_skilled_risk_not_sharpe]] / evaluator-revamp-260506.md).
     # total_alpha is presentation/tiebreaker only — never primary, per
@@ -447,10 +536,16 @@ def sweep(
 
     df = _run_combos(combinations, run_simulation_fn, base_config)
 
-    # Gate: require at least 50% of combos to succeed
+    # Gate: require at least 50% of combos to succeed.
+    # config-I7309: budget-skipped combos are NOT successes. Before the
+    # self-deadlining loop every planned combo produced a row, so
+    # `n_total - n_failed` was a valid success count; a truncated sweep breaks
+    # that identity and would have reported a short run as fully successful.
     n_total = len(combinations)
     if not df.empty and "error" in df.columns:
-        n_failed = df["error"].notna().sum()
+        n_failed = int(df["error"].notna().sum()) + int(
+            df.attrs.get("n_combos_skipped_for_budget", 0)
+        )
         n_valid = n_total - n_failed
         completion_pct = n_valid / n_total if n_total > 0 else 0
         if completion_pct < 0.50:
