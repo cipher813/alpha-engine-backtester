@@ -132,6 +132,17 @@ spot_common_init_defaults() {
     USE_VECTORIZED_SWEEP="${USE_VECTORIZED_SWEEP:-false}"
     EVAL_HALF="${EVAL_HALF:-all}"
     RUN_DATE="${RUN_DATE:-$(date -u +%Y-%m-%d)}"
+    # alpha-engine-config-I8155: initialized to empty (never to $RUN_DATE —
+    # that would silently reintroduce the trading-day-normalized value this
+    # carrier exists to avoid) purely so `set -u` doesn't abort the whole
+    # launch when the SF hasn't set it. The SF definition
+    # (nousergon-data/infrastructure/step_function.json) exports this
+    # directly into the SSM command environment; an empty value here means
+    # it genuinely wasn't set, and each `krepis.stage_coverage assert
+    # --run-date "$EXECUTION_RUN_DATE"` call site is what raises the loud
+    # signal (EXIT_NO_RUN_DATE) via its existing observe-mode `|| echo
+    # WARNING` guard — never fall back to RUN_DATE here.
+    EXECUTION_RUN_DATE="${EXECUTION_RUN_DATE:-}"
 
     # #883 bounded mid-run spot-reclaim relaunch — env-only, no CLI flag on
     # the monolith either. MAX_SPOT_ATTEMPTS=4 preserves the prior
@@ -322,6 +333,20 @@ spot_common_normalize_run_date() {
     else
         echo "WARNING: trading-day normalization of RUN_DATE=${RUN_DATE} failed — keeping calendar value (python entry points will re-normalize)" >&2
     fi
+    # alpha-engine-config-I8155: RUN_DATE is deliberately the (normalized)
+    # NYSE TRADING day — it drives artifact keys (backtest/{trading_day}/...,
+    # parity/$RUN_DATE/...) and must stay exactly as normalized above.
+    # EXECUTION_RUN_DATE is a SEPARATE carrier: the SF execution's own
+    # run_date, exported by the Step Functions definition
+    # (nousergon-data/infrastructure/step_function.json) and NEVER
+    # normalized by anything downstream. It is what every
+    # `krepis.stage_coverage assert --run-date` call groups verdicts on, so
+    # it must reach the CLI exactly as the SF set it. Do NOT default
+    # EXECUTION_RUN_DATE from RUN_DATE here or anywhere else in this file —
+    # an unset EXECUTION_RUN_DATE must reach krepis.stage_coverage empty so
+    # it exits loudly (EXIT_NO_RUN_DATE) under the existing `|| echo
+    # WARNING` observe-mode guard at each call site, rather than silently
+    # grouping under the wrong day.
 }
 
 # ── Dispatcher-side pre-launch preflight (L4485) ─────────────────────────────
