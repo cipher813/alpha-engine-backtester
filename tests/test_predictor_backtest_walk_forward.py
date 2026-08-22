@@ -186,19 +186,35 @@ def test_all_masked_rows_yield_empty_predictions_and_loud_error(
     assert any("ZERO test dates scored" in r.message for r in caplog.records)
 
 
-def test_no_folds_yields_empty_predictions(_stub_momentum_scorer):
-    """Too few dates for even one fold → empty predictions, no crash, no
-    spurious error (folds==0 is a benign short-history case, not a failure)."""
+def test_no_folds_aborts_the_pass(_stub_momentum_scorer):
+    """Too few dates for even one fold → RAISE (alpha-engine-config-I7309).
+
+    This test previously asserted the opposite — "folds==0 is a benign
+    short-history case, not a failure" — and that codified premise is what let
+    the failure hide. A pass with zero folds returns `{}`; `build_signals_by_
+    date` then iterates an empty date list, the simulation loop runs zero
+    dates, and the run reports `no_orders` with the note "No ENTER signals
+    passed risk rules during the simulation period". Nothing on that path is
+    false-looking, and nothing on it is true: no ENTER signal was ever
+    presented to a risk rule.
+
+    Live cost of the premise: `smoke-pit-parity` caps its axis at 60 trading
+    days while the canonical `min_train` is 504, so the smoke built zero folds
+    on every run. Its `pit_status: no_orders` was recorded in I7309 as blocker
+    2 — "the walk-forward pass places ZERO orders" — against the PRODUCTION
+    pass, which builds 95 folds over ~2500 dates and placed 2,489 orders on
+    2026-07-31. "Benign" is exactly what it was not.
+
+    Short history is a legitimate INPUT condition; producing a measurement
+    shape out of it is not. The caller either widens the axis or scales the
+    fold scheme — both named in the abort message.
+    """
     dates = _trading_dates(3)  # < min_train + test_window
 
-    preds, stats = predictor_backtest.run_walk_forward_inference(
-        _features(dates), dates, "/x", bucket="b", wf_params=_WF,
-    )
-
-    assert preds == {}
-    assert stats["n_folds"] == 0
-    assert stats["n_folds_scored"] == 0
-    assert stats["n_test_dates_scored"] == 0
+    with pytest.raises(RuntimeError, match="ZERO folds"):
+        predictor_backtest.run_walk_forward_inference(
+            _features(dates), dates, "/x", bucket="b", wf_params=_WF,
+        )
 
 
 # ── wiring / default-OFF guards ────────────────────────────────────────────

@@ -1685,6 +1685,28 @@ def _run_simulation_loop(
             ),
         }
 
+    # ── "nothing to simulate" is not "nothing passed the risk rules" ────────
+    # config-I7309: with an empty ``signals_by_date`` this loop runs zero
+    # iterations and then returned ``no_orders`` with the note "No ENTER
+    # signals passed risk rules during the simulation period" — a confident,
+    # plausible and WRONG attribution. It pointed three weeks of diagnosis at
+    # position sizing and the risk guard when the real cause was upstream (the
+    # walk-forward pass built zero folds, so there were no signals and no dates
+    # at all). A degeneracy of the INPUT must never be reported in the
+    # vocabulary of the strategy.
+    if dates_expected == 0:
+        return {
+            "status": "no_dates",
+            "dates_simulated": 0,
+            "dates_expected": 0,
+            "coverage": 0.0,
+            "note": (
+                "Nothing to simulate — the caller supplied zero simulation "
+                "dates. This is an upstream input failure (no signals were "
+                "produced), NOT a statement about entries or risk rules."
+            ),
+        }
+
     if not all_orders:
         return {
             "status": "no_orders",
@@ -4809,6 +4831,32 @@ _SMOKE_PHASE_MODES: dict[str, dict] = {
                 "min_trading_days": 30,
                 "max_trading_days": 60,
                 "top_n_signals_per_day": 5,
+                # config-I7309: the fold scheme has to FIT the slice. The
+                # canonical walk-forward defaults (min_train=504, i.e. ~2y of
+                # warm-up before the first fold) need 514 trading dates before
+                # `build_walk_forward_folds` emits anything; this fixture caps
+                # the axis at 60. For three weeks that produced ZERO folds →
+                # empty predictions → zero ENTER signals → `pit_status:
+                # no_orders`, which was recorded against the PRODUCTION
+                # walk-forward pass rather than against this fixture. The
+                # production pass runs ~2500 dates and builds 95 folds; the
+                # 2026-07-31 and 2026-08-07 pit_parity artifacts both show it
+                # placing thousands of orders.
+                #
+                # These values are scaled to the slice, not weakened: `purge`
+                # still separates train-end from test-start, and the scorer on
+                # this path is the DETERMINISTIC momentum baseline (no booster
+                # is refit), so `min_train` here governs only how much
+                # un-scored warm-up is skipped. `tests/
+                # test_pit_parity_smoke_fold_arithmetic.py` asserts at merge
+                # time that whatever these numbers become, they still place at
+                # least one fold inside `min_trading_days`.
+                "walk_forward_params": {
+                    "test_window": 5,
+                    "min_train": 10,
+                    "purge": 2,
+                    "embargo": 1,
+                },
             },
             "param_sweep": {
                 "min_score": [65, 70, 75],

@@ -142,3 +142,69 @@ def build_walk_forward_folds(
         fold_start_idx += advance
 
     return folds
+
+
+def min_trading_dates_for_one_fold(
+    *,
+    test_window: int,
+    min_train: int,
+    purge: int,
+    embargo: int,
+    train_mode: str = "expanding",
+    search_margin: int = 8,
+    max_probe_length: int = 20_000,
+) -> int | None:
+    """Smallest date-axis length for which :func:`build_walk_forward_folds`
+    emits at least one fold under these parameters — ``None`` if no length
+    within the search window does.
+
+    Derived BY CONSTRUCTION (the builder is called, not re-implemented) so it
+    can never drift from the fold scheme it describes. That matters because it
+    is the number two things depend on:
+
+      * ``run_walk_forward_inference``'s zero-fold abort message, so an
+        operator is told the axis length actually required rather than left to
+        rederive it; and
+      * the merge-blocking assertion that the ``smoke-pit-parity`` fixture's
+        ``max_trading_days`` is arithmetically capable of building a fold at
+        all (alpha-engine-config-I7309).
+
+    The second is the one with history. The smoke fixture caps the axis at 60
+    trading days while the canonical ``min_train`` is 504, so the fold loop's
+    ``while fold_start_idx < n`` never executed: ZERO folds, empty predictions,
+    zero ENTER signals, and a ``pit_status: no_orders`` that was read for three
+    weeks as the walk-forward pass declining to trade. Any future edit to
+    either number has to keep them compatible, and a hardcoded threshold would
+    not notice.
+
+    ``search_margin`` bounds the probe at ``min_train + search_margin *
+    max(test_window, 1) + purge``, and ``max_probe_length`` bounds it
+    absolutely: a scheme whose first fold needs a longer date axis than any
+    real market history could supply is reported as ``None`` rather than
+    probed, so a nonsense ``min_train`` cannot turn this into an
+    out-of-memory.
+    """
+    if test_window <= 0 or min_train <= 0 or purge < 0 or embargo < 0:
+        return None
+    ceiling = min_train + search_margin * max(test_window, 1) + purge
+    if ceiling > max_probe_length:
+        return None
+    base = _dt.date(2000, 1, 3)  # arbitrary; only the axis LENGTH matters
+    axis = [base + _dt.timedelta(days=i) for i in range(ceiling)]
+    # The builder's cursor starts at ``min_train`` and requires
+    # ``fold_start_idx < n``, so no axis of length <= min_train can ever emit a
+    # fold. Start the probe there rather than at 1 — the search is otherwise
+    # quadratic in ``min_train`` (504 canonically, and unbounded when a caller
+    # misconfigures it).
+    for n in range(min_train + 1, ceiling + 1):
+        folds = build_walk_forward_folds(
+            axis[:n],
+            test_window=test_window,
+            min_train=min_train,
+            purge=purge,
+            embargo=embargo,
+            train_mode=train_mode,
+        )
+        if folds:
+            return n
+    return None

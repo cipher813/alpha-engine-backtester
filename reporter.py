@@ -2478,6 +2478,20 @@ def _section_predictor_backtest(stats: dict) -> list[str]:
         lines += ["", f"> **Deferred.** {note}"]
         return lines
 
+    # config-I7309: `no_dates` is an UPSTREAM input failure (zero simulation
+    # dates were supplied at all) and must never be rendered in the sentence
+    # `no_orders` owns ("no ENTER signals passed risk rules") — that conflation
+    # is what sent three weeks of diagnosis at the risk guard.
+    if status == "no_dates":
+        lines += [
+            "",
+            "> **Not measured.** Nothing to simulate — zero simulation dates "
+            "were supplied. This is an upstream input failure (no signals were "
+            "produced), not a statement about entries or risk rules.",
+            f"> {stats.get('note', '')}",
+        ]
+        return lines
+
     if status == "no_orders":
         lines += [
             "",
