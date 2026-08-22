@@ -235,7 +235,7 @@ spot_common_emit_heartbeat evaluator
 # --eval-half=all (no single SF state name to assert against — see the
 # _COVERAGE_STAGE derivation above).
 if [ -n "$_COVERAGE_STAGE" ]; then
-    "$LIB_PYTHON" -m krepis.stage_coverage assert --stage "$_COVERAGE_STAGE" --window-start "$_STAGE_WINDOW_START" || echo "WARNING: stage-coverage assertion did not run for $_COVERAGE_STAGE (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
+    "$LIB_PYTHON" -m krepis.stage_coverage assert --stage "$_COVERAGE_STAGE" --window-start "$_STAGE_WINDOW_START" --run-date "$EXECUTION_RUN_DATE" || echo "WARNING: stage-coverage assertion did not run for $_COVERAGE_STAGE (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
 else
     echo "NOTE: stage-coverage assertion skipped — --eval-half=all is not a single SF state (config-I7214)." >&2
 fi
