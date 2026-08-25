@@ -3022,6 +3022,21 @@ def _main_impl() -> None:
             # grade every cycle; that grader is retired as a rendered
             # surface. The existing s3://.../backtest/grade_history.json is
             # RETAINED (data is an asset), just no longer appended to.
+            #
+            # alpha-engine-config-I8397 (2026-08-25): this key's staleness
+            # was investigated as a possible fail-loud/swallowed-exception
+            # defect (a try/except around `append_grades` quoted in that
+            # issue). That code path does NOT exist on this branch or on
+            # main as of this commit -- it was deleted by THIS retirement
+            # commit (3eba0bb / PR #678) on 2026-08-16, one day after the
+            # key's last write. There is no swallow to fix and no producer
+            # to repair: the artifact was deliberately decommissioned.
+            # `alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml`'s
+            # `backtest_grade_history` row (added 2026-08-21, config-PR7929,
+            # 5 days AFTER this retirement) still cites
+            # `analysis/grade_history.py::append_grades()` as the live
+            # producer and freshness-tracks a key nothing will ever write
+            # to again -- that row is what needs correcting, not this code.
 
         # Evaluator email — now a THIN digest (System Report Card + What Changed
         # + completeness) that deep-links to the console Analysis page for the
