@@ -159,18 +159,70 @@ def _classify_skipped_window(conn, cutoff: str, n_current: int, run_date: str) -
     }
 
 
+def _default_lookback_days() -> int:
+    """The horizon-derived rolling window, identical to the expression in
+    ``pipeline_common.push_predictor_rolling_metrics``.
+
+    ONE derivation, both producers (alpha-engine-config-I8701). The grade window
+    is ``forward_days`` TRADING days, ~1.4 calendar days each; the +30 is the
+    rolling history admitted on top of it. Falls back to the legacy literal 30
+    only if the active horizon cannot be read, and says so in the log rather
+    than silently narrowing the window.
+    """
+    try:
+        forward_days = int(ACTIVE_HORIZON_DAYS)
+    except (TypeError, ValueError):  # fall back loudly, never silently
+        log.warning(
+            "production_health: could not read the active horizon; falling back "
+            "to the legacy 30-day lookback, which structurally under-samples "
+            "graded rows (alpha-engine-config-I8701)",
+            exc_info=True,
+        )
+        return 30
+    grade_window_calendar = int(forward_days * 7 / 5) + 1
+    return grade_window_calendar + 30
+
+
 def compute_production_health(
     db_path: str,
     bucket: str,
     run_date: str | None = None,
-    lookback_days: int = 30,
+    lookback_days: int | None = None,
 ) -> dict:
     """
     Compute production model health metrics and write to S3.
 
     Returns summary dict with IC, hit rate, regime breakdown, and flags.
+
+    ``lookback_days`` defaults to the HORIZON-DERIVED window, not a literal 30
+    (alpha-engine-config-I8701). The hardcoded 30 was the same defect
+    ``pipeline_common.push_predictor_rolling_metrics`` already fixed on its own
+    side: a prediction's label takes ``forward_days`` TRADING days (~30 calendar
+    days at 21) to close, so graded rows always sit at the very START of a
+    30-day window and slide out of it within days of the database being
+    refreshed.
+
+    Measured 2026-08-26, and this is not a theoretical range:
+
+      * 2026-08-22 run, window [07-23, 08-22] -> n=25, degradation_flag TRUE
+      * 2026-08-26 run, window [07-27, 08-26] -> n=0, n_any_horizon=0, skipped
+
+      against the SAME research.db (S3 copy last written 2026-08-22; it is
+      refreshed weekly). Four days of window drift took every graded row out.
+
+    That made the newly un-paused weekday rule actively harmful: on the four
+    weekdays that are not the refresh day it computed nothing and OVERWROTE the
+    good artifact with an `insufficient_samples` payload — destroying the very
+    `degradation_flag` the detector exists to raise. Persisting on the skip path
+    is deliberate and correct (it fixed the 2026-05-15 stale-file landmine); the
+    window is what was wrong.
+
+    Deriving it the same way the sibling producer does keeps the two agreeing,
+    which is the whole of -I8701.
     """
     run_date = run_date or datetime.utcnow().strftime("%Y-%m-%d")
+    if lookback_days is None:
+        lookback_days = _default_lookback_days()
     cutoff = (datetime.strptime(run_date, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
     # ── Load resolved predictor outcomes ─────────────────────────────────────
