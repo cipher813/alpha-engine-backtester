@@ -208,6 +208,32 @@ def handler(event: dict, context) -> dict:
     if results.get("retrain_alert", {}).get("triggered"):
         status = "degraded"
 
+    # alpha-engine-config-I8704 — a dry run GRADED NOTHING, and must never say
+    # `ok`. Under dry_run both compute phases short-circuit to
+    # {"status": "dry_run"}, so `degradation_flag` is absent from
+    # `production_health` and every check above falls through to the initial
+    # "ok" — a canary that evaluated no metric reported
+    # `status=ok warnings=[]`, which is champion-challenger-policy §7.2's
+    # "well-formed artifact containing nothing".
+    #
+    # This is not hypothetical: the deploy canary
+    # (infrastructure/deploy_health.sh, `{"dry_run": true}`) is currently the
+    # ONLY thing invoking this Lambda — the scheduled EventBridge rule
+    # `alpha-engine-predictor-health-check` is DISABLED under the 2026-08-07
+    # automation pause. So every log line anyone has seen from this function
+    # since then said `ok` while `degradation_flag` sat true in the artifact
+    # the weekly backtester writes.
+    #
+    # The canary asserts on the Lambda's statusCode (200), never on this
+    # field, so making it honest cannot fail a deploy.
+    if dry_run:
+        status = "dry_run"
+        warnings.append(
+            "dry_run: NO metric was evaluated — production health, calibration "
+            "and the retrain triggers were all skipped. This is a canary "
+            "invocation, not a health verdict."
+        )
+
     if not dry_run:
         try:
             from nousergon_lib.health import Deliverable, write_health
