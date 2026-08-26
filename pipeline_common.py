@@ -1180,12 +1180,31 @@ def push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
         total_lookback = grade_window_calendar + 30
         cutoff = (datetime.utcnow() - timedelta(days=total_lookback)).strftime("%Y-%m-%d")
         conn = _sqlite3.connect(db_path)
+        # alpha-engine-config-I8701 — the horizon + cutover filters were added to
+        # `analysis/production_health.py` on 2026-05-15 and NEVER propagated here,
+        # although both functions answer the same question off the same table.
+        # This is the `fix-not-propagated-to-analogous-sites` class, and the
+        # consequence was not cosmetic: without them this pool blends
+        # pre-cutover 5d-arithmetic rows and off-horizon rows with post-cutover
+        # 21d log-alpha rows, whose distributions differ in both scale
+        # (variance ~sqrt(21/5)) and label semantics. The identical omission
+        # produced the false-positive `ic_degradation` retrain alert on
+        # 2026-05-11 (rolling = -0.1005 against training 0.4634) — see the
+        # CURRENT_HORIZON_FILTER_SQL and POST_CUTOVER_FILTER_SQL comments above,
+        # which document that incident against the sibling call site only.
+        #
+        # Measured 2026-08-26, the two producers disagreed in SIGN off the same
+        # weekly run: this function published ic_30d = -0.0768 over N=547 while
+        # production_health.py published rolling_30d_ic = +0.0321 over N=25.
+        # The -0.0768 was the number rendered on the daily Alpha Engine Brief.
         df = pd.read_sql_query(
             "SELECT *, "
             f"{ALPHA_COALESCE_SQL} AS canonical_actual, "
             f"{CORRECT_COALESCE_SQL} AS canonical_correct, "
             f"{HORIZON_COALESCE_SQL} AS canonical_horizon "
             f"FROM predictor_outcomes WHERE {OUTCOMES_GRADED_SQL} "
+            f"  AND {CURRENT_HORIZON_FILTER_SQL} "
+            f"  AND {POST_CUTOVER_FILTER_SQL} "
             "AND prediction_date >= ?",
             conn,
             params=(cutoff,),
@@ -1225,7 +1244,28 @@ def push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
             )[0]
             for i in range(n_chunks)
         ])
-        ic_ir_30d = round(float(chunk_ics.mean() / (chunk_ics.std() + _IC_STD_EPSILON)), 3)
+        # alpha-engine-config-I8701: a constant-signal chunk makes pearsonr
+        # return NaN, which propagated straight into the artifact as a bare
+        # `NaN` literal — invalid JSON that a strict reader rejects outright
+        # (measured in the live latest.json on 2026-08-26: `"ic_ir_30d": NaN`).
+        # Non-finite is reported as null, which every consumer already handles.
+        _ir = float(np.nanmean(chunk_ics) / (np.nanstd(chunk_ics) + _IC_STD_EPSILON))
+        ic_ir_30d = round(_ir, 3) if np.isfinite(_ir) else None
+
+    # alpha-engine-config-I8701 — EFFECTIVE sample size. `rolling_n` counts
+    # (ticker, date) rows, and the daily brief renders the IC beside it as if
+    # that were the N behind the estimate. It is not: the labels are 21-trading-day
+    # forward windows over ~30 names, so consecutive prediction dates share almost
+    # all of their realization period and the rows are nowhere near independent.
+    # The honest unit is the number of NON-OVERLAPPING label windows the pool
+    # spans. Reported alongside, never instead of, `rolling_n` — a reader
+    # comparing -0.0768 to its own standard error needs this and had no way to
+    # derive it from the artifact.
+    n_dates = int(pd.to_datetime(valid["prediction_date"], errors="coerce").dt.date.nunique()) if len(valid) else 0
+    n_effective = max(1, n_dates // max(1, int(forward_days))) if n_dates else 0
+    ic_se_effective = (
+        round(float(1.0 / (max(n_effective - 1, 1) ** 0.5)), 4) if n_effective else None
+    )
 
     s3 = boto3.client("s3")
     existing: dict = {}
@@ -1255,6 +1295,33 @@ def push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
     existing["rolling_n"] = len(df)
     existing["forward_days"] = forward_days
     existing["lookback_days"] = total_lookback
+    # alpha-engine-config-I8701 — the estimator's own description, carried WITH
+    # the number so no consumer has to reconstruct it from a function name.
+    # `ic_30d` is a misnomer retained for back-compat: the window is
+    # `lookback_days` (60 at forward_days=21), never 30. Every field below is
+    # additive; nothing existing is renamed or removed (S3 contract safety).
+    existing["realized_ic"] = {
+        "value": ic_30d,
+        "window_days": total_lookback,
+        "horizon_days": forward_days,
+        "signal_leg": "p_up_minus_p_down",
+        "estimator": "pearson_r",
+        "n_rows": len(valid),
+        "n_prediction_dates": n_dates,
+        # Non-overlapping label windows the pool spans — the unit a standard
+        # error may legitimately be computed against.
+        "n_effective": n_effective,
+        "se_effective": ic_se_effective,
+        "horizon_filtered": True,
+        "post_cutover_filtered": True,
+        "note": (
+            "Pearson r of (p_up - p_down) against realized canonical log-alpha, "
+            "over graded post-cutover outcomes at the active horizon. The signal "
+            "leg is the DERIVED direction probability, not canonical_predicted_alpha "
+            "— see production_health.json::l2_alpha_ic for the alpha leg. "
+            "n_effective, not n_rows, is the count a significance claim may use."
+        ),
+    }
     # Machine-readable reason when ic is null — lets consumers distinguish
     # "not enough graded data yet" from "producer never ran" from "producer
     # crashed" (config#5194 silent-failure class).
