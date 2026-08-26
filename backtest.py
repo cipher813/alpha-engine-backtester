@@ -3536,6 +3536,16 @@ def run_predictor_backtest(config: dict) -> dict:
             pit_sweep_df = _param_sweep.sweep(
                 grid, _pit_sim_fn, config, sweep_settings=sweep_settings,
             )
+            # config-I7309: the sweep's budget numbers are the ones that say
+            # whether the pass is sized right, and until they reach the pass
+            # ARTIFACT they exist only in a spot log nobody reads after the
+            # instance self-terminates (principles.md §2.7 — a component
+            # emitting nothing is unobserved, not healthy).
+            if pit_sweep_df is not None:
+                stats["_sweep_budget"] = {
+                    k: pit_sweep_df.attrs.get(k)
+                    for k in _param_sweep.SWEEP_BUDGET_ATTRS
+                }
             if pit_sweep_df is not None and not pit_sweep_df.empty and trading_dates:
                 stats.update(
                     _build_pit_parity_cscv_matrix(
@@ -4525,11 +4535,30 @@ def _build_pit_parity_cscv_matrix(
     returning ``{_cscv_block_matrix, _cscv_spec_ids, _cscv_n_trials}`` for the
     walk-forward pass stats. NaN cells for a combo that failed on a block are
     left in place — ``cscv_pbo`` drops non-finite rows honestly.
+
+    **Self-deadlining (config-I7309).** This is the THIRD long loop inside the
+    ``pit_parity`` walk-forward pass's single 2700 s subprocess ceiling, after
+    the walk-forward fold loop (config#7199) and the sweep combo loop. At the
+    canonical 8x12 defaults with the measured 272.5 s per-combo cost it is
+    ~3,270 s of work — more than the whole ceiling — and until this change it
+    was the one loop with no bound at all, so a pass whose sweep stopped
+    politely on its budget was still SIGKILLed here with nothing published.
+
+    The unit of work is a whole BLOCK ROW, never a partial one: a row with
+    some combos evaluated and the rest NaN is not a smaller CSCV, it is a
+    biased one — the missing cells are exactly the lower-ranked combos, which
+    is the ordering the PBO measures. Stopping at row boundaries yields a
+    genuinely smaller rectangular matrix instead.
     """
     from optimizer.executor_optimizer import _chronological_blocks
 
-    n_blocks = int(config.get("pit_parity_cscv_n_blocks", 8))
-    top_k = int(config.get("pit_parity_cscv_top_k", 12))
+    import deadline_budget as _budget
+    from analysis import param_sweep as _param_sweep
+
+    n_blocks = int(
+        config.get("pit_parity_cscv_n_blocks", _param_sweep.CSCV_DEFAULT_N_BLOCKS)
+    )
+    top_k = int(config.get("pit_parity_cscv_top_k", _param_sweep.CSCV_DEFAULT_TOP_K))
     metric_key = "sortino_ratio"
 
     # Sweep param columns = grid keys; use them to reconstruct per-combo configs.
@@ -4551,8 +4580,56 @@ def _build_pit_parity_cscv_matrix(
             "report will carry pbo=insufficient", len(blocks),
         )
 
+    remaining_s = _budget.deadline_remaining_s(
+        config,
+        tag=_param_sweep.CSCV_BUDGET_TAG,
+        reserve_s=_param_sweep.CSCV_BUDGET_RESERVE_S,
+    )
+    # Seeded from the sweep's own measured per-combo cost where the sweep
+    # published one: a block row re-simulates ``len(combos)`` combos over
+    # ~1/n_blocks of the grid. Falling back to the sweep's first-combo seed
+    # keeps the estimate erring high, which is the safe direction — an
+    # over-estimate costs one block row, an under-estimate costs the pass.
+    combo_p90_s = sweep_df.attrs.get("combo_p90_s")
+    try:
+        combo_p90_s = float(combo_p90_s) if combo_p90_s is not None else None
+    except (TypeError, ValueError):
+        combo_p90_s = None
+    first_row_estimate_s = (
+        (combo_p90_s or _param_sweep.SWEEP_FIRST_COMBO_ESTIMATE_S)
+        * len(combos) / float(max(n_blocks, 1))
+    )
+
     matrix: list[list[float]] = []
-    for block in blocks:
+    row_seconds: list[float] = []
+    n_blocks_stopped_for_budget = 0
+    for row_i, block in enumerate(blocks, 1):
+        if not _budget.next_unit_affordable(
+            remaining_s, row_seconds,
+            reserve_s=_param_sweep.CSCV_BUDGET_RESERVE_S,
+            first_unit_estimate_s=first_row_estimate_s,
+            tag=_param_sweep.CSCV_BUDGET_TAG,
+        ):
+            n_blocks_stopped_for_budget = len(blocks) - row_i + 1
+            # LOUD: a short matrix is a real coverage loss and it changes what
+            # the PBO means. A silently-short matrix would be indistinguishable
+            # from a deliberately coarse CSCV.
+            logger.error(
+                "%s stopping early on budget: %d of %d block row(s) not run "
+                "(p90 per-row %.1fs, %.0fs of budget left, reserve %.0fs). "
+                "The completed rows are returned as a PARTIAL CSCV matrix — "
+                "%d row(s) built against cscv min_splits=%d.",
+                _param_sweep.CSCV_BUDGET_TAG, n_blocks_stopped_for_budget,
+                len(blocks),
+                _budget.p90(row_seconds, default=first_row_estimate_s),
+                _budget.safe_remaining(
+                    remaining_s, tag=_param_sweep.CSCV_BUDGET_TAG,
+                ) if remaining_s is not None else float("inf"),
+                _param_sweep.CSCV_BUDGET_RESERVE_S,
+                len(matrix), _param_sweep.CSCV_MIN_BLOCKS,
+            )
+            break
+        t_row = _time.monotonic()
         rowvals: list[float] = []
         for combo in combos:
             # sim_fn (the sweep closure) expects a FULL config (base+params),
@@ -4572,11 +4649,38 @@ def _build_pit_parity_cscv_matrix(
                 )
                 rowvals.append(float("nan"))
         matrix.append(rowvals)
+        row_seconds.append(_time.monotonic() - t_row)
+        logger.info(
+            "pit_parity CSCV block row %d/%d done in %.1fs",
+            row_i, len(blocks), row_seconds[-1],
+        )
+
+    budget_meta = {
+        "_cscv_n_blocks_planned": len(blocks),
+        "_cscv_n_blocks_run": len(matrix),
+        "_cscv_n_blocks_skipped_for_budget": n_blocks_stopped_for_budget,
+        "_cscv_budget_stopped": bool(n_blocks_stopped_for_budget),
+        "_cscv_block_p90_s": (
+            round(_budget.p90(row_seconds, default=first_row_estimate_s), 1)
+            if row_seconds else None
+        ),
+    }
+
+    if not matrix:
+        # Zero rows is not a small matrix, it is no matrix. Return the budget
+        # metadata anyway so the artifact records WHY pbo is null — an absent
+        # explanation is what made this class invisible for three Saturdays.
+        logger.error(
+            "pit_parity CSCV built ZERO block rows before its budget ran out "
+            "— pbo stays null (honest N/A), never fabricated.",
+        )
+        return budget_meta
 
     return {
         "_cscv_block_matrix": matrix,
         "_cscv_spec_ids": list(range(len(combos))),
         "_cscv_n_trials": int(len(sweep_df)),
+        **budget_meta,
     }
 
 
