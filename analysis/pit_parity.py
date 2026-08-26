@@ -15,9 +15,36 @@ arithmetically.
 This both proves the leak was material (a non-trivial delta ⇒ the optimizer
 was selecting params on future-trained weights) and becomes the regression
 tripwire: a later code change that re-introduces look-ahead moves these
-numbers. It is **observational** — it never gates the Saturday SF and never
-writes optimizer configs. The `--walk-forward` default flip stays a manual,
-Brian-gated decision made *after* reading this report (plan §5).
+numbers. It never FAILS the Saturday SF (the parity branch degrades fail-open)
+and never writes optimizer configs. The `--walk-forward` default flip stays a
+manual, Brian-gated decision made *after* reading this report (plan §5).
+
+**It is no longer "observational" in the sense of having no downstream
+consumer** (corrected 2026-08-25, alpha-engine-config-I7309). That claim was
+true when this module was written, and it is the premise the 2026-08-13
+disable rests on — the CFN trigger comment reads *"the weekly pipeline was
+being blocked by a stage with no downstream consumer"*. It is now false:
+`crucible-evaluator/grading/attestation.py` reads
+`backtest/{run_date}/pit_parity.json` as the **contamination half of the run
+attestation**, and the Director stamps `advisory_unverified: true` and
+withholds `issue_filing` and `loop_verification` when it is absent. Measured
+on the 2026-08-22 cycle: `director/2026-08-21/action_plan.json` carries
+exactly that, naming *"contamination attestation absent at
+s3://alpha-engine-research/backtest/2026-08-21/pit_parity.json — the producer
+never ran this cycle"*, and the report card is `status: partial` for the same
+reason.
+
+Two consequences, both load-bearing for how this check is scheduled:
+
+* Under `sf-pipeline-policy` §2.3a rule 1 the verdict must REACH that
+  consumer. A verdict-producing stage that has acquired a consumer is not
+  optional any more, whatever its original posture said.
+* That consumer resolves the artifact **by exact run_date**
+  (`attestation._read_verdict_artifact` rejects a body stamped with any other
+  `run_date` — "a verdict from an earlier cycle is not this cycle's verdict"),
+  so moving this check onto its own out-of-band cadence does NOT decouple it
+  for free: the weekly cycle would keep reading UNKNOWN unless the evaluator
+  first grows an explicit freshness window for the contamination half.
 """
 
 from __future__ import annotations
