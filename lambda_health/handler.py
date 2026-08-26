@@ -129,9 +129,26 @@ def handler(event: dict, context) -> dict:
     phase_errors: list[str] = []
 
     # ── Download research.db from S3 ─────────────────────────────────────
-    db_path = _download_research_db(bucket)
-    if not db_path:
-        return _response(500, "Failed to download research.db from S3")
+    # alpha-engine-config-I8704 — the canary does NOT download it. Under
+    # dry_run both compute phases short-circuit and the retrain-alert email is
+    # skipped, so nothing reads the database: the download was 356 MB of pure
+    # waste per deploy. Worse, it POISONED the container it warmed. `/tmp` is
+    # 512 MB and research.db is 356 MB, so a warm container still holding the
+    # canary's copy has no room for a second, and the next REAL invocation died
+    # with `[Errno 28] No space left on device` — measured 2026-08-26T17:55Z,
+    # four minutes after a canary at 17:51Z, on the first live run of the
+    # freshly un-paused rule.
+    db_path = None
+    if dry_run:
+        log.info(
+            "[dry_run] Skipping research.db download — no phase reads it, and "
+            "leaving a 356 MB file in a warm /tmp breaks the next real run "
+            "(alpha-engine-config-I8704)"
+        )
+    else:
+        db_path = _download_research_db(bucket)
+        if not db_path:
+            return _response(500, "Failed to download research.db from S3")
 
     results = {}
 
@@ -282,11 +299,32 @@ def handler(event: dict, context) -> dict:
     })
 
 
-def _download_research_db(bucket: str) -> str | None:
-    """Download research.db from S3 to /tmp."""
+#: Where research.db lands on the Lambda's ephemeral volume. Named so a test
+#: can redirect it without patching `os.path` (alpha-engine-config-I8704).
+_RESEARCH_DB_PATH = "/tmp/research.db"
+
+
+def _download_research_db(bucket: str, db_path: str | None = None) -> str | None:
+    """Download research.db from S3 to /tmp.
+
+    alpha-engine-config-I8704: a warm container must never need 2x the file on
+    disk. Lambda's `/tmp` is 512 MB and research.db was 356 MB on 2026-08-26 and
+    grows weekly, so a stale copy from a previous invocation leaves no room for
+    boto3's managed download and the invocation dies with
+    `[Errno 28] No space left on device`. Removing the old file first is the
+    difference between "warm container" and "warm container that cannot work".
+    """
     import boto3
-    db_path = "/tmp/research.db"
+    db_path = db_path or _RESEARCH_DB_PATH
     try:
+        if os.path.exists(db_path):
+            stale_mb = os.path.getsize(db_path) / (1024 * 1024)
+            os.remove(db_path)
+            log.info(
+                "Removed a stale /tmp/research.db (%.1f MB) from a warm container "
+                "before re-downloading — /tmp cannot hold two copies "
+                "(alpha-engine-config-I8704)", stale_mb,
+            )
         s3 = boto3.client("s3")
         s3.download_file(bucket, "research.db", db_path)
         size_mb = os.path.getsize(db_path) / (1024 * 1024)
