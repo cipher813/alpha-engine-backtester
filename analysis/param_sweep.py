@@ -56,6 +56,12 @@ _SWEEP_BUDGET_TAG = "[param_sweep]"
 #: inside the same pass — ``_build_pit_parity_cscv_matrix``'s per-block
 #: re-simulations, stats assembly, and the pickle/S3 write. Being killed at the
 #: wall discards the whole pass; over-reserving costs at most one combo.
+#:
+#: **This flat value is the reserve for every caller that is NOT followed by the
+#: CSCV matrix build.** For the ``pit_parity_sweep`` path it is only a FLOOR:
+#: see :func:`cscv_reserve_s`, which derives the reserve from the work that
+#: actually follows. A flat 600 s was a guess, and the arithmetic it has to
+#: cover is not flat — it scales with the number of combos the sweep completes.
 SWEEP_BUDGET_RESERVE_S = float(os.environ.get("PARAM_SWEEP_RESERVE_S", "600"))
 
 #: Assumed cost of the FIRST combo, before this run has measured anything.
@@ -65,6 +71,100 @@ SWEEP_BUDGET_RESERVE_S = float(os.environ.get("PARAM_SWEEP_RESERVE_S", "600"))
 SWEEP_FIRST_COMBO_ESTIMATE_S = float(
     os.environ.get("PARAM_SWEEP_FIRST_COMBO_ESTIMATE_S", "300")
 )
+
+# ── config-I7309: the CSCV matrix build is the THIRD loop in the same pass ───
+# ``backtest._build_pit_parity_cscv_matrix`` runs immediately after this sweep,
+# inside the SAME 2700 s subprocess ceiling, re-simulating the sweep's top-K
+# combos on each of ``n_blocks`` chronological blocks — ``n_blocks x top_k``
+# simulations, each over roughly ``1/n_blocks`` of the date grid, so the whole
+# matrix costs about ``p90(combo) x top_k x n_blocks / n_blocks`` = one full
+# sweep of the top-K again.
+#
+# At the canonical defaults (8 blocks x top-12) with the measured 272.5 s
+# per-combo cost that is ~3,270 s of work — MORE than the entire 2700 s pass
+# ceiling — held back behind a flat 600 s reserve. So bounding only the combo
+# loop moved the SIGKILL from the sweep to the matrix build rather than
+# removing it: the pass still had nothing to publish. Both halves are bounded
+# here, and the reserve is DERIVED from the matrix build's own arithmetic
+# instead of guessed.
+#
+# These constants are defined once, here, and imported by
+# ``backtest._build_pit_parity_cscv_matrix`` so the reserve arithmetic and the
+# loop it is reserving for cannot drift apart.
+
+#: Default number of chronological CSCV blocks (rows of the block matrix).
+CSCV_DEFAULT_N_BLOCKS = 8
+
+#: Default number of top-Sortino combos re-evaluated on each block (columns).
+CSCV_DEFAULT_TOP_K = 12
+
+#: Minimum block ROWS that make a CSCV PBO computable at all (``cscv_pbo``'s
+#: ``min_splits``). The sweep reserves enough budget for this many rows and no
+#: more: reserving for all ``n_blocks`` would starve the sweep of the combos
+#: the matrix has to be built FROM, and rows beyond the minimum are bought out
+#: of whatever budget the sweep leaves behind.
+CSCV_MIN_BLOCKS = 4
+
+#: Seconds the CSCV matrix loop itself holds back, for stats assembly, the
+#: pickle to ``--stats-out`` and the S3 pass-artifact write. Distinct from
+#: :data:`SWEEP_BUDGET_RESERVE_S`, which covers the matrix build; this covers
+#: what follows the matrix build.
+CSCV_BUDGET_RESERVE_S = float(os.environ.get("PIT_PARITY_CSCV_RESERVE_S", "180"))
+
+#: Tag prefixing the CSCV loop's budget log lines, so the three self-deadlining
+#: loops inside one pass (``[walk_forward]``, ``[param_sweep]``,
+#: ``[cscv_matrix]``) stay distinguishable in one interleaved log.
+CSCV_BUDGET_TAG = "[cscv_matrix]"
+
+#: The ``df.attrs`` keys ``_run_combos`` publishes about its own budget. Named
+#: once so the producer and every consumer that lifts them into an artifact
+#: cannot drift apart — a key added here and forgotten at the consumer is a
+#: number that exists only in a log on a self-terminating spot instance.
+SWEEP_BUDGET_ATTRS = (
+    "n_combos_planned",
+    "n_combos_run",
+    "n_combos_skipped_for_budget",
+    "sweep_budget_stopped",
+    "combo_p90_s",
+    "cscv_reserve_s",
+)
+
+
+def cscv_reserve_s(
+    config: dict,
+    combo_seconds: list[float],
+    n_combos_done: int,
+    *,
+    first_combo_estimate_s: float = SWEEP_FIRST_COMBO_ESTIMATE_S,
+) -> float:
+    """Seconds the combo loop must hold back so a MINIMUM-VIABLE CSCV matrix
+    can still be built after it.
+
+    Returns :data:`SWEEP_BUDGET_RESERVE_S` unchanged when no CSCV build
+    follows (``pit_parity_sweep`` unset) — every non-pit_parity caller keeps
+    the behaviour it had.
+
+    The estimate is ``p90(observed combo) x top_k_effective x CSCV_MIN_BLOCKS /
+    n_blocks``, because one block row re-simulates ``top_k_effective`` combos
+    over ~``1/n_blocks`` of the date grid. ``top_k_effective`` is
+    ``min(n_combos_done + 1, top_k)`` — the matrix can only be built from
+    combos the sweep actually finished, so each additional combo raises the
+    reserve by a fraction of its own cost. That is self-limiting on purpose:
+    the loop stops at the point where one more combo would cost more than the
+    validation of the combos already in hand, rather than sweeping a grid it
+    cannot then evaluate.
+    """
+    if not config.get("pit_parity_sweep"):
+        return SWEEP_BUDGET_RESERVE_S
+    n_blocks = int(config.get("pit_parity_cscv_n_blocks", CSCV_DEFAULT_N_BLOCKS))
+    top_k = int(config.get("pit_parity_cscv_top_k", CSCV_DEFAULT_TOP_K))
+    if n_blocks <= 0 or top_k <= 0:
+        return SWEEP_BUDGET_RESERVE_S
+    top_k_effective = max(1, min(n_combos_done + 1, top_k))
+    per_combo = _budget.p90(combo_seconds, default=first_combo_estimate_s)
+    block_rows = min(CSCV_MIN_BLOCKS, n_blocks)
+    matrix_s = per_combo * top_k_effective * block_rows / float(n_blocks)
+    return CSCV_BUDGET_RESERVE_S + matrix_s
 
 
 def _deepcopy_safe_config(base: dict) -> dict:
@@ -354,15 +454,23 @@ def _run_combos(
     rows = []
     n = len(combinations)
     t_sweep_start = _time.monotonic()
+    reserve_s = cscv_reserve_s(base_config, [], 0)
     remaining_s = _budget.deadline_remaining_s(
-        base_config, tag=_SWEEP_BUDGET_TAG, reserve_s=SWEEP_BUDGET_RESERVE_S,
+        base_config, tag=_SWEEP_BUDGET_TAG, reserve_s=reserve_s,
     )
     combo_seconds: list[float] = []
     n_combos_stopped_for_budget = 0
     for i, params in enumerate(combinations, 1):
+        # config-I7309: the reserve is re-derived each iteration rather than
+        # held flat, because the work it covers — the CSCV matrix build — is a
+        # function of how many combos this sweep has already produced. A flat
+        # reserve is either too small (the matrix build is SIGKILLed, which is
+        # what a bounded combo loop alone still did) or too large (combos are
+        # given up to protect a matrix that never needed the room).
+        reserve_s = cscv_reserve_s(base_config, combo_seconds, len(rows))
         if not _budget.next_unit_affordable(
             remaining_s, combo_seconds,
-            reserve_s=SWEEP_BUDGET_RESERVE_S,
+            reserve_s=reserve_s,
             first_unit_estimate_s=SWEEP_FIRST_COMBO_ESTIMATE_S,
             tag=_SWEEP_BUDGET_TAG,
         ):
@@ -380,7 +488,7 @@ def _run_combos(
                 _budget.p90(combo_seconds, default=SWEEP_FIRST_COMBO_ESTIMATE_S),
                 _budget.safe_remaining(remaining_s, tag=_SWEEP_BUDGET_TAG)
                 if remaining_s is not None else float("inf"),
-                SWEEP_BUDGET_RESERVE_S,
+                reserve_s,
             )
             break
         # Per-combo progress at INFO so the sweep never goes silent. Each
@@ -442,6 +550,10 @@ def _run_combos(
         round(_budget.p90(combo_seconds, default=SWEEP_FIRST_COMBO_ESTIMATE_S), 1)
         if combo_seconds else None
     )
+    # The reserve is now derived, so it is a MEASUREMENT of this run rather
+    # than a constant anyone can look up — it has to be emitted or the
+    # sweep-vs-CSCV split cannot be reasoned about after the fact.
+    df.attrs["cscv_reserve_s"] = round(float(reserve_s), 1)
     # Sort by sortino_ratio (primary — skilled-risk basket per
     # [[anchor_gates_on_skilled_risk_not_sharpe]] / evaluator-revamp-260506.md).
     # total_alpha is presentation/tiebreaker only — never primary, per

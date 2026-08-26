@@ -69,6 +69,50 @@
       },
       "additionalProperties": true
     },
+    "budget": {
+      "type": "object",
+      "description": "config-I7309: how much work each of the walk-forward pass's self-deadlining loops actually bought inside the single 2700 s subprocess ceiling. The FOLD loop's share is the separate top-level `coverage` block; this block carries the other two — the param_sweep combo loop and the CSCV block-matrix build, which together are the pass's whole cost when `pit_parity_sweep` is set. Both halves are ALWAYS emitted, including on a pass that truncated nothing, so a producer that stopped emitting is distinguishable from a run that stopped nothing (principles.md §2.7). Absent on artifacts written before config-I7309, which read as budget-unmeasured, never as complete. A null field means the producer did not measure it and is never a completeness assertion.",
+      "properties": {
+        "sweep": {
+          "type": "object",
+          "description": "analysis/param_sweep._run_combos — one full simulation per combo.",
+          "properties": {
+            "n_combos_planned": { "type": ["integer", "null"] },
+            "n_combos_run": { "type": ["integer", "null"] },
+            "n_combos_skipped_for_budget": { "type": ["integer", "null"] },
+            "budget_stopped": {
+              "type": ["boolean", "null"],
+              "description": "True iff the combo loop stopped early on its budget. null = not measured, never False-by-default."
+            },
+            "combo_p90_s": {
+              "type": ["number", "null"],
+              "description": "p90 observed per-combo wall-clock — the number the NEXT run's affordability arithmetic is sized from."
+            },
+            "cscv_reserve_s": {
+              "type": ["number", "null"],
+              "description": "Seconds the combo loop held back for the CSCV matrix build that follows it in the same process. DERIVED per iteration from combo_p90_s and the top-K the matrix will use (analysis/param_sweep.cscv_reserve_s), not a flat constant: the work it covers scales with the combos the sweep produces."
+            }
+          },
+          "additionalProperties": true
+        },
+        "cscv": {
+          "type": "object",
+          "description": "backtest._build_pit_parity_cscv_matrix — one whole block ROW per unit. Never a partial row: a row missing its lower-ranked combos biases the very ordering the PBO measures, so a truncated matrix is smaller and rectangular rather than ragged.",
+          "properties": {
+            "n_blocks_planned": { "type": ["integer", "null"] },
+            "n_blocks_run": {
+              "type": ["integer", "null"],
+              "description": "Block rows actually built. Below cscv min_splits (4) the PBO is honest-insufficient; zero rows means no matrix at all and the compare reports pbo null, never fabricated."
+            },
+            "n_blocks_skipped_for_budget": { "type": ["integer", "null"] },
+            "budget_stopped": { "type": ["boolean", "null"] },
+            "block_p90_s": { "type": ["number", "null"] }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
     "reuse": {
       "type": "object",
       "description": "config#6032: PredictorBacktest-phase predictor_stats.json reuse status for the walkforward pass — the phase runs the same walk-forward inference over the same config earlier in the SF, so its artifact can substitute for this pass's own subprocess (~25 min saved). Always attempted=false for the lookahead pass, which forces the legacy single-pass mode no phase artifact reproduces.",

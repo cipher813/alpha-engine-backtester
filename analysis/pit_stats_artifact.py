@@ -151,6 +151,71 @@ def extract_pass_stats(stats: dict) -> dict:
     return out
 
 
+#: config-I7309: the per-loop budget outcome of the walk-forward pass. Three
+#: loops share one 2700 s subprocess ceiling — the fold loop (whose coverage is
+#: already lifted to the artifact's top-level ``coverage`` block), the sweep
+#: combo loop and the CSCV matrix build. The latter two decide how many combos
+#: and how many CSCV block rows the pass actually bought, which is what says
+#: whether the ceiling and the reserve split are sized right. Emitted ALWAYS,
+#: including on a pass that stopped nothing: a block that appears only when
+#: something was truncated cannot be told apart from a producer that stopped
+#: emitting (principles.md §2.7).
+_CSCV_BUDGET_FIELDS = (
+    "_cscv_n_blocks_planned",
+    "_cscv_n_blocks_run",
+    "_cscv_n_blocks_skipped_for_budget",
+    "_cscv_budget_stopped",
+    "_cscv_block_p90_s",
+)
+
+
+def extract_budget(stats: dict) -> dict:
+    """The pass's sweep + CSCV budget outcome, as strict JSON.
+
+    Keys are always present; a value is ``None`` where the producer did not
+    measure it. ``None`` is never rendered as "complete" — the same rule the
+    ``coverage`` block already follows.
+    """
+    sweep = stats.get("_sweep_budget") or {}
+    return {
+        "sweep": {
+            "n_combos_planned": _coerce_int(sweep.get("n_combos_planned")),
+            "n_combos_run": _coerce_int(sweep.get("n_combos_run")),
+            "n_combos_skipped_for_budget": _coerce_int(
+                sweep.get("n_combos_skipped_for_budget")
+            ),
+            "budget_stopped": _coerce_bool(sweep.get("sweep_budget_stopped")),
+            "combo_p90_s": _coerce_number(sweep.get("combo_p90_s")),
+            "cscv_reserve_s": _coerce_number(sweep.get("cscv_reserve_s")),
+        },
+        "cscv": {
+            "n_blocks_planned": _coerce_int(stats.get("_cscv_n_blocks_planned")),
+            "n_blocks_run": _coerce_int(stats.get("_cscv_n_blocks_run")),
+            "n_blocks_skipped_for_budget": _coerce_int(
+                stats.get("_cscv_n_blocks_skipped_for_budget")
+            ),
+            "budget_stopped": _coerce_bool(stats.get("_cscv_budget_stopped")),
+            "block_p90_s": _coerce_number(stats.get("_cscv_block_p90_s")),
+        },
+    }
+
+
+def _coerce_int(value):
+    """Explicit int, or ``None`` when the producer did not measure it."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_bool(value):
+    """``None`` (not measured) is preserved rather than collapsing to False —
+    "the loop did not stop" and "nobody looked" are different findings."""
+    return bool(value) if value is not None else None
+
+
 def build_pass_artifact(
     stats: dict, which: str, run_date: str, wall_clock_seconds: float | None = None,
 ) -> dict:
@@ -167,6 +232,9 @@ def build_pass_artifact(
     }
     if status == "ok":
         artifact["stats"] = extract_pass_stats(stats)
+        # config-I7309: always emitted, both halves, in every state — see
+        # _CSCV_BUDGET_FIELDS.
+        artifact["budget"] = extract_budget(stats)
         # config#7199: lift the walk-forward coverage block to the TOP LEVEL of
         # the pass artifact. It is already inside stats.predictor_metadata, but
         # the compare's verdict depends on it, and a field a verdict depends on
