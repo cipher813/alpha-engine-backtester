@@ -71,6 +71,21 @@ def _persist_metric(bucket: str, key: str, result: dict) -> None:
     `degradation_flag` — the 2026-05-15 forensic landmine that opened this
     investigation (`training_ic_source: None` was read off that stale file).
     """
+    # alpha-engine-config-I8704 — the LIVENESS ANCHOR. `date` is the run date
+    # the metrics describe; it says nothing about when a grade last actually
+    # happened, so "this detector has not evaluated anything in N days" was not
+    # derivable from the artifact. It needed to be: the only consumer of
+    # `degradation_flag` is the retrain alert in the predictor-health-check
+    # Lambda, whose EventBridge rule has been DISABLED since 2026-08-07, and
+    # nothing about that silence was visible on any surface.
+    #
+    # Stamped here, in the single write path every non-error return goes
+    # through, rather than at each call site — a call site that forgets it is
+    # exactly how the gap reappears.
+    result = {
+        **result,
+        "evaluated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
     try:
         boto3.client("s3").put_object(
             Bucket=bucket,

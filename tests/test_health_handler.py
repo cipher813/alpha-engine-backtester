@@ -119,12 +119,25 @@ def test_load_feature_drift_not_found(mock_json):
 @patch("lambda_health.handler.compute_calibration_validation", create=True)
 @patch("lambda_health.handler.compute_production_health", create=True)
 def test_handler_dry_run(mock_health, mock_cal, mock_db, mock_drift):
-    """dry_run should skip S3 writes and email."""
+    """dry_run should skip S3 writes and email — and SAY it graded nothing.
+
+    This test previously asserted ``status == "ok"``, pinning the defect
+    alpha-engine-config-I8704 fixes: a canary that evaluates no metric reported
+    the same word a healthy graded run does. Measured 2026-08-26, that was not
+    a latent risk — the deploy canary was the ONLY caller of this Lambda (the
+    scheduled rule is DISABLED under the 2026-08-07 automation pause), so every
+    log line anyone had seen from it said ``status=ok warnings=[]`` while
+    ``production_health.json`` carried ``degradation_flag: true``.
+    """
     result = handler({"dry_run": True}, None)
 
+    # Still a 200 — the deploy canary gates on statusCode, so an honest status
+    # field cannot fail a deploy (infrastructure/deploy_health.sh).
     assert result["statusCode"] == 200
     body = json.loads(result["body"])
-    assert body["status"] == "ok"
+    assert body["status"] == "dry_run", (
+        "a dry run graded nothing and must not report a health verdict"
+    )
     # Should NOT have called the analysis functions (dry_run skips them)
     mock_health.assert_not_called()
     mock_cal.assert_not_called()
