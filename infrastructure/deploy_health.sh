@@ -92,6 +92,21 @@ echo ""
 echo "==> Waiting for Lambda update to complete..."
 aws lambda wait function-updated --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}"
 
+# ── Step 5b: Ephemeral storage headroom ──────────────────────────────────────
+# alpha-engine-config-I8704. This Lambda downloads research.db into /tmp to
+# grade production health. On 2026-08-26 that database was 356 MB against
+# Lambda's DEFAULT 512 MB /tmp — already 70% full, and it grows every week.
+# The measured failure was `[Errno 28] No space left on device` on a warm
+# container (fixed in handler.py too: the canary no longer downloads it, and a
+# stale copy is removed before re-downloading). Those two make the CURRENT size
+# work; this is the headroom so the next 150 MB of database growth is not
+# another outage. Declared in the deploy script rather than set by hand so it
+# survives a function replacement — a console-only change would not.
+echo ""
+echo "==> Ensuring 2048 MB ephemeral storage (research.db is ~356 MB and growing)"
+aws lambda update-function-configuration --function-name "${LAMBDA_FUNCTION}" --ephemeral-storage '{"Size": 2048}' --region "${AWS_REGION}" --query 'EphemeralStorage.Size' --output text
+aws lambda wait function-updated --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}"
+
 # ── Step 6: Publish version (do NOT promote 'live' yet) ──────────────────────
 echo ""
 echo "==> Publishing Lambda version..."
