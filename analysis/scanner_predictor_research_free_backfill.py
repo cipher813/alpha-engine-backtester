@@ -164,6 +164,100 @@ _WEIGHTS_PREFIX = "predictor/weights/meta/"
 # reads THIS artifact now, not the dead table.
 _CANDIDATES_PREFIX = "candidates"
 
+# alpha-engine-config-I8755: the cohort must also cover the cut the PREDICTOR
+# resolves from, not only the scanner-passing set.
+#
+# The entry-selection slot runs two arms over this one parquet
+# (champion-challenger-policy.md §2): `scanner_predictor_direct` selects from
+# the scanner-passing pool, `scanner_predictor_top20` from the predictor's own
+# cut. Both read the SAME `predicted_alpha` per (ticker, prediction_date) — the
+# pool is the only treatment, which is what makes the comparison answer "which
+# pool selects better" rather than "which alpha is better".
+#
+# That only works if every member of both pools has a row. Measured 2026-08-27
+# on the 2026-08-21 cohort: 60 rows, all scanner-passing, and only 8 of the 20
+# `attractiveness_top_20` members among them. A top-N drawn from 8 candidates is
+# not an arm, it is nearly the whole set.
+#
+# The cut NAME is read from the membership artifact's own `predictor_universe_cut`
+# field rather than hardcoded here (champion-challenger-policy.md §7.5 —
+# provenance true by construction). When crucible-research moves that pointer,
+# this producer follows it with no edit. A hardcoded cut name is exactly the
+# defect §7.5 was written for: every prediction row stayed annotated
+# `watchlist_source: "scanner_candidate"` for weeks after the champion moved to
+# an attractiveness cut.
+_MEMBERSHIP_PREFIX = "universe_membership"
+
+
+def _predictor_cut_members(
+    bucket: str,
+    run_date: str,
+    *,
+    s3_client,
+) -> tuple[set[str], dict]:
+    """``(tickers, coverage)`` for the cut the predictor resolves from on ``run_date``.
+
+    Reads ``universe_membership/{run_date}/membership.json`` and returns the
+    members of whichever cut that artifact's ``predictor_universe_cut`` names.
+
+    **Fail-soft, but never silent.** This union only ever WIDENS the work list,
+    so an unreadable membership yields a narrower-but-valid backfill rather than
+    no backfill — the same posture as
+    ``crucible-predictor/inference/stages/load_universe.py::_read_holdings``.
+    But the narrowing is REPORTED, in the returned ``coverage`` dict and at
+    WARNING, because a silently short pool would make the top-20 arm look like
+    it selected badly when it was never given its candidates. A record asserting
+    an action that never happened is this fleet's dominant bug class; the
+    `coverage` dict is what keeps this one out of it.
+    """
+    coverage = {
+        "run_date": run_date,
+        "cut_name": None,
+        "n_members": 0,
+        "resolved": False,
+        "reason": None,
+    }
+    key = f"{_MEMBERSHIP_PREFIX}/{run_date}/membership.json"
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        doc = json.loads(obj["Body"].read())
+    except (ClientError, BotoCoreError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        coverage["reason"] = f"unreadable: {exc!r}"
+        logger.warning(
+            "predictor-cut union: s3://%s/%s unreadable (%s) — this cohort date "
+            "will carry only the scanner-passing pool, so any arm selecting from "
+            "the predictor cut is scored on a SHORT pool for %s",
+            bucket, key, exc, run_date,
+        )
+        return set(), coverage
+
+    cut_name = doc.get("predictor_universe_cut")
+    coverage["cut_name"] = cut_name
+    if not cut_name:
+        coverage["reason"] = "artifact names no predictor_universe_cut"
+        logger.warning(
+            "predictor-cut union: s3://%s/%s carries no predictor_universe_cut "
+            "— cannot know which cut the predictor resolves from for %s",
+            bucket, key, run_date,
+        )
+        return set(), coverage
+
+    cut = (doc.get("cuts") or {}).get(cut_name) or {}
+    tickers = {
+        str(t).upper() for t in (cut.get("tickers") or []) if t
+    }
+    if not tickers:
+        coverage["reason"] = f"cut {cut_name!r} is empty or absent from cuts"
+        logger.warning(
+            "predictor-cut union: s3://%s/%s names cut %r but it is empty or "
+            "absent — pool short for %s", bucket, key, cut_name, run_date,
+        )
+        return set(), coverage
+
+    coverage["resolved"] = True
+    coverage["n_members"] = len(tickers)
+    return tickers, coverage
+
 
 class NoCandidatesArtifactError(RuntimeError):
     """Raised when no ``candidates.json`` exists anywhere in the lookback
@@ -325,6 +419,13 @@ def _pending_universe(
     exact same field shape the old table did (``ticker``, ``quant_filter_pass``,
     ...); the artifact's own ``run_date`` becomes each row's ``eval_date``.
 
+    The work list is the UNION of that scanner-passing set and the members of
+    the cut the predictor resolves from (``_predictor_cut_members``,
+    alpha-engine-config-I8755), so both arms of the entry-selection slot have a
+    fully-populated pool over one shared ``predicted_alpha`` per
+    ``(ticker, prediction_date)``. Per-date coverage of that union is carried on
+    the returned frame's ``.attrs["predictor_cut_coverage"]``.
+
     Raises :class:`NoCandidatesArtifactError` if no ``candidates.json`` exists
     anywhere in the lookback window — the caller decides how to surface that
     (this module has no fallback universe to fall back to). A week whose
@@ -346,6 +447,7 @@ def _pending_universe(
         )
 
     rows: list[dict] = []
+    cut_coverage: list[dict] = []
     for d in dates:
         key = f"{_CANDIDATES_PREFIX}/{d}/candidates.json"
         try:
@@ -367,18 +469,45 @@ def _pending_universe(
                 "(config#3053)", bucket, key, run_date,
             )
             continue
+        scanner_passing: set[str] = set()
         for rec in eval_log:
             ticker = rec.get("ticker")
             if not ticker or not rec.get("quant_filter_pass"):
                 continue
+            scanner_passing.add(str(ticker).upper())
             rows.append({"ticker": ticker, "eval_date": run_date})
+
+        # alpha-engine-config-I8755: union in the predictor's own cut so the
+        # entry-selection slot's second arm has a pool to select from. Widening
+        # only — a name already scanner-passing is a no-op after drop_duplicates.
+        cut_members, coverage = _predictor_cut_members(
+            bucket, run_date, s3_client=s3,
+        )
+        added = sorted(cut_members - scanner_passing)
+        coverage["n_added_beyond_scanner_pool"] = len(added)
+        coverage["n_already_scanner_passing"] = len(cut_members & scanner_passing)
+        cut_coverage.append(coverage)
+        for ticker in added:
+            rows.append({"ticker": ticker, "eval_date": run_date})
+        if coverage["resolved"]:
+            logger.info(
+                "predictor-cut union %s: cut=%s %d member(s), %d already "
+                "scanner-passing, %d added to the work list",
+                run_date, coverage["cut_name"], coverage["n_members"],
+                coverage["n_already_scanner_passing"], len(added),
+            )
 
     df = pd.DataFrame(rows, columns=["ticker", "eval_date"]).drop_duplicates()
     existing = _existing_keys(conn)
     if existing and not df.empty:
         mask = ~df.apply(lambda r: (r["ticker"], r["eval_date"]) in existing, axis=1)
         df = df[mask]
-    return df.sort_values(["eval_date", "ticker"]).reset_index(drop=True)
+    out = df.sort_values(["eval_date", "ticker"]).reset_index(drop=True)
+    # Carried on the frame rather than returned as a second value so every
+    # existing caller is unaffected. `run_backfill` reads it to emit coverage;
+    # a caller that ignores it loses observability, not correctness.
+    out.attrs["predictor_cut_coverage"] = cut_coverage
+    return out
 
 
 def _download_weights_to_temp(
@@ -779,10 +908,25 @@ def run_backfill(
     except NoCandidatesArtifactError as exc:
         return {"status": "skipped", "reason": str(exc)}
 
+    # alpha-engine-config-I8755: emitted on EVERY run, healthy included. An
+    # absent field is unmeasured, not fine — and a short predictor-cut pool is
+    # indistinguishable from an arm that selected badly unless this is carried.
+    cut_coverage = list(pending.attrs.get("predictor_cut_coverage") or [])
+    unresolved = [c for c in cut_coverage if not c.get("resolved")]
+    if unresolved:
+        logger.warning(
+            "predictor-cut union unresolved on %d of %d cohort date(s): %s — "
+            "any arm selecting from the predictor cut is scored on a SHORT pool "
+            "for those dates (alpha-engine-config-I8755)",
+            len(unresolved), len(cut_coverage),
+            [(c["run_date"], c.get("reason")) for c in unresolved],
+        )
+
     if pending.empty:
         return {
             "status": "ok", "n_written": 0, "n_dates": 0, "n_errors": 0,
             "n_seeded_from_artifact": n_seeded,
+            "predictor_cut_coverage": cut_coverage,
         }
 
     mm = _load_meta_model(predictor_path, bucket, region=region)
@@ -950,4 +1094,5 @@ def run_backfill(
         "artifact_key": artifact_key,
         "feature_names": feat_names,
         "n_research_features_missing": n_research_missing,
+        "predictor_cut_coverage": cut_coverage,
     }
