@@ -38,6 +38,7 @@ from analysis.scanner_predictor_research_free_backfill import (
     _existing_keys,
     _list_recent_candidate_dates,
     _pending_universe,
+    _predictor_cut_members,
     assert_champion_feed_fresh,
 )
 
@@ -59,6 +60,10 @@ class _FakeS3:
 
     def put_candidates(self, date: str, artifact: dict) -> None:
         key = f"candidates/{date}/candidates.json"
+        self._bodies[key] = json.dumps(artifact).encode("utf-8")
+
+    def put_membership(self, date: str, artifact: dict) -> None:
+        key = f"universe_membership/{date}/membership.json"
         self._bodies[key] = json.dumps(artifact).encode("utf-8")
 
     def download_file(self, bucket, key, dest):
@@ -576,3 +581,142 @@ def test_fixture_dates_are_inside_the_lookback_window():
             f"{label} is {age}d old, outside the {_LOOKBACK_DAYS}d window "
             f"_pending_universe filters on"
         )
+
+
+# ── The predictor-cut union (alpha-engine-config-I8755) ──────────────────────
+#
+# The entry-selection slot runs two arms over ONE parquet: the champion selects
+# from the scanner-passing pool, the challenger from the cut the predictor
+# resolves from. Both read the same `predicted_alpha` per (ticker, date), so
+# the pool is the only treatment — which only holds if every member of BOTH
+# pools has a row.
+#
+# Every test below is RED without the union: the pre-change `_pending_universe`
+# returned scanner-passing rows only, so the cut-only names are simply absent
+# and `.attrs` carries nothing (champion-challenger-policy.md §7.4 — a guard
+# that cannot fail is worse than no guard).
+
+
+def _membership(cut_name: str, tickers: list[str], run_date: str) -> dict:
+    return {
+        "run_date": run_date,
+        "predictor_universe_cut": cut_name,
+        "cuts": {
+            cut_name: {"tickers": tickers},
+            "some_other_cut": {"tickers": ["ZZ0", "ZZ1"]},
+        },
+    }
+
+
+def test_pending_universe_unions_the_predictor_cut(tmp_path):
+    """Cut members absent from the scanner-passing set still get a work row."""
+    conn = sqlite3.connect(str(tmp_path / "r.db"))
+    _ensure_table(conn)
+    s3 = _seeded_s3(tmp_path, dates=(_D_RECENT,))  # passing T0/T1/T2
+    # C0/C1 are cut-only; T0 overlaps the scanner pool.
+    s3.put_membership(_D_RECENT, _membership("attractiveness_top_20", ["T0", "C0", "C1"], _D_RECENT))
+
+    pending = _pending_universe(conn, bucket="any-bucket", s3_client=s3)
+
+    assert set(pending["ticker"]) == {"T0", "T1", "T2", "C0", "C1"}, pending
+    # The overlap is not duplicated.
+    assert len(pending) == 5, pending
+    assert set(pending["eval_date"]) == {_D_RECENT}
+
+
+def test_pending_universe_does_not_union_a_cut_the_artifact_does_not_name(tmp_path):
+    """The cut NAME comes from the artifact, never from a literal here.
+
+    `predictor_universe_cut` points at `some_other_cut`, so THAT is the pool —
+    a hardcoded "attractiveness_top_20" would pick the wrong one and go stale
+    the moment crucible-research moves the pointer (policy §7.5).
+    """
+    conn = sqlite3.connect(str(tmp_path / "r.db"))
+    _ensure_table(conn)
+    s3 = _seeded_s3(tmp_path, dates=(_D_RECENT,))
+    doc = _membership("attractiveness_top_20", ["C0", "C1"], _D_RECENT)
+    doc["predictor_universe_cut"] = "some_other_cut"  # -> ZZ0/ZZ1
+    s3.put_membership(_D_RECENT, doc)
+
+    pending = _pending_universe(conn, bucket="any-bucket", s3_client=s3)
+
+    assert set(pending["ticker"]) == {"T0", "T1", "T2", "ZZ0", "ZZ1"}, pending
+    assert "C0" not in set(pending["ticker"])
+
+
+def test_pending_universe_reports_coverage_per_cohort_date(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "r.db"))
+    _ensure_table(conn)
+    s3 = _seeded_s3(tmp_path, dates=(_D_RECENT,))
+    s3.put_membership(_D_RECENT, _membership("attractiveness_top_20", ["T0", "C0", "C1"], _D_RECENT))
+
+    pending = _pending_universe(conn, bucket="any-bucket", s3_client=s3)
+    coverage = pending.attrs["predictor_cut_coverage"]
+
+    assert len(coverage) == 1
+    row = coverage[0]
+    assert row["run_date"] == _D_RECENT
+    assert row["cut_name"] == "attractiveness_top_20"
+    assert row["resolved"] is True
+    assert row["n_members"] == 3
+    assert row["n_already_scanner_passing"] == 1   # T0
+    assert row["n_added_beyond_scanner_pool"] == 2  # C0, C1
+
+
+def test_missing_membership_degrades_to_the_scanner_pool_and_says_so(tmp_path):
+    """Fail-soft, never silent.
+
+    The union only WIDENS the work list, so an unreadable membership must yield
+    a narrower-but-valid backfill rather than no backfill. But a short pool is
+    indistinguishable from an arm that selected badly, so it is REPORTED.
+    """
+    conn = sqlite3.connect(str(tmp_path / "r.db"))
+    _ensure_table(conn)
+    s3 = _seeded_s3(tmp_path, dates=(_D_RECENT,))  # no membership written
+
+    pending = _pending_universe(conn, bucket="any-bucket", s3_client=s3)
+
+    assert set(pending["ticker"]) == {"T0", "T1", "T2"}
+    row = pending.attrs["predictor_cut_coverage"][0]
+    assert row["resolved"] is False
+    assert row["n_members"] == 0
+    assert "unreadable" in row["reason"]
+
+
+def test_predictor_cut_members_reports_an_empty_named_cut(tmp_path):
+    """An artifact naming a cut it does not contain is reported, not silently
+    treated as 'no members'."""
+    s3 = _FakeS3(tmp_path)
+    s3.put_membership(
+        _D_RECENT,
+        {
+            "run_date": _D_RECENT,
+            "predictor_universe_cut": "attractiveness_top_20",
+            "cuts": {"attractiveness_top_20": {"tickers": []}},
+        },
+    )
+
+    tickers, coverage = _predictor_cut_members("any-bucket", _D_RECENT, s3_client=s3)
+
+    assert tickers == set()
+    assert coverage["resolved"] is False
+    assert coverage["cut_name"] == "attractiveness_top_20"
+    assert "empty or absent" in coverage["reason"]
+
+
+def test_predictor_cut_members_uppercases_and_drops_blanks(tmp_path):
+    s3 = _FakeS3(tmp_path)
+    s3.put_membership(
+        _D_RECENT,
+        {
+            "run_date": _D_RECENT,
+            "predictor_universe_cut": "c",
+            "cuts": {"c": {"tickers": ["aapl", "MSFT", "", None]}},
+        },
+    )
+
+    tickers, coverage = _predictor_cut_members("any-bucket", _D_RECENT, s3_client=s3)
+
+    assert tickers == {"AAPL", "MSFT"}
+    assert coverage["resolved"] is True
+    assert coverage["n_members"] == 2
