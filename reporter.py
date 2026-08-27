@@ -22,6 +22,7 @@ from botocore.exceptions import ClientError
 
 from nousergon_lib.quant.horizons import DEFAULT_POLICY
 
+from analysis.attestation import latest_attestation_key as _latest_attestation_key
 from analysis.attestation import run_attestation as _run_attestation
 from analysis.lookahead_disclosure import build_disclosure as _build_lookahead
 from analysis.lookahead_disclosure import render_section as _render_lookahead
@@ -1696,6 +1697,39 @@ def save(
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
             logger.info("Wrote %s (status=%s)", out_dir / filename, data.get("status"))
             _persist(out_dir / filename)
+
+    # alpha-engine-config-I8769: also overwrite the standing
+    # `backtest/latest/attestation.json` pointer with the SAME body written
+    # to the dated `backtest/{run_date}/attestation.json` key above, plus a
+    # `trading_day` field — mirroring `crucible-evaluator/director/
+    # handler.py`'s `director/latest/action_plan.json` pattern
+    # (config-I7157). A console `document-fields` binding on the
+    # date-templated dated key would render ABSENT every day the template
+    # isn't the key that exists; this fixed key is what such a binding reads
+    # instead. `trading_day` is added (not renamed from `run_date`, which the
+    # dated-key consumer `read_attestation` already validates) so a reader of
+    # ONLY the latest pointer can tell which cycle it reflects without
+    # depending on S3 `LastModified`. Only written when uploads are enabled
+    # (mirrors every other write in this function); per-tile fail-soft, same
+    # as `_persist` — a `latest`-pointer hiccup must not abort the compute
+    # phase, and the dated key above is the record of truth either way.
+    if upload_bucket is not None and attestation is not None:
+        latest_key = _latest_attestation_key()
+        latest_body = {**attestation, "trading_day": run_date}
+        try:
+            _s3_client(s3_client).put_object(
+                Bucket=upload_bucket,
+                Key=latest_key,
+                Body=json.dumps(latest_body, indent=2, default=str).encode(),
+                ContentType="application/json",
+            )
+            logger.info("Wrote s3://%s/%s", upload_bucket, latest_key)
+        except Exception as e:  # noqa: BLE001 — fail-soft; the dated key above is the record of truth
+            logger.warning(
+                "Latest-pointer S3 upload failed for %s (continuing; the "
+                "dated key is unaffected): %s",
+                latest_key, e,
+            )
 
     return out_dir
 
