@@ -2639,8 +2639,31 @@ def _scanner_factor_counterfactual(
         return {"status": "error", "reason": str(e)}
 
 
-def _scanner_then_predictor_topN(conn) -> dict:
+def _scanner_then_predictor_topN(conn, reference_date: str | None = None) -> dict:
     """Arm-4 counterfactual (config#1405): scanner -> research-free predictor direct.
+
+    **Source-staleness gate (alpha-engine-config-I8757).** This function joins
+    ``scanner_evaluations`` and count-matches against ``cio_evaluations``
+    ADVANCE rows — BOTH written by the six-team Research LangGraph, retired
+    2026-07-12. The reads never failed; the tables simply stopped changing, so
+    the function kept returning a well-formed number computed entirely from
+    cohort dates on or before 2026-07-10. Measured 2026-08-27: the champion
+    gate consumed an identical ``sector_neutral_mean_alpha_21d = -0.00203``,
+    ``n_cycles=15``, ``n_picks=119`` on 2026-08-13, -08-14 AND -08-21 — three
+    consecutive weekly runs reporting the same frozen point as new evidence,
+    for an arm that has been trading live throughout.
+
+    So the sources are checked BEFORE anything is computed, and a stale source
+    returns ``status="unmeasurable"`` rather than a number.
+    ``leaderboard_entry_from_e2e_lift`` already treats any non-``ok`` status as
+    "no new point this week", so the champion gate degrades to an honest
+    no-contest and holds the pointer — which is what it would have done all
+    along had the number not been available to mislead it.
+
+    ``reference_date`` is the "now" staleness is measured against. It defaults
+    to ``MAX(universe_returns.eval_date)`` — data-derived rather than
+    wall-clock, so re-running this over an archived research.db reports what
+    was true THEN instead of spuriously failing for being old.
 
     Bypasses the research/agentic layer entirely. Among the scanner-passing
     universe (``scanner_evaluations.quant_filter_pass=1``), rank by the
@@ -2678,6 +2701,41 @@ def _scanner_then_predictor_topN(conn) -> dict:
         missing = need - tabs
         if missing:
             return {"status": "skipped", "reason": f"missing tables: {sorted(missing)}"}
+
+        # ── Source staleness (alpha-engine-config-I8757) — see docstring ──
+        from analysis.retired_table_guard import (
+            StaleResearchTableError,
+            assert_sources_current,
+            survey_retired_tables,
+        )
+
+        ref = reference_date
+        if not ref:
+            _row = conn.execute("SELECT MAX(eval_date) FROM universe_returns").fetchone()
+            ref = _row[0] if _row and _row[0] else None
+        if not ref:
+            return {"status": "skipped", "reason": "universe_returns carries no eval_date"}
+        try:
+            source_freshness = assert_sources_current(
+                conn,
+                str(ref)[:10],
+                ("scanner_evaluations", "cio_evaluations"),
+                measurement="scanner_then_predictor_topN",
+            )
+        except StaleResearchTableError as stale:
+            logger.error(
+                "scanner_then_predictor_topN is UNMEASURABLE: %s", stale,
+            )
+            return {
+                "status": "unmeasurable",
+                "reason": str(stale),
+                "reference_date": str(ref)[:10],
+                "source_freshness": survey_retired_tables(
+                    conn,
+                    str(ref)[:10],
+                    tables=("scanner_evaluations", "cio_evaluations"),
+                ),
+            }
         se_cols = {r[1] for r in conn.execute("PRAGMA table_info(scanner_evaluations)")}
         if "quant_filter_pass" not in se_cols:
             return {"status": "skipped", "reason": "scanner_evaluations has no quant_filter_pass"}
@@ -2812,6 +2870,13 @@ def _scanner_then_predictor_topN(conn) -> dict:
             "status": "ok",
             "horizon": "21d",
             "n_cycles": n_cycles,
+            # alpha-engine-config-I8757: the ages of the retired-writer tables
+            # this number was computed from, carried on the HEALTHY path too.
+            # An absent field is unmeasured, not fine — and for seven weeks a
+            # frozen source was indistinguishable from a fresh one precisely
+            # because nothing said how old it was.
+            "reference_date": str(ref)[:10],
+            "source_freshness": source_freshness,
             "selection_count_basis": "per-cycle top-N matched to the live CIO ADVANCE count",
             "n_predictor_scored": n_scored_total,
             # Expect 4 (the 4 research meta-features omitted) — a guard that the

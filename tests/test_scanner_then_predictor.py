@@ -135,3 +135,108 @@ def test_insufficient_without_cio_advance(tmp_path):
     conn = _db(tmp_path, cio_decision_for=lambda i: "REJECT")
     r = _scanner_then_predictor_topN(conn)
     assert r["status"] == "insufficient_data", r
+
+
+# ── source staleness (alpha-engine-config-I8757) ─────────────────────────
+#
+# Both tables this counterfactual joins — scanner_evaluations and
+# cio_evaluations — were written by the six-team Research LangGraph, retired
+# 2026-07-12. The reads never failed; the data stopped changing. Measured
+# 2026-08-27 on the live research.db: universe_returns ran to 2026-08-14 while
+# scanner_evaluations stopped at 2026-07-17 and cio_evaluations at 2026-07-10,
+# and this function returned status="ok" with a number computed entirely from
+# cohorts on or before 2026-07-10. The champion gate consumed that identical
+# number (sector_neutral_mean_alpha_21d=-0.00203, n_cycles=15, n_picks=119) on
+# 2026-08-13, 2026-08-14 AND 2026-08-21.
+#
+# Every test below is RED without the guard: the pre-change function computes
+# and returns status="ok" regardless of how far behind its sources are.
+
+
+def _age_the_retired_tables(conn, newest_return_date: str):
+    """Advance universe_returns past the retired-writer tables, reproducing the
+    live shape: fresh returns, frozen sources."""
+    conn.execute(
+        "INSERT INTO universe_returns VALUES (?,?,?,?,?)",
+        ("T0", newest_return_date, "Tech", 0.01, 0.0),
+    )
+    conn.commit()
+
+
+def test_stale_sources_are_unmeasurable_not_ok(tmp_path):
+    conn = _db(tmp_path)
+    # Sources end 2026-01-23; returns run to 2026-03-01 — 37 days, past the 14d bound.
+    _age_the_retired_tables(conn, "2026-03-01")
+
+    r = _scanner_then_predictor_topN(conn)
+
+    assert r["status"] == "unmeasurable", r
+    assert "scanner_evaluations" in r["reason"]
+    assert "cio_evaluations" in r["reason"]
+    assert r["reference_date"] == "2026-03-01"
+    stale = {row["table"]: row for row in r["source_freshness"]}
+    assert stale["cio_evaluations"]["stale"] is True
+    assert stale["cio_evaluations"]["newest_date"] == "2026-01-23"
+
+
+def test_an_unmeasurable_result_yields_no_leaderboard_point(tmp_path):
+    """The whole consequence chain: unmeasurable -> no point -> the champion
+    gate has no score -> no_contest -> the pointer is held. Which is what the
+    gate would have done all along had the frozen number not been available to
+    mislead it."""
+    from optimizer.champion_promotion import leaderboard_entry_from_e2e_lift
+
+    conn = _db(tmp_path)
+    _age_the_retired_tables(conn, "2026-03-01")
+
+    r = _scanner_then_predictor_topN(conn)
+
+    assert leaderboard_entry_from_e2e_lift(
+        {"scanner_then_predictor_counterfactual": r}
+    ) is None
+
+
+def test_one_missed_cycle_still_measures(tmp_path):
+    """The bound is 14d against a 7d cadence. A single late weekly run must not
+    blank the arm's score — refusing on a transient is its own failure mode."""
+    conn = _db(tmp_path)
+    _age_the_retired_tables(conn, "2026-02-04")  # 12 days past 2026-01-23
+
+    r = _scanner_then_predictor_topN(conn)
+
+    assert r["status"] == "ok", r
+
+
+def test_a_healthy_run_states_its_source_ages(tmp_path):
+    """Emitted on the healthy path too — an absent field is unmeasured, not
+    fine, and a frozen source was indistinguishable from a fresh one for seven
+    weeks precisely because nothing said how old it was."""
+    conn = _db(tmp_path)
+
+    r = _scanner_then_predictor_topN(conn)
+
+    assert r["status"] == "ok"
+    assert r["reference_date"] == "2026-01-23"
+    ages = {row["table"]: row["age_days"] for row in r["source_freshness"]}
+    assert ages == {"scanner_evaluations": 0, "cio_evaluations": 0}
+
+
+def test_reference_date_is_data_derived_so_an_archived_db_still_reads_true(tmp_path):
+    """Re-running this over an archived research.db must report what was true
+    THEN, not fail for being old. The reference is MAX(universe_returns.eval_date),
+    never wall-clock."""
+    conn = _db(tmp_path)
+
+    r = _scanner_then_predictor_topN(conn)
+
+    assert r["reference_date"] == "2026-01-23"
+    assert r["status"] == "ok"
+
+
+def test_an_explicit_reference_date_overrides_the_derived_one(tmp_path):
+    conn = _db(tmp_path)
+
+    r = _scanner_then_predictor_topN(conn, reference_date="2026-06-01")
+
+    assert r["status"] == "unmeasurable", r
+    assert r["reference_date"] == "2026-06-01"
