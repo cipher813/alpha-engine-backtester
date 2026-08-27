@@ -21,6 +21,16 @@ updates:
     ignore:
       - dependency-name: "pandas"
         update-types: ["version-update:semver-major"]
+      # plotly majors break `import vectorbt` (alpha-engine-config-I8759): vectorbt 0.28.5
+      # builds its templates at import time and plotly 7 changed the validator
+      # they go through, so four test files fail at COLLECTION. Dependabot
+      # proposed it, CI refused it, and the cycle repeated as queue noise.
+      # Narrow by dependency-name for the same reason `pandas` is: a blanket
+      # "*" major ignore would also suppress security-relevant majors.
+      # REMOVING THIS ENTRY IS PART OF alpha-engine-config-I8759's closes-when — it goes when
+      # vectorbt supports the plotly major, not when the noise is annoying.
+      - dependency-name: "plotly"
+        update-types: ["version-update:semver-major"]
     groups:
       minor-and-patch:
         update-types:
