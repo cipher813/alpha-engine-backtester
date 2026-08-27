@@ -289,3 +289,92 @@ def predictor_cut_ranked_picks(
         candidates.sort(key=lambda row: row[1], reverse=True)
         out[str(eval_date)] = [t for t, _ in candidates]
     return out
+
+
+# ── reading the predictor's dated output (alpha-engine-config-I8756) ─────
+
+PREDICTIONS_PREFIX = "predictor/predictions/"
+
+#: How far back to read dated predictions when scoring the cut arm. The arm
+#: only qualifies from ~2026-07-30 (before that `predictor_universe_cut` named a
+#: different cut), so a wide window costs reads that can never contribute — but
+#: it must comfortably exceed the 21-day maturation lag plus the evidence floor,
+#: or the arm would be starved of history by its own reader.
+PREDICTIONS_LOOKBACK_DAYS = 180
+
+_DATED_PREDICTIONS_RE = None
+
+
+def load_dated_predictions(
+    bucket: str,
+    *,
+    s3_client=None,
+    lookback_days: int = PREDICTIONS_LOOKBACK_DAYS,
+    today: str | None = None,
+) -> dict[str, list[dict]]:
+    """``{date: predictions list}`` from ``predictor/predictions/{date}.json``.
+
+    The dated artifacts, never ``latest.json``: ``latest`` is a mutable pointer
+    and scoring history through it would attribute every past cohort to today's
+    cut. The dated objects are what the arm actually consumed on the day.
+
+    Fail-soft PER DATE — one unreadable object costs that cohort, not the run —
+    but never silently: each miss is logged, and the caller sees a short dict
+    rather than an exception it would have to distinguish from "no history".
+    """
+    import re
+    from datetime import date as _date
+    from datetime import timedelta as _td
+
+    global _DATED_PREDICTIONS_RE
+    if _DATED_PREDICTIONS_RE is None:
+        _DATED_PREDICTIONS_RE = re.compile(r"predictions/(\d{4}-\d{2}-\d{2})\.json$")
+
+    import boto3
+
+    s3 = s3_client or boto3.client("s3")
+    horizon = (
+        _date.fromisoformat(today) if today else _date.today()
+    ) - _td(days=lookback_days)
+
+    keys: list[str] = []
+    token = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": PREDICTIONS_PREFIX}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = s3.list_objects_v2(**kwargs)
+        for obj in page.get("Contents") or []:
+            m = _DATED_PREDICTIONS_RE.search(obj["Key"])
+            if not m:
+                continue
+            try:
+                if _date.fromisoformat(m.group(1)) < horizon:
+                    continue
+            except ValueError:
+                continue
+            keys.append(obj["Key"])
+        if not page.get("IsTruncated"):
+            break
+        token = page.get("NextContinuationToken")
+
+    import json as _json
+
+    out: dict[str, list[dict]] = {}
+    n_unreadable = 0
+    for key in sorted(keys):
+        eval_date = _DATED_PREDICTIONS_RE.search(key).group(1)
+        try:
+            body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            out[eval_date] = _json.loads(body).get("predictions") or []
+        except Exception as exc:  # noqa: BLE001 — one bad object costs one cohort
+            n_unreadable += 1
+            logger.warning(
+                "[arm_realized_lift] s3://%s/%s unreadable (%s) — that cohort "
+                "date will not contribute", bucket, key, exc,
+            )
+    logger.info(
+        "[arm_realized_lift] loaded %d dated predictions file(s) from the last "
+        "%dd (%d unreadable)", len(out), lookback_days, n_unreadable,
+    )
+    return out

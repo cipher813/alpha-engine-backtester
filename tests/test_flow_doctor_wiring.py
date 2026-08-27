@@ -392,7 +392,7 @@ class TestColdStartDeferral:
 # The tag every deploy artifact must pin. `tests/test_lib_pin_lockstep.py`
 # asserts requirements.txt and the three Lambda Dockerfiles all carry the SAME
 # tag; this constant is what that tag must be.
-_EXPECTED_LIB_TAG = "v0.124.83"
+_EXPECTED_LIB_TAG = "v0.124.93"
 
 
 class TestLibVersionPin:
@@ -443,7 +443,7 @@ class TestLibVersionPin:
             "counterfactual_winner; additive, no schema_version bump), "
             "consumed by crucible-backtester-PR712's shadow-only ruling "
             "(alpha-engine-config-I2515). Prior: v0.124.70 — "
-            "restored CO-INSTALL PARITY with crucible-predictor / "
+            "the producer_champion_audit contract gains a THIRD entry-selection arm — `scanner_top20_predictor` on the four champion enums, `challenger` admitting null, the new `arm_scores` object (nousergon-lib-PR360) and the arm's three `blocked_by` slugs (nousergon-lib-PR361). Those are ENUM values in a FROZEN contract, so the N-arm gate (alpha-engine-config-I8756, Brian's 2026-08-27 ruling) cannot write its weekly audit record below this pin — and a failed audit write loses the WHOLE week's evidence, not just the new arm's. Bumped in lockstep with crucible-predictor (crucible-predictor-PR566) because spot_backtest.sh co-installs both into one venv and the weekly SF's LibPinDriftGate hard-fails on a mismatch. Prior: v0.124.83 — restored CO-INSTALL PARITY with crucible-predictor / "
             "nousergon-data / crucible-research, which all moved to v0.124.70 "
             "on 2026-08-18 (nousergon-lib-PR329, the run-scope registry entry "
             "for alpha-engine-config-I7620). This repo stayed at v0.124.69, "

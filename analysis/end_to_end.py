@@ -742,6 +742,21 @@ def compute_lift_metrics(
             logger.warning("scanner_then_predictor_topN failed (non-fatal): %s", _stp)
             result["scanner_then_predictor_counterfactual"] = {"status": "error", "reason": str(_stp)}
 
+        # 3b. scanner_top20_predictor — the second entry-selection arm
+        # (alpha-engine-config-I8756). Same yardstick, same fixed N, same
+        # sector-neutral realized 21d alpha; the POOL is the only treatment.
+        # Fail-soft on the same terms as its sibling: the weekly gate reads a
+        # non-"ok" status as "no point this week" and holds the pointer.
+        try:
+            result["scanner_top20_predictor_counterfactual"] = (
+                _scanner_top20_predictor_lift(conn, bucket)
+            )
+        except Exception as _t20:  # pragma: no cover - defensive
+            logger.warning("scanner_top20_predictor lift failed (non-fatal): %s", _t20)
+            result["scanner_top20_predictor_counterfactual"] = {
+                "status": "error", "reason": str(_t20),
+            }
+
         # 4. Predictor lift
         result["predictor_lift"] = _predictor_lift(conn, ur, date_filter, params)
 
@@ -2632,6 +2647,93 @@ def _scanner_factor_counterfactual(
             "objective_axes": axes,
             "breadth_stratified": breadth_strat,
             "reconciliation": reconciliation,
+        }
+    except sqlite3.OperationalError as e:
+        return {"status": "skipped", "reason": f"sqlite: {e}"}
+    except Exception as e:  # pragma: no cover - defensive; never break e2e_lift
+        return {"status": "error", "reason": str(e)}
+
+
+def _scanner_top20_predictor_lift(conn, bucket: str, s3_client=None) -> dict:
+    """``scanner_top20_predictor``'s realized 21d lift (alpha-engine-config-I8756).
+
+    Brian, 2026-08-27: *"The scanner should be providing the top 20 to
+    predictor, weekly."* So this arm's ranking is the predictor's own
+    ``predicted_alpha`` over the members of ``predictor_universe_cut``, read
+    from the DATED ``predictor/predictions/{date}.json`` artifacts — the objects
+    the arm actually consumed on the day, never ``latest.json``, which is a
+    mutable pointer that would attribute every past cohort to today's cut.
+
+    Identical yardstick to ``_scanner_then_predictor_topN``: the same fixed
+    N=10, the same realized 21d SPY-relative return, the same within-cycle
+    sector neutralisation, via the same ``score_arm``. **The pool is the only
+    treatment** (champion-challenger-policy.md §4), which is the whole point of
+    scoring both through one function rather than two.
+
+    A cohort date whose cut is not this arm's cut is REFUSED upstream in
+    ``predictor_cut_ranked_picks`` — see that function for why that is a
+    refusal rather than a filter.
+    """
+    try:
+        from analysis.arm_realized_lift import (
+            DEFAULT_SELECTION_N,
+            load_dated_predictions,
+            load_realized_alpha,
+            predictor_cut_ranked_picks,
+            score_arm,
+        )
+
+        tabs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "universe_returns" not in tabs:
+            return {"status": "skipped", "reason": "missing table: universe_returns"}
+
+        realized = load_realized_alpha(conn)
+        if realized.empty:
+            return {
+                "status": "insufficient_data",
+                "reason": "universe_returns carries no matured 21d rows",
+            }
+
+        predictions = load_dated_predictions(bucket, s3_client=s3_client)
+        ranked = predictor_cut_ranked_picks(predictions)
+        if not ranked:
+            return {
+                "status": "insufficient_data",
+                "reason": (
+                    f"none of the {len(predictions)} dated predictions file(s) "
+                    "carries this arm's cut — predictor_universe_cut named a "
+                    "different cut on every date read"
+                ),
+                "n_cycles": 0,
+            }
+
+        lift = score_arm(
+            "scanner_top20_predictor", ranked, realized,
+            selection_n=DEFAULT_SELECTION_N,
+        )
+        if lift.n_cycles == 0:
+            return {
+                "status": "insufficient_data",
+                "reason": (
+                    f"the arm has {len(ranked)} qualifying cohort date(s) "
+                    f"(earliest {min(ranked)}) but none has matured — the newest "
+                    f"realized 21d row is {realized['eval_date'].max()}"
+                ),
+                "n_cycles": 0,
+                "n_qualifying_dates": len(ranked),
+            }
+
+        return {
+            "status": "ok",
+            "horizon": "21d",
+            "n_cycles": lift.n_cycles,
+            "n_qualifying_dates": len(ranked),
+            "selection_count_basis": (
+                f"fixed N={DEFAULT_SELECTION_N} — identical to "
+                "scanner_then_predictor_topN, so the pool is the only treatment"
+            ),
+            "reference_date": str(realized["eval_date"].max())[:10],
+            "methods": {"scanner_top20_predictor": lift.as_dict()},
         }
     except sqlite3.OperationalError as e:
         return {"status": "skipped", "reason": f"sqlite: {e}"}
