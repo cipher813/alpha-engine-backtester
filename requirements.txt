@@ -39,7 +39,19 @@ vectorbt~=0.28.5
 # total_return, i.e. the numba-compiled path actually executes.
 numba>=0.67
 numpy>=2.0,<2.6
-plotly<6
+# A VECTORBT ceiling, not a stale pin (alpha-engine-config-I8759). `vectorbt~=0.28.5`
+# builds its plot templates at import time, and plotly 7.0.0 changed the
+# validator those go through: measured on crucible-backtester-PR743, four test
+# files fail at COLLECTION with `_set_compound_prop -> validate_coerce` inside
+# `plotly/graph_objs/layout/_template.py`, before an assertion runs. Same shape
+# as the numpy ceiling above: the break is at `import vectorbt`, not in our code.
+#
+# Raising it is verified the way that one is — a clean 3.12 venv where
+# `import vectorbt` succeeds AND `vbt.Portfolio.from_signals(...)` returns the
+# correct total_return, so the numba-compiled path actually executed — never
+# inferred from metadata. `<7` rather than `<6` is that verification: Dependabot
+# jumped `<6` straight to `<8` and 6.x had never been tried.
+plotly<7
 pandas~=2.2
 boto3~=1.43
 pyyaml~=6.0
