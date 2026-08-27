@@ -118,7 +118,7 @@ cvxpy>=1.9.2,<1.10
 # test). Without it the test's `pytest.importorskip` would not skip but ERROR at
 # first validate() (module imports; jsonschema missing) — so the shared-schema
 # gate would never actually run in backtester CI, defeating the cross-repo pin.
-nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.83
+nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.93
 # ── Predictor-replay runtime deps (config#3031) ──────────────────────────────
 # synthetic/predictor_backtest.py and analysis/scanner_predictor_research_free_
 # backfill.py import crucible-predictor CODE in-process (sys.path), so THIS

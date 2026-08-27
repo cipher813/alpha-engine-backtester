@@ -18,7 +18,8 @@ own top-~20 by independent TT rating). ``scanner_predictor_direct`` is the
 new BASE-CASE champion (already live since 2026-07-13T22:07 UTC,
 config-I2364)::
 
-    VALID_CHAMPIONS = ("scanner_predictor_direct", "thinktank_coverage")
+    VALID_CHAMPIONS = ("scanner_top20_predictor", "scanner_predictor_direct",
+                       "thinktank_coverage")   # 2026-08-27: three arms, I8756
 
 ``agentic`` is READ-TOLERATED (a historical pointer/audit value must never
 crash this engine — ``_normalize_champion_before`` below WARNs and treats
@@ -363,7 +364,39 @@ AUDIT_SCHEMA_VERSION = 2    # config/apply_audit/producer_champion/{date}.json �
 POINTER_KEY = "config/producer_champion.json"
 AUDIT_PREFIX = "config/apply_audit/producer_champion"
 
-VALID_CHAMPIONS = ("scanner_predictor_direct", "thinktank_coverage")
+# alpha-engine-config-I8756 — Brian's ruling 2026-08-27:
+#
+#     "I want the champion/challenger for research to include the scanner top 20
+#      (not top 60) passed directly to the predictor. I want all other
+#      challengers to remain challengers such as think tank and other scanner
+#      configurations. But at this point I'm thinking we promote the best
+#      performer weekly"
+#
+# Three arms, one slot, best performer weekly. `scanner_top20_predictor` is
+# listed first because it is the arm the ruling names; ORDER IS NOT PRECEDENCE.
+# `evaluate_gates` breaks a champion-vs-challenger tie toward the INCUMBENT and
+# a challenger-vs-challenger tie on this tuple's order — the second is a
+# stability choice (a declared order beats dict iteration order), never a
+# statement that an earlier arm is preferred.
+VALID_CHAMPIONS = (
+    "scanner_top20_predictor",
+    "scanner_predictor_direct",
+    "thinktank_coverage",
+)
+
+# The arm an unrecognized or legacy pointer normalizes to FOR GATE PURPOSES.
+#
+# Named explicitly rather than taken as `DEFAULT_GATE_CHAMPION`, which is what it
+# used to be. Under two arms those were the same value by accident; adding a
+# third made TUPLE POSITION silently decide which arm a legacy `agentic`
+# pointer is treated as — so reordering the tuple, a cosmetic edit, would have
+# changed which arm a stale pointer normalizes to. Caught by
+# `TestShadowOnlyEndToEnd` before this shipped, not by inspection.
+#
+# It is the BASE-CASE arm: the one live since 2026-07-13, not the one the
+# 2026-08-27 ruling adds. A normalization is a guess about what a stale pointer
+# meant, and the only defensible guess is the incumbent.
+DEFAULT_GATE_CHAMPION = "scanner_predictor_direct"
 
 # Retired seat(s) — READ-TOLERATED (a historical pointer/audit artifact using
 # this value must never crash the engine) but WRITE-FORBIDDEN (excluded from
@@ -396,7 +429,26 @@ _LEGACY_CHAMPIONS = ("agentic",)
 # (the executor has a live consumer for it, executor/champion.py::
 # _apply_thinktank_coverage) and a legal arm to score; it is simply not a
 # legal arm for this engine to promote.
-SHADOW_ONLY_ARMS: frozenset[str] = frozenset({"thinktank_coverage"})
+# **Brian's ruling 2026-08-27 SUPERSEDES the 2026-08-20 shadow-only ruling**
+# recorded above, on the single question of whether `thinktank_coverage` may
+# take the pointer:
+#
+#     "I want all other challengers to remain challengers such as think tank and
+#      other scanner configurations. But at this point I'm thinking we promote
+#      the best performer weekly"
+#                                                     — Brian, 2026-08-27
+#
+# An arm that can never win is an observation, not a challenger. The set is now
+# EMPTY, which is the honest way to say "every registered arm can take the seat
+# this week."
+#
+# The SET AND BOTH ENFORCEMENT LAYERS STAY. They are the mechanism, not the
+# membership: a future arm introduced in shadow mode inherits the protection at
+# `evaluate_gates` (the policy) and `write_champion_pointer` (the invariant)
+# simultaneously, by being added here and nowhere else. Deleting the mechanism
+# because it is currently unused is how it would have to be rebuilt — and
+# rebuilt at one layer instead of two — the next time an arm needs it.
+SHADOW_ONLY_ARMS: frozenset[str] = frozenset()
 
 
 def is_shadow_only(arm: str | None) -> bool:
@@ -448,6 +500,13 @@ _BLOCKED_BY_SLUGS = (
     # repo's own research.db cycles.
     "scanner_predictor_direct_thin_evidence",
     "scanner_predictor_direct_confidence_unknown",
+    # alpha-engine-config-I8756 — the third arm's own slugs. Separate per arm
+    # because the operator response differs: a thin top-20 arm waits on the
+    # 21-day maturation of a cut that only began on 2026-07-30, which is time,
+    # not a defect to chase.
+    "scanner_top20_predictor_counterfactual_unavailable",
+    "scanner_top20_predictor_thin_evidence",
+    "scanner_top20_predictor_confidence_unknown",
     "leaderboard_unavailable",
     "leaderboard_stale_gt_8d",
     "leaderboard_horizon_mismatch",
@@ -744,13 +803,31 @@ def hac_significance(
 # ── Gate engine (weekly winner-take-all) ────────────────────────────────────
 
 
-def _other_champion(champion: str) -> str:
-    others = [c for c in VALID_CHAMPIONS if c != champion]
-    if len(others) != 1:
-        raise ValueError(
-            f"_other_champion expects exactly 2 VALID_CHAMPIONS, got {VALID_CHAMPIONS!r}"
-        )
-    return others[0]
+def _challengers(champion: str) -> list[str]:
+    """Every registered arm that is not the incumbent, in ``VALID_CHAMPIONS`` order.
+
+    Replaces ``_other_champion``, which returned "the other one" and raised
+    unless exactly two arms existed (alpha-engine-config-I2518 / -I8756). An
+    N-arm gate has no "the other one", and the raise made adding a third arm a
+    crash rather than a comparison.
+    """
+    return [c for c in VALID_CHAMPIONS if c != champion]
+
+
+def _best_challenger(
+    champion: str, scores: dict,
+) -> tuple[str | None, float | None]:
+    """The highest-scoring challenger, or ``(None, None)`` if none is scored.
+
+    Ties among challengers break on ``VALID_CHAMPIONS`` order — declared and
+    stable — never on dict iteration order, which is neither.
+    """
+    challengers = _challengers(champion)
+    ranked = sorted(
+        ((arm, scores.get(arm)) for arm in challengers if scores.get(arm) is not None),
+        key=lambda row: (-row[1], challengers.index(row[0])),
+    )
+    return (ranked[0][0], ranked[0][1]) if ranked else (None, None)
 
 
 def _normalize_champion_before(champion: str) -> str:
@@ -771,15 +848,15 @@ def _normalize_champion_before(champion: str) -> str:
             "alpha-engine-config-I2518 seat swap) — normalizing to %r for "
             "gate purposes only; the pointer itself is left untouched unless "
             "this week's gates clear a move.",
-            champion, VALID_CHAMPIONS[0],
+            champion, DEFAULT_GATE_CHAMPION,
         )
-        return VALID_CHAMPIONS[0]
+        return DEFAULT_GATE_CHAMPION
     logger.warning(
         "Champion pointer had unrecognized champion=%r — treating as %r for "
         "gate purposes only (the pointer itself is left untouched unless "
-        "gates clear a move)", champion, VALID_CHAMPIONS[0],
+        "gates clear a move)", champion, DEFAULT_GATE_CHAMPION,
     )
-    return VALID_CHAMPIONS[0]
+    return DEFAULT_GATE_CHAMPION
 
 
 def evaluate_gates(
@@ -869,11 +946,14 @@ def evaluate_gates(
     challenger, champion_score, challenger_score, blocked_by,
     leaderboard_date_used, arm_confidence, counterfactual_winner.
     """
-    challenger = _other_champion(champion_before)
     scores = arm_scores.get("scores", {})
     reasons = arm_scores.get("unavailable_reasons", {})
     champ_score = scores.get(champion_before)
-    chall_score = scores.get(challenger)
+    # alpha-engine-config-I8756 — N arms. The incumbent is compared against
+    # EVERY other registered arm, and only the best-scoring one can take the
+    # seat, so `challenger` keeps its two-arm meaning ("the arm that could win")
+    # and every historical reader of the audit record keeps working.
+    challenger, chall_score = _best_challenger(champion_before, scores)
 
     record: dict[str, Any] = {
         "champion_before": champion_before,
@@ -881,6 +961,11 @@ def evaluate_gates(
         "challenger": challenger,
         "champion_score": champ_score,
         "challenger_score": chall_score,
+        # The N-arm view. `champion_score`/`challenger_score` collapse the week
+        # into the pair that happened to matter; this keeps the rest legible. A
+        # null VALUE means that arm produced no comparable evidence — different
+        # from the arm being absent (nousergon-lib v0.124.92 admits the field).
+        "arm_scores": {arm: scores.get(arm) for arm in VALID_CHAMPIONS},
         "blocked_by": None,
         "leaderboard_date_used": arm_scores.get("leaderboard_date_used"),
         # alpha-engine-config-I7549 — carried on EVERY outcome, so the audit
@@ -892,16 +977,25 @@ def evaluate_gates(
         "counterfactual_winner": None,
     }
 
+    # A contest needs the incumbent scored AND at least one scored challenger.
+    # An unscored incumbent is not a beatable incumbent: promoting over it would
+    # be promoting over an ABSENCE, which is how a silent producer failure
+    # becomes a pointer move.
     if champ_score is None or chall_score is None:
         blocked: list[str] = []
         if champ_score is None:
             blocked.append(reasons.get(champion_before, "arm_score_unavailable"))
-        if chall_score is None:
-            blocked.append(reasons.get(challenger, "arm_score_unavailable"))
+        # Every unscored arm is named, not just one. With N arms, "the
+        # challenger had no score" no longer identifies which challenger.
+        for arm in _challengers(champion_before):
+            if scores.get(arm) is None:
+                blocked.append(reasons.get(arm, "arm_score_unavailable"))
         record["outcome"] = "no_contest"
         record["blocked_by"] = blocked
         return record
 
+    # Ties favour the incumbent — the pointer never moves on an exactly-equal
+    # signal.
     winner = challenger if chall_score > champ_score else champion_before
     record["counterfactual_winner"] = winner
 
@@ -1055,7 +1149,7 @@ def write_champion_pointer(
 def read_champion_pointer(bucket: str, s3_client=None) -> dict | None:
     """Read the current pointer. Returns None on 404/NoSuchKey (pre-bootstrap
     — no promotion has ever been written; callers should treat champion as
-    the base-case arm, ``VALID_CHAMPIONS[0]`` == 'scanner_predictor_direct',
+    the base-case arm, ``DEFAULT_GATE_CHAMPION`` ('scanner_predictor_direct'),
     mirroring executor/champion.py's own default post-I2515). Any other
     error is NOT swallowed here (this is the producer side, not the
     fail-loud executor consumer) but is logged and returns None so a
@@ -1466,6 +1560,72 @@ def _score_thinktank_coverage(
     return float(alpha["mean"]), None, confidence
 
 
+def _score_scanner_top20_predictor(
+    e2e_lift: dict | None,
+) -> tuple[float | None, str | None, str]:
+    """``scanner_top20_predictor``'s weekly score (alpha-engine-config-I8756).
+
+    Mirrors ``_score_scanner_predictor_direct`` exactly — same evidence floor,
+    same three-element return, same confidence vocabulary — because both sides
+    of a comparison must state how much evidence stands behind them in ONE
+    vocabulary or the audit record cannot be read as a comparison.
+
+    Reads ``scanner_top20_predictor_counterfactual``, produced in the same
+    evaluate run by ``analysis/end_to_end.py::_scanner_top20_predictor_lift``.
+    """
+    if not isinstance(e2e_lift, dict):
+        return (
+            None,
+            "scanner_top20_predictor_counterfactual_unavailable",
+            CONFIDENCE_INSUFFICIENT,
+        )
+    cf = e2e_lift.get("scanner_top20_predictor_counterfactual")
+    if not isinstance(cf, dict) or cf.get("status") != "ok":
+        return (
+            None,
+            "scanner_top20_predictor_counterfactual_unavailable",
+            CONFIDENCE_INSUFFICIENT,
+        )
+    method = (cf.get("methods") or {}).get("scanner_top20_predictor")
+    if not isinstance(method, dict):
+        return (
+            None,
+            "scanner_top20_predictor_counterfactual_unavailable",
+            CONFIDENCE_INSUFFICIENT,
+        )
+    n_cycles = cf.get("n_cycles")
+    if isinstance(n_cycles, bool) or not isinstance(n_cycles, int) or n_cycles < 0:
+        # A mean with no honest count behind it is refused, never trusted.
+        logger.warning(
+            "[champion_promotion] scanner_top20_predictor reported no usable "
+            "n_cycles (%r) — refusing to score it, no-contest", n_cycles,
+        )
+        return None, "scanner_top20_predictor_confidence_unknown", CONFIDENCE_UNKNOWN
+    if n_cycles == 0:
+        return (
+            None,
+            "scanner_top20_predictor_counterfactual_unavailable",
+            CONFIDENCE_INSUFFICIENT,
+        )
+    if n_cycles < MIN_CYCLES_FOR_INFERENCE:
+        logger.warning(
+            "[champion_promotion] scanner_top20_predictor NOT scored this week: "
+            "n_cycles=%d < MIN_CYCLES_FOR_INFERENCE=%d. Expected while the cut "
+            "matures — it began 2026-07-30 and each cohort needs 21 trading "
+            "days — not a defect to chase.",
+            n_cycles, MIN_CYCLES_FOR_INFERENCE,
+        )
+        return None, "scanner_top20_predictor_thin_evidence", CONFIDENCE_THIN
+    sn = method.get("sector_neutral_mean_alpha_21d")
+    if sn is None:
+        return (
+            None,
+            "scanner_top20_predictor_counterfactual_unavailable",
+            CONFIDENCE_INSUFFICIENT,
+        )
+    return float(sn), None, CONFIDENCE_OK
+
+
 def build_weekly_arm_scores(
     e2e_lift: dict | None,
     tt_leaderboard: dict | None,
@@ -1501,22 +1661,28 @@ def build_weekly_arm_scores(
     through ``evaluate_gates`` into the weekly audit record so the audit trail
     shows WHICH EVIDENCE declined to decide, not merely that something did."""
     spd_score, spd_reason, spd_confidence = _score_scanner_predictor_direct(e2e_lift)
+    t20_score, t20_reason, t20_confidence = _score_scanner_top20_predictor(e2e_lift)
     tt_score, tt_reason, tt_confidence = _score_thinktank_coverage(
         tt_leaderboard, run_date, leaderboard_date_used,
     )
     reasons: dict[str, str] = {}
-    if spd_reason is not None:
-        reasons["scanner_predictor_direct"] = spd_reason
-    if tt_reason is not None:
-        reasons["thinktank_coverage"] = tt_reason
+    for arm, reason in (
+        ("scanner_predictor_direct", spd_reason),
+        ("scanner_top20_predictor", t20_reason),
+        ("thinktank_coverage", tt_reason),
+    ):
+        if reason is not None:
+            reasons[arm] = reason
     return {
         "scores": {
             "scanner_predictor_direct": spd_score,
+            "scanner_top20_predictor": t20_score,
             "thinktank_coverage": tt_score,
         },
         "unavailable_reasons": reasons,
         "arm_confidence": {
             "scanner_predictor_direct": spd_confidence,
+            "scanner_top20_predictor": t20_confidence,
             "thinktank_coverage": tt_confidence,
         },
         "leaderboard_date_used": leaderboard_date_used,
@@ -1615,7 +1781,7 @@ def run_weekly_evaluation(
     """
     pointer = read_champion_pointer(bucket, s3_client=s3_client)
     champion_before = _normalize_champion_before(
-        (pointer or {}).get("champion", VALID_CHAMPIONS[0])
+        (pointer or {}).get("champion", DEFAULT_GATE_CHAMPION)
     )
 
     gate_result = None
@@ -1637,12 +1803,15 @@ def run_weekly_evaluation(
         # win condition so a no-contest/defended-incumbent week never pays
         # for an S3 read + parquet parse whose result couldn't change the
         # outcome either way.
-        challenger = _other_champion(champion_before)
+        # alpha-engine-config-I8756: with N arms the probe targets the
+        # BEST-scoring challenger — the only one that can take the seat this
+        # week — so the S3 read count does not grow with the number of arms.
         scores = arm_scores.get("scores", {})
+        challenger, _best_score = _best_challenger(champion_before, scores)
         challenger_would_win = (
-            scores.get(champion_before) is not None
-            and scores.get(challenger) is not None
-            and scores[challenger] > scores[champion_before]
+            challenger is not None
+            and scores.get(champion_before) is not None
+            and _best_score > scores[champion_before]
         )
         # alpha-engine-config-I2515: a shadow-only challenger's win is
         # vetoed by evaluate_gates regardless of feed liveness, so the
