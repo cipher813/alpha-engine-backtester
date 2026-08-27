@@ -39,7 +39,7 @@ vectorbt~=0.28.5
 # total_return, i.e. the numba-compiled path actually executes.
 numba>=0.67
 numpy>=2.0,<2.6
-plotly<6
+plotly<8
 pandas~=2.2
 boto3~=1.43
 pyyaml~=6.0
