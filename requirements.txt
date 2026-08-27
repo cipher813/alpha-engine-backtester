@@ -130,7 +130,7 @@ nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.c
 # requirements files are now NEVER co-resolved: predictor's checkout on the
 # spot box is code-only, and these floors mirror predictor's own (all
 # compatible with the numpy cap above). Guard: tests/test_spot_backtest_no_sibling_requirements.py.
-scipy>=1.18.0
+scipy>=1.18.1
 lightgbm>=4.7.0
 catboost>=1.2.10
 hmmlearn>=0.3.3
