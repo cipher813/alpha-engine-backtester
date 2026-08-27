@@ -76,6 +76,13 @@ _UNIVERSE_RETURNS_EXEMPT = frozenset({
     # its universe_returns column names now resolve from HorizonPolicy
     # (OutcomeColumns attribute access), so no wide-column literal remains.
     "analysis/end_to_end.py",              # universe_returns joins + locally-computed alpha
+    # alpha-engine-config-I8757 — `load_realized_alpha` SELECTs
+    # (log_return_21d - log_spy_return_21d) FROM universe_returns. This is the
+    # same read `analysis/end_to_end.py` (above) has always done, LIFTED into
+    # its own module when the entry-selection scorer was rebuilt off the
+    # retired CIO tables; the debt is relocated, not added. Not a config#1483
+    # consumer: it never touches score_performance.
+    "analysis/arm_realized_lift.py",       # SELECT ... FROM universe_returns
     # config-I6975 — the runtime classification-count attestation builds a FROZEN
     # in-memory `universe_returns` table and drives `analysis/end_to_end.py`'s own
     # classification path over it. The fixture's columns must be exactly the ones
