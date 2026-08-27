@@ -206,7 +206,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "replay/batch.py": 2,
     "replay/counterfactual.py": 2,
     "replay/runner.py": 2,
-    "reporter.py": 1,
+    # +1 (1→2) alpha-engine-config-I8769: `save` gained a second put_object —
+    # the standing `backtest/latest/attestation.json` pointer, written
+    # alongside the existing dated `backtest/{date}/attestation.json` write —
+    # mirroring `crucible-evaluator/director/handler.py`'s
+    # `director/latest/action_plan.json` pointer (config-I7157). Registered
+    # in ARTIFACT_REGISTRY.yaml as `backtest_numeric_attestation_latest`
+    # (cadence saturday_sf), sibling of `backtest_numeric_attestation`.
+    "reporter.py": 2,
     # alpha-engine-config-I7039: the Evaluator stage's §2.3a correctness verdict
     # at backtest/{date}/evaluator_attestation.json — one put_object in
     # `write_attestation`. Registered in ARTIFACT_REGISTRY.yaml with a real
