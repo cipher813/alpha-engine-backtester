@@ -509,6 +509,10 @@ def _section_cio_rule_tag_precision(precision: dict) -> list[str]:
     """
     lines = ["## CIO Rule-Tag Precision", ""]
 
+    stale = _stale_sources_lines(precision)
+    if stale:
+        return lines + stale
+
     status = precision.get("status")
     if status == "insufficient_data":
         lines.append(f"> {precision.get('reason', 'insufficient tagged decisions')}")
@@ -1056,6 +1060,12 @@ def build_report(
     # Macro multiplier evaluation
     if macro_eval and macro_eval.get("status") == "ok":
         lines += _section_macro_eval(macro_eval)
+        lines += [""]
+    elif _stale_sources_lines(macro_eval):
+        # I8757: an omitted section reads as "nothing to report". A refusal
+        # is a finding and gets its own lines.
+        lines += ["## Macro multiplier evaluation", ""]
+        lines += _stale_sources_lines(macro_eval)
         lines += [""]
 
     # ── Phase 4: Self-adjustment mechanisms ──────────────────────────────
@@ -3429,9 +3439,45 @@ def _section_predictor_sizing(result: dict) -> list[str]:
     return lines
 
 
+def _stale_sources_lines(result: dict) -> list[str] | None:
+    """The rendered form of a `stale_sources` refusal (I8757), or None.
+
+    A refusal that renders as "skipped: unknown" — or worse, falls through to
+    a section that prints 0.0% for a number nobody computed — teaches the
+    reader to ignore the section. It names the dead table, its age and its
+    retirement, so the report says WHY there is no number this week.
+    """
+    from analysis.retired_table_guard import STALE_SOURCES_STATUS
+
+    if not result or result.get("status") != STALE_SOURCES_STATUS:
+        return None
+    fresh = result.get("source_freshness") or {}
+    tables = ", ".join(fresh.get("stale_tables") or []) or "a retired table"
+    ages = "; ".join(
+        f"{r['table']} newest={r['newest_date']} ({r['age_days']}d old, "
+        f"writer retired {r['retired_date']})"
+        for r in fresh.get("sources", []) if r.get("stale")
+    )
+    return [
+        f"> **No measurement this week — sources stale: {tables}.**",
+        "",
+        f"> {ages}" if ages else "",
+        "",
+        "> The rows are present and joinable; nothing has written them since "
+        "the research-graph retirement, so any number here would be a "
+        "historical artifact presented as this week's evidence "
+        "(alpha-engine-config-I8757).",
+        "",
+    ]
+
+
 def _section_scanner_opt(result: dict) -> list[str]:
     """Build scanner optimizer section."""
     lines = ["## Scanner filter optimizer (4a)", ""]
+
+    stale = _stale_sources_lines(result)
+    if stale:
+        return lines + stale
 
     if result.get("status") == "insufficient_data":
         note = result.get("note", "")
@@ -3535,6 +3581,10 @@ def _section_tech_weight_ablation(result: dict) -> list[str]:
     table and any cross-the-gate recommendations for operator review.
     """
     lines = ["## Tech weight ablation (per-sector quant scorer)", ""]
+
+    stale = _stale_sources_lines(result)
+    if stale:
+        return lines + stale
 
     if result.get("status") == "no_data":
         lines.append(f"> {result.get('reason', 'no team_candidates data')}")

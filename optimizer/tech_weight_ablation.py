@@ -54,6 +54,8 @@ from typing import Any
 
 import yaml
 
+from analysis import retired_table_guard
+
 logger = logging.getLogger(__name__)
 
 
@@ -429,6 +431,22 @@ def compute_tech_weight_ablation(
                     f"(needs v24 migration); missing: {missing}"
                 ),
             }
+
+        # alpha-engine-config-I8757. This recommendation ACTS: evaluate.py
+        # calls apply(), which writes the shadow + live per-sector weight
+        # artifacts to S3. Its only evidence table stopped being written on
+        # 2026-07-17, so without this check the optimizer would re-derive the
+        # same weights from the same frozen rows every week and present them
+        # as this week's finding — the exact failure the champion gate hit.
+        # apply() already refuses any status != "ok", so refusing here blocks
+        # the write without adding a new gate.
+        freshness = retired_table_guard.source_freshness(
+            conn, ("scanner_evaluations",),
+            measurement="tech_weight_ablation",
+            run_date=run_date,
+        )
+        if freshness["stale"]:
+            return retired_table_guard.refuse(freshness, run_date=run_date)
 
         # Surface what is currently deployed per team so the operator can see
         # the gap between the recommendation and the live config. Empty dict

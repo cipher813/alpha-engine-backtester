@@ -25,6 +25,8 @@ from nousergon_lib.eval_artifacts import (
 import boto3
 import pandas as pd
 
+from analysis import retired_table_guard
+
 logger = logging.getLogger(__name__)
 
 S3_PARAMS_KEY = "config/scanner_params.json"
@@ -110,6 +112,20 @@ def analyze(research_db_path: str) -> dict:
                 "status": "insufficient_data",
                 "note": "scanner_evaluations or universe_returns table not found",
             }
+
+        # alpha-engine-config-I8757. This analysis ACTS: recommend() feeds
+        # apply(), which writes scanner params to S3. `scanner_evaluations`
+        # has had no writer since 2026-07-12 (last row 2026-07-17), so the
+        # 8-week min-data gate below is satisfied entirely by frozen rows and
+        # would keep re-recommending the same params forever. recommend() and
+        # apply() both short-circuit on status != "ok", so refusing here stops
+        # the actuation at its source.
+        freshness = retired_table_guard.source_freshness(
+            conn, ("scanner_evaluations",), measurement="scanner_optimizer",
+        )
+        if freshness["stale"]:
+            conn.close()
+            return retired_table_guard.refuse(freshness)
 
         se = pd.read_sql_query("SELECT * FROM scanner_evaluations", conn)
         ur = pd.read_sql_query(

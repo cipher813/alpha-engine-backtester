@@ -567,6 +567,36 @@ def _run_diagnostics(
                         "WHERE u.log_return_21d IS NOT NULL"
                     )
                 ]
+                # alpha-engine-config-I8757. This eval-date set drives THREE
+                # S3 loaders below, and it is keyed off `scanner_evaluations`
+                # — a table with no writer since 2026-07-12. Measured
+                # 2026-08-28 against the live research.db: the join yields 17
+                # dates, newest 2026-07-17, so every counterfactual built on
+                # these loadings is silently capped at July no matter how
+                # fresh `universe_returns` (178 dates, newest 2026-08-14) is.
+                #
+                # NOT repointed here: `universe_returns` is DAILY (71 dates
+                # since 2026-04-12 against 18 weekly research cycles), so
+                # substituting it would 8x the S3 GETs and ask for
+                # per-cycle artifacts on dates that have none. The live
+                # replacement is the `candidates/{run_date}/candidates.json`
+                # cycle list (the config#3053 producer-side repoint), tracked
+                # separately. Until then the cap is at least LOUD.
+                from analysis import retired_table_guard
+
+                _fresh = retired_table_guard.source_freshness(
+                    _conn, ("scanner_evaluations",),
+                    measurement="counterfactual eval-date driver",
+                )
+                if _fresh["stale"]:
+                    logger.warning(
+                        "counterfactual eval-date set is CAPPED: %s — %d dates, "
+                        "newest %s. Factor loadings, pillar profiles and "
+                        "trajectory scores are loaded for those dates only "
+                        "(alpha-engine-config-I8757)",
+                        _fresh["reason"], len(eval_dates),
+                        max(eval_dates) if eval_dates else None,
+                    )
             finally:
                 _conn.close()
             factor_loadings = end_to_end.load_historical_factor_loadings(

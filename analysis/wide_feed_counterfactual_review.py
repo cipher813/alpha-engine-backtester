@@ -57,6 +57,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from analysis import retired_table_guard
 from analysis.attractiveness_eval import (
     compute_attractiveness_eval,
     load_attractiveness_history,
@@ -158,6 +159,16 @@ def build_review(research_db_path: str, bucket: str, as_of: str) -> dict:
     conn = sqlite3.connect(research_db_path)
     try:
         sizes = cohort_sizes(conn, history_df)
+        # alpha-engine-config-I8757: the cohort below is counted from
+        # `scanner_evaluations`, retired 2026-07-12. The review still renders
+        # — it is an operator-facing recomputation, not an actuator — but it
+        # states the age of the cohort it counted rather than presenting a
+        # July universe as the current one.
+        freshness = retired_table_guard.source_freshness(
+            conn, ("scanner_evaluations",),
+            measurement="wide_feed_counterfactual_review.cohort",
+            run_date=as_of,
+        )
     finally:
         conn.close()
 
@@ -188,6 +199,7 @@ def build_review(research_db_path: str, bucket: str, as_of: str) -> dict:
             "n_universe_avg": round(n_universe_avg, 1) if n_universe_avg else None,
             "n_scored_avg": round(n_scored_avg, 1) if n_scored_avg else None,
             "eval_dates": sorted(sizes.keys()),
+            "source_freshness": freshness,
         },
     }
 
@@ -196,6 +208,7 @@ def format_report(review: dict) -> str:
     """Render the annotated review as a markdown fragment (stdout /
     EXPERIMENTS.md-pastable)."""
     art = review["artifact"]
+    fresh = review.get("cohort", {}).get("source_freshness") or {}
     cf = art.get("counterfactual", {})
     lg = cf.get("live_gate", {})
     cic = art.get("composite_ic", {})
@@ -219,6 +232,15 @@ def format_report(review: dict) -> str:
         "capture_rate_vs_null | mean_alpha | n_cycles |",
         "|---|---|---|---|---|---|---|",
     ]
+    # alpha-engine-config-I8757: the verdict rides on the rendered report too.
+    # A reader of this fragment could not otherwise tell a July cohort from
+    # this week's.
+    if fresh.get("stale"):
+        lines[3:3] = [
+            f"> **Sources stale — {', '.join(fresh.get('stale_tables', []))}.** "
+            f"{fresh.get('reason')}",
+            "",
+        ]
     for row in cf.get("top_n", []):
         lines.append(
             f"| {row['n']} | {row['sector_balanced']} | {row.get('capture_rate')} | "

@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from analysis import retired_table_guard
 from analysis.classification_metrics import compute_binary_metrics
 
 logger = logging.getLogger(__name__)
@@ -1151,6 +1152,20 @@ def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dic
         unfiltered["last_eval_date"] = all_eval_dates[-1] if all_eval_dates else None
         result["unfiltered"] = unfiltered
 
+        # alpha-engine-config-I8757. `scanner_evaluations` has had no writer
+        # since 2026-07-12 (newest row 2026-07-17), so this arm's lift is a
+        # July measurement that the weekly artifact republishes unchanged.
+        # It is STAMPED, not refused: `analysis/attestation.py` drives this
+        # exact function over a deliberately FROZEN 2024 fixture to attest the
+        # classification path, and a refusal here would break the attestation
+        # battery. The verdict rides beside `last_eval_date` so a consumer
+        # reading the artifact alone can tell a July number from this week's.
+        retired_table_guard.stamp(
+            result,
+            retired_table_guard.source_freshness(
+                conn, ("scanner_evaluations",), measurement="scanner_lift",
+            ),
+        )
         return result
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "scanner_evaluations table not found"}

@@ -42,6 +42,15 @@ from optimizer.tech_weight_ablation import (
 )
 
 
+# alpha-engine-config-I8757: these fixtures seed 2026-04-01..08 and used to
+# assert `status == "ok"` at a run_date of 2026-04-30 — a newest row 22 days
+# behind the run, i.e. three missed weekly cycles. That is exactly the shape
+# the frozen `scanner_evaluations` had in production, and the module now
+# refuses it. The run_date moved to 2026-04-15 (one cycle behind the newest
+# seeded row) so each test still exercises what it was written to exercise;
+# `TestStaleSources` below covers the refusal directly.
+
+
 @pytest.fixture
 def conn():
     """Build an in-memory DB with the v15 schema (sub-score columns)."""
@@ -261,7 +270,7 @@ class TestComputeTechWeightAblation:
             ]
             _seed(conn, "financials", date, picks)
         result = compute_tech_weight_ablation(
-            db_conn=conn, run_date="2026-04-30",
+            db_conn=conn, run_date="2026-04-15",
         )
         assert result["status"] == "ok"
         fin = next(t for t in result["per_team"]
@@ -290,7 +299,7 @@ class TestComputeTechWeightAblation:
             ]
             _seed(conn, "healthcare", date, picks)
         result = compute_tech_weight_ablation(
-            db_conn=conn, run_date="2026-04-30",
+            db_conn=conn, run_date="2026-04-15",
         )
         assert result["status"] == "ok"
         hc = next(t for t in result["per_team"]
@@ -313,7 +322,7 @@ class TestComputeTechWeightAblation:
             ]
             _seed(conn, "technology", date, picks)
         result = compute_tech_weight_ablation(
-            db_conn=conn, run_date="2026-04-30",
+            db_conn=conn, run_date="2026-04-15",
         )
         assert result["status"] == "ok"
         # compute_tech_weight_ablation() itself NEVER auto-applies;
@@ -340,7 +349,7 @@ class TestComputeTechWeightAblation:
             ("ANCIENT", 99, 99, 99, 99, 99, 0.99),
         ])
         result = compute_tech_weight_ablation(
-            db_conn=conn, run_date="2026-04-30", lookback_weeks=8,
+            db_conn=conn, run_date="2026-04-15", lookback_weeks=8,
         )
         tech = next(t for t in result["per_team"]
                     if t["team_id"] == "technology")
@@ -427,7 +436,7 @@ class TestLiveBaselineWeightsReader:
             ]
             _seed(conn, "healthcare", date, picks)
         result = compute_tech_weight_ablation(
-            db_conn=conn, run_date="2026-04-30",
+            db_conn=conn, run_date="2026-04-15",
         )
         hc = next(t for t in result["per_team"] if t["team_id"] == "healthcare")
         assert hc["live_baseline_weights"] == {

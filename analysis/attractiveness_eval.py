@@ -87,6 +87,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from analysis import retired_table_guard
 from analysis.information_coefficient import compute_ic
 from nousergon_lib.quant.horizons import DEFAULT_POLICY
 
@@ -400,7 +401,8 @@ def _excess_stats(basket: list[float], population: list[float]) -> dict:
     return out
 
 
-def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
+def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame,
+                    as_of: str | None = None) -> dict:
     """Top-N-by-attractiveness vs the live tech_score survivor gate
     (config#1398). The live survivor set is ``scanner_evaluations`` rows with
     ``quant_filter_pass == 1`` — the same identification
@@ -410,6 +412,19 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
     (date-clustered means, never pooled names)."""
     tabs = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
+    # alpha-engine-config-I8757. The live_gate leg below IS the
+    # `scanner_evaluations` survivor set, and that table has had no writer
+    # since 2026-07-12. This block is NOT refused — the attractiveness legs
+    # beside it are computed from live history, and refusing would discard
+    # them — but every number here now states how old the cohort it was drawn
+    # from is, against the artifact's own as_of. live_gate.mean_alpha is the
+    # figure that renders largest on the report card, and it was the one
+    # basket published with no age on it.
+    freshness = retired_table_guard.source_freshness(
+        conn, ("scanner_evaluations",),
+        measurement="attractiveness_eval.counterfactual",
+        run_date=as_of,
+    )
     # The absent-data live_gate carries the population-leg keys explicitly as
     # None (config-I7213): an ABSENT key and a MEASURED-NOTHING key must not
     # be indistinguishable to a consumer — the same reason every other block
@@ -419,6 +434,7 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
                                         "n_survivors": 0,
                                         **_excess_stats([], [])},
              "n_cycles": 0, "holding_rule": HOLDING_RULE}
+    retired_table_guard.stamp(empty, freshness)
     if "scanner_evaluations" not in tabs:
         empty["reason"] = "scanner_evaluations table absent"
         return empty
@@ -516,6 +532,9 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
         "top_n": top_n,
         "live_gate": live_gate,
         "n_cycles": n_cycles,
+        # alpha-engine-config-I8757: the age of the cohort every row above was
+        # drawn from, on healthy runs as well as stale ones.
+        "source_freshness": freshness,
         # config#7213: cohort definition for every basket row above — a
         # counterfactual-level constant (not per-row: it's the same rule for
         # every N/sector_balanced variant this producer emits).
@@ -687,7 +706,7 @@ def compute_attractiveness_eval(
 
         weights, shrinkage = suggest_pillar_weights(pillar_ic)
         trajectory_ic = _trajectory_ic(ur, trajectory_scores)
-        counterfactual = _counterfactual(conn, merged, ur)
+        counterfactual = _counterfactual(conn, merged, ur, as_of=as_of)
 
         status = ("ok" if composite_ic["n_eval_dates"] >= MIN_EVAL_DATES_T
                   else "insufficient_data")

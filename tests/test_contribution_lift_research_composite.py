@@ -496,7 +496,15 @@ def test_scanner_na_when_the_population_table_is_empty(tmp_path):
 def test_scanner_baseline_is_the_live_selection(tmp_path):
     axis = _axis()
     dates = [d.strftime("%Y-%m-%d") for d in axis[:40]]
-    db = _research_db(tmp_path, [(t, dates[0]) for t in TICKERS])
+    # alpha-engine-config-I8757: the population must reach the END of the
+    # replayed window. A single cycle at dates[0] leaves every later cycle
+    # drawing its unranked arm from a population ~2 months old, which the
+    # component now refuses — that is the production defect, not a fixture
+    # detail. Seeding both ends keeps this test about the BASELINE.
+    db = _research_db(
+        tmp_path,
+        [(t, dates[0]) for t in TICKERS] + [(t, dates[-1]) for t in TICKERS],
+    )
     inputs = _cycle_inputs(research_db_path=db)
 
     arms = rc.build_scanner_feed_counterfactual_arms(inputs)
@@ -508,7 +516,10 @@ def test_scanner_baseline_is_the_live_selection(tmp_path):
 def test_scanner_ablated_draws_from_the_pre_scanner_population(tmp_path):
     axis = _axis()
     dates = [d.strftime("%Y-%m-%d") for d in axis[:40]]
-    db = _research_db(tmp_path, [(t, dates[0]) for t in TICKERS])
+    db = _research_db(  # both ends seeded — see I8757 note above
+        tmp_path,
+        [(t, dates[0]) for t in TICKERS] + [(t, dates[-1]) for t in TICKERS],
+    )
     inputs = _cycle_inputs(research_db_path=db)
 
     arms = rc.build_scanner_feed_counterfactual_arms(inputs)
@@ -526,7 +537,14 @@ def test_scanner_population_is_point_in_time_as_of(tmp_path):
     axis = _axis()
     dates = [d.strftime("%Y-%m-%d") for d in axis[:40]]
     early, late = dates[0], dates[10]
-    rows = [(t, early) for t in TICKERS[:8]] + [(t, late) for t in TICKERS]
+    rows = (
+        [(t, early) for t in TICKERS[:8]]
+        + [(t, late) for t in TICKERS]
+        # I8757: a cycle at the end of the window, so the population is not
+        # frozen relative to the replay. The as-of assertion below is on
+        # dates[5], which still resolves to `early`.
+        + [(t, dates[-1]) for t in TICKERS]
+    )
     db = _research_db(tmp_path, rows)
     inputs = _cycle_inputs(research_db_path=db)
 
@@ -539,7 +557,10 @@ def test_scanner_population_is_point_in_time_as_of(tmp_path):
 def test_scanner_skips_cycles_before_the_first_research_cycle(tmp_path):
     axis = _axis()
     dates = [d.strftime("%Y-%m-%d") for d in axis[:40]]
-    db = _research_db(tmp_path, [(t, dates[5]) for t in TICKERS])
+    db = _research_db(  # both ends seeded — see I8757 note above
+        tmp_path,
+        [(t, dates[5]) for t in TICKERS] + [(t, dates[-1]) for t in TICKERS],
+    )
     inputs = _cycle_inputs(research_db_path=db)
 
     arms = rc.build_scanner_feed_counterfactual_arms(inputs)
