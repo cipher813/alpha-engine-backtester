@@ -66,6 +66,8 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Any
 
+from analysis import retired_table_guard
+
 logger = logging.getLogger(__name__)
 
 
@@ -331,6 +333,21 @@ def compute_cio_rule_tag_precision(
                 "run_date": run_date,
                 "reason": "cio_evaluations.cio_decision column missing",
             }
+
+        # alpha-engine-config-I8757. EVERY input of this diagnostic comes from
+        # `cio_evaluations`, whose writer (the six-team Research LangGraph CIO
+        # pass) was retired 2026-07-12; the newest row is 2026-07-10. The
+        # rolling 8-week window silently slid off the end of the data, so the
+        # precision numbers stopped moving while still rendering as this
+        # week's measurement. With no live half to preserve, the honest result
+        # is a refusal naming the dead table, not a number.
+        freshness = retired_table_guard.source_freshness(
+            conn, ("cio_evaluations",),
+            measurement="cio_rule_tag_precision",
+            run_date=run_date,
+        )
+        if freshness["stale"]:
+            return retired_table_guard.refuse(freshness, run_date=run_date)
 
         rows = conn.execute(
             """

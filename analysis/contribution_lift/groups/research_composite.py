@@ -70,8 +70,16 @@ ranking of the ~900-name PIT universe down to the passing pool.
 * ablated  — the same count drawn from the **pre-scanner** PIT population
   (every ``scanner_evaluations`` row for the as-of research cycle, i.e. the
   names the scanner had in front of it) with its ranking removed, by the same
-  deterministic rotation. ``scanner_evaluations`` is LIVE — it is written every
-  research cycle and is not part of the retired research graph.
+  deterministic rotation. ``scanner_evaluations`` is **NOT live** (corrected
+  2026-08-28, alpha-engine-config-I8757): its writer was retired with the rest
+  of the research graph on 2026-07-12 and the newest row is 2026-07-17. This
+  paragraph claimed the opposite for six weeks, and that claim is precisely
+  what let the component compare a live selection against a July population.
+  The component now emits ``N/A-MISSING-INPUT`` naming the retirement once the
+  population is further behind the replayed cycles than
+  ``retired_table_guard.DEFAULT_MAX_AGE_DAYS`` — a frozen population makes the
+  ablated arm a comparison against a system that no longer exists, which is the
+  same reason ``sector_teams_avg`` below is N/A.
 
 ``sector_teams_avg`` and ``cio_selection_skill`` — **N/A-RETIRED**. Their only
 sources are the six-team / CIO research-graph tables, retired 2026-07-12
@@ -100,6 +108,7 @@ from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
+from analysis import retired_table_guard
 from analysis.contribution_lift.harness import (
     ArmSet,
     NotAvailable,
@@ -468,6 +477,32 @@ def build_scanner_feed_counterfactual_arms(
         )
 
     eval_dates = sorted(population)
+
+    # alpha-engine-config-I8757. `_as_of` takes the last research cycle at or
+    # before each replayed cycle. With the writer retired that is permanently
+    # 2026-07-17, so every cycle after it draws its unranked arm from the same
+    # July population — a live selection measured against a universe that has
+    # not existed for weeks, reported as a lift number. A stale population is
+    # a MISSING current population, so it takes the existing N/A status rather
+    # than inventing a vocabulary the report card has never seen.
+    newest_replayed = sorted(live_width)[-1]
+    population_age = retired_table_guard.age_days(eval_dates[-1], newest_replayed)
+    if (population_age is not None
+            and population_age > retired_table_guard.DEFAULT_MAX_AGE_DAYS):
+        return NotAvailable(
+            status="N/A-MISSING-INPUT",
+            reason=(
+                f"the pre-scanner PIT population is frozen: the newest "
+                f"scanner_evaluations cycle in {path} is {eval_dates[-1]}, "
+                f"{population_age}d before the newest replayed ENTER cycle "
+                f"{newest_replayed} (bound "
+                f"{retired_table_guard.DEFAULT_MAX_AGE_DAYS}d). Its writer was "
+                "retired 2026-07-12 with the rest of the research graph "
+                "(alpha-engine-config-I8757), so the unranked arm would be "
+                "drawn from a universe that no longer exists and the lift "
+                f"would not be a measurement of this window ({ISSUE})"
+            ),
+        )
     columns = set(map(str, inputs.price_matrix.columns))
     baseline_cycles: list[dict] = []
     ablated_cycles: list[dict] = []

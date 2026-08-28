@@ -347,5 +347,11 @@ class TestMacroEval:
             conn.commit()
             conn.close()
             result = compute_macro_evaluation(f.name, min_samples=5)
-            # May return ok, insufficient_data, or error depending on schema match
-            assert result["status"] in ("ok", "insufficient_data", "error")
+            # May return ok, insufficient_data, or error depending on schema
+            # match — plus stale_sources (alpha-engine-config-I8757), which is
+            # what a fixture dated 2026-04-01 now gets: cio_evaluations has had
+            # no writer since 2026-07-12, so a macro verdict computed from rows
+            # that old is a historical artifact, not this week's measurement.
+            assert result["status"] in (
+                "ok", "insufficient_data", "error", "stale_sources",
+            )

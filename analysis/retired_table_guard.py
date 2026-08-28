@@ -149,7 +149,13 @@ def table_max_date(conn, table: str, date_column: str) -> str | None:
     return row[0] if row and row[0] else None
 
 
-def _age_days(newest: str, run_date: str) -> int | None:
+def age_days(newest: str, run_date: str) -> int | None:
+    """Whole days between ``newest`` and ``run_date``; None if either is unparseable.
+
+    Public because a consumer whose staleness bound is the DATE RANGE it is
+    replaying — rather than today — needs the same arithmetic
+    (``contribution_lift.groups.research_composite``).
+    """
     try:
         return (date.fromisoformat(run_date) - date.fromisoformat(str(newest)[:10])).days
     except (TypeError, ValueError):
@@ -185,7 +191,7 @@ def survey_retired_tables(
             )
             continue
         newest = table_max_date(conn, spec.table, spec.date_column)
-        age = _age_days(newest, run_date) if newest else None
+        age = age_days(newest, run_date) if newest else None
         out.append(
             {
                 "table": spec.table,
@@ -226,15 +232,113 @@ def assert_sources_current(
     )
     stale = [row for row in survey if row["stale"]]
     if stale:
-        detail = "; ".join(
-            f"{r['table']} newest={r['newest_date']} age={r['age_days']}d "
-            f"(writer {r['writer']} retired {r['retired_date']}, {r['reference']})"
-            for r in stale
-        )
         raise StaleResearchTableError(
-            f"{measurement} cannot be measured on {run_date}: "
-            f"{len(stale)} source table(s) past the {max_age_days}d bound — {detail}. "
-            "Refusing to emit a number computed from a frozen source: it would be "
-            "a historical artifact presented as this week's evidence."
+            _stale_reason(stale, measurement, run_date, max_age_days)
         )
     return survey
+
+
+# --------------------------------------------------------------------------
+# The sweep half (alpha-engine-config-I8757, deliverable 3).
+#
+# `assert_sources_current` above is the enforcement layer, wired only where a
+# stale number ACTS. But nine further modules read these same dead tables and
+# emit a number from them every weekly run, and the champion gate proved that
+# a well-formed number from a frozen source is indistinguishable from a
+# measurement. So every such consumer now carries a VERDICT on its own result:
+#
+#   * `source_freshness(...)` builds that verdict and never raises — safe in
+#     any analytic, including ones nobody trades on.
+#   * `stamp(result, block)` rides it on the result, healthy runs included. A
+#     field present only on failure is a field nobody learns to read.
+#   * `refuse(block, ...)` is the shape a consumer returns INSTEAD of a number
+#     when its sources are dead. `status` is the fleet-standard
+#     "stale_sources" so the existing `status != "ok"` guards in
+#     `optimizer/*.apply()` and `reporter._section_*` route it without any of
+#     them needing to learn a new concept.
+#
+# Which consumers refuse and which only stamp is decided by ONE question:
+# would the number act, or is every input of it dead? Both answers refuse.
+# A block that mixes live and dead inputs stamps, because refusing it would
+# discard the live half.
+# --------------------------------------------------------------------------
+
+#: `status` value a consumer returns when its sources are past the bound.
+#: Deliberately not "error" (nothing failed) and not "insufficient_data"
+#: (the data is abundant — it is just old).
+STALE_SOURCES_STATUS = "stale_sources"
+
+
+def _stale_reason(stale: list[dict], measurement: str, run_date: str,
+                  max_age_days: int) -> str:
+    detail = "; ".join(
+        f"{r['table']} newest={r['newest_date']} age={r['age_days']}d "
+        f"(writer {r['writer']} retired {r['retired_date']}, {r['reference']})"
+        for r in stale
+    )
+    return (
+        f"{measurement} cannot be measured on {run_date}: "
+        f"{len(stale)} source table(s) past the {max_age_days}d bound — {detail}. "
+        "Refusing to emit a number computed from a frozen source: it would be "
+        "a historical artifact presented as this week's evidence."
+    )
+
+
+def source_freshness(
+    conn,
+    tables: tuple[str, ...],
+    *,
+    measurement: str,
+    run_date: str | None = None,
+    max_age_days: int = DEFAULT_MAX_AGE_DAYS,
+) -> dict:
+    """Build a staleness verdict for ``tables``. NEVER raises.
+
+    ``run_date`` defaults to today (UTC-naive local date) so a consumer that
+    has no run_date of its own can still say how old its inputs are — an age
+    against today is the honest reading when no as-of was supplied.
+
+    Returns ``{measurement, run_date, stale, stale_tables, max_age_days,
+    sources, reason}``. ``reason`` is None when nothing is stale.
+    """
+    run_date = run_date or date.today().isoformat()
+    survey = survey_retired_tables(
+        conn, run_date, tables=tables, max_age_days=max_age_days
+    )
+    stale = [r for r in survey if r["stale"]]
+    return {
+        "measurement": measurement,
+        "run_date": run_date,
+        "stale": bool(stale),
+        "stale_tables": [r["table"] for r in stale],
+        "max_age_days": max_age_days,
+        "sources": survey,
+        "reason": (
+            _stale_reason(stale, measurement, run_date, max_age_days)
+            if stale else None
+        ),
+    }
+
+
+def stamp(result: dict, block: dict) -> dict:
+    """Attach ``block`` to ``result`` under ``source_freshness``. In place.
+
+    Emitted on healthy runs too: the champion gate read a frozen table for
+    seven weeks precisely because nothing on the result said how old it was.
+    """
+    result["source_freshness"] = block
+    return result
+
+
+def refuse(block: dict, **extra) -> dict:
+    """The result a consumer returns instead of a number, when sources are dead.
+
+    Carries the full verdict, so the artifact says WHICH table died, WHEN, to
+    which retirement, rather than a bare "skipped".
+    """
+    return {
+        "status": STALE_SOURCES_STATUS,
+        "reason": block.get("reason") or f"{block.get('measurement')}: sources stale",
+        "source_freshness": block,
+        **extra,
+    }

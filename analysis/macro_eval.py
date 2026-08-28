@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from analysis import retired_table_guard
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,6 +55,17 @@ def compute_macro_evaluation(
 
     try:
         conn = sqlite3.connect(db_path)
+
+        # alpha-engine-config-I8757. Both legs of this A/B (combined_score and
+        # final_score) live in `cio_evaluations`, retired 2026-07-12 with a
+        # newest row of 2026-07-10. A macro-shift verdict computed from it is
+        # a July finding presented as this week's; refuse rather than emit it.
+        freshness = retired_table_guard.source_freshness(
+            conn, ("cio_evaluations",), measurement="macro_eval",
+        )
+        if freshness["stale"]:
+            conn.close()
+            return retired_table_guard.refuse(freshness)
 
         # Check if cio_evaluations exists and has macro_shift
         try:
