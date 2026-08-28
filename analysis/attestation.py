@@ -86,10 +86,12 @@ log line. A verdict-producing stage that dies must not kill the stages that do n
 depend on it (§2.3a), and must equally not let the ones that do proceed unmarked —
 hence ``UNKNOWN``, never a silent pass.
 
-Consumers: ``reporter.save`` always-emits ``backtest/{run_date}/attestation.json``;
-``crucible-evaluator``'s Backtester tile grades it as a **critical** component and
-the Report Card carries the verdict at top level. See `sf-pipeline-policy.md` §2.3a
-rules 1–3.
+Consumers: ``reporter.save`` always-emits ``backtest/{run_date}/attestation.json``
+and, when uploads are enabled, the standing ``backtest/latest/attestation.json``
+pointer (alpha-engine-config-I8769 — see ``LATEST_ATTESTATION_KEY`` below);
+``crucible-evaluator``'s Backtester tile grades the dated key as a **critical**
+component and the Report Card carries the verdict at top level. See
+`sf-pipeline-policy.md` §2.3a rules 1–3.
 """
 
 from __future__ import annotations
@@ -677,6 +679,29 @@ def run_attestation(
 def attestation_key(run_date: str) -> str:
     """S3 key of the backtest engine's verdict for ``run_date``."""
     return f"backtest/{run_date}/attestation.json"
+
+
+# The standing, continuously-maintained pointer (alpha-engine-config-I8769),
+# mirroring `crucible-evaluator/director/handler.py::LATEST_ACTION_PLAN_KEY` /
+# `latest_action_plan_key()`'s `director/latest/action_plan.json` pattern
+# (itself mirroring `grading/aggregate.py::LATEST_REPORT_CARD_KEY`'s
+# `evaluator/latest/report_card.json`): `reporter.save` overwrites this key
+# with the SAME body it writes to the dated `attestation_key(run_date)`, plus
+# a `trading_day` field, so a fixed-key console `document-fields` binding has
+# something to read every week without templating on `run_date` — a binding
+# on the date-templated key renders ABSENT every day the template isn't the
+# key that exists, which is a detector that cries wolf rather than one that
+# measures (`nous-ergon-ops-PR614`, restated `alpha-engine-config-I7157`).
+# The DATED key stays the record any date-scoped reader (this module's own
+# `read_attestation`, the evaluator's Backtester tile) consumes; this
+# `latest` pointer is deliberately never read back by this module, same as
+# the report-card / action-plan `latest` pointers are never read by their own
+# producers.
+LATEST_ATTESTATION_KEY = "backtest/latest/attestation.json"
+
+
+def latest_attestation_key() -> str:
+    return LATEST_ATTESTATION_KEY
 
 
 def read_attestation(

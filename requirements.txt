@@ -55,7 +55,7 @@ plotly<7
 pandas~=2.2
 boto3~=1.43
 pyyaml~=6.0
-yfinance~=1.6.0
+yfinance~=1.7.0
 pyarrow~=25.0
 ib_insync~=0.9.86
 # setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
@@ -118,7 +118,7 @@ cvxpy>=1.9.2,<1.10
 # test). Without it the test's `pytest.importorskip` would not skip but ERROR at
 # first validate() (module imports; jsonschema missing) — so the shared-schema
 # gate would never actually run in backtester CI, defeating the cross-repo pin.
-nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.83
+nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.93
 # ── Predictor-replay runtime deps (config#3031) ──────────────────────────────
 # synthetic/predictor_backtest.py and analysis/scanner_predictor_research_free_
 # backfill.py import crucible-predictor CODE in-process (sys.path), so THIS
@@ -130,7 +130,7 @@ nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.c
 # requirements files are now NEVER co-resolved: predictor's checkout on the
 # spot box is code-only, and these floors mirror predictor's own (all
 # compatible with the numpy cap above). Guard: tests/test_spot_backtest_no_sibling_requirements.py.
-scipy>=1.18.0
+scipy>=1.18.1
 lightgbm>=4.7.0
 catboost>=1.2.10
 hmmlearn>=0.3.3
@@ -218,7 +218,7 @@ psutil>=7.2.2
 # already-published release would be silently satisfied by a krepis that does
 # NOT carry resolve_model_spec). If a third krepis PR merges before PR172,
 # raise this line to match the release PR172 actually produces.
-krepis[openai]>=0.59.33  # floor raised for alpha-engine-config-I8298 — 0.59.33 is the first krepis whose flow-doctor extra floors flow-doctor>=0.16.0; below it a TimeoutError from an unreachable api.telegram.org escapes TelegramNotifier.validate() on the IMPORT path (it killed alpha-engine-predictor-inference and degraded two postclose safety gates on 2026-08-24). flow-doctor reaches this repo via nousergon-lib[flow-doctor] -> krepis[flow-doctor].
+krepis[openai]>=0.59.39  # floor raised for alpha-engine-config-I8298 — 0.59.33 is the first krepis whose flow-doctor extra floors flow-doctor>=0.16.0; below it a TimeoutError from an unreachable api.telegram.org escapes TelegramNotifier.validate() on the IMPORT path (it killed alpha-engine-predictor-inference and degraded two postclose safety gates on 2026-08-24). flow-doctor reaches this repo via nousergon-lib[flow-doctor] -> krepis[flow-doctor].
 # Raised to >=0.59.23 (alpha-engine-config-I7925, krepis-PR175): the first
 # published krepis carrying `krepis.aws remove-lambda-env`, the removal
 # counterpart to merge-lambda-env — deploy_concordance.sh / deploy_

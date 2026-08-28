@@ -33,6 +33,9 @@ from nousergon_lib.contracts import load_schema as _load_contract_schema
 from optimizer.champion_promotion import (
     ARM_FEED_DEPENDENCIES,
     CONFIDENCE_INSUFFICIENT,
+    CONFIDENCE_UNKNOWN,
+    DEFAULT_GATE_CHAMPION,
+    _score_scanner_top20_predictor,
     CONFIDENCE_NOT_LEADERBOARD_SCORED,
     MIN_CYCLES_FOR_INFERENCE,
     CONFIDENCE_OK,
@@ -109,7 +112,7 @@ class TestHacSignificance:
 # ── Weekly arm-score sourcing ────────────────────────────────────────────────
 
 
-def _e2e_lift_ok(sn_lift=0.02, n_cycles=6):
+def _e2e_lift_ok(sn_lift=0.02, n_cycles=6, t20_sn=0.005, t20_cycles=6):
     """alpha-engine-config-I2998: the gate's score source is
     ``sector_neutral_mean_alpha_21d`` (this arm's own SPY-relative realized
     alpha, NOT ``sn_lift_vs_agentic_cio``) -- the ``sn_lift`` param sets
@@ -134,6 +137,27 @@ def _e2e_lift_ok(sn_lift=0.02, n_cycles=6):
                 },
             },
         },
+        # alpha-engine-config-I8756 — the slot is three-armed. The default
+        # fixture SCORES the top-20 arm (below the champion, so the default
+        # outcome is unchanged) rather than omitting it: an omitted arm makes
+        # every test that does not mention it a silent test of "the third arm
+        # is unscored", which is a different assertion from the one it claims.
+        # `t20_sn=None` opts a test out explicitly.
+        "scanner_top20_predictor_counterfactual": (
+            {
+                "status": "ok",
+                "n_cycles": t20_cycles,
+                "methods": {
+                    "scanner_top20_predictor": {
+                        "mean_alpha_21d": 0.02,
+                        "sector_neutral_mean_alpha_21d": t20_sn,
+                        "n_picks": 40,
+                    },
+                },
+            }
+            if t20_sn is not None
+            else {"status": "insufficient_data", "reason": "fixture: arm opted out"}
+        ),
     }
 
 
@@ -452,7 +476,7 @@ class TestEvidenceConfidenceGate:
         """The mirror case: a thin row with a great mean must not take the
         seat from the incumbent."""
         arm_scores = build_weekly_arm_scores(
-            _e2e_lift_ok(sn_lift=0.001),
+            _e2e_lift_ok(sn_lift=0.001, t20_sn=None),
             _tt_leaderboard_ok(n_dates_scored=1, mean=0.99),
             run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
@@ -587,7 +611,7 @@ class TestEvidenceConfidenceGate:
         """I7549 deliverable 4 / §7.2: failing to decide must be VISIBLE, and
         the record must name WHICH evidence declined."""
         arm_scores = build_weekly_arm_scores(
-            _e2e_lift_ok(), _tt_leaderboard_ok(n_dates_scored=1),
+            _e2e_lift_ok(t20_sn=None), _tt_leaderboard_ok(n_dates_scored=1),
             run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
         record = evaluate_gates(
@@ -596,7 +620,11 @@ class TestEvidenceConfidenceGate:
         )
         audit = build_champion_audit("2026-07-18", record, freeze=False)
         assert audit["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_THIN
-        assert audit["blocked_by"] == ["thinktank_coverage_thin_evidence"]
+        # Every unscored arm is named (alpha-engine-config-I8756).
+        assert audit["blocked_by"] == [
+            "scanner_top20_predictor_counterfactual_unavailable",
+            "thinktank_coverage_thin_evidence",
+        ]
         jsonschema = pytest.importorskip("jsonschema", reason="jsonschema not installed")
         jsonschema.validate(
             instance=audit, schema=AUDIT_SCHEMA,
@@ -712,7 +740,15 @@ class TestLeaderboardRowConfidence:
 
 class TestEvaluateGates:
     def test_seat_swap_valid_champions(self):
-        assert VALID_CHAMPIONS == ("scanner_predictor_direct", "thinktank_coverage")
+        assert VALID_CHAMPIONS == (
+            "scanner_top20_predictor", "scanner_predictor_direct", "thinktank_coverage",
+        )
+        # Order is NOT precedence. A stale/legacy pointer normalizes to the
+        # BASE-CASE arm, named explicitly — not to whichever arm is listed
+        # first. Under two arms those coincided by accident; the third made
+        # tuple position a silent behaviour switch.
+        assert DEFAULT_GATE_CHAMPION == "scanner_predictor_direct"
+        assert DEFAULT_GATE_CHAMPION != VALID_CHAMPIONS[0]
         assert "agentic" not in VALID_CHAMPIONS
 
     def test_challenger_wins_promotes(self):
@@ -764,7 +800,11 @@ class TestEvaluateGates:
         """Same rule set, reversed seats: thinktank_coverage is champion,
         scanner_predictor_direct challenges and wins -> promotes."""
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.04, "thinktank_coverage": 0.01},
+            "scores": {
+                "scanner_predictor_direct": 0.04,
+                "scanner_top20_predictor": 0.005,
+                "thinktank_coverage": 0.01,
+            },
             "unavailable_reasons": {},
         }
         result = evaluate_gates(
@@ -775,9 +815,18 @@ class TestEvaluateGates:
         assert result["champion_after"] == "scanner_predictor_direct"
 
     def test_no_contest_champion_score_missing(self):
+        """An UNSCORED INCUMBENT is a no-contest however many challengers are
+        scored. Promoting over it would be promoting over an ABSENCE, which is
+        how a silent producer failure becomes a pointer move."""
         arm_scores = {
-            "scores": {"scanner_predictor_direct": None, "thinktank_coverage": 0.02},
-            "unavailable_reasons": {"scanner_predictor_direct": "scanner_predictor_direct_counterfactual_unavailable"},
+            "scores": {
+                "scanner_predictor_direct": None,
+                "scanner_top20_predictor": 0.03,
+                "thinktank_coverage": 0.02,
+            },
+            "unavailable_reasons": {
+                "scanner_predictor_direct": "scanner_predictor_direct_counterfactual_unavailable",
+            },
         }
         result = evaluate_gates(
             champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
@@ -786,16 +835,50 @@ class TestEvaluateGates:
         assert result["blocked_by"] == ["scanner_predictor_direct_counterfactual_unavailable"]
         assert result["champion_after"] == "scanner_predictor_direct"
 
-    def test_no_contest_challenger_score_missing(self):
+    def test_one_unscored_challenger_does_not_end_the_contest(self):
+        """SEMANTIC CHANGE under N arms (alpha-engine-config-I8756). With two
+        arms, "the challenger has no score" WAS a no-contest. With three, it
+        means only that THAT challenger cannot win — a contest still exists if
+        another challenger is scored, and the pointer decides on the arms that
+        did produce evidence."""
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.02, "thinktank_coverage": None},
+            "scores": {
+                "scanner_predictor_direct": 0.02,
+                "scanner_top20_predictor": 0.04,
+                "thinktank_coverage": None,
+            },
             "unavailable_reasons": {"thinktank_coverage": "thinktank_coverage_not_in_leaderboard"},
         }
         result = evaluate_gates(
             champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
         )
+        assert result["outcome"] == "promoted"
+        assert result["champion_after"] == "scanner_top20_predictor"
+        assert result["challenger"] == "scanner_top20_predictor"
+
+    def test_no_contest_when_no_challenger_is_scored(self):
+        arm_scores = {
+            "scores": {
+                "scanner_predictor_direct": 0.02,
+                "scanner_top20_predictor": None,
+                "thinktank_coverage": None,
+            },
+            "unavailable_reasons": {
+                "scanner_top20_predictor": "scanner_top20_predictor_thin_evidence",
+                "thinktank_coverage": "thinktank_coverage_not_in_leaderboard",
+            },
+        }
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
         assert result["outcome"] == "no_contest"
-        assert result["blocked_by"] == ["thinktank_coverage_not_in_leaderboard"]
+        # Every unscored arm is named — with N arms, "the challenger had no
+        # score" no longer identifies WHICH challenger.
+        assert result["blocked_by"] == [
+            "scanner_top20_predictor_thin_evidence",
+            "thinktank_coverage_not_in_leaderboard",
+        ]
+        assert result["challenger"] is None
 
     def test_no_contest_both_sides_missing(self):
         arm_scores = {"scores": {"scanner_predictor_direct": None, "thinktank_coverage": None},
@@ -804,7 +887,7 @@ class TestEvaluateGates:
             champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
         )
         assert result["outcome"] == "no_contest"
-        assert result["blocked_by"] == ["arm_score_unavailable", "arm_score_unavailable"]
+        assert result["blocked_by"] == ["arm_score_unavailable"] * 3
 
     def test_freeze_suppresses_pointer_move_but_reports_would_be_outcome(self):
         # Non-shadow winner (seats reversed) -- --freeze semantics are
@@ -842,13 +925,19 @@ class TestWriteChampionPointer:
         body = json.loads(call.kwargs["Body"])
         assert body == pointer
 
-    def test_refuses_shadow_only_arm(self):
-        """alpha-engine-config-I2515 (Brian's 2026-08-20 ruling) -- DEFENCE
-        IN DEPTH at the writer. thinktank_coverage remains a VALID_CHAMPIONS
-        value (read-tolerated; the executor has a live consumer for it) but
-        the single writer refuses to move the live pointer onto it, so a
-        future caller that bypasses evaluate_gates entirely -- a new
-        bootstrap, a backfill, a repair script -- still cannot flip it."""
+    def test_refuses_shadow_only_arm(self, monkeypatch):
+        """DEFENCE IN DEPTH at the writer. A shadow-only arm stays a
+        VALID_CHAMPIONS value — the executor has a live consumer for it — but
+        the single writer refuses to move the live pointer onto it, so a caller
+        that bypasses evaluate_gates entirely (a bootstrap, a backfill, a
+        repair script) still cannot flip it.
+
+        `SHADOW_ONLY_ARMS` is empty in production since Brian's 2026-08-27
+        ruling, so the membership is synthetic here: the LAYER is what must
+        survive a membership change."""
+        from optimizer import champion_promotion as cp
+
+        monkeypatch.setattr(cp, "SHADOW_ONLY_ARMS", frozenset({"thinktank_coverage"}))
         s3 = MagicMock()
         with pytest.raises(ValueError, match="SHADOW-ONLY"):
             write_champion_pointer(
@@ -857,11 +946,14 @@ class TestWriteChampionPointer:
             )
         s3.put_object.assert_not_called()
 
-    def test_refuses_shadow_only_arm_even_with_upload_false(self):
-        """The refusal is about the VALUE, not about whether S3 is touched
-        -- a dry run that "would have" set a shadow arm live must fail just
-        as loudly, or a --freeze rehearsal would report a promotion the real
-        run can never perform."""
+    def test_refuses_shadow_only_arm_even_with_upload_false(self, monkeypatch):
+        """The refusal is about the VALUE, not about whether S3 is touched — a
+        dry run that "would have" set a shadow arm live must fail just as
+        loudly, or a --freeze rehearsal would report a promotion the real run
+        can never perform."""
+        from optimizer import champion_promotion as cp
+
+        monkeypatch.setattr(cp, "SHADOW_ONLY_ARMS", frozenset({"thinktank_coverage"}))
         with pytest.raises(ValueError, match="SHADOW-ONLY"):
             write_champion_pointer(
                 "bucket", "thinktank_coverage",
@@ -1184,6 +1276,8 @@ class TestBuildChampionAudit:
     def test_error_path_conforms_and_reports_unavailable_leaderboard(self):
         audit = build_champion_audit("2026-07-18", None, freeze=False, error="leaderboard missing")
         assert audit["outcome"] == "error"
+        # The ERROR path never reached evaluate_gates, so nothing per-arm was
+        # computed — this slug describes the run, not an arm.
         assert audit["blocked_by"] == ["leaderboard_unavailable"]
         assert audit["champion_before"] is None
         assert audit["schema_version"] == 2
@@ -1320,12 +1414,15 @@ class TestRunWeeklyEvaluation:
         s3 = _FakeS3()
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
-            e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+            e2e_lift=_e2e_lift_ok(sn_lift=0.03, t20_sn=None),
             tt_leaderboard=None,
             freeze=False, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "no_contest"
-        assert result["blocked_by"] == ["leaderboard_unavailable"]
+        assert result["blocked_by"] == [
+            "scanner_top20_predictor_counterfactual_unavailable",
+            "leaderboard_unavailable",
+        ]
         assert result["leaderboard_date_used"] is None
         assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
@@ -1341,13 +1438,16 @@ class TestRunWeeklyEvaluation:
         lb["specs"] = [s for s in lb["specs"] if s["name"] != "thinktank_coverage"]
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
-            e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+            e2e_lift=_e2e_lift_ok(sn_lift=0.03, t20_sn=None),
             tt_leaderboard=lb,
             tt_leaderboard_date_used="2026-07-18",
             freeze=False, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "no_contest"
-        assert result["blocked_by"] == ["thinktank_coverage_not_in_leaderboard"]
+        assert result["blocked_by"] == [
+            "scanner_top20_predictor_counterfactual_unavailable",
+            "thinktank_coverage_not_in_leaderboard",
+        ]
         assert result["leaderboard_date_used"] == "2026-07-18"
 
     def test_no_contest_leaderboard_stale_beyond_8_days(self):
@@ -1359,13 +1459,16 @@ class TestRunWeeklyEvaluation:
         lb = _tt_leaderboard_ok(run_date="2026-07-09", mean=0.03)
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
-            e2e_lift=_e2e_lift_ok(sn_lift=0.01),
+            e2e_lift=_e2e_lift_ok(sn_lift=0.01, t20_sn=None),
             tt_leaderboard=lb,
             tt_leaderboard_date_used="2026-07-09",
             freeze=False, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "no_contest"
-        assert result["blocked_by"] == ["leaderboard_stale_gt_8d"]
+        assert result["blocked_by"] == [
+            "scanner_top20_predictor_counterfactual_unavailable",
+            "leaderboard_stale_gt_8d",
+        ]
         assert result["leaderboard_date_used"] == "2026-07-09"
         assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
 
@@ -1621,15 +1724,25 @@ class TestSchemaConformance:
         record must both conform to the (additive) v2 schema and carry the
         leaderboard_date_used field naming what was found and rejected."""
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": None},
-            "unavailable_reasons": {"thinktank_coverage": "leaderboard_stale_gt_8d"},
+            "scores": {
+                "scanner_predictor_direct": 0.01,
+                "scanner_top20_predictor": None,
+                "thinktank_coverage": None,
+            },
+            "unavailable_reasons": {
+                "scanner_top20_predictor": "scanner_top20_predictor_thin_evidence",
+                "thinktank_coverage": "leaderboard_stale_gt_8d",
+            },
             "leaderboard_date_used": "2026-07-09",
         }
         gate_result = evaluate_gates(
             champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
         )
         audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
-        assert audit["blocked_by"] == ["leaderboard_stale_gt_8d"]
+        assert audit["blocked_by"] == [
+            "scanner_top20_predictor_thin_evidence",
+            "leaderboard_stale_gt_8d",
+        ]
         assert audit["leaderboard_date_used"] == "2026-07-09"
         self._validate(AUDIT_SCHEMA, audit)
 
@@ -1977,7 +2090,7 @@ class TestRunWeeklyEvaluationFeedLiveness:
         pointer_key = f"{self.BUCKET}/config/producer_champion.json"
         assert json.loads(s3.store[pointer_key])["champion"] == "thinktank_coverage"
 
-    def test_shadow_only_winner_never_pays_for_the_feed_probe(self):
+    def test_shadow_only_winner_never_pays_for_the_feed_probe(self, monkeypatch):
         """Was ``test_champion_defending_own_seat_is_unaffected_by_
         challenger_feed_liveness`` -- it asserted that thinktank_coverage
         winning promotes without a feed check, which alpha-engine-config
@@ -1990,10 +2103,13 @@ class TestRunWeeklyEvaluationFeedLiveness:
         the feed guard, and run_weekly_evaluation skips the probe's S3 read
         entirely for a shadow-only challenger because its result could not
         change the outcome."""
+        from optimizer import champion_promotion as cp
+
+        monkeypatch.setattr(cp, "SHADOW_ONLY_ARMS", frozenset({"thinktank_coverage"}))
         s3 = _FakeS3()
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date=self.RUN_DATE,
-            e2e_lift=_e2e_lift_ok(sn_lift=0.01),           # scanner_predictor_direct loses
+            e2e_lift=_e2e_lift_ok(sn_lift=0.01, t20_sn=None),           # scanner_predictor_direct loses
             tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=0.05),
             tt_leaderboard_date_used=self.RUN_DATE,
             freeze=False, upload=True, s3_client=s3,
@@ -2044,6 +2160,9 @@ class TestChampionSideEvidenceFloor:
         )
         assert gate["outcome"] == "no_contest"
         assert gate["champion_after"] == "scanner_predictor_direct"
+        # Only the champion is unscored — the top-20 arm carries evidence in
+        # this fixture, and an unscored INCUMBENT is a no-contest however many
+        # challengers are scored.
         assert gate["blocked_by"] == ["scanner_predictor_direct_thin_evidence"]
 
     def test_thin_champion_cannot_be_flipped_off_by_a_challenger(self):
@@ -2051,7 +2170,7 @@ class TestChampionSideEvidenceFloor:
         the pointer. thinktank_coverage is champion; a one-cycle
         scanner_predictor_direct number must not promote."""
         result = build_weekly_arm_scores(
-            _e2e_lift_ok(sn_lift=0.5, n_cycles=1),
+            _e2e_lift_ok(sn_lift=0.5, n_cycles=1, t20_sn=None),
             _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
             run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
@@ -2164,32 +2283,42 @@ class TestChampionSideEvidenceFloor:
 
 
 class TestShadowOnlyArms:
-    """THE regression bar for the 2026-08-20 shadow-only ruling:
+    """The shadow-only MECHANISM — measured, never promoted.
 
-        "research should now be think tank in shadow mode only with the main
-        research process skipped by passing a scanner top 20 to predictor"
+    `thinktank_coverage` held this property under Brian's 2026-08-20 ruling.
+    His 2026-08-27 ruling released it:
 
-    Think Tank is MEASURED; it does not become the live selection by winning.
-    Before this change the gate would have flipped
-    config/producer_champion.json to thinktank_coverage the first week TT
-    outscored the champion -- and crucible-executor's
-    executor/champion.py::_apply_thinktank_coverage is a LIVE consumer of
-    that value, so the ruling would have been violated by a real trading
-    behaviour change on a weekly-firing path. 2026-08-14 was the first week
-    TT produced a real score and it LOST (-0.060751 vs -0.00203); that loss,
-    not any guard, is the only reason the pointer had not already moved.
+        "I want all other challengers to remain challengers such as think tank
+        and other scanner configurations. But at this point I'm thinking we
+        promote the best performer weekly"
+
+    So `SHADOW_ONLY_ARMS` is now EMPTY, and every test below exercises the
+    mechanism with a SYNTHETIC arm rather than with whichever arm happens to
+    hold the property today. That is the point: the mechanism is what must
+    survive a membership change, and a test written against the membership
+    dies with it — taking the coverage of the mechanism with it, exactly when
+    the next arm needs the protection.
     """
 
-    def test_registry_is_the_single_source_of_truth(self):
-        """The class-level fix: shadow-only-ness is a declared PROPERTY OF
-        AN ARM, not a string literal at the veto site. A future arm added in
-        shadow mode inherits the protection at BOTH enforcement layers by
-        joining this frozenset, and a future promotion is a one-line data
-        change plus Brian's ruling."""
-        assert SHADOW_ONLY_ARMS == frozenset({"thinktank_coverage"})
-        assert is_shadow_only("thinktank_coverage") is True
-        assert is_shadow_only("scanner_predictor_direct") is False
+    def test_the_mechanism_is_empty_but_intact(self):
+        """The 2026-08-27 ruling emptied the SET; it did not delete the
+        MECHANISM. Deleting it because it is currently unused is how it would
+        have to be rebuilt — at one enforcement layer instead of two — the next
+        time an arm needs it."""
+        assert SHADOW_ONLY_ARMS == frozenset()
+        assert is_shadow_only("thinktank_coverage") is False
+        assert is_shadow_only("scanner_top20_predictor") is False
         assert is_shadow_only(None) is False
+
+    def test_an_arm_added_to_the_set_becomes_shadow_only(self, monkeypatch):
+        """Shadow-only-ness is a declared PROPERTY OF AN ARM, not a literal at
+        the veto site. A future arm inherits the protection at BOTH enforcement
+        layers by joining this frozenset and nothing else."""
+        from optimizer import champion_promotion as cp
+
+        monkeypatch.setattr(cp, "SHADOW_ONLY_ARMS", frozenset({"thinktank_coverage"}))
+        assert cp.is_shadow_only("thinktank_coverage") is True
+        assert cp.is_shadow_only("scanner_predictor_direct") is False
 
     def test_veto_site_does_not_hard_code_the_arm_name(self):
         """Fix the CLASS, not the instance: the module may name
@@ -2221,11 +2350,19 @@ class TestShadowOnlyArms:
             assert "is_shadow_only(" in code, fn.__name__
             assert "thinktank_coverage" not in code, fn.__name__
 
-    def test_shadow_arm_winning_holds_the_pointer(self):
-        """Deliverable: TT wins on score -> NOT promoted, explicit slug, and
-        the counterfactual winner is recorded."""
+    def test_shadow_arm_winning_holds_the_pointer(self, monkeypatch):
+        """A shadow arm wins on score -> NOT promoted, explicit slug, and the
+        counterfactual winner is recorded. Exercised through a monkeypatched
+        set so the mechanism is covered whatever the current membership is."""
+        from optimizer import champion_promotion as cp
+
+        monkeypatch.setattr(cp, "SHADOW_ONLY_ARMS", frozenset({"thinktank_coverage"}))
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "scores": {
+                "scanner_predictor_direct": 0.01,
+                "scanner_top20_predictor": 0.005,
+                "thinktank_coverage": 0.03,
+            },
             "unavailable_reasons": {},
         }
         result = evaluate_gates(
@@ -2245,7 +2382,11 @@ class TestShadowOnlyArms:
         This is the 2026-08-14 shape (champion -0.00203 vs TT -0.060751),
         the state production is actually in today."""
         arm_scores = {
-            "scores": {"scanner_predictor_direct": -0.00203, "thinktank_coverage": -0.060751},
+            "scores": {
+                "scanner_predictor_direct": -0.00203,
+                "scanner_top20_predictor": -0.05,
+                "thinktank_coverage": -0.060751,
+            },
             "unavailable_reasons": {},
         }
         result = evaluate_gates(
@@ -2262,7 +2403,11 @@ class TestShadowOnlyArms:
         champion still promotes immediately -- no significance test, no
         hysteresis, no cooldown."""
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.04, "thinktank_coverage": 0.01},
+            "scores": {
+                "scanner_predictor_direct": 0.04,
+                "scanner_top20_predictor": 0.005,
+                "thinktank_coverage": 0.01,
+            },
             "unavailable_reasons": {},
         }
         result = evaluate_gates(
@@ -2272,13 +2417,20 @@ class TestShadowOnlyArms:
         assert result["champion_after"] == "scanner_predictor_direct"
         assert result["blocked_by"] is None
 
-    def test_shadow_veto_precedes_freeze(self):
+    def test_shadow_veto_precedes_freeze(self, monkeypatch):
         """--freeze is a suppression of an otherwise-valid promotion; a
         shadow hold is a standing policy decision. The record must name the
         TRUE, stable reason the pointer did not move, or a --freeze run
         would imply the promotion becomes valid once the flag is dropped."""
+        from optimizer import champion_promotion as cp
+
+        monkeypatch.setattr(cp, "SHADOW_ONLY_ARMS", frozenset({"thinktank_coverage"}))
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "scores": {
+                "scanner_predictor_direct": 0.01,
+                "scanner_top20_predictor": 0.005,
+                "thinktank_coverage": 0.03,
+            },
             "unavailable_reasons": {},
         }
         result = evaluate_gates(
@@ -2287,11 +2439,18 @@ class TestShadowOnlyArms:
         assert result["outcome"] == "held_shadow_only"
         assert result["blocked_by"] == ["shadow_only_arm"]
 
-    def test_shadow_veto_precedes_the_feed_guard(self):
+    def test_shadow_veto_precedes_the_feed_guard(self, monkeypatch):
         """Same reasoning against a transient guard: feed_producer_dead
         would suggest the pointer moves once the feed recovers."""
+        from optimizer import champion_promotion as cp
+
+        monkeypatch.setattr(cp, "SHADOW_ONLY_ARMS", frozenset({"thinktank_coverage"}))
         arm_scores = {
-            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "scores": {
+                "scanner_predictor_direct": 0.01,
+                "scanner_top20_predictor": 0.005,
+                "thinktank_coverage": 0.03,
+            },
             "unavailable_reasons": {},
         }
         result = evaluate_gates(
@@ -2319,10 +2478,24 @@ class TestShadowOnlyArms:
 
 class TestShadowOnlyEndToEnd:
     """run_weekly_evaluation -- the wiring evaluate.py actually calls in the
-    weekly SF's EvaluatorOptimize stage."""
+    weekly SF's EvaluatorOptimize stage.
+
+    `SHADOW_ONLY_ARMS` is EMPTY in production since Brian's 2026-08-27 ruling
+    (alpha-engine-config-I8756). This class re-arms it with a synthetic
+    membership so the end-to-end mechanism stays covered — a shadow arm's win
+    must reach the audit record and never the pointer, whichever arm holds the
+    property. Deleting these with the membership would leave the next shadow
+    arm protected only by code nobody exercises.
+    """
 
     BUCKET = "test-bucket"
-    RUN_DATE = "2026-08-22"  # the next weekly SF firing after the ruling
+    RUN_DATE = "2026-08-22"
+
+    @pytest.fixture(autouse=True)
+    def _shadow_arm(self, monkeypatch):
+        from optimizer import champion_promotion as cp
+
+        monkeypatch.setattr(cp, "SHADOW_ONLY_ARMS", frozenset({"thinktank_coverage"}))
 
     def test_shadow_arm_win_writes_audit_but_never_the_pointer(self):
         s3 = _FakeS3()
@@ -2399,7 +2572,7 @@ class TestShadowOnlyEndToEnd:
         s3 = _FakeS3()
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date=self.RUN_DATE,
-            e2e_lift=_e2e_lift_ok(sn_lift=-0.00203),
+            e2e_lift=_e2e_lift_ok(sn_lift=-0.00203, t20_sn=None),
             tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=-0.060751),
             tt_leaderboard_date_used=self.RUN_DATE,
             freeze=False, upload=True, s3_client=s3,
@@ -2429,3 +2602,195 @@ class TestShadowOnlyEndToEnd:
         assert audit["challenger_score"] is not None
         assert audit["leaderboard_date_used"] == self.RUN_DATE
         assert audit["arm_confidence"]["thinktank_coverage"] == "ok"
+
+
+# ── The slot is N-arm (alpha-engine-config-I8756) ────────────────────────
+#
+# Brian's ruling 2026-08-27:
+#
+#     "I want the champion/challenger for research to include the scanner top
+#      20 (not top 60) passed directly to the predictor. I want all other
+#      challengers to remain challengers such as think tank and other scanner
+#      configurations. But at this point I'm thinking we promote the best
+#      performer weekly"
+
+
+class TestNArmGate:
+    def test_the_best_scoring_challenger_is_the_one_that_can_win(self):
+        arm_scores = {
+            "scores": {
+                "scanner_predictor_direct": 0.01,
+                "scanner_top20_predictor": 0.04,
+                "thinktank_coverage": 0.02,
+            },
+            "unavailable_reasons": {},
+        }
+
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+
+        assert result["outcome"] == "promoted"
+        assert result["challenger"] == "scanner_top20_predictor"
+        assert result["challenger_score"] == 0.04
+        assert result["champion_after"] == "scanner_top20_predictor"
+
+    def test_a_middling_challenger_does_not_take_the_seat(self):
+        """Only the BEST challenger can win. A second challenger that also
+        outscores the incumbent must not muddy which arm the pointer moves to."""
+        arm_scores = {
+            "scores": {
+                "scanner_predictor_direct": 0.01,
+                "scanner_top20_predictor": 0.04,
+                "thinktank_coverage": 0.03,
+            },
+            "unavailable_reasons": {},
+        }
+
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+
+        assert result["champion_after"] == "scanner_top20_predictor"
+        assert result["counterfactual_winner"] == "scanner_top20_predictor"
+
+    def test_a_challenger_tie_breaks_on_declared_order_not_dict_order(self):
+        """Two challengers tied at the top must resolve the SAME way every run.
+        Dict iteration order is an implementation detail; VALID_CHAMPIONS order
+        is declared, so it is what decides."""
+        scores = {
+            "scanner_predictor_direct": 0.01,
+            "thinktank_coverage": 0.04,
+            "scanner_top20_predictor": 0.04,
+        }
+        reversed_scores = dict(reversed(list(scores.items())))
+
+        a = evaluate_gates(
+            champion_before="scanner_predictor_direct",
+            arm_scores={"scores": scores, "unavailable_reasons": {}}, freeze=False,
+        )
+        b = evaluate_gates(
+            champion_before="scanner_predictor_direct",
+            arm_scores={"scores": reversed_scores, "unavailable_reasons": {}}, freeze=False,
+        )
+
+        assert a["challenger"] == b["challenger"] == "scanner_top20_predictor"
+
+    def test_arm_scores_carries_every_arm_on_every_outcome(self):
+        """`champion_score`/`challenger_score` collapse an N-way week into the
+        pair that happened to matter. A three-way week must stay legible."""
+        arm_scores = {
+            "scores": {
+                "scanner_predictor_direct": 0.01,
+                "scanner_top20_predictor": 0.04,
+                "thinktank_coverage": None,
+            },
+            "unavailable_reasons": {"thinktank_coverage": "thinktank_coverage_not_in_leaderboard"},
+        }
+
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+
+        assert result["arm_scores"] == {
+            "scanner_top20_predictor": 0.04,
+            "scanner_predictor_direct": 0.01,
+            "thinktank_coverage": None,
+        }
+        assert set(result["arm_scores"]) == set(VALID_CHAMPIONS)
+
+    def test_an_unscored_incumbent_is_never_promoted_over(self):
+        """Promoting over an unscored incumbent is promoting over an ABSENCE —
+        how a silent producer failure becomes a pointer move."""
+        arm_scores = {
+            "scores": {
+                "scanner_predictor_direct": None,
+                "scanner_top20_predictor": 0.04,
+                "thinktank_coverage": 0.03,
+            },
+            "unavailable_reasons": {
+                "scanner_predictor_direct": "scanner_predictor_direct_counterfactual_unavailable",
+            },
+        }
+
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+
+        assert result["outcome"] == "no_contest"
+        assert result["champion_after"] == "scanner_predictor_direct"
+        assert result["counterfactual_winner"] is None
+
+    def test_the_challengers_helper_has_no_two_arm_assumption(self):
+        from optimizer.champion_promotion import _challengers
+
+        assert _challengers("scanner_predictor_direct") == [
+            "scanner_top20_predictor", "thinktank_coverage",
+        ]
+        assert _challengers("scanner_top20_predictor") == [
+            "scanner_predictor_direct", "thinktank_coverage",
+        ]
+        # An unrecognized incumbent yields the whole field rather than raising —
+        # the old `_other_champion` raised unless exactly two arms existed.
+        assert _challengers("not_an_arm") == list(VALID_CHAMPIONS)
+
+
+class TestScannerTop20PredictorScoring:
+    def test_it_scores_from_its_own_counterfactual(self):
+        score, reason, confidence = _score_scanner_top20_predictor(
+            _e2e_lift_ok(t20_sn=0.0042, t20_cycles=7)
+        )
+
+        assert score == pytest.approx(0.0042)
+        assert reason is None
+        assert confidence == CONFIDENCE_OK
+
+    def test_thin_evidence_is_its_own_slug(self):
+        """Per-arm rather than a shared 'thin' value: a thin top-20 arm is
+        waiting on the 21-day maturation of a cut that began 2026-07-30, which
+        is time, not a defect to chase."""
+        score, reason, confidence = _score_scanner_top20_predictor(
+            _e2e_lift_ok(t20_sn=0.0042, t20_cycles=1)
+        )
+
+        assert score is None
+        assert reason == "scanner_top20_predictor_thin_evidence"
+        assert confidence == CONFIDENCE_THIN
+
+    def test_the_live_shape_today_is_unavailable_not_zero(self):
+        """The arm has qualifying cohort dates but none matured. That is 'no
+        evidence', which is a no-contest — never a 0.0 a gate could promote on."""
+        lift = _e2e_lift_ok()
+        lift["scanner_top20_predictor_counterfactual"] = {
+            "status": "insufficient_data",
+            "reason": "17 qualifying cohort date(s) but none has matured",
+            "n_cycles": 0,
+            "n_qualifying_dates": 17,
+        }
+
+        score, reason, confidence = _score_scanner_top20_predictor(lift)
+
+        assert score is None
+        assert reason == "scanner_top20_predictor_counterfactual_unavailable"
+        assert confidence == CONFIDENCE_INSUFFICIENT
+
+    def test_a_mean_with_no_honest_count_is_refused(self):
+        lift = _e2e_lift_ok(t20_sn=0.02)
+        del lift["scanner_top20_predictor_counterfactual"]["n_cycles"]
+
+        score, reason, confidence = _score_scanner_top20_predictor(lift)
+
+        assert score is None
+        assert reason == "scanner_top20_predictor_confidence_unknown"
+        assert confidence == CONFIDENCE_UNKNOWN
+
+    def test_build_weekly_arm_scores_carries_all_three_arms(self):
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(sn_lift=0.02, t20_sn=0.03),
+            _tt_leaderboard_ok(mean=0.015),
+            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+
+        assert set(result["scores"]) == set(VALID_CHAMPIONS)
+        assert set(result["arm_confidence"]) == set(VALID_CHAMPIONS)
+        assert result["scores"]["scanner_top20_predictor"] == pytest.approx(0.03)

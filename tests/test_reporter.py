@@ -1392,6 +1392,98 @@ class TestWriteAsYouCompute:
             assert body == b'{"run_date": "2026-06-26"}'
 
 
+# ── standing backtest/latest/attestation.json pointer (alpha-engine-config-I8769) ──
+
+
+class TestLatestAttestationPointer:
+    """``save`` overwrites the FIXED ``backtest/latest/attestation.json`` key
+    alongside the dated ``backtest/{run_date}/attestation.json`` write, so a
+    console `document-fields` binding has something to read every week
+    without templating on ``run_date`` (mirrors
+    `crucible-evaluator-PR220`'s `director/latest/action_plan.json`)."""
+
+    def _save(self, tmp_path, s3, **kw):
+        from reporter import save
+        return save(
+            report_md="# r",
+            signal_quality={"status": "ok", "overall": {}},
+            score_analysis=[],
+            run_date="2026-06-26",
+            results_dir=str(tmp_path),
+            upload_bucket="alpha-engine-research",
+            upload_prefix="backtest",
+            s3_client=s3,
+            **kw,
+        )
+
+    def test_latest_pointer_written_at_fixed_key(self, tmp_path):
+        import json
+
+        from analysis.attestation import latest_attestation_key
+        from tests.test_phase_registry import _FakeS3
+
+        s3 = _FakeS3()
+        self._save(tmp_path, s3)
+        assert latest_attestation_key() == "backtest/latest/attestation.json"
+        assert ("alpha-engine-research", "backtest/latest/attestation.json") in s3.store
+        # Dated key still written alongside it.
+        assert ("alpha-engine-research", "backtest/2026-06-26/attestation.json") in s3.store
+
+    def test_latest_body_matches_dated_body_plus_trading_day(self, tmp_path):
+        import json
+
+        from tests.test_phase_registry import _FakeS3
+
+        s3 = _FakeS3()
+        self._save(tmp_path, s3)
+        dated = json.loads(
+            s3.get_object(Bucket="alpha-engine-research", Key="backtest/2026-06-26/attestation.json")["Body"].read()
+        )
+        latest = json.loads(
+            s3.get_object(Bucket="alpha-engine-research", Key="backtest/latest/attestation.json")["Body"].read()
+        )
+        assert latest["trading_day"] == "2026-06-26"
+        # Same body otherwise (including the verdict block).
+        latest_without_trading_day = {k: v for k, v in latest.items() if k != "trading_day"}
+        assert latest_without_trading_day == dated
+        assert latest["verdict"] in ("PASS", "FAIL", "UNKNOWN")
+
+    def test_no_latest_pointer_when_bucket_none(self, tmp_path):
+        """Local-only / dry-run mode must not touch S3 at all — same gate as
+        every other write in ``save``."""
+        from reporter import save
+        from tests.test_phase_registry import _FakeS3
+
+        s3 = _FakeS3()
+        save(
+            report_md="# r",
+            signal_quality={"status": "ok", "overall": {}},
+            score_analysis=[],
+            run_date="2026-06-26",
+            results_dir=str(tmp_path),
+            upload_bucket=None,
+            s3_client=s3,
+        )
+        assert s3.store == {}
+
+    def test_latest_pointer_upload_failure_is_fail_soft(self, tmp_path):
+        """A latest-pointer S3 hiccup must not raise out of ``save`` — the
+        dated key (already written) is the record of truth."""
+        from tests.test_phase_registry import _FakeS3
+
+        class _FailLatestS3(_FakeS3):
+            def put_object(self, *, Bucket, Key, Body, ContentType=None):
+                if Key == "backtest/latest/attestation.json":
+                    raise RuntimeError("S3 hiccup")
+                return super().put_object(Bucket=Bucket, Key=Key, Body=Body, ContentType=ContentType)
+
+        s3 = _FailLatestS3()
+        out = self._save(tmp_path, s3)  # must not raise
+        assert (out / "attestation.json").exists()
+        assert ("alpha-engine-research", "backtest/2026-06-26/attestation.json") in s3.store
+        assert ("alpha-engine-research", "backtest/latest/attestation.json") not in s3.store
+
+
 # ── all_orders.csv trade-by-trade export (config#806) ────────────────────────
 
 

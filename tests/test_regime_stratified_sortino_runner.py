@@ -12,6 +12,7 @@ graceful handling of empty / pre-migration DBs, and the dry-run path.
 from __future__ import annotations
 
 import sqlite3
+from datetime import date, timedelta
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -80,13 +81,26 @@ def _create_score_perf_db(path: Path, rows: list[dict]) -> None:
         conn.close()
 
 
-def _seed_well_populated_rows(*, end: str = "2026-07-13") -> list[dict]:
+def _seed_well_populated_rows(*, end: str | None = None) -> list[dict]:
     """Enough rows to clear DEFAULT_MIN_PICKS_PER_STRATUM in bull + bear.
 
     Values are PERCENT POINTS — the convention ``attach_outcomes`` reproduces
     from the long store and the one the runner declares. Seeding fractions
     here would make every test pass against a runner that lies about its units.
+
+    ``end`` is relative to the REAL wall clock (``date.today()``), not a
+    hardcoded literal — the runner's own freshness gate compares its newest
+    measured input against ``now_dual().trading_day`` (a live date), so a
+    fixed literal is a ticking time bomb: this suite passed for weeks against
+    a hardcoded ``"2026-07-13"`` and then failed by itself, with no code
+    change, once wall-clock date crossed the gate's 30d-horizon + 14d-grace
+    allowance (measured failing 2026-08-27, `alpha-engine-config-I8769`
+    incidental find while unrelated backtester work was in flight). 10 days
+    back leaves comfortable headroom under that allowance regardless of when
+    this suite runs.
     """
+    if end is None:
+        end = (date.today() - timedelta(days=10)).isoformat()
     rows: list[dict] = []
     base_dates = pd.date_range(end=pd.Timestamp(end), periods=80, freq="W-MON")
     for i, d in enumerate(base_dates[:40]):

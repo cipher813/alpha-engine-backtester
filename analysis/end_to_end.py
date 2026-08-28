@@ -742,6 +742,21 @@ def compute_lift_metrics(
             logger.warning("scanner_then_predictor_topN failed (non-fatal): %s", _stp)
             result["scanner_then_predictor_counterfactual"] = {"status": "error", "reason": str(_stp)}
 
+        # 3b. scanner_top20_predictor — the second entry-selection arm
+        # (alpha-engine-config-I8756). Same yardstick, same fixed N, same
+        # sector-neutral realized 21d alpha; the POOL is the only treatment.
+        # Fail-soft on the same terms as its sibling: the weekly gate reads a
+        # non-"ok" status as "no point this week" and holds the pointer.
+        try:
+            result["scanner_top20_predictor_counterfactual"] = (
+                _scanner_top20_predictor_lift(conn, bucket)
+            )
+        except Exception as _t20:  # pragma: no cover - defensive
+            logger.warning("scanner_top20_predictor lift failed (non-fatal): %s", _t20)
+            result["scanner_top20_predictor_counterfactual"] = {
+                "status": "error", "reason": str(_t20),
+            }
+
         # 4. Predictor lift
         result["predictor_lift"] = _predictor_lift(conn, ur, date_filter, params)
 
@@ -2639,257 +2654,217 @@ def _scanner_factor_counterfactual(
         return {"status": "error", "reason": str(e)}
 
 
-def _scanner_then_predictor_topN(conn, reference_date: str | None = None) -> dict:
-    """Arm-4 counterfactual (config#1405): scanner -> research-free predictor direct.
+def _scanner_top20_predictor_lift(conn, bucket: str, s3_client=None) -> dict:
+    """``scanner_top20_predictor``'s realized 21d lift (alpha-engine-config-I8756).
 
-    **Source-staleness gate (alpha-engine-config-I8757).** This function joins
-    ``scanner_evaluations`` and count-matches against ``cio_evaluations``
-    ADVANCE rows — BOTH written by the six-team Research LangGraph, retired
-    2026-07-12. The reads never failed; the tables simply stopped changing, so
-    the function kept returning a well-formed number computed entirely from
-    cohort dates on or before 2026-07-10. Measured 2026-08-27: the champion
-    gate consumed an identical ``sector_neutral_mean_alpha_21d = -0.00203``,
-    ``n_cycles=15``, ``n_picks=119`` on 2026-08-13, -08-14 AND -08-21 — three
-    consecutive weekly runs reporting the same frozen point as new evidence,
-    for an arm that has been trading live throughout.
+    Brian, 2026-08-27: *"The scanner should be providing the top 20 to
+    predictor, weekly."* So this arm's ranking is the predictor's own
+    ``predicted_alpha`` over the members of ``predictor_universe_cut``, read
+    from the DATED ``predictor/predictions/{date}.json`` artifacts — the objects
+    the arm actually consumed on the day, never ``latest.json``, which is a
+    mutable pointer that would attribute every past cohort to today's cut.
 
-    So the sources are checked BEFORE anything is computed, and a stale source
-    returns ``status="unmeasurable"`` rather than a number.
-    ``leaderboard_entry_from_e2e_lift`` already treats any non-``ok`` status as
-    "no new point this week", so the champion gate degrades to an honest
-    no-contest and holds the pointer — which is what it would have done all
-    along had the number not been available to mislead it.
+    Identical yardstick to ``_scanner_then_predictor_topN``: the same fixed
+    N=10, the same realized 21d SPY-relative return, the same within-cycle
+    sector neutralisation, via the same ``score_arm``. **The pool is the only
+    treatment** (champion-challenger-policy.md §4), which is the whole point of
+    scoring both through one function rather than two.
 
-    ``reference_date`` is the "now" staleness is measured against. It defaults
-    to ``MAX(universe_returns.eval_date)`` — data-derived rather than
-    wall-clock, so re-running this over an archived research.db reports what
-    was true THEN instead of spuriously failing for being old.
-
-    Bypasses the research/agentic layer entirely. Among the scanner-passing
-    universe (``scanner_evaluations.quant_filter_pass=1``), rank by the
-    research-free predictor's ``predicted_alpha`` (table
-    ``predictor_outcomes_research_free`` — the meta-ensemble's
-    ``canonical_predicted_alpha`` run with the 4 research meta-features omitted ->
-    0.0, per the issue's research-free definition) and take the count-matched
-    top-N, then compare realized 21d log-alpha against:
-
-      * ``actual_scanner_pass``  — the full live scanner pass pool (the input the
-        arm re-ranks), and
-      * ``agentic_cio_advance``  — the live CIO ADVANCE selection (the agentic
-        path this arm would REPLACE).
-
-    Answers config#1405's question: *does the research layer add anything over
-    the ML predictor on scanner candidates?* Count basis: per cycle, N = the live
-    CIO ADVANCE count (``ADVANCE`` + ``ADVANCE_FORCED``) so the predictor selects
-    the same NUMBER of names the agentic stack ultimately holds — an
-    apples-to-apples selection-size match (mirrors the count-matched top-N of
-    ``_scanner_factor_counterfactual``). Cycles with no CIO advance are skipped
-    (no agentic baseline to match). Sector(+cycle)-neutral residual = alpha minus
-    its per-``sector`` group mean WITHIN the cycle. Pure read; fail-soft to
-    ``status="skipped"`` so it can never break the e2e_lift contract — and it
-    stays ``skipped`` until the Saturday spot-box backfill populates
-    ``predictor_outcomes_research_free``.
+    A cohort date whose cut is not this arm's cut is REFUSED upstream in
+    ``predictor_cut_ranked_picks`` — see that function for why that is a
+    refusal rather than a filter.
     """
     try:
+        from analysis.arm_realized_lift import (
+            DEFAULT_SELECTION_N,
+            load_dated_predictions,
+            load_realized_alpha,
+            predictor_cut_ranked_picks,
+            score_arm,
+        )
+
         tabs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        need = {
-            "scanner_evaluations",
-            "universe_returns",
-            "predictor_outcomes_research_free",
-            "cio_evaluations",
-        }
-        missing = need - tabs
-        if missing:
-            return {"status": "skipped", "reason": f"missing tables: {sorted(missing)}"}
+        if "universe_returns" not in tabs:
+            return {"status": "skipped", "reason": "missing table: universe_returns"}
 
-        # ── Source staleness (alpha-engine-config-I8757) — see docstring ──
-        from analysis.retired_table_guard import (
-            StaleResearchTableError,
-            assert_sources_current,
-            survey_retired_tables,
-        )
-
-        ref = reference_date
-        if not ref:
-            _row = conn.execute("SELECT MAX(eval_date) FROM universe_returns").fetchone()
-            ref = _row[0] if _row and _row[0] else None
-        if not ref:
-            return {"status": "skipped", "reason": "universe_returns carries no eval_date"}
-        try:
-            source_freshness = assert_sources_current(
-                conn,
-                str(ref)[:10],
-                ("scanner_evaluations", "cio_evaluations"),
-                measurement="scanner_then_predictor_topN",
-            )
-        except StaleResearchTableError as stale:
-            logger.error(
-                "scanner_then_predictor_topN is UNMEASURABLE: %s", stale,
-            )
+        realized = load_realized_alpha(conn)
+        if realized.empty:
             return {
-                "status": "unmeasurable",
-                "reason": str(stale),
-                "reference_date": str(ref)[:10],
-                "source_freshness": survey_retired_tables(
-                    conn,
-                    str(ref)[:10],
-                    tables=("scanner_evaluations", "cio_evaluations"),
+                "status": "insufficient_data",
+                "reason": "universe_returns carries no matured 21d rows",
+            }
+
+        predictions = load_dated_predictions(bucket, s3_client=s3_client)
+        ranked = predictor_cut_ranked_picks(predictions)
+        if not ranked:
+            return {
+                "status": "insufficient_data",
+                "reason": (
+                    f"none of the {len(predictions)} dated predictions file(s) "
+                    "carries this arm's cut — predictor_universe_cut named a "
+                    "different cut on every date read"
                 ),
+                "n_cycles": 0,
             }
-        se_cols = {r[1] for r in conn.execute("PRAGMA table_info(scanner_evaluations)")}
-        if "quant_filter_pass" not in se_cols:
-            return {"status": "skipped", "reason": "scanner_evaluations has no quant_filter_pass"}
-        prf_cols = {r[1] for r in conn.execute("PRAGMA table_info(predictor_outcomes_research_free)")}
-        if "predicted_alpha" not in prf_cols:
-            return {"status": "skipped", "reason": "predictor_outcomes_research_free has no predicted_alpha"}
-        has_nmiss = "n_research_features_missing" in prf_cols
-        nmiss_sel = "prf.n_research_features_missing, " if has_nmiss else ""
 
-        # Scanner-passing universe x realized 21d x research-free predicted_alpha.
-        # LEFT JOIN so the actual-scanner-pass pool is the FULL passing set even
-        # where the backfill lacks a prediction (predictor ranks only the scored
-        # subset, but the scanner baseline must reflect every name it passed).
-        passing = pd.read_sql_query(
-            "SELECT se.ticker, se.eval_date, u.sector, "
-            "(u.log_return_21d - u.log_spy_return_21d) AS alpha21, "
-            f"prf.predicted_alpha, {nmiss_sel}"
-            "se.quant_filter_pass "
-            "FROM scanner_evaluations se "
-            "JOIN universe_returns u ON u.ticker=se.ticker AND u.eval_date=se.eval_date "
-            "LEFT JOIN predictor_outcomes_research_free prf "
-            "  ON prf.ticker=se.ticker AND prf.prediction_date=se.eval_date "
-            "WHERE se.quant_filter_pass=1 "
-            "  AND u.log_return_21d IS NOT NULL AND u.log_spy_return_21d IS NOT NULL",
-            conn,
+        lift = score_arm(
+            "scanner_top20_predictor", ranked, realized,
+            selection_n=DEFAULT_SELECTION_N,
         )
-        if passing.empty:
-            return {"status": "insufficient_data", "reason": "no scanner-passing rows with realized 21d"}
-
-        # Live agentic CIO ADVANCE selection x realized 21d (the path replaced).
-        cio = pd.read_sql_query(
-            "SELECT ce.ticker, ce.eval_date, ce.cio_decision, u.sector, "
-            "(u.log_return_21d - u.log_spy_return_21d) AS alpha21 "
-            "FROM cio_evaluations ce "
-            "JOIN universe_returns u ON u.ticker=ce.ticker AND u.eval_date=ce.eval_date "
-            "WHERE u.log_return_21d IS NOT NULL AND u.log_spy_return_21d IS NOT NULL",
-            conn,
-        )
-        cio_adv = cio[cio["cio_decision"].isin(("ADVANCE", "ADVANCE_FORCED"))]
-
-        methods = ["actual_scanner_pass", "scanner_then_predictor_topN", "agentic_cio_advance"]
-        picked: dict = {k: [] for k in methods}
-        picked_sn: dict = {k: [] for k in methods}
-        n_cycles = 0
-        n_scored_total = 0
-        nmiss_vals: list = []
-
-        def _sector_neutral(frame: pd.DataFrame) -> pd.Series:
-            if frame["sector"].notna().any():
-                return frame["alpha21"] - frame.groupby("sector")["alpha21"].transform("mean")
-            return frame["alpha21"]
-
-        for d, g in passing.groupby("eval_date"):
-            g = g[g["alpha21"].notna()].copy()
-            if g.empty:
-                continue
-            adv = cio_adv[cio_adv["eval_date"] == d].copy()
-            adv = adv[adv["alpha21"].notna()]
-            n_adv = len(adv)
-            if n_adv == 0:
-                continue  # no agentic baseline to count-match against this cycle
-            n_cycles += 1
-            g["alpha_sn"] = _sector_neutral(g)
-
-            # actual scanner pass pool (full passing set)
-            picked["actual_scanner_pass"].extend(g["alpha21"].tolist())
-            picked_sn["actual_scanner_pass"].extend(g["alpha_sn"].tolist())
-
-            # research-free predictor: rank the SCORED passing names, count-matched
-            scored = g[g["predicted_alpha"].notna()]
-            n_scored_total += len(scored)
-            if has_nmiss:
-                nmiss_vals.extend(scored["n_research_features_missing"].dropna().tolist())
-            if not scored.empty:
-                top = scored.sort_values("predicted_alpha", ascending=False).head(min(n_adv, len(scored)))
-                picked["scanner_then_predictor_topN"].extend(top["alpha21"].tolist())
-                picked_sn["scanner_then_predictor_topN"].extend(top["alpha_sn"].tolist())
-
-            # agentic CIO advance picks this cycle
-            adv["alpha_sn"] = _sector_neutral(adv)
-            picked["agentic_cio_advance"].extend(adv["alpha21"].tolist())
-            picked_sn["agentic_cio_advance"].extend(adv["alpha_sn"].tolist())
-
-        if n_cycles < 1:
-            return {"status": "insufficient_data", "reason": "no cycles with both scanner pass + CIO advance"}
-        if not picked["scanner_then_predictor_topN"]:
-            return {"status": "skipped", "reason": "no research-free predictions matched the scanner-passing universe"}
-
-        def _mean(xs):
-            return round(float(sum(xs) / len(xs)), 5) if xs else None
-
-        scanner_mean = _mean(picked["actual_scanner_pass"])
-        scanner_sn = _mean(picked_sn["actual_scanner_pass"])
-        cio_mean = _mean(picked["agentic_cio_advance"])
-        cio_sn = _mean(picked_sn["agentic_cio_advance"])
-
-        out_methods: dict = {}
-        for k in methods:
-            out_methods[k] = {
-                "mean_alpha_21d": _mean(picked[k]),
-                "sector_neutral_mean_alpha_21d": _mean(picked_sn[k]),
-                "n_picks": len(picked[k]),
+        if lift.n_cycles == 0:
+            return {
+                "status": "insufficient_data",
+                "reason": (
+                    f"the arm has {len(ranked)} qualifying cohort date(s) "
+                    f"(earliest {min(ranked)}) but none has matured — the newest "
+                    f"realized 21d row is {realized['eval_date'].max()}"
+                ),
+                "n_cycles": 0,
+                "n_qualifying_dates": len(ranked),
             }
-        pred = out_methods["scanner_then_predictor_topN"]
-        pm, psn = pred["mean_alpha_21d"], pred["sector_neutral_mean_alpha_21d"]
-        pred["lift_vs_actual_scanner"] = (
-            round(pm - scanner_mean, 5) if (pm is not None and scanner_mean is not None) else None
-        )
-        pred["sn_lift_vs_actual_scanner"] = (
-            round(psn - scanner_sn, 5) if (psn is not None and scanner_sn is not None) else None
-        )
-        pred["lift_vs_agentic_cio"] = (
-            round(pm - cio_mean, 5) if (pm is not None and cio_mean is not None) else None
-        )
-        pred["sn_lift_vs_agentic_cio"] = (
-            round(psn - cio_sn, 5) if (psn is not None and cio_sn is not None) else None
-        )
-
-        predictor_beats_agentic = bool(
-            pred["lift_vs_agentic_cio"] is not None and pred["lift_vs_agentic_cio"] > 0
-        )
-        predictor_beats_scanner = bool(
-            pred["lift_vs_actual_scanner"] is not None and pred["lift_vs_actual_scanner"] > 0
-        )
-        nmiss_mode = None
-        if nmiss_vals:
-            from collections import Counter
-
-            nmiss_mode = Counter(int(x) for x in nmiss_vals).most_common(1)[0][0]
 
         return {
             "status": "ok",
             "horizon": "21d",
-            "n_cycles": n_cycles,
-            # alpha-engine-config-I8757: the ages of the retired-writer tables
-            # this number was computed from, carried on the HEALTHY path too.
-            # An absent field is unmeasured, not fine — and for seven weeks a
-            # frozen source was indistinguishable from a fresh one precisely
-            # because nothing said how old it was.
-            "reference_date": str(ref)[:10],
-            "source_freshness": source_freshness,
-            "selection_count_basis": "per-cycle top-N matched to the live CIO ADVANCE count",
-            "n_predictor_scored": n_scored_total,
-            # Expect 4 (the 4 research meta-features omitted) — a guard that the
-            # backfill ran truly research-free, not with research features present.
-            "research_features_missing_mode": nmiss_mode,
-            "methods": out_methods,
-            "predictor_beats_agentic_cio": predictor_beats_agentic,
-            "predictor_beats_actual_scanner": predictor_beats_scanner,
+            "n_cycles": lift.n_cycles,
+            "n_qualifying_dates": len(ranked),
+            "selection_count_basis": (
+                f"fixed N={DEFAULT_SELECTION_N} — identical to "
+                "scanner_then_predictor_topN, so the pool is the only treatment"
+            ),
+            "reference_date": str(realized["eval_date"].max())[:10],
+            "methods": {"scanner_top20_predictor": lift.as_dict()},
+        }
+    except sqlite3.OperationalError as e:
+        return {"status": "skipped", "reason": f"sqlite: {e}"}
+    except Exception as e:  # pragma: no cover - defensive; never break e2e_lift
+        return {"status": "error", "reason": str(e)}
+
+
+def _scanner_then_predictor_topN(conn, reference_date: str | None = None) -> dict:
+    """``scanner_predictor_direct``'s realized 21d lift (config#1405 origin).
+
+    **Rewritten 2026-08-27 (alpha-engine-config-I8757) to remove two dead
+    dependencies.** It previously joined ``scanner_evaluations`` for its pool
+    and count-matched each cycle to the number of names the agentic CIO stage
+    marked ADVANCE, skipping any cycle with none. Both tables lost their writer
+    when the six-team Research graph retired 2026-07-12 — measured 2026-08-27,
+    ``cio_evaluations`` stopped at 2026-07-10 and ``scanner_evaluations`` at
+    2026-07-17, against a ``universe_returns`` running to 2026-08-14. So no
+    cohort after 2026-07-10 could be scored, and this function returned an
+    identical ``sector_neutral_mean_alpha_21d = -0.00203`` on the 2026-08-13,
+    -08-14 and -08-21 gate runs while reporting ``status: ok``.
+
+    Brian, 2026-08-27: *"the cio no longer exists, that was deprecated long
+    ago."* This is therefore a repair of a reference to a deleted component,
+    not a redesign.
+
+    Two changes, both removals:
+
+    * **The count-match basis is a fixed N**, ``DEFAULT_SELECTION_N`` = 10 —
+      the size every arm in this slot actually trades at
+      (``champion_top_n_default``). Count-matching (champion-challenger-policy
+      §4) is satisfied directly, and the basis no longer depends on any other
+      component being alive, which is exactly how the old one failed.
+    * **The pool is the research-free parquet's own cohort.** Its producer
+      builds its work list from ``quant_filter_pass`` rows, so the cohort
+      contains only scanner-passing names BY CONSTRUCTION. The join against
+      ``scanner_evaluations`` re-filtered an already-filtered set — redundant
+      even before that table died, and the thing that made a live measurement
+      depend on a dead one.
+
+    ``agentic_cio_advance`` is gone from ``methods`` with the component it
+    described. ``actual_research_free_pool`` replaces ``actual_scanner_pass``
+    as the "what the arm re-ranked" baseline, from the same live source.
+
+    Fail-soft to a non-``ok`` status so it can never break the e2e_lift
+    contract; ``leaderboard_entry_from_e2e_lift`` treats any non-``ok`` as "no
+    point this week".
+    """
+    try:
+        from analysis.arm_realized_lift import (
+            DEFAULT_SELECTION_N,
+            load_realized_alpha,
+            research_free_ranked_picks,
+            score_arm,
+        )
+
+        tabs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        missing = {"universe_returns", "predictor_outcomes_research_free"} - tabs
+        if missing:
+            return {"status": "skipped", "reason": f"missing tables: {sorted(missing)}"}
+
+        realized = load_realized_alpha(conn)
+        if realized.empty:
+            return {
+                "status": "insufficient_data",
+                "reason": "universe_returns carries no matured 21d rows",
+            }
+
+        ranked = research_free_ranked_picks(conn)
+        if not ranked:
+            return {
+                "status": "insufficient_data",
+                "reason": "predictor_outcomes_research_free carries no scored rows",
+            }
+
+        lift = score_arm(
+            "scanner_predictor_direct", ranked, realized,
+            selection_n=DEFAULT_SELECTION_N,
+        )
+        if lift.n_cycles == 0:
+            # Every cohort date is either unmatured or unscorable. An honest
+            # "no point this week", never a number.
+            return {
+                "status": "insufficient_data",
+                "reason": (
+                    f"no matured cohort overlaps the arm's {len(ranked)} scored "
+                    "date(s) — the newest realized 21d row is "
+                    f"{realized['eval_date'].max()}"
+                ),
+                "n_cycles": 0,
+            }
+
+        # The pool the arm re-ranked, at full width — the "did selecting help?"
+        # baseline that `actual_scanner_pass` used to serve, from a live source.
+        pool = score_arm(
+            "actual_research_free_pool", ranked, realized,
+            selection_n=10 ** 6,
+        )
+
+        pred = lift.as_dict()
+        pool_sn = pool.sector_neutral_mean_alpha_21d
+        pred["sn_lift_vs_pool"] = (
+            round(lift.sector_neutral_mean_alpha_21d - pool_sn, 5)
+            if (lift.sector_neutral_mean_alpha_21d is not None and pool_sn is not None)
+            else None
+        )
+
+        return {
+            "status": "ok",
+            "horizon": "21d",
+            "n_cycles": lift.n_cycles,
+            "selection_count_basis": (
+                f"fixed N={DEFAULT_SELECTION_N} — the size every arm in this "
+                "slot trades at (champion_top_n_default)"
+            ),
+            "reference_date": str(reference_date or realized["eval_date"].max())[:10],
+            "source_freshness": {
+                "universe_returns_max_eval_date": str(realized["eval_date"].max()),
+                "research_free_max_prediction_date": max(ranked),
+            },
+            "methods": {
+                "scanner_then_predictor_topN": pred,
+                "actual_research_free_pool": pool.as_dict(),
+            },
+            "predictor_beats_actual_pool": bool(
+                pred["sn_lift_vs_pool"] is not None and pred["sn_lift_vs_pool"] > 0
+            ),
             "interpretation": (
-                "scanner_then_predictor_topN > agentic_cio_advance => the research/agentic layer "
-                "subtracts value vs a research-free predictor on scanner candidates; <= => the "
-                "agentic layer adds selection skill the predictor alone lacks. Directional until "
-                "enough 21d cohorts mature (config#1405)."
+                "scanner_then_predictor_topN vs actual_research_free_pool => did "
+                "ranking the pool by research-free predicted alpha beat holding "
+                "the pool? A SELECTION stage is graded against the population it "
+                "drew from, not against SPY (alpha-engine-config-I7552)."
             ),
         }
     except sqlite3.OperationalError as e:
