@@ -243,6 +243,96 @@ class TestModulePresentVerdictLandsInPayload:
         assert fake_stage_coverage_module == []
 
 
+# ── dry_run must never assert (and so never overwrite) coverage ─────────────
+
+
+class TestDryRunNeverAssertsCoverage:
+    """alpha-engine-config-I8206.
+
+    Measured 2026-08-22: the real weekly ``ReplayConcordance`` Task
+    invocation (05:21:24 PT) replayed the corpus and persisted
+    ``decision_artifacts/_replay_summary/2608220900_deepseek-v4-
+    flash.json``, and its own embedded assertion recorded ``status:
+    COVERED``. ``deploy_concordance.sh``'s deploy-time canary — a
+    ``dry_run=True, window_days=14`` invocation of the SAME handler, run
+    against Lambda version 240 eleven seconds after that version
+    published (18:01:06 UTC / 18:00:55 UTC) — reached the SAME
+    unconditional assertion at the end of ``_run``, with ``window_start``
+    captured at the CANARY's own (much later) entry time. It overwrote
+    ``_stage_coverage/2026-08-22/ReplayConcordance.json`` with `status:
+    STALE, covered: []` — a stage that ran and wrote its declared
+    artifact hours earlier reported, after the fact, as having produced
+    nothing. Only a functional exercise of the ``dry_run=True`` path
+    catches this: the sibling ``TestModulePresentVerdictLandsInPayload``
+    class above never passes ``dry_run`` and so never reached the branch
+    that was wrong.
+
+    lambda_counterfactual is not exercised here: its canary shape and
+    dry-run semantics are a separate contract (Counterfactual's own
+    handler has no ``dry_run`` kwarg on ``compute_and_emit`` today) —
+    this issue and its evidence are ReplayConcordance-specific.
+    """
+
+    def test_dry_run_never_calls_assert_stage_coverage(self, fake_stage_coverage_module):
+        mod = _load_handler_module("lambda_concordance", _HANDLERS["lambda_concordance"]["path"])
+        mod._init_done = False
+        with patch.object(mod, "_ensure_init"), \
+             patch(
+                 "replay.batch.compute_and_emit_concordance",
+                 return_value={
+                     "dry_run": True,
+                     "would_replay": 12,
+                     "target_resolution": [{
+                         "target_model": "deepseek-v4-flash",
+                         "resolved": True,
+                         "deployment_id": "deepseek-v4-flash",
+                         "route": "litellm_proxy",
+                         "exec_context": "lambda",
+                     }],
+                 },
+             ):
+            result = mod.handler({"dry_run": True, "window_days": 14}, context=None)
+        assert result["status"] == "OK"
+        assert fake_stage_coverage_module == [], (
+            "a dry_run=True (deploy canary) invocation must never call "
+            "assert_stage_coverage — doing so overwrites the real weekly "
+            "run's COVERED verdict with a false STALE one (config-I8206)"
+        )
+
+    def test_dry_run_result_carries_an_explicit_skip_marker(self, fake_stage_coverage_module):
+        mod = _load_handler_module("lambda_concordance", _HANDLERS["lambda_concordance"]["path"])
+        mod._init_done = False
+        with patch.object(mod, "_ensure_init"), \
+             patch(
+                 "replay.batch.compute_and_emit_concordance",
+                 return_value={
+                     "dry_run": True,
+                     "would_replay": 12,
+                     "target_resolution": [{
+                         "target_model": "deepseek-v4-flash",
+                         "resolved": True,
+                         "deployment_id": "deepseek-v4-flash",
+                         "route": "litellm_proxy",
+                         "exec_context": "lambda",
+                     }],
+                 },
+             ):
+            result = mod.handler({"dry_run": True}, context=None)
+        # Never silently omit the key (no-silent-swallows) — a dry run
+        # states plainly why no verdict was asserted.
+        assert result["stage_coverage"]["stage"] == "ReplayConcordance"
+        assert result["stage_coverage"]["status"] == "SKIPPED"
+
+    def test_non_dry_run_still_asserts_coverage(self, handler_case, fake_stage_coverage_module):
+        """Guards the fix from over-correcting into never asserting at all."""
+        name, mod, cfg = handler_case
+        with patch.object(mod, "_ensure_init"), \
+             patch(cfg["compute_target"], return_value=_ok_summary(name)):
+            mod.handler({}, context=None)
+        assert len(fake_stage_coverage_module) == 1
+        assert fake_stage_coverage_module[0]["stage"] == cfg["sf_stage"]
+
+
 # ── The primitive must actually be installable, not merely called ───────────
 
 
