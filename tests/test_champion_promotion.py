@@ -1313,6 +1313,57 @@ class TestBuildChampionAudit:
         assert audit["outcome"] == "promoted"
         assert audit["leaderboard_date_used"] == "2026-07-11"
 
+    def test_arm_scores_reaches_the_durable_audit_record(self):
+        """The N-arm view must survive into the artifact, not just the gate.
+
+        alpha-engine-config-I8756 added ``arm_scores`` to ``evaluate_gates``'s
+        record AND to the published ``producer_champion_audit`` contract, but
+        ``build_champion_audit`` never copied it across — so the field was
+        computed weekly and dropped before it became durable. Measured on the
+        live 2026-08-28 artifact: it carries ``arm_confidence`` for all three
+        arms and no ``arm_scores`` at all, and because both challengers were
+        unscored that week (``challenger: null``) the pair-shaped
+        ``champion_score``/``challenger_score`` fields named a single arm.
+        champion-challenger-policy.md §3 requires every arm's measurement to be
+        recorded every cycle; a number discarded before it is written was not
+        recorded.
+        """
+        arm_scores = {
+            "scores": {
+                "scanner_top20_predictor": None,
+                "scanner_predictor_direct": 0.00257,
+                "thinktank_coverage": None,
+            },
+            "unavailable_reasons": {
+                "scanner_top20_predictor": "scanner_top20_predictor_thin_evidence",
+                "thinktank_coverage": "thinktank_coverage_thin_evidence",
+            },
+            "leaderboard_date_used": "2026-08-28",
+        }
+        gate_result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+        audit = build_champion_audit("2026-08-28", gate_result, freeze=False)
+        assert audit["outcome"] == "no_contest"
+        assert audit["arm_scores"] == {
+            "scanner_top20_predictor": None,
+            "scanner_predictor_direct": 0.00257,
+            "thinktank_coverage": None,
+        }, "the N-arm score view was dropped between the gate and the artifact"
+        # Every registered arm is present as an explicit key. A MISSING key and
+        # a null VALUE are different facts (§3) and the record must carry the
+        # second, never collapse to the first.
+        for arm in VALID_CHAMPIONS:
+            assert arm in audit["arm_scores"]
+
+    def test_error_path_still_declares_arm_scores_explicitly(self):
+        """An error run computed no per-arm score. The field is present and
+        null — "we did not measure" stated, rather than a missing key a reader
+        has to interpret."""
+        audit = build_champion_audit("2026-08-28", None, freeze=False, error="boom")
+        assert "arm_scores" in audit
+        assert audit["arm_scores"] is None
+
     @pytest.mark.parametrize("outcome", OUTCOMES)
     def test_all_outcomes_are_in_frozen_vocabulary(self, outcome):
         # held_shadow_only added alpha-engine-config-I2515 (2026-08-20) --
@@ -1328,6 +1379,63 @@ class TestBuildChampionAudit:
 
 class TestRunWeeklyEvaluation:
     BUCKET = "test-bucket"
+
+    @pytest.fixture(autouse=True)
+    def _no_real_digest(self):
+        """``run_weekly_evaluation`` now delivers the verdict by email. Without
+        this seam every test in this class would attempt a real SMTP/SES send
+        and a real S3 dedup-marker read, and the failed send's own escalation
+        would add a second ``publish_ops_alert`` call to the gate-error tests.
+        The wiring itself is asserted explicitly below, against this mock."""
+        with mock.patch(
+            "optimizer.champion_promotion.champion_digest.send_verdict_digest",
+            return_value=True,
+        ) as digest:
+            self.digest = digest
+            yield digest
+
+    def test_every_outcome_is_delivered_not_only_a_promotion(self):
+        """The measurability gap this seam closes: eleven weekly verdicts
+        (2026-07-13 → 2026-08-28), nine of them ``no_contest``, reached no
+        operator surface at all. A digest that fired only on a promotion would
+        have delivered ONE of the eleven and left the loop indistinguishable
+        from a dead one for the other ten."""
+        s3 = _FakeS3()
+        result = run_weekly_evaluation(
+            bucket=self.BUCKET, run_date="2026-07-18",
+            e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+            tt_leaderboard=None, tt_leaderboard_date_used=None,
+            freeze=False, upload=True, s3_client=s3,
+        )
+        # Whatever this fixture's evidence produces, the verdict is delivered.
+        assert result["outcome"] in OUTCOMES
+        self.digest.assert_called_once()
+        assert self.digest.call_args[0][0]["date"] == "2026-07-18"
+
+    def test_a_dry_run_never_emails(self):
+        """``upload=False`` is the dry-run contract — it must not write S3 and
+        must not reach an operator's inbox either."""
+        s3 = _FakeS3()
+        run_weekly_evaluation(
+            bucket=self.BUCKET, run_date="2026-07-18",
+            e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+            tt_leaderboard=None, tt_leaderboard_date_used=None,
+            freeze=False, upload=False, s3_client=s3,
+        )
+        self.digest.assert_not_called()
+
+    def test_a_raising_digest_never_fails_the_weekly_run(self):
+        """A notification must never red the pipeline it reports on."""
+        s3 = _FakeS3()
+        self.digest.side_effect = RuntimeError("SES down")
+        result = run_weekly_evaluation(
+            bucket=self.BUCKET, run_date="2026-07-18",
+            e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+            tt_leaderboard=None, tt_leaderboard_date_used=None,
+            freeze=False, upload=True, s3_client=s3,
+        )
+        assert result["outcome"] in OUTCOMES
+        assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
 
     def test_challenger_wins_promotes_and_writes_pointer(self):
         s3 = _FakeS3()
