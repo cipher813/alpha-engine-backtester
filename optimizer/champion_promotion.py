@@ -357,6 +357,8 @@ from typing import Any
 import boto3
 from botocore.exceptions import ClientError
 
+from optimizer import champion_digest
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1          # config/producer_champion.json pointer — unchanged shape
@@ -1282,6 +1284,7 @@ def build_champion_audit(
             "feed_dependencies": None,
             "counterfactual_winner": None,
             "arm_confidence": None,
+            "arm_scores": None,
         }
     return {
         "schema_version": AUDIT_SCHEMA_VERSION,
@@ -1305,6 +1308,17 @@ def build_champion_audit(
         # point of shadow mode (champion-challenger-policy.md §3).
         "counterfactual_winner": gate_result.get("counterfactual_winner"),
         "arm_confidence": gate_result.get("arm_confidence"),
+        # alpha-engine-config-I8756 built this N-arm view in ``evaluate_gates``
+        # and then dropped it HERE, so it never reached the durable artifact:
+        # every audit record from 2026-08-21 onward carries ``arm_confidence``
+        # but no ``arm_scores``, and on 2026-08-28 (``challenger: null``, both
+        # challengers unscored) the record therefore named NO arm's score at
+        # all. ``champion_score``/``challenger_score`` collapse the week into
+        # the pair that happened to matter; with three arms that is no longer
+        # the verdict. champion-challenger-policy.md §3 requires every arm's
+        # measurement to be recorded every cycle, and a number computed and
+        # then discarded before it becomes durable was never recorded.
+        "arm_scores": gate_result.get("arm_scores"),
     }
 
 
@@ -1864,6 +1878,24 @@ def run_weekly_evaluation(
             raise
     else:
         logger.info("producer_champion audit S3 write skipped (upload=%s) — logged only", upload)
+
+    # ── Deliver the verdict (alpha-engine-config-I2364 measurability gap) ──
+    # Eleven weekly verdicts were computed between 2026-07-13 and 2026-08-28
+    # and NONE reached an operator: the audit record above was the whole
+    # delivery. A verdict nobody is told is indistinguishable from a loop that
+    # stopped running (principles.md §2.7). Gated on ``upload`` for the same
+    # reason the S3 write is — a dry run must not email — and never allowed to
+    # fail the weekly evaluate run, since a notification must not red the
+    # pipeline it reports on. ``send_verdict_digest`` escalates its OWN failure
+    # as an ops alert, so the fail-soft here cannot become a second silence.
+    if upload:
+        try:
+            champion_digest.send_verdict_digest(audit)
+        except Exception:  # noqa: BLE001 — notification must never crash the run
+            logger.exception(
+                "producer_champion verdict digest raised — the verdict is still "
+                "durable in the audit record, but no operator was told",
+            )
 
     result = dict(audit)
     if pointer_written is not None:
