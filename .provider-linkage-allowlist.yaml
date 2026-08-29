@@ -1,0 +1,44 @@
+# .provider-linkage-allowlist.yaml — pre-cleared provider-linkage-guard
+# matches for crucible-backtester (alpha-engine-config-I9295, spine I9294).
+#
+# Schema: nousergon-lib scripts/provider_linkage_guard.py::load_allowlist.
+# Every entry needs path, pattern (<provider>:<class>), reason, expires
+# (YYYY-MM-DD — a past date fails CI loudly), and tracking.
+#
+# Generated 2026-08-29 from the guard's first run against this repo
+# (7 raw findings, 0 genuine violations after triage).
+schema_version: 1
+entries:
+  - path: infrastructure/deploy_concordance.sh
+    pattern: anthropic:env_key
+    reason: >-
+      Prose in a code comment naming ANTHROPIC_API_KEY as one of this
+      Lambda's OTHER, container-image-owned env vars that this script does
+      not set or read -- the script itself only merges KREPIS_* router
+      addressing variables (see _apply_router_env below the flagged line).
+      The comment documents a known uncodified-env gap tracked on the
+      sibling research Lambda (alpha-engine-config-I6377), not a live
+      direct-provider call site here.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
+  - path: tests/conftest.py
+    pattern: deepseek:base_url
+    reason: >-
+      Test fixture (_TEST_REGISTRY_YAML): a fake model-registry document used
+      to stub router resolution in tests. Every model entry routes through
+      route: egress_proxy at api_base http://127.0.0.1:8990 -- the
+      upstream_host: api.deepseek.com lines are inert metadata on the fixture
+      string, never dialed by the code under test, which only ever calls the
+      local egress proxy.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
+  - path: tests/test_no_secret_environ_reads.py
+    pattern: anthropic:env_key
+    reason: >-
+      Regression test asserting the literal's ABSENCE: this repo re-greps
+      for direct os.environ reads of pinned secrets (including
+      ANTHROPIC_API_KEY) on every CI run so one can't be silently
+      reintroduced post the 2026-05-12 .env-to-SSM migration. The literal
+      appears only inside the test's own denylist, never as a live read.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
