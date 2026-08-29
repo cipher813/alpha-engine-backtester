@@ -350,6 +350,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import pathlib
 import re
 from datetime import date, datetime, timezone
 from typing import Any
@@ -380,9 +381,22 @@ AUDIT_PREFIX = "config/apply_audit/producer_champion"
 # a challenger-vs-challenger tie on this tuple's order — the second is a
 # stability choice (a declared order beats dict iteration order), never a
 # statement that an earlier arm is preferred.
+# FALLBACK ONLY since alpha-engine-config-I9277. The live arm set is resolved
+# from the producer leaderboard's `arms` block (see `resolve_arms`), which is
+# crucible-research's `producers/registry.py` projected onto the artifact.
+#
+# This tuple remains for two narrow jobs: read-tolerance of a pre-I9277 board
+# that carries no `arms` block, and the write-forbidden boundary in
+# `write_champion_pointer` when no resolved set is supplied. It is kept in sync
+# with the register by `tests/test_champion_arm_register.py`, which fails if
+# the two disagree — as a hand-maintained list it had silently omitted
+# `no_agent_quant` and `single_agent_quant`, the only two arms on the
+# 2026-08-28 board with sufficient evidence to win.
 VALID_CHAMPIONS = (
-    "scanner_top20_predictor",
+    "no_agent_quant",
     "scanner_predictor_direct",
+    "scanner_top20_predictor",
+    "single_agent_quant",
     "thinktank_coverage",
 )
 
@@ -474,6 +488,12 @@ OUTCOMES = (
     # counterfactual shadow mode exists to measure. The record carries
     # `counterfactual_winner` naming who actually won.
     "held_shadow_only",
+    # alpha-engine-config-I9277 — an eligible arm won but the executor cannot
+    # serve it. Distinct from held_shadow_only (a standing policy decision not
+    # to promote a measured arm) and from no_contest (no comparable evidence):
+    # here there WAS a contest, it HAD a winner, and the hold is a capability
+    # gap with a named unblock.
+    "held_arm_not_servable",
     "error",
 )
 
@@ -519,6 +539,7 @@ _BLOCKED_BY_SLUGS = (
     # promoted. Paired with outcome="held_shadow_only" and the record's
     # `counterfactual_winner` field.
     "shadow_only_arm",
+    "arm_not_servable_by_executor",
     "frozen",
     "unclassified_error",
     # retired (pre-I2518 HAC/hysteresis/cooldown engine) — historical read-only
@@ -534,6 +555,7 @@ _BLOCKED_BY_SLUGS = (
     # for the age-bound case).
     "leaderboard_stale",
 )
+
 
 # Honest staleness bound (alpha-engine-config-I2544, 2026-07-14): a selected
 # research/producer_leaderboard/{date}.json artifact older than this many
@@ -573,6 +595,33 @@ CONFIDENCE_UNRECOGNISED = "unrecognised"  # confidence present, outside the voca
 # constant stays defined for read-tolerance of any audit record written in that
 # window; nothing emits it.
 CONFIDENCE_NOT_LEADERBOARD_SCORED = "not_leaderboard_scored"
+
+
+# ── Generated per-arm refusal slugs (alpha-engine-config-I9277 / -I9279) ────
+#
+# `_score_arm_from_leaderboard` builds its refusal slug from the ARM NAME, so
+# the vocabulary is a function of the register and can no longer be a literal:
+# the moment an arm is added to the register, its slugs exist, and a fixed
+# tuple would silently not contain them. That is the same silent-omission class
+# `VALID_CHAMPIONS` had — a list in this repo failing to describe a register in
+# another one — so it gets the same fix rather than three more typed lines.
+#
+# The bespoke pre-I9279 slugs above are retained for read-tolerance of historic
+# audit records; these are what the live path now writes.
+_PER_ARM_REFUSAL_SUFFIXES = (
+    "not_in_leaderboard",
+    "no_intersection_evidence",
+    f"{CONFIDENCE_THIN}_evidence",
+    f"{CONFIDENCE_INSUFFICIENT}_evidence",
+    f"{CONFIDENCE_UNKNOWN}_evidence",
+    f"{CONFIDENCE_UNRECOGNISED}_evidence",
+)
+
+_BLOCKED_BY_SLUGS = _BLOCKED_BY_SLUGS + tuple(
+    f"{arm}_{suffix}"
+    for arm in VALID_CHAMPIONS
+    for suffix in _PER_ARM_REFUSAL_SUFFIXES
+)
 
 # ── The champion side's evidence floor (alpha-engine-config-I7549) ─────────
 #
@@ -805,7 +854,7 @@ def hac_significance(
 # ── Gate engine (weekly winner-take-all) ────────────────────────────────────
 
 
-def _challengers(champion: str) -> list[str]:
+def _challengers(champion: str, arms: list[str] | None = None) -> list[str]:
     """Every registered arm that is not the incumbent, in ``VALID_CHAMPIONS`` order.
 
     Replaces ``_other_champion``, which returned "the other one" and raised
@@ -813,21 +862,28 @@ def _challengers(champion: str) -> list[str]:
     N-arm gate has no "the other one", and the raise made adding a third arm a
     crash rather than a comparison.
     """
-    return [c for c in VALID_CHAMPIONS if c != champion]
+    return [c for c in (arms if arms is not None else VALID_CHAMPIONS) if c != champion]
 
 
 def _best_challenger(
-    champion: str, scores: dict,
+    champion: str, scores: dict, arms: list[str] | None = None,
 ) -> tuple[str | None, float | None]:
     """The highest-scoring challenger, or ``(None, None)`` if none is scored.
 
     Ties among challengers break on ``VALID_CHAMPIONS`` order — declared and
     stable — never on dict iteration order, which is neither.
     """
-    challengers = _challengers(champion)
+    challengers = _challengers(champion, arms)
+    # Ties break on ARM NAME, not on the caller's iteration order
+    # (alpha-engine-config-I9277). Before the arm set was resolved from the
+    # register it was a module-level tuple, so `challengers.index(...)` was a
+    # declared, stable order. It no longer is: the set now arrives from the
+    # board, and ordering a tie by the position an arm happened to occupy in a
+    # dict would make the winner depend on artifact key order. Alphabetical is
+    # a total order over the register that no upstream edit can perturb.
     ranked = sorted(
         ((arm, scores.get(arm)) for arm in challengers if scores.get(arm) is not None),
-        key=lambda row: (-row[1], challengers.index(row[0])),
+        key=lambda row: (-row[1], row[0]),
     )
     return (ranked[0][0], ranked[0][1]) if ranked else (None, None)
 
@@ -955,7 +1011,17 @@ def evaluate_gates(
     # EVERY other registered arm, and only the best-scoring one can take the
     # seat, so `challenger` keeps its two-arm meaning ("the arm that could win")
     # and every historical reader of the audit record keeps working.
-    challenger, chall_score = _best_challenger(champion_before, scores)
+    # THE arm set for this week, resolved from the register via the board
+    # (alpha-engine-config-I9277). `VALID_CHAMPIONS` is only the read-tolerance
+    # fallback for a pre-I9277 artifact that carries no `arms` block; the live
+    # path never consults it. The incumbent is always included even if the
+    # register has dropped it — an arm that is SERVING is by definition part of
+    # this week's comparison, and silently excluding it would make the pointer
+    # unmovable rather than make the decision.
+    arms = list(arm_scores.get("scores") or {}) or list(VALID_CHAMPIONS)
+    if champion_before not in arms:
+        arms.append(champion_before)
+    challenger, chall_score = _best_challenger(champion_before, scores, arms)
 
     record: dict[str, Any] = {
         "champion_before": champion_before,
@@ -967,7 +1033,17 @@ def evaluate_gates(
         # into the pair that happened to matter; this keeps the rest legible. A
         # null VALUE means that arm produced no comparable evidence — different
         # from the arm being absent (nousergon-lib v0.124.92 admits the field).
-        "arm_scores": {arm: scores.get(arm) for arm in VALID_CHAMPIONS},
+        "arm_scores": {arm: scores.get(arm) for arm in arms},
+        # Arms that WERE scored but may not take the pointer, each with the
+        # reason recorded in the register (alpha-engine-config-I9277). An
+        # exclusion is a stated fact on the artifact, never an absence.
+        "ineligible_arms": arm_scores.get("ineligible_arms") or None,
+        # champion-challenger-policy.md §4 — the shared cohort every score in
+        # `arm_scores` was computed over, and its size.
+        "cohort_intersection": arm_scores.get("cohort_intersection") or [],
+        "n_dates_intersection": arm_scores.get("n_dates_intersection") or 0,
+        "score_source": arm_scores.get("score_source"),
+        "score_metric": arm_scores.get("score_metric"),
         "blocked_by": None,
         "leaderboard_date_used": arm_scores.get("leaderboard_date_used"),
         # alpha-engine-config-I7549 — carried on EVERY outcome, so the audit
@@ -989,7 +1065,7 @@ def evaluate_gates(
             blocked.append(reasons.get(champion_before, "arm_score_unavailable"))
         # Every unscored arm is named, not just one. With N arms, "the
         # challenger had no score" no longer identifies which challenger.
-        for arm in _challengers(champion_before):
+        for arm in _challengers(champion_before, arms):
             if scores.get(arm) is None:
                 blocked.append(reasons.get(arm, "arm_score_unavailable"))
         record["outcome"] = "no_contest"
@@ -1021,6 +1097,31 @@ def evaluate_gates(
     # durable in config/apply_audit/producer_champion/{date}.json. Removing
     # the arm from SHADOW_ONLY_ARMS (with Brian's ruling) restores the
     # ordinary promotion path with no other change here.
+    # ── Servability veto (alpha-engine-config-I9277) ─────────────────────
+    # The winner is promotion-ELIGIBLE (the register says so, per Brian's
+    # 2026-08-29 ruling) but the executor has no handler for it, so moving the
+    # pointer would raise ChampionPointerError at planner start and halt
+    # trading. Held, loudly, with the win preserved as counterfactual_winner —
+    # never silently rescored, and never a no_contest, which would falsely
+    # assert the week produced no comparable evidence when it produced a clear
+    # winner. Checked before the shadow-only and feed guards because it is the
+    # most fundamental: those ask whether a promotion SHOULD happen, this asks
+    # whether the resulting state could function at all.
+    if winner not in servable_arms():
+        record["outcome"] = "held_arm_not_servable"
+        record["blocked_by"] = ["arm_not_servable_by_executor"]
+        logger.warning(
+            "champion_promotion: %r WON this week (%s > %s, champion %r) and is "
+            "promotion-eligible, but the alpha-engine executor has no handler "
+            "for it — it is absent from contracts/producer_champion.schema.json's "
+            "champion enum. The pointer is HELD at %r to avoid a "
+            "ChampionPointerError at planner start. The win is recorded as "
+            "counterfactual_winner. Unblock: crucible-executor arm handler "
+            "(alpha-engine-config-I9299), which appends the arm to that enum.",
+            winner, chall_score, champ_score, champion_before, champion_before,
+        )
+        return record
+
     if is_shadow_only(winner):
         record["outcome"] = "held_shadow_only"
         record["blocked_by"] = ["shadow_only_arm"]
@@ -1074,8 +1175,15 @@ def write_champion_pointer(
     promotion_source: str,
     upload: bool,
     s3_client=None,
+    allowed_arms: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
-    """THE single writer for ``config/producer_champion.json``. Both the
+    """THE single writer for ``config/producer_champion.json``.
+
+    ``allowed_arms`` (alpha-engine-config-I9277) is the promotion-eligible set
+    resolved from the register for THIS run. Supplying it keeps the
+    write-forbidden boundary tied to the same register the gate decided on,
+    rather than to a literal in this repo that can drift from it. Omitted, the
+    boundary falls back to ``VALID_CHAMPIONS``. Both the
     gate engine (``promotion_source="gate_engine"``) and the one-shot
     2026-07-13 operator bootstrap (``promotion_source="operator_bootstrap"``)
     call this function — never write the pointer directly.
@@ -1106,9 +1214,10 @@ def write_champion_pointer(
     Raises on S3 write failure when ``upload=True`` — a swallowed failure
     here would silently leave the live executor trading the wrong arm.
     """
-    if champion not in VALID_CHAMPIONS:
+    allowed = tuple(allowed_arms) if allowed_arms else VALID_CHAMPIONS
+    if champion not in allowed:
         raise ValueError(
-            f"write_champion_pointer: champion={champion!r} not in {VALID_CHAMPIONS}"
+            f"write_champion_pointer: champion={champion!r} not in {allowed}"
         )
     if is_shadow_only(champion):
         # Fail LOUD (module posture: no silent swallows on a writer). A
@@ -1284,6 +1393,11 @@ def build_champion_audit(
             "feed_dependencies": None,
             "counterfactual_winner": None,
             "arm_confidence": None,
+            "ineligible_arms": None,
+            "cohort_intersection": [],
+            "n_dates_intersection": 0,
+            "score_source": None,
+            "score_metric": None,
             "arm_scores": None,
         }
     return {
@@ -1308,6 +1422,16 @@ def build_champion_audit(
         # point of shadow mode (champion-challenger-policy.md §3).
         "counterfactual_winner": gate_result.get("counterfactual_winner"),
         "arm_confidence": gate_result.get("arm_confidence"),
+        # alpha-engine-config-I9277 / -I9279, additive. `ineligible_arms` makes
+        # every exclusion a stated fact with a reason; the cohort fields make
+        # the audit say WHICH DATES the week's scores describe, which no
+        # previous record did — the 2026-08-28 record ranked a 2-date arm
+        # against a 6-date arm and the artifact could not show that.
+        "ineligible_arms": gate_result.get("ineligible_arms"),
+        "cohort_intersection": gate_result.get("cohort_intersection") or [],
+        "n_dates_intersection": gate_result.get("n_dates_intersection") or 0,
+        "score_source": gate_result.get("score_source"),
+        "score_metric": gate_result.get("score_metric"),
         # alpha-engine-config-I8756 built this N-arm view in ``evaluate_gates``
         # and then dropped it HERE, so it never reached the durable artifact:
         # every audit record from 2026-08-21 onward carries ``arm_confidence``
@@ -1640,6 +1764,211 @@ def _score_scanner_top20_predictor(
     return float(sn), None, CONFIDENCE_OK
 
 
+# ── Register-driven arm resolution + symmetric scoring (I9277 / I9279) ──────
+
+
+ARMS_BLOCK_ABSENT = "leaderboard_has_no_arms_block"
+
+# ── Servability: an arm may be ELIGIBLE without being SERVABLE ──────────────
+#
+# alpha-engine-config-I9277. Brian's 2026-08-29 ruling makes every research arm
+# promotion-eligible, and the register now says so. Eligibility is a statement
+# about MEASUREMENT — which arms compete. It is not a statement about the
+# executor's ability to turn that arm's picks into orders.
+#
+# The alpha-engine executor dispatches per-arm: `executor/champion.py`
+# ``load_champion_pointer`` raises ``ChampionPointerError`` on a champion value
+# it does not recognise, and ``apply_champion_selection`` raises when no
+# handler exists for the arm. Both fire at PLANNER START. So promoting onto an
+# arm with no executor handler does not degrade — it halts trading on the next
+# session, which is the most expensive possible way to discover the gap.
+#
+# The servable set is therefore read from the FROZEN cross-repo pointer
+# contract (`contracts/producer_champion.schema.json`'s `champion` enum), which
+# is the artifact the executor's own allowlist mirrors — never a fourth
+# hand-maintained tuple in this file. An eligible-but-unservable arm that wins
+# is recorded as the `counterfactual_winner` with `blocked_by:
+# ["arm_not_servable_by_executor"]`: the measurement is kept in full, the
+# pointer is held, and the audit names the exact unblock.
+#
+# Tracked: alpha-engine-config-I9299 (generic shadow-signals arm handler in
+# crucible-executor). When that lands, its PR appends the arm to the schema
+# enum in the same change, and this guard stops firing for it — by
+# construction, with no edit here.
+_POINTER_CONTRACT = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "contracts" / "producer_champion.schema.json"
+)
+
+
+def servable_arms() -> frozenset[str]:
+    """Arms the alpha-engine executor can actually trade, from the frozen
+    pointer contract's ``champion`` enum. Fail-LOUD: an unreadable contract
+    must never degrade to "everything is servable", which would let this guard
+    silently stop guarding."""
+    try:
+        enum = json.loads(_POINTER_CONTRACT.read_text())["properties"]["champion"]["enum"]
+    except Exception as exc:
+        raise RuntimeError(
+            f"producer_champion contract unreadable at {_POINTER_CONTRACT}: {exc}. "
+            "Refusing to evaluate promotion servability against an unknown "
+            "serving contract (alpha-engine-config-I9277)."
+        ) from exc
+    return frozenset(enum) - frozenset(_LEGACY_CHAMPIONS)
+
+
+def _leaderboard_validity_reason(
+    leaderboard: dict | None, run_date: str, leaderboard_date_used: str | None,
+) -> str | None:
+    """Why this producer leaderboard may not be scored AT ALL, or None.
+
+    Hoisted out of the per-arm scorers (alpha-engine-config-I9279). Staleness,
+    a future-dated artifact and a horizon disagreement are properties of the
+    ARTIFACT, not of any one arm — but they used to live inside
+    ``_score_thinktank_coverage`` only, so the two counterfactual-scored arms
+    were never subject to them. One arm could be refused for reading a stale
+    board in the same cycle another was scored from a different source that
+    had no staleness bound at all.
+    """
+    if not isinstance(leaderboard, dict) or leaderboard_date_used is None:
+        return "leaderboard_unavailable"
+    age_days = (
+        date.fromisoformat(run_date) - date.fromisoformat(leaderboard_date_used)
+    ).days
+    if age_days < 0:
+        # A "future" artifact is never this week's evidence.
+        return "leaderboard_unavailable"
+    if age_days > LEADERBOARD_STALENESS_DAYS:
+        return "leaderboard_stale_gt_8d"
+    declared_horizon = leaderboard.get("horizon_days")
+    if declared_horizon is not None and declared_horizon != GATE_HORIZON_DAYS:
+        logger.warning(
+            "[champion_promotion] producer leaderboard %s declares "
+            "horizon_days=%r but this gate decides at %d sessions "
+            "(GATE_HORIZON_DAYS) — refusing to score, no-contest",
+            leaderboard_date_used, declared_horizon, GATE_HORIZON_DAYS,
+        )
+        return "leaderboard_horizon_mismatch"
+    if not isinstance(leaderboard.get("specs"), list):
+        return "leaderboard_unavailable"
+    return None
+
+
+def resolve_arms(leaderboard: dict | None) -> tuple[list[str], dict[str, str]]:
+    """``(promotion_eligible_arms, {arm: ineligible_reason})`` from the producer
+    leaderboard's ``arms`` block — THE register, projected across the repo
+    boundary (alpha-engine-config-I9277, Brian's ruling 2026-08-29: "for the
+    research arm, we should make all arms promote eligible, including think
+    tank").
+
+    This replaces the ``VALID_CHAMPIONS`` literal below as the live arm set.
+    That tuple was a SECOND, hand-maintained register in a different repo from
+    the one that defines and scores the arms, and it silently omitted
+    ``no_agent_quant`` and ``single_agent_quant`` — the only two arms on the
+    2026-08-28 board with ``confidence: "ok"``. The two arms with enough
+    evidence to win were the two that could not, and nothing recorded that,
+    because an omission from a tuple leaves no artifact.
+
+    Resolving from the artifact rather than importing crucible-research's
+    ``producers/registry.py`` is deliberate: the score and the eligibility then
+    travel in ONE document describing ONE cohort, so they can never disagree
+    about which run they describe. An imported register would be a second fact
+    to keep in sync with the artifact the score came from — the same
+    multi-writer drift class, one layer up.
+
+    Arms are returned in the board's own order (stable, artifact-declared),
+    never dict-iteration order.
+    """
+    arms = (leaderboard or {}).get("arms")
+    if not isinstance(arms, list) or not arms:
+        return [], {}
+    eligible: list[str] = []
+    ineligible: dict[str, str] = {}
+    for row in arms:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if row.get("promotion_eligible"):
+            eligible.append(name)
+        else:
+            ineligible[name] = row.get("ineligible_reason") or "no reason recorded"
+    return eligible, ineligible
+
+
+def _leaderboard_rows(leaderboard: dict | None) -> dict[str, dict]:
+    specs = (leaderboard or {}).get("specs")
+    if not isinstance(specs, list):
+        return {}
+    return {
+        r["name"]: r for r in specs
+        if isinstance(r, dict) and isinstance(r.get("name"), str)
+    }
+
+
+def _score_arm_from_leaderboard(
+    arm: str, leaderboard: dict | None,
+) -> tuple[float | None, str | None, str]:
+    """One arm's weekly score, read from the producer leaderboard row —
+    the SAME source, metric, horizon, benchmark and COHORT for every arm
+    (alpha-engine-config-I9279).
+
+    The defect this closes: the incumbent was scored from this repo's own
+    end-to-end counterfactual while challengers were scored from
+    crucible-research's leaderboard. On 2026-08-28 that produced TWO numbers
+    for `scanner_predictor_direct` in one cycle — +0.00257 (counterfactual,
+    graded "ok") defending against +0.009203 (leaderboard, graded "thin"),
+    3.6x apart, from different code over different cohorts. An incumbent with
+    2 scored dates was defending against a challenger REJECTED for having 4.
+    champion-challenger-policy.md §3: "The champion is scored on the same axis
+    as the challengers, using the same metric, horizon, and benchmark."
+
+    The metric read is ``topn_alpha_vs_benchmark_intersection`` — the arm's
+    realized top-N alpha vs SPY restricted to the dates EVERY eligible arm
+    produced output (§4). ``topn_alpha_vs_benchmark`` (each arm's own cohort)
+    is deliberately NOT the gate's input: it is what made a 2-date arm
+    rankable against a 6-date arm as though the numbers described the same
+    weeks.
+    """
+    row = _leaderboard_rows(leaderboard).get(arm)
+    if row is None:
+        logger.warning(
+            "[champion_promotion] %s NOT scored this week: absent from the "
+            "producer leaderboard's specs. It cannot win, and it cannot be "
+            "compared — this is a MISS, not a zero. Recorded as blocked_by=%r.",
+            arm, f"{arm}_not_in_leaderboard",
+        )
+        return None, f"{arm}_not_in_leaderboard", CONFIDENCE_UNKNOWN
+    confidence = leaderboard_row_confidence(row, leaderboard or {})
+    alpha = row.get("topn_alpha_vs_benchmark_intersection")
+    if not isinstance(alpha, dict) or alpha.get("mean") is None:
+        # An arm contributing nothing to the shared cohort cannot be compared
+        # on it. Reported as its own verdict, never silently back-filled from
+        # the arm's own-cohort figure — that substitution is precisely the
+        # asymmetry I9279 exists to remove.
+        logger.warning(
+            "[champion_promotion] %s NOT scored this week: it contributed no "
+            "dates to the shared cohort (n_dates_scored=%s over its OWN dates). "
+            "Its own-cohort figure is deliberately NOT substituted — that "
+            "substitution is the asymmetry alpha-engine-config-I9279 removes. "
+            "Recorded as blocked_by=%r.",
+            arm, row.get("n_dates_scored"), f"{arm}_no_intersection_evidence",
+        )
+        return None, f"{arm}_no_intersection_evidence", CONFIDENCE_INSUFFICIENT
+    if confidence != CONFIDENCE_OK:
+        slug = f"{arm}_{confidence}_evidence"
+        logger.warning(
+            "[champion_promotion] %s NOT scored this week: leaderboard row "
+            "confidence=%r (needs %r), recorded as blocked_by=%r. Evidence "
+            "exists but is below the inference floor — declining to decide, "
+            "not deciding against it.",
+            arm, confidence, CONFIDENCE_OK, slug,
+        )
+        return None, slug, confidence
+    return float(alpha["mean"]), None, confidence
+
+
 def build_weekly_arm_scores(
     e2e_lift: dict | None,
     tt_leaderboard: dict | None,
@@ -1674,31 +2003,60 @@ def build_weekly_arm_scores(
     Threaded
     through ``evaluate_gates`` into the weekly audit record so the audit trail
     shows WHICH EVIDENCE declined to decide, not merely that something did."""
-    spd_score, spd_reason, spd_confidence = _score_scanner_predictor_direct(e2e_lift)
-    t20_score, t20_reason, t20_confidence = _score_scanner_top20_predictor(e2e_lift)
-    tt_score, tt_reason, tt_confidence = _score_thinktank_coverage(
+    # The arm SET comes from the register (projected onto the board's `arms`
+    # block), not from a literal in this repo (I9277). The staleness/validity
+    # guards that used to live per-arm are hoisted here: they are properties of
+    # the LEADERBOARD, and applying them once means every arm is admitted or
+    # refused on identical terms rather than on whichever guards its own
+    # hand-written scorer happened to carry.
+    board_reason = _leaderboard_validity_reason(
         tt_leaderboard, run_date, leaderboard_date_used,
     )
+    eligible, ineligible = resolve_arms(tt_leaderboard)
+
+    if board_reason is not None or not eligible:
+        # No usable board => no arm is scored, and the record says which.
+        # Falling back to VALID_CHAMPIONS here would re-open exactly the
+        # silent-omission hole I9277 closes, so the arm set is reported as
+        # empty with a stated reason instead.
+        reason = board_reason or ARMS_BLOCK_ABSENT
+        arms = list(eligible) or list(VALID_CHAMPIONS)
+        return {
+            "scores": dict.fromkeys(arms),
+            "unavailable_reasons": dict.fromkeys(arms, reason),
+            "arm_confidence": dict.fromkeys(arms, CONFIDENCE_UNKNOWN),
+            "ineligible_arms": ineligible,
+            "cohort_intersection": [],
+            "n_dates_intersection": 0,
+            "score_source": "research_producer_leaderboard",
+            "score_metric": "topn_alpha_vs_benchmark_intersection",
+            "leaderboard_date_used": leaderboard_date_used,
+        }
+
+    scores: dict[str, float | None] = {}
     reasons: dict[str, str] = {}
-    for arm, reason in (
-        ("scanner_predictor_direct", spd_reason),
-        ("scanner_top20_predictor", t20_reason),
-        ("thinktank_coverage", tt_reason),
-    ):
+    confidences: dict[str, str] = {}
+    for arm in eligible:
+        score, reason, confidence = _score_arm_from_leaderboard(arm, tt_leaderboard)
+        scores[arm] = score
+        confidences[arm] = confidence
         if reason is not None:
             reasons[arm] = reason
+
+    intersection = (tt_leaderboard or {}).get("cohort_intersection") or []
     return {
-        "scores": {
-            "scanner_predictor_direct": spd_score,
-            "scanner_top20_predictor": t20_score,
-            "thinktank_coverage": tt_score,
-        },
+        "scores": scores,
         "unavailable_reasons": reasons,
-        "arm_confidence": {
-            "scanner_predictor_direct": spd_confidence,
-            "scanner_top20_predictor": t20_confidence,
-            "thinktank_coverage": tt_confidence,
-        },
+        "arm_confidence": confidences,
+        # Recorded so the audit says WHY an arm could not win, for arms that
+        # were scored but are not promotable — never an absence (I9277).
+        "ineligible_arms": ineligible,
+        # champion-challenger-policy.md §4 — the cohort every score above was
+        # computed on, carried onto the audit artifact.
+        "cohort_intersection": list(intersection),
+        "n_dates_intersection": len(intersection),
+        "score_source": "research_producer_leaderboard",
+        "score_metric": "topn_alpha_vs_benchmark_intersection",
         "leaderboard_date_used": leaderboard_date_used,
     }
 
@@ -1800,6 +2158,7 @@ def run_weekly_evaluation(
 
     gate_result = None
     error = None
+    arm_scores = None
     try:
         arm_scores = build_weekly_arm_scores(
             e2e_lift, tt_leaderboard, run_date=run_date,
@@ -1857,6 +2216,10 @@ def run_weekly_evaluation(
         pointer_written = write_champion_pointer(
             bucket, gate_result["champion_after"],
             promotion_source="gate_engine", upload=upload, s3_client=s3_client,
+            # The register this run actually decided on (I9277) — so the write
+            # boundary and the gate can never be reasoning from different arm
+            # sets.
+            allowed_arms=list((arm_scores or {}).get("scores") or ()) or None,
         )
 
     logger.info(

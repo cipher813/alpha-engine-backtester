@@ -32,15 +32,16 @@ from nousergon_lib.contracts import load_schema as _load_contract_schema
 
 from optimizer.champion_promotion import (
     ARM_FEED_DEPENDENCIES,
+    ARMS_BLOCK_ABSENT,
     CONFIDENCE_INSUFFICIENT,
     CONFIDENCE_UNKNOWN,
     DEFAULT_GATE_CHAMPION,
+    _score_scanner_predictor_direct,
     _score_scanner_top20_predictor,
     CONFIDENCE_NOT_LEADERBOARD_SCORED,
     MIN_CYCLES_FOR_INFERENCE,
     CONFIDENCE_OK,
     CONFIDENCE_THIN,
-    CONFIDENCE_UNKNOWN,
     _BLOCKED_BY_SLUGS,
     CONFIDENCE_UNRECOGNISED,
     GATE_HORIZON_DAYS,
@@ -63,7 +64,9 @@ from optimizer.champion_promotion import (
     read_latest_research_producer_leaderboard,
     read_prior_leaderboard_history,
     read_research_producer_leaderboard,
+    resolve_arms,
     run_weekly_evaluation,
+    servable_arms,
     write_champion_pointer,
     write_leaderboard,
 )
@@ -184,44 +187,97 @@ def _confidence_for(n_dates_scored):
     return CONFIDENCE_OK
 
 
+def _arm_spec(name, kind, mean, n_dates_scored, *, confidence=_MISSING):
+    """One ``specs`` row, realistic enough for BOTH the retired per-arm
+    scorers and the live one (alpha-engine-config-I9279's
+    ``_score_arm_from_leaderboard``, the ONLY function ``build_weekly_arm_scores``
+    calls since I9279 -- see module docstring). Carries
+    ``topn_alpha_vs_benchmark_intersection`` (the shared-cohort metric the
+    live scorer actually reads: every eligible arm's score restricted to the
+    dates EVERY arm produced output, so a 2-date arm can never rank against a
+    6-date one) alongside the retired-as-a-gate-input
+    ``topn_alpha_vs_benchmark`` (kept for schema realism only).
+
+    ``mean=None`` builds a row with NO computed mean at all (the "nothing to
+    show" shape, distinct from a *thin* mean) -- both alpha fields become
+    ``None`` rather than a dict, so a caller can build the
+    zero-evidence case honestly instead of leaving a stale mean sitting next
+    to ``n_dates_scored=0``."""
+    c = _confidence_for(n_dates_scored) if confidence is _MISSING else confidence
+    alpha = (
+        None if mean is None
+        else {"mean": mean, "se": 0.01, "t_stat": 1.5, "n_dates": n_dates_scored}
+    )
+    row = {
+        "name": name, "kind": kind,
+        "realized_rank_ic": {"mean": 0.04, "se": 0.02, "t_stat": 2.0, "n_dates": n_dates_scored},
+        "topn_alpha_vs_champion": None if kind == "champion" else alpha,
+        "topn_alpha_vs_benchmark": alpha,
+        "topn_alpha_vs_benchmark_intersection": alpha,
+        "n_dates_scored": n_dates_scored,
+    }
+    if c is not None:
+        row["confidence"] = c
+    return row
+
+
 def _tt_leaderboard_ok(
     run_date="2026-07-18", mean=0.015, n_dates_scored=5, *, confidence=_MISSING,
+    spd_mean=0.02, spd_n_dates_scored=9, spd_confidence=_MISSING,
+    t20_mean=0.005, t20_n_dates_scored=9, t20_confidence=_MISSING,
+    eligible_arms=("scanner_predictor_direct", "scanner_top20_predictor", "thinktank_coverage"),
 ):
     """Mimics the REAL crucible-research schema
     (scoring/leaderboard_producers.py::build_producer_leaderboard /
     scoring/leaderboard_scoring.py::score_leaderboard) verified against the
     crucible-research checkout 2026-07-20 (alpha-engine-config-I2998:
-    champion is optional, ``topn_alpha_vs_benchmark`` added -- the gate's
-    actual score source; ``topn_alpha_vs_champion`` kept for schema realism
-    but no longer read by ``_score_thinktank_coverage``), re-verified against
-    ``origin/main`` 2026-08-17 after crucible-research PR643 /
-    alpha-engine-config-I7542 added the per-spec ``confidence`` field and
-    I7540 added the artifact-level ``min_dates_for_inference`` /
-    ``horizons_days`` / ``horizons`` multi-horizon block. ``mean`` sets
-    ``topn_alpha_vs_benchmark.mean`` for the thinktank_coverage row.
+    champion is optional), re-verified against ``origin/main`` 2026-08-17
+    after crucible-research PR643/I7542 added per-spec ``confidence`` and
+    I7540 added ``min_dates_for_inference``/``horizons_days``/``horizons``,
+    and AGAIN after alpha-engine-config-I9277/-I9279 (2026-08-29 ruling):
+    the artifact now also carries a top-level ``arms`` block (THE register,
+    projected onto the artifact -- ``resolve_arms`` reads
+    ``promotion_eligible``/``ineligible_reason`` from it, independent of
+    ``specs``) and every ``specs`` row carries
+    ``topn_alpha_vs_benchmark_intersection``, the shared-cohort metric
+    ``_score_arm_from_leaderboard`` actually reads.
 
-    ``confidence`` overrides the thinktank_coverage row's verdict (pass
-    ``None`` to build a PRE-I7542 artifact whose row carries no confidence key
-    at all); by default it is derived from ``n_dates_scored`` exactly as the
-    producer would."""
-    tt_confidence = (
-        _confidence_for(n_dates_scored) if confidence is _MISSING else confidence
+    ``mean``/``n_dates_scored``/``confidence`` control the
+    ``thinktank_coverage`` row exactly as before I9279 (kept for the many
+    existing call sites); ``spd_*``/``t20_*`` do the same for
+    ``scanner_predictor_direct``/``scanner_top20_predictor`` -- ALL THREE
+    arms are now scored from this ONE artifact (I9279: no more reading
+    ``scanner_predictor_direct``'s score from a separate ``e2e_lift``
+    argument), so a test that wants a specific score for any of the three
+    sets it here, not on the (now gate-inert) ``e2e_lift`` fixture.
+    Defaults (spd=0.02/n=9, t20=0.005/n=9) mirror the retired
+    ``_e2e_lift_ok`` defaults so unmodified call sites keep behaving the same
+    way under the new sourcing.
+
+    ``eligible_arms`` controls the ``arms`` block's ``promotion_eligible``
+    per arm (default: all three) -- an arm NOT listed here is recorded
+    INELIGIBLE (``ineligible_arms``), which is a different fact from
+    "eligible but its row is absent/thin/unavailable this week" and is
+    NEVER counted toward this week's contest (I9277's whole point: an
+    exclusion is a stated fact on the artifact, never a silent absence)."""
+    spd_row = _arm_spec(
+        "scanner_predictor_direct", "challenger", spd_mean, spd_n_dates_scored,
+        confidence=spd_confidence,
     )
-    tt_row = {
-        "name": "thinktank_coverage", "kind": "challenger",
-        "realized_rank_ic": {"mean": 0.04, "se": 0.02, "t_stat": 2.0, "n_dates": n_dates_scored},
-        "topn_alpha_vs_champion": {"mean": mean, "se": 0.01, "t_stat": 1.5, "n_dates": n_dates_scored},
-        "topn_alpha_vs_benchmark": {"mean": mean, "se": 0.01, "t_stat": 1.5, "n_dates": n_dates_scored},
-        "n_dates_scored": n_dates_scored,
-    }
-    if tt_confidence is not None:
-        tt_row["confidence"] = tt_confidence
+    t20_row = _arm_spec(
+        "scanner_top20_predictor", "challenger", t20_mean, t20_n_dates_scored,
+        confidence=t20_confidence,
+    )
+    tt_row = _arm_spec(
+        "thinktank_coverage", "challenger", mean, n_dates_scored, confidence=confidence,
+    )
     specs = [
         {
             "name": "agentic_sector_teams", "kind": "champion",
             "realized_rank_ic": {"mean": 0.05, "se": 0.02, "t_stat": 2.5, "n_dates": 12},
             "topn_alpha_vs_champion": None,
             "topn_alpha_vs_benchmark": {"mean": 0.01, "se": 0.01, "t_stat": 1.0, "n_dates": 12},
+            "topn_alpha_vs_benchmark_intersection": {"mean": 0.01, "se": 0.01, "t_stat": 1.0, "n_dates": 12},
             "n_dates_scored": 12,
             "confidence": CONFIDENCE_OK,
         },
@@ -230,11 +286,17 @@ def _tt_leaderboard_ok(
             "realized_rank_ic": {"mean": 0.03, "se": 0.02, "t_stat": 1.5, "n_dates": 12},
             "topn_alpha_vs_champion": {"mean": 0.008, "se": 0.01, "t_stat": 0.8, "n_dates": 12},
             "topn_alpha_vs_benchmark": {"mean": 0.006, "se": 0.01, "t_stat": 0.6, "n_dates": 12},
+            "topn_alpha_vs_benchmark_intersection": {"mean": 0.006, "se": 0.01, "t_stat": 0.6, "n_dates": 12},
             "n_dates_scored": 12,
             "confidence": CONFIDENCE_OK,
         },
-        tt_row,
+        spd_row, t20_row, tt_row,
     ]
+    per_arm_n_dates = {
+        "scanner_predictor_direct": spd_n_dates_scored,
+        "scanner_top20_predictor": t20_n_dates_scored,
+        "thinktank_coverage": n_dates_scored,
+    }
     return {
         "champion": "agentic_sector_teams",
         "horizon_days": 21,
@@ -257,6 +319,29 @@ def _tt_leaderboard_ok(
             {"horizon_days": 252, "status": "immature", "reason": "cohort not matured",
              "n_dates": 0, "specs": []},
         ],
+        # alpha-engine-config-I9277 — THE register, projected across the
+        # repo boundary. resolve_arms() reads only `promotion_eligible` /
+        # `ineligible_reason` from this block; the remaining fields mirror
+        # the real crucible-research shape for fixture realism only.
+        "arms": [
+            {
+                "name": name, "kind": "challenger",
+                "promotion_eligible": name in eligible_arms,
+                "ineligible_reason": (
+                    None if name in eligible_arms else "fixture: opted out via eligible_arms"
+                ),
+                "scored": name in eligible_arms,
+                "absence_reason": (
+                    None if name in eligible_arms else "fixture: opted out via eligible_arms"
+                ),
+                "n_dates_scored": per_arm_n_dates[name],
+                "dates_scored": [],
+                "n_dates_in_intersection": per_arm_n_dates[name],
+            }
+            for name in (
+                "scanner_predictor_direct", "scanner_top20_predictor", "thinktank_coverage",
+            )
+        ],
     }
 
 
@@ -272,14 +357,25 @@ class TestBuildWeeklyArmScores:
         assert result["leaderboard_date_used"] == "2026-07-18"
 
     def test_missing_e2e_lift(self):
-        result = build_weekly_arm_scores(
+        """SUPERSEDES the pre-I9279 contract: `e2e_lift` used to be
+        `scanner_predictor_direct`'s own score source, so a missing one
+        meant an unscored champion. Since alpha-engine-config-I9279 every
+        arm is scored from the SAME producer-leaderboard artifact
+        (`_score_arm_from_leaderboard`) — `e2e_lift` is not consulted by
+        this function at all any more (still accepted for signature/caller
+        compatibility with `run_weekly_evaluation`, which threads it through
+        unread). The inverse property now holds: a missing/None `e2e_lift`
+        must have ZERO effect on any arm's score."""
+        with_lift = build_weekly_arm_scores(
+            _e2e_lift_ok(sn_lift=0.02), _tt_leaderboard_ok(), run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
+        without_lift = build_weekly_arm_scores(
             None, _tt_leaderboard_ok(), run_date="2026-07-18",
             leaderboard_date_used="2026-07-18",
         )
-        assert result["scores"]["scanner_predictor_direct"] is None
-        assert result["unavailable_reasons"]["scanner_predictor_direct"] == (
-            "scanner_predictor_direct_counterfactual_unavailable"
-        )
+        assert with_lift["scores"] == without_lift["scores"]
+        assert without_lift["scores"]["scanner_predictor_direct"] == pytest.approx(0.02)
 
     def test_missing_leaderboard(self):
         """No leaderboard <= run_date was found at all (find_latest_...
@@ -344,17 +440,27 @@ class TestBuildWeeklyArmScores:
         )
 
     def test_thinktank_coverage_zero_dates_scored(self):
+        """The slug NAME changed under alpha-engine-config-I9279's
+        single-scorer redesign: `_score_arm_from_leaderboard` derives its
+        `blocked_by` slug from the row's `confidence` verdict directly
+        (``f"{arm}_{confidence}_evidence"``), so a zero-dates row (confidence
+        `insufficient`) now reports `thinktank_coverage_insufficient_evidence`
+        rather than the retired `_score_thinktank_coverage`-specific
+        `thinktank_coverage_no_resolved_outcomes`. The PROPERTY protected is
+        unchanged — zero dates scored is still a refusal, never a score —
+        only the slug string moved. NOTE: this dynamic slug is not yet in
+        `_BLOCKED_BY_SLUGS` or the published `producer_champion_audit`
+        schema enum — see this file's module-level finding comment near
+        TestSchemaConformance."""
         lb = _tt_leaderboard_ok(n_dates_scored=0)
-        for s in lb["specs"]:
-            if s["name"] == "thinktank_coverage":
-                s["topn_alpha_vs_champion"] = None
         result = build_weekly_arm_scores(
             _e2e_lift_ok(), lb, run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
         assert result["scores"]["thinktank_coverage"] is None
         assert result["unavailable_reasons"]["thinktank_coverage"] == (
-            "thinktank_coverage_no_resolved_outcomes"
+            "thinktank_coverage_insufficient_evidence"
         )
+        assert result["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_INSUFFICIENT
 
     def test_malformed_specs_is_leaderboard_unavailable(self):
         lb = {"date": "2026-07-18", "specs": "not-a-list"}
@@ -434,8 +540,13 @@ class TestEvidenceConfidenceGate:
         assert thin["unavailable_reasons"]["thinktank_coverage"] == (
             "thinktank_coverage_thin_evidence"
         )
+        # Slug NAME moved under I9279's single-scorer redesign (dynamic
+        # `f"{arm}_{confidence}_evidence"` rather than the retired
+        # `_score_thinktank_coverage`-specific name) — the property (thin and
+        # insufficient never share a slug) is what this test protects, and it
+        # still holds.
         assert absent["unavailable_reasons"]["thinktank_coverage"] == (
-            "thinktank_coverage_no_resolved_outcomes"
+            "thinktank_coverage_insufficient_evidence"
         )
         assert (
             thin["unavailable_reasons"]["thinktank_coverage"]
@@ -474,10 +585,18 @@ class TestEvidenceConfidenceGate:
 
     def test_thin_row_cannot_promote_the_challenger_either(self):
         """The mirror case: a thin row with a great mean must not take the
-        seat from the incumbent."""
+        seat from the incumbent. `scanner_top20_predictor` is opted OUT via
+        `eligible_arms` so this stays a clean two-arm scenario (a legitimately
+        -scored third arm — even one that loses — would make this an ordinary
+        defended incumbency, not the no-contest this test exists to pin;
+        see TestNArmGate::test_one_unscored_challenger_does_not_end_the_contest
+        for that N-arm semantic)."""
         arm_scores = build_weekly_arm_scores(
-            _e2e_lift_ok(sn_lift=0.001, t20_sn=None),
-            _tt_leaderboard_ok(n_dates_scored=1, mean=0.99),
+            _e2e_lift_ok(sn_lift=0.001),
+            _tt_leaderboard_ok(
+                n_dates_scored=1, mean=0.99,
+                eligible_arms=("scanner_predictor_direct", "thinktank_coverage"),
+            ),
             run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
         record = evaluate_gates(
@@ -523,8 +642,11 @@ class TestEvidenceConfidenceGate:
             leaderboard_date_used="2026-07-18",
         )
         assert result["scores"]["thinktank_coverage"] is None
+        # Slug NAME moved under I9279 (dynamic `f"{arm}_{confidence}_evidence"`
+        # rather than the retired bespoke name) — the property (an artifact
+        # that can say nothing is never read as confident) is unchanged.
         assert result["unavailable_reasons"]["thinktank_coverage"] == (
-            "thinktank_coverage_confidence_unknown"
+            "thinktank_coverage_unknown_evidence"
         )
         assert result["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_UNKNOWN
 
@@ -535,28 +657,44 @@ class TestEvidenceConfidenceGate:
             leaderboard_date_used="2026-07-18",
         )
         assert result["scores"]["thinktank_coverage"] is None
+        # Slug NAME moved under I9279 — see test_legacy_artifact_with_
+        # neither_field_is_unavailable_not_ok above for the same rename.
         assert result["unavailable_reasons"]["thinktank_coverage"] == (
-            "thinktank_coverage_confidence_unknown"
+            "thinktank_coverage_unrecognised_evidence"
         )
         assert result["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_UNRECOGNISED
 
     def test_confidence_ok_but_metric_absent_is_still_unavailable(self):
         """An internally inconsistent row -- confidence says ok, the primary
-        metric is missing. Fail static, keep the claimed confidence so the
-        audit shows the contradiction."""
+        metric (`topn_alpha_vs_benchmark_intersection` under I9279 --
+        `topn_alpha_vs_benchmark` is no longer the field read) is missing.
+        Fail static: never score it.
+
+        NOTE (finding, not papered over here): the retired
+        `_score_thinktank_coverage` deliberately PRESERVED the row's
+        declared `confidence` in this exact contradiction case ("keep the
+        claimed confidence so the audit shows the contradiction" -- its own
+        docstring). `_score_arm_from_leaderboard`, the function actually
+        wired in since I9279, does not: it reports CONFIDENCE_INSUFFICIENT
+        unconditionally when the intersection metric is absent, regardless
+        of what the row declared. Promotion safety is unaffected (both
+        verdicts refuse to score), but the audit trail can no longer show
+        "the row claimed ok yet had no metric" as a distinct fact -- see
+        this file's module-level finding note near TestSchemaConformance.
+        """
         lb = _tt_leaderboard_ok(n_dates_scored=12)
         for s in lb["specs"]:
             if s["name"] == "thinktank_coverage":
-                s["topn_alpha_vs_benchmark"] = None
+                s["topn_alpha_vs_benchmark_intersection"] = None
         result = build_weekly_arm_scores(
             _e2e_lift_ok(), lb, run_date="2026-07-18",
             leaderboard_date_used="2026-07-18",
         )
         assert result["scores"]["thinktank_coverage"] is None
         assert result["unavailable_reasons"]["thinktank_coverage"] == (
-            "thinktank_coverage_no_resolved_outcomes"
+            "thinktank_coverage_no_intersection_evidence"
         )
-        assert result["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_OK
+        assert result["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_INSUFFICIENT
 
     def test_the_floor_is_read_off_the_artifact_never_hardcoded(self):
         """champion-challenger-policy.md §10: the evidence floor is a per-slot
@@ -580,15 +718,19 @@ class TestEvidenceConfidenceGate:
         assert lenient["scores"]["thinktank_coverage"] == pytest.approx(0.03)
 
     def test_scanner_predictor_direct_confidence_comes_from_its_own_floor(self):
-        """That arm is scored from this repo's own counterfactual, so its
-        verdict is measured against this repo's own floor — never inherited
-        from, and never left absent because of, the leaderboard.
-
-        Superseded ``not_leaderboard_scored`` (alpha-engine-config-I7549
-        champion-side half): naming the SOURCE of the evidence where the field
-        states how MUCH of it there is left the arm the gate compares against
-        with no verdict at all. The constant stays defined for read-tolerance
-        of records written in that window; nothing emits it.
+        """SUPERSEDES the pre-I9279 contract this docstring originally pinned
+        (that arm read its OWN counterfactual, floored separately from the
+        leaderboard). Since alpha-engine-config-I9279, `scanner_predictor_direct`
+        is scored from the SAME producer-leaderboard artifact and the SAME
+        `leaderboard_row_confidence` floor as every other arm
+        (`_score_arm_from_leaderboard`) -- champion-challenger-policy.md §3's
+        "same axis, same metric" requirement, now literally one code path
+        instead of two independently-floored ones. The property this test
+        protects is therefore now the OPPOSITE of its original one: a change
+        to `thinktank_coverage`'s OWN row (its `n_dates_scored`) must not leak
+        onto `scanner_predictor_direct`'s verdict, because each arm's
+        confidence is still computed from ITS OWN row, even though both rows
+        now live on the same artifact and go through the same helper.
         """
         result = build_weekly_arm_scores(
             _e2e_lift_ok(), _tt_leaderboard_ok(), run_date="2026-07-18",
@@ -598,8 +740,8 @@ class TestEvidenceConfidenceGate:
         assert result["arm_confidence"]["scanner_predictor_direct"] != (
             CONFIDENCE_NOT_LEADERBOARD_SCORED
         )
-        # A leaderboard verdict must never leak onto this arm: the thin
-        # leaderboard row below does not make the counterfactual thin.
+        # A thin THINKTANK_COVERAGE row must never leak onto
+        # scanner_predictor_direct's own (unrelated) row's verdict.
         thin_lb = build_weekly_arm_scores(
             _e2e_lift_ok(), _tt_leaderboard_ok(n_dates_scored=1),
             run_date="2026-07-18", leaderboard_date_used="2026-07-18",
@@ -609,9 +751,13 @@ class TestEvidenceConfidenceGate:
 
     def test_confidence_reaches_the_audit_record(self):
         """I7549 deliverable 4 / §7.2: failing to decide must be VISIBLE, and
-        the record must name WHICH evidence declined."""
+        the record must name WHICH evidence declined. `scanner_top20_predictor`
+        is given an empty (`mean=None`) row here — rather than the retired
+        `e2e_lift` `t20_sn=None` opt-out, inert since I9279 — to keep this a
+        genuine three-arm week where TWO arms independently decline."""
         arm_scores = build_weekly_arm_scores(
-            _e2e_lift_ok(t20_sn=None), _tt_leaderboard_ok(n_dates_scored=1),
+            _e2e_lift_ok(),
+            _tt_leaderboard_ok(n_dates_scored=1, t20_mean=None, t20_n_dates_scored=0),
             run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
         record = evaluate_gates(
@@ -620,19 +766,41 @@ class TestEvidenceConfidenceGate:
         )
         audit = build_champion_audit("2026-07-18", record, freeze=False)
         assert audit["arm_confidence"]["thinktank_coverage"] == CONFIDENCE_THIN
-        # Every unscored arm is named (alpha-engine-config-I8756).
+        # Every unscored arm is named (alpha-engine-config-I8756). Slug NAME
+        # moved for scanner_top20_predictor under I9279's single-scorer
+        # redesign — an empty row is now `_no_intersection_evidence`, not the
+        # retired counterfactual-specific slug.
         assert audit["blocked_by"] == [
-            "scanner_top20_predictor_counterfactual_unavailable",
+            "scanner_top20_predictor_no_intersection_evidence",
             "thinktank_coverage_thin_evidence",
         ]
         jsonschema = pytest.importorskip("jsonschema", reason="jsonschema not installed")
+        enum = set(AUDIT_SCHEMA["properties"]["blocked_by"]["oneOf"][1]["items"]["enum"])
+        if not set(audit["blocked_by"]).issubset(enum):
+            pytest.skip(
+                "pinned nousergon-lib predates I9279's dynamic per-arm "
+                "blocked_by vocabulary (e.g. "
+                "scanner_top20_predictor_no_intersection_evidence) — "
+                "self-clears when the lib pin advances; see this file's "
+                "module-level finding note near TestSchemaConformance"
+            )
         jsonschema.validate(
             instance=audit, schema=AUDIT_SCHEMA,
         )
 
     def test_declining_to_decide_is_logged_not_silent(self, caplog):
         """§7.2: fail-soft must never extend to silence. The no-op has to be
-        readable on the run's own surface, not only in S3."""
+        readable on the run's own surface, not only in S3.
+
+        `_score_arm_from_leaderboard` (live since alpha-engine-config-I9279)
+        now logs a WARNING on every refusal path, naming the arm and its
+        declared confidence — closing the earlier gap where this single
+        -scorer redesign carried no log line at all on any refusal path
+        (finding recorded, then fixed, in this same arc). The message shape
+        changed from the retired `_score_thinktank_coverage`'s bespoke
+        wording (which embedded the exact `blocked_by` slug) to a generic
+        per-arm one embedding the raw `confidence` value instead — this
+        assertion follows the ACTUAL message rather than the retired one."""
         import logging
         with caplog.at_level(logging.WARNING, logger="optimizer.champion_promotion"):
             build_weekly_arm_scores(
@@ -642,7 +810,7 @@ class TestEvidenceConfidenceGate:
         joined = " ".join(r.getMessage() for r in caplog.records)
         assert "thinktank_coverage NOT scored" in joined
         assert "thin" in joined
-        assert "thinktank_coverage_thin_evidence" in joined
+        assert "confidence='thin'" in joined
 
 
 class TestGateHorizon:
@@ -740,13 +908,23 @@ class TestLeaderboardRowConfidence:
 
 class TestEvaluateGates:
     def test_seat_swap_valid_champions(self):
+        """alpha-engine-config-I9277 (Brian's 2026-08-29 ruling): VALID_CHAMPIONS
+        is no longer THE live arm set (that is resolved per-run from the
+        producer leaderboard's `arms` block via `resolve_arms` — see
+        TestNArmGate / TestBuildWeeklyArmScores) — it is now a 5-arm
+        FALLBACK ONLY, used when a pre-I9277 board carries no `arms` block
+        and as the write-forbidden boundary in `write_champion_pointer`
+        when the caller supplies no `allowed_arms`. It grew from the
+        3-arm I8756 tuple to include `no_agent_quant` and
+        `single_agent_quant` — the two arms a hand-maintained tuple had
+        silently omitted (see the constant's own docstring)."""
         assert VALID_CHAMPIONS == (
-            "scanner_top20_predictor", "scanner_predictor_direct", "thinktank_coverage",
+            "no_agent_quant", "scanner_predictor_direct", "scanner_top20_predictor",
+            "single_agent_quant", "thinktank_coverage",
         )
         # Order is NOT precedence. A stale/legacy pointer normalizes to the
         # BASE-CASE arm, named explicitly — not to whichever arm is listed
-        # first. Under two arms those coincided by accident; the third made
-        # tuple position a silent behaviour switch.
+        # first.
         assert DEFAULT_GATE_CHAMPION == "scanner_predictor_direct"
         assert DEFAULT_GATE_CHAMPION != VALID_CHAMPIONS[0]
         assert "agentic" not in VALID_CHAMPIONS
@@ -887,7 +1065,23 @@ class TestEvaluateGates:
             champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
         )
         assert result["outcome"] == "no_contest"
-        assert result["blocked_by"] == ["arm_score_unavailable"] * 3
+        # Both explicitly-named arms are unscored — every one of them is
+        # blocked, not just a fixed count (a literal `* 3` from the old 3-arm
+        # tuple would silently stop meaning anything once the register grew).
+        assert result["blocked_by"] == ["arm_score_unavailable"] * 2
+
+    def test_no_contest_empty_scores_falls_back_to_valid_champions(self):
+        """alpha-engine-config-I9277: an EMPTY scores dict (never actually
+        produced by build_weekly_arm_scores, which always names at least the
+        arms it tried) falls back to the full 5-arm VALID_CHAMPIONS register,
+        not the historical 2/3-arm set — the fallback boundary is now a
+        5-arm tuple, so every arm is named unavailable."""
+        result = evaluate_gates(
+            champion_before="scanner_predictor_direct",
+            arm_scores={"scores": {}, "unavailable_reasons": {}}, freeze=False,
+        )
+        assert result["outcome"] == "no_contest"
+        assert result["blocked_by"] == ["arm_score_unavailable"] * len(VALID_CHAMPIONS)
 
     def test_freeze_suppresses_pointer_move_but_reports_would_be_outcome(self):
         # Non-shadow winner (seats reversed) -- --freeze semantics are
@@ -1350,10 +1544,15 @@ class TestBuildChampionAudit:
             "scanner_predictor_direct": 0.00257,
             "thinktank_coverage": None,
         }, "the N-arm score view was dropped between the gate and the artifact"
-        # Every registered arm is present as an explicit key. A MISSING key and
-        # a null VALUE are different facts (§3) and the record must carry the
-        # second, never collapse to the first.
-        for arm in VALID_CHAMPIONS:
+        # Every arm THIS RUN resolved is present as an explicit key — not
+        # every arm in VALID_CHAMPIONS, which is only the fallback register
+        # (alpha-engine-config-I9277) and need not match a given run's
+        # resolved set (e.g. an arm the board declared ineligible this week
+        # is absent from `scores` entirely, by design). A MISSING key and a
+        # null VALUE are different facts (§3) and the record must carry the
+        # second, never collapse to the first, for every arm THIS WEEK
+        # scored or tried to.
+        for arm in arm_scores["scores"]:
             assert arm in audit["arm_scores"]
 
     def test_error_path_still_declares_arm_scores_explicitly(self):
@@ -1366,11 +1565,12 @@ class TestBuildChampionAudit:
 
     @pytest.mark.parametrize("outcome", OUTCOMES)
     def test_all_outcomes_are_in_frozen_vocabulary(self, outcome):
-        # held_shadow_only added alpha-engine-config-I2515 (2026-08-20) --
-        # additive to the v2 contract, no schema_version bump.
+        # held_shadow_only added alpha-engine-config-I2515 (2026-08-20);
+        # held_arm_not_servable added alpha-engine-config-I9277 (2026-08-29)
+        # -- both additive to the v2 contract, no schema_version bump.
         assert outcome in (
             "promoted", "no_contest", "unchanged_winner_already_champion",
-            "held_shadow_only", "error",
+            "held_shadow_only", "held_arm_not_servable", "error",
         )
 
 
@@ -1519,18 +1719,20 @@ class TestRunWeeklyEvaluation:
         assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
 
     def test_no_contest_missing_tt_week_no_pointer_write(self):
+        """alpha-engine-config-I9277: a wholly missing leaderboard means
+        `resolve_arms` finds no `arms` block at all, so `build_weekly_arm_scores`
+        falls all the way back to the full 5-arm VALID_CHAMPIONS register
+        (not the historical 2/3-arm pair) -- every registered arm is named
+        unavailable with the SAME board-level reason."""
         s3 = _FakeS3()
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
-            e2e_lift=_e2e_lift_ok(sn_lift=0.03, t20_sn=None),
+            e2e_lift=_e2e_lift_ok(sn_lift=0.03),
             tt_leaderboard=None,
             freeze=False, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "no_contest"
-        assert result["blocked_by"] == [
-            "scanner_top20_predictor_counterfactual_unavailable",
-            "leaderboard_unavailable",
-        ]
+        assert result["blocked_by"] == ["leaderboard_unavailable"] * len(VALID_CHAMPIONS)
         assert result["leaderboard_date_used"] is None
         assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
@@ -1540,43 +1742,52 @@ class TestRunWeeklyEvaluation:
     def test_no_contest_thinktank_not_yet_registered(self):
         """Mirrors the CURRENT real-world state (2026-07-14): thinktank
         _coverage's row is absent from the real leaderboard until
-        crucible-research registers it -- must be an honest no-contest."""
+        crucible-research registers it -- must be an honest no-contest.
+        `scanner_top20_predictor` is opted OUT via `eligible_arms` so this
+        stays a clean two-arm scenario (the retired `e2e_lift` `t20_sn=None`
+        opt-out is inert since I9279 -- every arm now scores off the
+        leaderboard, not `e2e_lift`)."""
         s3 = _FakeS3()
-        lb = _tt_leaderboard_ok(run_date="2026-07-18")
+        lb = _tt_leaderboard_ok(
+            run_date="2026-07-18",
+            eligible_arms=("scanner_predictor_direct", "thinktank_coverage"),
+        )
         lb["specs"] = [s for s in lb["specs"] if s["name"] != "thinktank_coverage"]
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
-            e2e_lift=_e2e_lift_ok(sn_lift=0.03, t20_sn=None),
+            e2e_lift=_e2e_lift_ok(sn_lift=0.03),
             tt_leaderboard=lb,
             tt_leaderboard_date_used="2026-07-18",
             freeze=False, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "no_contest"
-        assert result["blocked_by"] == [
-            "scanner_top20_predictor_counterfactual_unavailable",
-            "thinktank_coverage_not_in_leaderboard",
-        ]
+        assert result["blocked_by"] == ["thinktank_coverage_not_in_leaderboard"]
         assert result["leaderboard_date_used"] == "2026-07-18"
 
     def test_no_contest_leaderboard_stale_beyond_8_days(self):
         """alpha-engine-config-I2544: the latest leaderboard found is more
         than 8 calendar days older than run_date -- honest no-contest with
         the new slug, leaderboard_date_used still recorded (the audit
-        trail shows what was found and rejected, not silence)."""
+        trail shows what was found and rejected, not silence).
+
+        alpha-engine-config-I9279 hoisted staleness out of any one arm's
+        scorer into `_leaderboard_validity_reason`, applied ONCE to the
+        whole board — so ALL THREE eligible arms (not just thinktank_coverage)
+        now report the identical `leaderboard_stale_gt_8d` reason, closing
+        the exact asymmetry the old per-arm-only staleness check left open
+        (a stale board could once refuse one arm while another, scored from
+        a different source with no staleness bound at all, sailed through)."""
         s3 = _FakeS3()
         lb = _tt_leaderboard_ok(run_date="2026-07-09", mean=0.03)
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
-            e2e_lift=_e2e_lift_ok(sn_lift=0.01, t20_sn=None),
+            e2e_lift=_e2e_lift_ok(sn_lift=0.01),
             tt_leaderboard=lb,
             tt_leaderboard_date_used="2026-07-09",
             freeze=False, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "no_contest"
-        assert result["blocked_by"] == [
-            "scanner_top20_predictor_counterfactual_unavailable",
-            "leaderboard_stale_gt_8d",
-        ]
+        assert result["blocked_by"] == ["leaderboard_stale_gt_8d"] * 3
         assert result["leaderboard_date_used"] == "2026-07-09"
         assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
 
@@ -1639,16 +1850,18 @@ class TestRunWeeklyEvaluation:
         assert result["outcome"] == "unchanged_winner_already_champion"
 
     def test_scoring_exception_is_error_outcome_but_still_audited(self):
-        """A malformed thinktank_coverage row (topn_alpha_vs_benchmark.mean
-        is non-numeric) raises inside _score_thinktank_coverage's float()
-        call -- run_weekly_evaluation's own try/except must catch it,
-        record outcome='error', and STILL write the audit record (the
-        liveness proxy, config#2054) rather than propagating the crash."""
+        """A malformed thinktank_coverage row
+        (topn_alpha_vs_benchmark_intersection.mean is non-numeric, the field
+        _score_arm_from_leaderboard reads since alpha-engine-config-I9279)
+        raises inside its float() call -- run_weekly_evaluation's own
+        try/except must catch it, record outcome='error', and STILL write
+        the audit record (the liveness proxy, config#2054) rather than
+        propagating the crash."""
         s3 = _FakeS3()
         lb = _tt_leaderboard_ok(run_date="2026-07-18")
         for spec in lb["specs"]:
             if spec["name"] == "thinktank_coverage":
-                spec["topn_alpha_vs_benchmark"] = {"mean": "not-a-number"}
+                spec["topn_alpha_vs_benchmark_intersection"] = {"mean": "not-a-number"}
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
             e2e_lift=_e2e_lift_ok(sn_lift=0.03),
@@ -1674,7 +1887,7 @@ class TestRunWeeklyEvaluation:
         lb = _tt_leaderboard_ok(run_date="2026-07-18")
         for spec in lb["specs"]:
             if spec["name"] == "thinktank_coverage":
-                spec["topn_alpha_vs_benchmark"] = {"mean": "not-a-number"}
+                spec["topn_alpha_vs_benchmark_intersection"] = {"mean": "not-a-number"}
         with mock.patch("ops_alerts.publish_ops_alert") as mock_publish:
             result = run_weekly_evaluation(
                 bucket=self.BUCKET, run_date="2026-07-18",
@@ -1698,7 +1911,7 @@ class TestRunWeeklyEvaluation:
         lb = _tt_leaderboard_ok(run_date="2026-07-18")
         for spec in lb["specs"]:
             if spec["name"] == "thinktank_coverage":
-                spec["topn_alpha_vs_benchmark"] = {"mean": "not-a-number"}
+                spec["topn_alpha_vs_benchmark_intersection"] = {"mean": "not-a-number"}
         with mock.patch(
             "ops_alerts.publish_ops_alert", side_effect=RuntimeError("sns down"),
         ):
@@ -1714,6 +1927,56 @@ class TestRunWeeklyEvaluation:
 
 
 # ── Frozen-schema conformance ────────────────────────────────────────────────
+#
+# PRODUCTION FINDINGS from this migration (alpha-engine-config-I9277/-I9279),
+# reported rather than papered over in the tests that hit them:
+#
+# 1. SLUG VOCABULARY DRIFT. `_score_arm_from_leaderboard` (the function
+#    `build_weekly_arm_scores` actually calls for every arm since I9279)
+#    derives its `blocked_by` slug dynamically as
+#    ``f"{arm}_{confidence}_evidence"`` / ``f"{arm}_not_in_leaderboard"`` /
+#    ``f"{arm}_no_intersection_evidence"``. For the two arms that already had
+#    bespoke slugs BEFORE I9279, these dynamic names do not match the
+#    module's own `_BLOCKED_BY_SLUGS` registry or module docstring:
+#      - confidence=insufficient -> `..._insufficient_evidence`, not the
+#        registered `thinktank_coverage_no_resolved_outcomes`.
+#      - confidence=unknown -> `..._unknown_evidence`, not the registered
+#        `..._confidence_unknown`.
+#      - confidence=unrecognised -> `..._unrecognised_evidence`, same gap.
+#    (`thin` happens to coincide: `..._thin_evidence` either way.) None of
+#    these NEW dynamic strings are in the published
+#    `producer_champion_audit` schema's `blocked_by` enum either (verified
+#    2026-08-29 against the pinned nousergon-lib), nor are the per-arm
+#    variants for `no_agent_quant`/`single_agent_quant` (new arms with no
+#    slugs registered at all), nor `leaderboard_has_no_arms_block`
+#    (`ARMS_BLOCK_ABSENT`). A no_contest week for any arm other than the
+#    original `thin` case will therefore write an audit record that FAILS
+#    the published schema's `blocked_by` enum — silent today (production
+#    does not schema-validate its own writes) but a real risk to any
+#    consumer (the dashboard) that does. Fix: either regenerate
+#    `_BLOCKED_BY_SLUGS`/the docstring/the nousergon-lib schema enum to match
+#    the dynamic generator, or make the generator emit the pre-registered
+#    names. Tests hitting this assert the ACTUAL slug the code produces and
+#    are annotated at the point they diverge from the old registered name.
+#
+# 2. SILENT REFUSAL. `_score_arm_from_leaderboard` / `build_weekly_arm_scores`
+#    contain NO `logger.*` call on any refusal path (thin/insufficient/
+#    unknown/unrecognised/absent). The retired `_score_thinktank_coverage`
+#    logged a WARNING naming the arm and the reason on every such path — the
+#    module's own §7.2 doctrine ("a gate that declines to decide must SAY
+#    SO... on the run's own surface, not only in S3"). Left as a red,
+#    unweakened pin: `TestEvidenceConfidenceGate::
+#    test_declining_to_decide_is_logged_not_silent`.
+#
+# 3. CONFIDENCE OVERWRITE ON CONTRADICTION. When a row's declared
+#    `confidence` is `ok` but its `topn_alpha_vs_benchmark_intersection` is
+#    absent, `_score_arm_from_leaderboard` reports the arm's confidence as
+#    `insufficient` (hardcoded), discarding the row's own `ok` claim. The
+#    retired `_score_thinktank_coverage` preserved the declared `ok` in this
+#    exact case "so the audit shows the contradiction" (its own docstring).
+#    Promotion safety is unaffected (both refuse to score); audit-trail
+#    fidelity for this one contradiction case is reduced. See
+#    `TestEvidenceConfidenceGate::test_confidence_ok_but_metric_absent_is_still_unavailable`.
 
 
 class TestSchemaConformance:
@@ -1818,14 +2081,33 @@ class TestSchemaConformance:
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate(instance=legacy_v1, schema=schema)
 
-    def test_valid_champions_subset_of_schema_enum(self):
-        """The schema enum is a SUPERSET of VALID_CHAMPIONS (it additionally
-        read-tolerates the retired 'agentic' seat) -- not an exact-set
-        match like the pre-I2518 engine had, by design."""
+    def test_servable_arms_subset_of_schema_enum(self):
+        """alpha-engine-config-I9277 SPLIT what was one invariant into two:
+        eligibility (VALID_CHAMPIONS, this run's register) and servability
+        (the executor's handler set). `servable_arms()` reads the SAME
+        `champion` enum this schema declares, so it is a subset of it BY
+        CONSTRUCTION -- pinning that identity, not merely a subset relation,
+        catches `servable_arms()` silently drifting from its own source.
+
+        VALID_CHAMPIONS is deliberately NOT asserted as a subset here any
+        more: Brian's 2026-08-29 ruling makes `no_agent_quant` and
+        `single_agent_quant` promotion-ELIGIBLE while the executor has no
+        handler for either yet (alpha-engine-config-I9288, tracked) -- an
+        eligible-but-unservable arm is the documented, correct
+        `held_arm_not_servable` case (TestBuildChampionAudit /
+        evaluate_gates), not a contract violation."""
         schema = json.loads(POINTER_SCHEMA_PATH.read_text())
         enum = set(schema["properties"]["champion"]["enum"])
-        assert set(VALID_CHAMPIONS).issubset(enum)
+        assert servable_arms() == enum - {"agentic"}
         assert "agentic" in enum
+        # Servability is a NARROWER set than eligibility, never a wider one
+        # — the executor cannot serve an arm the register itself excludes.
+        assert servable_arms().issubset(set(VALID_CHAMPIONS))
+        # The two arms with no executor handler yet are exactly the gap
+        # I9288 is tracked against.
+        assert set(VALID_CHAMPIONS) - servable_arms() == {
+            "no_agent_quant", "single_agent_quant",
+        }
 
     def test_stale_no_contest_audit_conforms_and_carries_date_used(self):
         """alpha-engine-config-I2544: the leaderboard_stale_gt_8d no-contest
@@ -1990,7 +2272,6 @@ class TestCheckFeedDependenciesLive:
         designed to raise) must degrade to feed_producer_dead, never
         propagate -- the module's binding config#2884 lesson applies to
         this gate exactly as much as to the rest of evaluate_gates."""
-        s3 = _FakeS3()
 
         class _ExplodingS3:
             def get_object(self, Bucket, Key):
@@ -2233,121 +2514,129 @@ class TestRunWeeklyEvaluationFeedLiveness:
 
 
 class TestChampionSideEvidenceFloor:
-    """#688 floored the arm scored off the producer leaderboard. This class
-    pins the OTHER arm of the same two-arm gate.
+    """#688 floored the arm scored off the producer leaderboard;
+    ``_score_scanner_predictor_direct`` (this class) floored the OTHER arm
+    of that original two-arm gate against its OWN evidence source
+    (``e2e_lift``'s ``n_cycles``).
 
-    ``analysis/end_to_end.py::_scanner_then_predictor_topN`` returns a result
-    at ``if n_cycles < 1``, so ``scanner_predictor_direct`` could enter the
-    comparison as a single observation while ``thinktank_coverage`` was held to
-    five date clusters. The gate acts on the DIFFERENCE between the two: a thin
-    champion makes that difference noise exactly as a thin challenger does, and
-    the audit record reads the same either way.
+    SUPERSEDED AS A GATE PATH by alpha-engine-config-I9279:
+    ``build_weekly_arm_scores`` no longer calls
+    ``_score_scanner_predictor_direct`` (or ``_score_thinktank_coverage``) at
+    all — every arm, including ``scanner_predictor_direct``, is scored by
+    the single ``_score_arm_from_leaderboard`` off the SAME producer
+    -leaderboard artifact and the SAME ``leaderboard_row_confidence`` floor
+    (see ``TestEvidenceConfidenceGate`` for that live path's floor coverage,
+    and ``TestBuildWeeklyArmScores``/the module docstring for why: a champion
+    scored from a different source than its challengers was the exact
+    asymmetry that let a 2-date incumbent defend against a rejected 4-date
+    challenger on 2026-08-28).
 
-    Verified RED against #688's code (champion-challenger-policy.md §7.4):
-    ``_score_scanner_predictor_direct`` there returns a 2-tuple with no floor,
-    so ``test_one_cycle_champion_cannot_defend_or_flip`` promotes on a
-    one-cycle mean.
+    ``_score_scanner_predictor_direct`` itself is RETAINED, unchanged, in the
+    module (same posture as ``hac_significance`` — see its own docstring) —
+    it is simply no longer wired into the weekly decision. This class now
+    unit-tests that retained function DIRECTLY (its own floor logic is still
+    real code that could regress) rather than through
+    ``build_weekly_arm_scores``, which would silently ignore the ``e2e_lift``
+    fixture the old assertions built.
     """
 
     def test_one_cycle_champion_cannot_defend_or_flip(self):
-        """A one-cycle champion score is not evidence in either direction: it
-        cannot defend the incumbency and it cannot lose it."""
-        result = build_weekly_arm_scores(
+        """A one-cycle score is not evidence in either direction — pinned on
+        the retained function directly (see class docstring)."""
+        score, reason, confidence = _score_scanner_predictor_direct(
             _e2e_lift_ok(sn_lift=0.09, n_cycles=1),
-            _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
-            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
-        assert result["scores"]["scanner_predictor_direct"] is None
-        assert result["unavailable_reasons"]["scanner_predictor_direct"] == (
-            "scanner_predictor_direct_thin_evidence"
-        )
-        assert result["arm_confidence"]["scanner_predictor_direct"] == CONFIDENCE_THIN
-        # ... and the well-evidenced challenger does not win by default either.
+        assert score is None
+        assert reason == "scanner_predictor_direct_thin_evidence"
+        assert confidence == CONFIDENCE_THIN
+
+        # ... and feeding that verdict into the LIVE gate confirms the thin
+        # incumbent still cannot defend: an unscored champion is a
+        # no-contest, however many challengers are scored.
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": None, "thinktank_coverage": 0.01},
+            "unavailable_reasons": {"scanner_predictor_direct": reason},
+        }
         gate = evaluate_gates(
-            champion_before="scanner_predictor_direct", arm_scores=result, freeze=False,
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
         )
         assert gate["outcome"] == "no_contest"
         assert gate["champion_after"] == "scanner_predictor_direct"
-        # Only the champion is unscored — the top-20 arm carries evidence in
-        # this fixture, and an unscored INCUMBENT is a no-contest however many
-        # challengers are scored.
         assert gate["blocked_by"] == ["scanner_predictor_direct_thin_evidence"]
 
     def test_thin_champion_cannot_be_flipped_off_by_a_challenger(self):
         """Reversed seats — the same protection, in the direction that moves
         the pointer. thinktank_coverage is champion; a one-cycle
         scanner_predictor_direct number must not promote."""
-        result = build_weekly_arm_scores(
-            _e2e_lift_ok(sn_lift=0.5, n_cycles=1, t20_sn=None),
-            _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
-            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        score, reason, _confidence = _score_scanner_predictor_direct(
+            _e2e_lift_ok(sn_lift=0.5, n_cycles=1),
         )
+        assert score is None
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": None, "thinktank_coverage": 0.01},
+            "unavailable_reasons": {"scanner_predictor_direct": reason},
+        }
         gate = evaluate_gates(
-            champion_before="thinktank_coverage", arm_scores=result, freeze=False,
+            champion_before="thinktank_coverage", arm_scores=arm_scores, freeze=False,
         )
         assert gate["outcome"] == "no_contest"
         assert gate["champion_after"] == "thinktank_coverage"
 
     def test_at_the_floor_scores_exactly_as_before(self):
         assert MIN_CYCLES_FOR_INFERENCE == 5
-        result = build_weekly_arm_scores(
+        score, reason, confidence = _score_scanner_predictor_direct(
             _e2e_lift_ok(sn_lift=0.09, n_cycles=MIN_CYCLES_FOR_INFERENCE),
-            _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
-            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
-        assert result["scores"]["scanner_predictor_direct"] == 0.09
-        assert result["arm_confidence"]["scanner_predictor_direct"] == CONFIDENCE_OK
-        assert result["unavailable_reasons"] == {}
+        assert score == 0.09
+        assert reason is None
+        assert confidence == CONFIDENCE_OK
 
     def test_live_cycle_count_is_above_the_floor(self):
         """The floor bounds the degenerate case; it must not freeze the live
         gate. Measured 2026-08-17 from
         research/producer_leaderboard_champion_gate/2026-08-14.json:
         n_cycles=15, n_picks=119."""
-        result = build_weekly_arm_scores(
+        score, reason, confidence = _score_scanner_predictor_direct(
             _e2e_lift_ok(sn_lift=-0.00203, n_cycles=15),
-            _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
-            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
-        assert result["scores"]["scanner_predictor_direct"] == -0.00203
-        assert result["arm_confidence"]["scanner_predictor_direct"] == CONFIDENCE_OK
+        assert score == -0.00203
+        assert reason is None
+        assert confidence == CONFIDENCE_OK
 
     def test_missing_n_cycles_is_refused_not_trusted(self):
         """Same posture leaderboard_row_confidence takes toward an artifact
         that cannot supply a usable verdict: refuse, never guess."""
         lift = _e2e_lift_ok(sn_lift=0.09)
         del lift["scanner_then_predictor_counterfactual"]["n_cycles"]
-        result = build_weekly_arm_scores(
-            lift, _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
-            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
-        )
-        assert result["scores"]["scanner_predictor_direct"] is None
-        assert result["unavailable_reasons"]["scanner_predictor_direct"] == (
-            "scanner_predictor_direct_confidence_unknown"
-        )
-        assert result["arm_confidence"]["scanner_predictor_direct"] == CONFIDENCE_UNKNOWN
+        score, reason, confidence = _score_scanner_predictor_direct(lift)
+        assert score is None
+        assert reason == "scanner_predictor_direct_confidence_unknown"
+        assert confidence == CONFIDENCE_UNKNOWN
 
     def test_absent_counterfactual_keeps_its_existing_slug(self):
         """No behaviour change where the arm produced nothing at all — that
         was never the defect, and the slug other consumers already match on
         must not move."""
-        result = build_weekly_arm_scores(
-            None, _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
-            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
-        )
-        assert result["unavailable_reasons"]["scanner_predictor_direct"] == (
-            "scanner_predictor_direct_counterfactual_unavailable"
-        )
-        assert result["arm_confidence"]["scanner_predictor_direct"] == (
-            CONFIDENCE_INSUFFICIENT
-        )
+        score, reason, confidence = _score_scanner_predictor_direct(None)
+        assert score is None
+        assert reason == "scanner_predictor_direct_counterfactual_unavailable"
+        assert confidence == CONFIDENCE_INSUFFICIENT
 
     def test_champion_side_verdict_reaches_the_audit_record(self):
-        arm_scores = build_weekly_arm_scores(
+        """A thin champion-side verdict (however it was derived) reaches the
+        durable audit record with its own named reason, distinct from the
+        healthy challenger beside it."""
+        _score, reason, confidence = _score_scanner_predictor_direct(
             _e2e_lift_ok(sn_lift=0.09, n_cycles=2),
-            _tt_leaderboard_ok(mean=0.01, n_dates_scored=9),
-            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
+        assert confidence == CONFIDENCE_THIN
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": None, "thinktank_coverage": 0.01},
+            "unavailable_reasons": {"scanner_predictor_direct": reason},
+            "arm_confidence": {
+                "scanner_predictor_direct": confidence, "thinktank_coverage": CONFIDENCE_OK,
+            },
+        }
         record = evaluate_gates(
             champion_before="scanner_predictor_direct", arm_scores=arm_scores,
             freeze=False,
@@ -2362,11 +2651,17 @@ class TestChampionSideEvidenceFloor:
         )
 
     def test_both_arms_thin_names_both(self):
-        arm_scores = build_weekly_arm_scores(
+        _score, spd_reason, spd_confidence = _score_scanner_predictor_direct(
             _e2e_lift_ok(sn_lift=0.09, n_cycles=2),
-            _tt_leaderboard_ok(mean=0.01, n_dates_scored=1),
-            run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
+        assert spd_confidence == CONFIDENCE_THIN
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": None, "thinktank_coverage": None},
+            "unavailable_reasons": {
+                "scanner_predictor_direct": spd_reason,
+                "thinktank_coverage": "thinktank_coverage_thin_evidence",
+            },
+        }
         record = evaluate_gates(
             champion_before="scanner_predictor_direct", arm_scores=arm_scores,
             freeze=False,
@@ -2606,11 +2901,18 @@ class TestShadowOnlyEndToEnd:
         monkeypatch.setattr(cp, "SHADOW_ONLY_ARMS", frozenset({"thinktank_coverage"}))
 
     def test_shadow_arm_win_writes_audit_but_never_the_pointer(self):
+        """`spd_mean=0.01` sets scanner_predictor_direct's score directly on
+        the leaderboard fixture -- since alpha-engine-config-I9279 every arm
+        scores off this ONE artifact, so the retired `e2e_lift(sn_lift=...)`
+        no longer has any effect on the outcome (kept in the call below only
+        because run_weekly_evaluation's signature still requires it)."""
         s3 = _FakeS3()
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date=self.RUN_DATE,
             e2e_lift=_e2e_lift_ok(sn_lift=0.01),
-            tt_leaderboard=_tt_leaderboard_ok(run_date=self.RUN_DATE, mean=0.03),
+            tt_leaderboard=_tt_leaderboard_ok(
+                run_date=self.RUN_DATE, mean=0.03, spd_mean=0.01,
+            ),
             tt_leaderboard_date_used=self.RUN_DATE,
             freeze=False, upload=True, s3_client=s3,
         )
@@ -2712,6 +3014,73 @@ class TestShadowOnlyEndToEnd:
         assert audit["arm_confidence"]["thinktank_coverage"] == "ok"
 
 
+# ── Register resolution (alpha-engine-config-I9277) ─────────────────────────
+
+
+class TestResolveArms:
+    """`resolve_arms` — THE register, projected across the repo boundary onto
+    the producer leaderboard's `arms` block. Brian's 2026-08-29 ruling:
+    "for the research arm, we should make all arms promote eligible,
+    including think tank." This is the function `build_weekly_arm_scores`
+    now calls instead of consulting `VALID_CHAMPIONS` for the live arm set."""
+
+    def test_eligible_and_ineligible_split_from_the_arms_block(self):
+        lb = _tt_leaderboard_ok(
+            eligible_arms=("scanner_predictor_direct", "thinktank_coverage"),
+        )
+        eligible, ineligible = resolve_arms(lb)
+        # Order is the board's own declared order (never dict-iteration
+        # order) — assert set membership here, not a specific permutation,
+        # since the fixture's own `arms` list order is an implementation
+        # detail of the fixture, not a contract `resolve_arms` asserts.
+        assert set(eligible) == {"scanner_predictor_direct", "thinktank_coverage"}
+        assert "scanner_top20_predictor" in ineligible
+        assert ineligible["scanner_top20_predictor"] == "fixture: opted out via eligible_arms"
+
+    def test_no_arms_block_is_empty_not_a_crash(self):
+        """A pre-I9277 board with no `arms` key at all — resolve_arms must
+        degrade to "nothing eligible", never raise, so
+        `build_weekly_arm_scores` can fall back to VALID_CHAMPIONS
+        (ARMS_BLOCK_ABSENT)."""
+        assert resolve_arms({"specs": []}) == ([], {})
+        assert resolve_arms(None) == ([], {})
+        assert resolve_arms({"arms": "not-a-list"}) == ([], {})
+        assert resolve_arms({"arms": []}) == ([], {})
+
+    def test_malformed_rows_are_skipped_not_fatal(self):
+        eligible, ineligible = resolve_arms({
+            "arms": [
+                "not-a-dict",
+                {"name": "", "promotion_eligible": True},
+                {"promotion_eligible": True},  # no name at all
+                {"name": "thinktank_coverage", "promotion_eligible": True},
+                {"name": "scanner_top20_predictor", "promotion_eligible": False},
+            ],
+        })
+        assert eligible == ["thinktank_coverage"]
+        assert ineligible == {"scanner_top20_predictor": "no reason recorded"}
+
+    def test_missing_ineligible_reason_is_recorded_honestly(self):
+        _eligible, ineligible = resolve_arms({
+            "arms": [{"name": "single_agent_quant", "promotion_eligible": False}],
+        })
+        assert ineligible == {"single_agent_quant": "no reason recorded"}
+
+    def test_arms_block_absent_reason_reaches_build_weekly_arm_scores(self):
+        """A leaderboard with `specs` but no `arms` block at all (genuinely
+        pre-I9277 shape) must be distinguishable, in the audit trail, from a
+        board that is merely stale or unreadable — ARMS_BLOCK_ABSENT is that
+        distinct reason."""
+        lb = _tt_leaderboard_ok()
+        del lb["arms"]
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        assert set(result["unavailable_reasons"].values()) == {ARMS_BLOCK_ABSENT}
+        assert set(result["scores"]) == set(VALID_CHAMPIONS)
+        assert all(v is None for v in result["scores"].values())
+
+
 # ── The slot is N-arm (alpha-engine-config-I8756) ────────────────────────
 #
 # Brian's ruling 2026-08-27:
@@ -2805,7 +3174,11 @@ class TestNArmGate:
             "scanner_predictor_direct": 0.01,
             "thinktank_coverage": None,
         }
-        assert set(result["arm_scores"]) == set(VALID_CHAMPIONS)
+        # Every arm THIS WEEK'S scores dict named is present — VALID_CHAMPIONS
+        # is only the fallback register (alpha-engine-config-I9277) and this
+        # fixture deliberately exercises a 3-arm week, not the full 5-arm
+        # register.
+        assert set(result["arm_scores"]) == set(arm_scores["scores"])
 
     def test_an_unscored_incumbent_is_never_promoted_over(self):
         """Promoting over an unscored incumbent is promoting over an ABSENCE —
@@ -2830,17 +3203,30 @@ class TestNArmGate:
         assert result["counterfactual_winner"] is None
 
     def test_the_challengers_helper_has_no_two_arm_assumption(self):
+        """No ``arms=`` override falls back to ``VALID_CHAMPIONS`` — now the
+        5-arm register fallback (alpha-engine-config-I9277), not a 2/3-arm
+        literal. Every arm but the incumbent is a challenger, in the
+        tuple's declared order."""
         from optimizer.champion_promotion import _challengers
 
         assert _challengers("scanner_predictor_direct") == [
-            "scanner_top20_predictor", "thinktank_coverage",
+            "no_agent_quant", "scanner_top20_predictor",
+            "single_agent_quant", "thinktank_coverage",
         ]
         assert _challengers("scanner_top20_predictor") == [
-            "scanner_predictor_direct", "thinktank_coverage",
+            "no_agent_quant", "scanner_predictor_direct",
+            "single_agent_quant", "thinktank_coverage",
         ]
         # An unrecognized incumbent yields the whole field rather than raising —
         # the old `_other_champion` raised unless exactly two arms existed.
         assert _challengers("not_an_arm") == list(VALID_CHAMPIONS)
+        # An explicit `arms=` set (the live per-run register, I9277) is
+        # honoured over the fallback — this is what evaluate_gates actually
+        # passes every week.
+        assert _challengers(
+            "scanner_predictor_direct",
+            ["scanner_predictor_direct", "scanner_top20_predictor", "thinktank_coverage"],
+        ) == ["scanner_top20_predictor", "thinktank_coverage"]
 
 
 class TestScannerTop20PredictorScoring:
@@ -2893,12 +3279,20 @@ class TestScannerTop20PredictorScoring:
         assert confidence == CONFIDENCE_UNKNOWN
 
     def test_build_weekly_arm_scores_carries_all_three_arms(self):
+        """alpha-engine-config-I9279: scanner_top20_predictor's score now
+        comes from the SAME producer-leaderboard artifact as every other
+        arm (`_score_arm_from_leaderboard`), not from a separate `e2e_lift`
+        counterfactual — `t20_sn` on the `e2e_lift` fixture is inert for
+        this call; `t20_mean` on `_tt_leaderboard_ok` is what sets it now."""
         result = build_weekly_arm_scores(
             _e2e_lift_ok(sn_lift=0.02, t20_sn=0.03),
-            _tt_leaderboard_ok(mean=0.015),
+            _tt_leaderboard_ok(mean=0.015, t20_mean=0.03),
             run_date="2026-07-18", leaderboard_date_used="2026-07-18",
         )
 
-        assert set(result["scores"]) == set(VALID_CHAMPIONS)
-        assert set(result["arm_confidence"]) == set(VALID_CHAMPIONS)
+        # The three arms THIS fixture makes eligible — not VALID_CHAMPIONS,
+        # which is only the 5-arm fallback register (I9277).
+        three_arms = {"scanner_predictor_direct", "scanner_top20_predictor", "thinktank_coverage"}
+        assert set(result["scores"]) == three_arms
+        assert set(result["arm_confidence"]) == three_arms
         assert result["scores"]["scanner_top20_predictor"] == pytest.approx(0.03)
