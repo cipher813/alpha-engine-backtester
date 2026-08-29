@@ -733,7 +733,12 @@ def publish_cycle_alert(cycle: ArenaCycle, gaps: list[SeriesGap]) -> None:
         publish_ops_alert(
             message,
             severity="error",
-            source="crucible-backtester/optimizer/producer_arena.py::run_arena_cycle",
+            # `alpha-engine-backtester/`, not `crucible-backtester/`: the
+            # canonical alert-source prefix the overseer's `alert_classes`
+            # registry keys on (alpha-engine-config-I3302 completed that
+            # rename). A second prefix for the same repo would land the class
+            # in the registry twice under two names.
+            source="alpha-engine-backtester/optimizer/producer_arena.py::run_arena_cycle",
             dedup_key=f"producer_arena_{cycle.decision.status}_{cycle.as_of}",
             dedup_window_min=720,
         )
