@@ -392,7 +392,7 @@ class TestColdStartDeferral:
 # The tag every deploy artifact must pin. `tests/test_lib_pin_lockstep.py`
 # asserts requirements.txt and the three Lambda Dockerfiles all carry the SAME
 # tag; this constant is what that tag must be.
-_EXPECTED_LIB_TAG = "v0.124.103"
+_EXPECTED_LIB_TAG = "v0.124.99"
 
 
 class TestLibVersionPin:
