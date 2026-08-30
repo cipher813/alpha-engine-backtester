@@ -50,7 +50,6 @@ from optimizer import producer_arena
 from optimizer.champion_promotion import (
     _BLOCKED_BY_SLUGS,
     ARM_FEED_DEPENDENCIES,
-    AUDIT_ENUM_ARMS,
     CONFIDENCE_MEASURED,
     CONFIDENCE_UNAVAILABLE,
     DEFAULT_GATE_CHAMPION,
@@ -323,20 +322,21 @@ class TestArmRoster:
         assert DEFAULT_GATE_CHAMPION == INCUMBENT
         assert DEFAULT_GATE_CHAMPION in VALID_CHAMPIONS
 
-    def test_the_audit_enum_is_read_off_the_frozen_contract(self):
-        """And it is NARROWER than the roster, which is the live cost of the
-        projection (alpha-engine-config-I9406, option B retires this record).
+    def test_the_audit_enum_covers_every_promotion_eligible_arm(self):
+        """The narrowed audit record names every arm the slot can promote onto.
 
-        Asserted rather than left implicit: the arms this record cannot NAME
-        are exactly the arms whose measurement would be lost if the open
-        ``arm_scores`` map were ever dropped from the projection.
+        When the enum lags the register, enum-typed fields project to null and
+        read as "no comparison was possible" — which is false. The open
+        ``arm_scores`` map preserves the measurement; this test guards the
+        enum-typed fields (alpha-engine-config-I9406).
         """
-        enum = {v for v in AUDIT_SCHEMA["properties"]["champion_after"]["enum"] if v is not None}
-        assert AUDIT_ENUM_ARMS == enum
-        unnameable = set(VALID_CHAMPIONS) - AUDIT_ENUM_ARMS
-        assert unnameable == {"no_agent_quant", "single_agent_quant"}, (
-            "if this set changed, the enum moved in nousergon-lib and I9406 "
-            "should be re-read before the projection is trusted"
+        enum = {
+            v for v in AUDIT_SCHEMA["properties"]["champion_after"]["enum"]
+            if v is not None
+        }
+        assert set(VALID_CHAMPIONS).issubset(enum), (
+            "if this failed, widen producer_champion_audit in nousergon-lib "
+            "before trusting enum-typed audit fields"
         )
 
 
