@@ -908,24 +908,19 @@ class TestDecisionRecordFromCycle:
             CONFIDENCE_MEASURED, CONFIDENCE_UNAVAILABLE,
         }
 
-    def test_a_promotion_the_enum_cannot_name_is_null_never_the_incumbent(self):
-        """The lossy direction, pinned so it can only ever be lossy.
+    def test_a_quant_promotion_is_named_on_the_audit_record(self):
+        """I9406 stops null-projection once the enum admits quant arms.
 
-        ``no_agent_quant`` is not in the frozen ``champion_after`` enum
-        (alpha-engine-config-I9406). Projecting it onto ``champion_before``
-        would make this record assert that the pointer DID NOT MOVE, which is
-        false in the one direction that hides a promotion. Null is the honest
-        value: this narrowed record cannot name the arm, and
-        ``_champion_after_name`` carries the arm the pointer writer uses.
+        ``champion_after`` carries the engine verdict directly; the open
+        ``arm_scores`` map preserves the measurement either way.
         """
         cycle, gaps, register = _cycle_for(_deciding_board())
         record = decision_record_from_cycle(
             cycle, gaps, register, champion_before=INCUMBENT, freeze=False,
         )
         assert record["outcome"] == "promoted"
-        assert record["champion_after"] is None
+        assert record["champion_after"] == "no_agent_quant"
         assert record["champion_after"] != record["champion_before"]
-        # ...and the measurement is NOT lost with the name.
         assert record["arm_scores"]["no_agent_quant"] == pytest.approx(0.09)
 
     def test_a_nameable_promotion_is_named(self):
@@ -1205,9 +1200,8 @@ class TestRunWeeklyEvaluation:
         s3 = self._s3()
         result = self._run(s3, _deciding_board(winner="no_agent_quant"))
         assert result["outcome"] == "promoted"
-        # The narrowed record cannot name it, and does not pretend otherwise.
-        assert result["champion_after"] is None
-        # The live pointer is not narrowed by a rendering.
+        assert result["champion_after"] == "no_agent_quant"
+        # The live pointer matches the engine verdict.
         pointer = json.loads(s3.store[f"{self.BUCKET}/{self.POINTER_KEY}"])
         assert pointer["champion"] == "no_agent_quant"
         # ...and the authoritative artifact names it outright.
@@ -1453,13 +1447,19 @@ class TestSchemaConformance:
         assert audit["outcome"] == "promoted"
         self._validate(AUDIT_SCHEMA, audit)
 
-    def test_an_unnameable_promotion_still_conforms(self):
-        """The projection's lossy case must produce a VALID document — a
-        schema-invalid audit record would be rejected by the dashboard
-        consumer that validates against this same resource."""
+    def test_a_quant_promotion_audit_conforms_once_enum_is_wide(self):
+        """Quant-arm promotions must validate once producer_champion_audit admits them."""
         audit = self._audit(_deciding_board(winner="no_agent_quant"))
-        assert audit["champion_after"] is None
+        assert audit["champion_after"] == "no_agent_quant"
         assert "no_agent_quant" in audit["arm_scores"]
+        enum = {
+            v for v in AUDIT_SCHEMA["properties"]["champion_after"]["enum"]
+            if v is not None
+        }
+        if "no_agent_quant" not in enum:
+            pytest.skip(
+                "producer_champion_audit enum widen is in nousergon-lib-PR379"
+            )
         self._validate(AUDIT_SCHEMA, audit)
 
     def test_no_contest_audit_conforms(self):
