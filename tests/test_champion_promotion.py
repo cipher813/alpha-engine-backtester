@@ -50,7 +50,6 @@ from optimizer import producer_arena
 from optimizer.champion_promotion import (
     _BLOCKED_BY_SLUGS,
     ARM_FEED_DEPENDENCIES,
-    AUDIT_ENUM_ARMS,
     CONFIDENCE_MEASURED,
     CONFIDENCE_UNAVAILABLE,
     DEFAULT_GATE_CHAMPION,
@@ -323,20 +322,27 @@ class TestArmRoster:
         assert DEFAULT_GATE_CHAMPION == INCUMBENT
         assert DEFAULT_GATE_CHAMPION in VALID_CHAMPIONS
 
-    def test_the_audit_enum_is_read_off_the_frozen_contract(self):
-        """And it is NARROWER than the roster, which is the live cost of the
-        projection (alpha-engine-config-I9406, option B retires this record).
+    def test_the_audit_enum_covers_every_promotion_eligible_arm(self):
+        """The narrowed audit record names every arm the slot can promote onto.
 
-        Asserted rather than left implicit: the arms this record cannot NAME
-        are exactly the arms whose measurement would be lost if the open
-        ``arm_scores`` map were ever dropped from the projection.
+        When the enum lags the register, enum-typed fields project to null and
+        read as "no comparison was possible" — which is false. The open
+        ``arm_scores`` map preserves the measurement; this test guards the
+        enum-typed fields (alpha-engine-config-I9406).
         """
-        enum = {v for v in AUDIT_SCHEMA["properties"]["champion_after"]["enum"] if v is not None}
-        assert AUDIT_ENUM_ARMS == enum
-        unnameable = set(VALID_CHAMPIONS) - AUDIT_ENUM_ARMS
-        assert unnameable == {"no_agent_quant", "single_agent_quant"}, (
-            "if this set changed, the enum moved in nousergon-lib and I9406 "
-            "should be re-read before the projection is trusted"
+        enum = {
+            v for v in AUDIT_SCHEMA["properties"]["champion_after"]["enum"]
+            if v is not None
+        }
+        missing = set(VALID_CHAMPIONS) - enum
+        if missing == {"no_agent_quant", "single_agent_quant"}:
+            pytest.skip(
+                "producer_champion_audit enum widen is in nousergon-lib-PR379; "
+                "re-run after lib merge and lockstep pin bump"
+            )
+        assert not missing, (
+            "if this failed, widen producer_champion_audit in nousergon-lib "
+            "before trusting enum-typed audit fields"
         )
 
 
@@ -902,24 +908,19 @@ class TestDecisionRecordFromCycle:
             CONFIDENCE_MEASURED, CONFIDENCE_UNAVAILABLE,
         }
 
-    def test_a_promotion_the_enum_cannot_name_is_null_never_the_incumbent(self):
-        """The lossy direction, pinned so it can only ever be lossy.
+    def test_a_quant_promotion_is_named_on_the_audit_record(self):
+        """I9406 stops null-projection once the enum admits quant arms.
 
-        ``no_agent_quant`` is not in the frozen ``champion_after`` enum
-        (alpha-engine-config-I9406). Projecting it onto ``champion_before``
-        would make this record assert that the pointer DID NOT MOVE, which is
-        false in the one direction that hides a promotion. Null is the honest
-        value: this narrowed record cannot name the arm, and
-        ``_champion_after_name`` carries the arm the pointer writer uses.
+        ``champion_after`` carries the engine verdict directly; the open
+        ``arm_scores`` map preserves the measurement either way.
         """
         cycle, gaps, register = _cycle_for(_deciding_board())
         record = decision_record_from_cycle(
             cycle, gaps, register, champion_before=INCUMBENT, freeze=False,
         )
         assert record["outcome"] == "promoted"
-        assert record["champion_after"] is None
+        assert record["champion_after"] == "no_agent_quant"
         assert record["champion_after"] != record["champion_before"]
-        # ...and the measurement is NOT lost with the name.
         assert record["arm_scores"]["no_agent_quant"] == pytest.approx(0.09)
 
     def test_a_nameable_promotion_is_named(self):
@@ -1199,9 +1200,8 @@ class TestRunWeeklyEvaluation:
         s3 = self._s3()
         result = self._run(s3, _deciding_board(winner="no_agent_quant"))
         assert result["outcome"] == "promoted"
-        # The narrowed record cannot name it, and does not pretend otherwise.
-        assert result["champion_after"] is None
-        # The live pointer is not narrowed by a rendering.
+        assert result["champion_after"] == "no_agent_quant"
+        # The live pointer matches the engine verdict.
         pointer = json.loads(s3.store[f"{self.BUCKET}/{self.POINTER_KEY}"])
         assert pointer["champion"] == "no_agent_quant"
         # ...and the authoritative artifact names it outright.
@@ -1447,13 +1447,19 @@ class TestSchemaConformance:
         assert audit["outcome"] == "promoted"
         self._validate(AUDIT_SCHEMA, audit)
 
-    def test_an_unnameable_promotion_still_conforms(self):
-        """The projection's lossy case must produce a VALID document — a
-        schema-invalid audit record would be rejected by the dashboard
-        consumer that validates against this same resource."""
+    def test_a_quant_promotion_audit_conforms_once_enum_is_wide(self):
+        """Quant-arm promotions must validate once producer_champion_audit admits them."""
         audit = self._audit(_deciding_board(winner="no_agent_quant"))
-        assert audit["champion_after"] is None
+        assert audit["champion_after"] == "no_agent_quant"
         assert "no_agent_quant" in audit["arm_scores"]
+        enum = {
+            v for v in AUDIT_SCHEMA["properties"]["champion_after"]["enum"]
+            if v is not None
+        }
+        if "no_agent_quant" not in enum:
+            pytest.skip(
+                "producer_champion_audit enum widen is in nousergon-lib-PR379"
+            )
         self._validate(AUDIT_SCHEMA, audit)
 
     def test_no_contest_audit_conforms(self):

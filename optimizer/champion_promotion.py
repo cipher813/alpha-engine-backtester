@@ -154,55 +154,6 @@ AUDIT_PREFIX = "config/apply_audit/producer_champion"
 # the largest supported lead, never by position in this tuple.
 VALID_CHAMPIONS: tuple[str, ...] = producer_arena.promotion_eligible_arm_names()
 
-# The arms the FROZEN `producer_champion_audit` contract admits as a value of
-# `champion_before` / `champion_after` / `challenger` / `counterfactual_winner`.
-#
-# READ OFF THE SCHEMA, not typed. Typed as a literal — which it was for one
-# afternoon — this is a fifth hand-maintained arm register, and it went stale
-# the same way every other one did: the enum lives in nousergon-lib and cannot
-# be widened from this repo, so a copy here records what the enum said on the
-# day somebody looked.
-#
-# It is a STRICT SUBSET of VALID_CHAMPIONS today: `no_agent_quant` and
-# `single_agent_quant` are registered, scored, ranked and reported on the
-# authoritative `arena_cycle` artifact, but this narrowed view cannot NAME
-# them. That gap is why `arena_cycle` is authoritative and this record is a
-# projection of it, and it is filed rather than papered over
-# (alpha-engine-config-I9406).
-
-
-def _audit_enum_arms() -> frozenset[str]:
-    """The `champion_after` enum, minus the null the schema also admits."""
-    from nousergon_lib.contracts import load_schema
-
-    enum = load_schema("producer_champion_audit")["properties"]["champion_after"]["enum"]
-    return frozenset(v for v in enum if v is not None)
-
-
-AUDIT_ENUM_ARMS: frozenset[str] = _audit_enum_arms()
-
-
-def _audit_arm(name: str | None) -> str | None:
-    """Project an arm name onto the frozen audit enum, LOUDLY when it does not fit.
-
-    A name the enum does not admit becomes ``null`` rather than being written
-    through, because writing it through would produce a schema-INVALID audit
-    record and the dashboard consumer validates against the same resource. The
-    WARN is the point: a silently nulled field reads as "no challenger this
-    week", which is a different and false claim.
-    """
-    if name is None or name in AUDIT_ENUM_ARMS:
-        return name
-    logger.warning(
-        "champion_promotion: arm %r cannot be named in the producer_champion_audit "
-        "record — the frozen enum (nousergon_lib.contracts) admits only %s. The arm IS "
-        "on the authoritative arena_cycle artifact and in this record's open "
-        "`arm_scores` map; only the enum-typed fields are narrowed "
-        "(alpha-engine-config-I9406).",
-        name, sorted(AUDIT_ENUM_ARMS),
-    )
-    return None
-
 # The arm an unrecognized or legacy pointer normalizes to FOR GATE PURPOSES.
 #
 # Named explicitly rather than taken as `DEFAULT_GATE_CHAMPION`, which is what it
@@ -1029,12 +980,12 @@ def decision_record_from_cycle(
     record: dict[str, Any] = {
         "champion_before": champion_before,
         "champion_after": champion_before,
-        "challenger": _audit_arm(challenger),
+        "challenger": challenger,
         "champion_score": arm_scores.get(champion_before),
         "challenger_score": arm_scores.get(challenger) if challenger else None,
         "arm_scores": arm_scores,
         "arm_confidence": arm_confidence,
-        "counterfactual_winner": _audit_arm(counterfactual),
+        "counterfactual_winner": counterfactual,
         "blocked_by": None,
         "leaderboard_date_used": None,  # filled by the caller
         # Not part of the frozen audit shape — carried on the returned record
@@ -1090,17 +1041,7 @@ def decision_record_from_cycle(
         return record
 
     record["outcome"] = "promoted"
-    # NULL, never `champion_before`, when the frozen enum cannot name the arm.
-    #
-    # Falling back to the incumbent here would make this record state that the
-    # pointer did not move — which is FALSE, and false in the direction that
-    # hides a promotion. `null` says "this narrowed record cannot name it";
-    # `_audit_arm` has already logged which arm, `arm_scores` carries its
-    # number, and `arena_cycle` carries the whole decision. The narrowing is
-    # the tracked cost of the projection (alpha-engine-config-I9406), and
-    # `_reconcile_pointer` reads `_champion_after_name` — the arm the ENGINE
-    # decided — so the live pointer is never narrowed by it.
-    record["champion_after"] = _audit_arm(champion_after_name)
+    record["champion_after"] = champion_after_name
     return record
 
 
