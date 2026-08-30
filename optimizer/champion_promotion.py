@@ -1,348 +1,104 @@
-"""champion_promotion.py — weekly winner-take-all champion/challenger gate
-(config#2364 / config#2367 origin; redesigned alpha-engine-config-I2518 /
-epic I2515, 2026-07-14 ruling; scoring redesigned to direct per-arm lift,
-no shared comparator, alpha-engine-config-I2998, 2026-07-20 ruling).
+"""champion_promotion.py — the selection-producer slot's pointer.
 
-Writes the live pointer ``config/producer_champion.json`` that the
-alpha-engine executor's ``executor/champion.py::load_champion_pointer``
-reads at planner start to decide which entry-candidate producer arm is
-LIVE. Statistical correctness matters here in a way it does not for the
-advisory optimizers elsewhere in this module: a wrong pointer move silently
-changes which strategy trades real (paper) capital.
+**The decision is not taken here.** ``nousergon_lib.arena.engine.run_cycle``
+takes it, once, from one ``ArenaCycle``; this module owns the three artifacts
+around it and nothing about the rule itself
+(``optimizer/producer_arena.py`` is the slot's wiring, and
+``champion-challenger-policy.md`` §§3–6 is the rule). What lives here:
 
-**2026-07-14 seat swap (Brian's ruling, config-I2518, binding on this
-issue):** the ``agentic`` seat retires with the multi-agent Research graph
-(epic config-I2515) and is replaced by ``thinktank_coverage`` — the Think
-Tank challenger arm (scanner top-~60 -> Think Tank full-coverage -> its
-own top-~20 by independent TT rating). ``scanner_predictor_direct`` is the
-new BASE-CASE champion (already live since 2026-07-13T22:07 UTC,
-config-I2364)::
+  1. ``config/producer_champion.json`` — THE single writer for the live
+     pointer the executor's ``executor/champion.py::load_champion_pointer``
+     reads at planner start. Three invariants, all fail-loud: the arm is in
+     the derived roster, it is not declared shadow-only, and the frozen
+     ``contracts/producer_champion.schema.json`` enum admits it.
+  2. ``config/apply_audit/producer_champion/{date}.json`` (+ ``latest.json``)
+     — the ``producer_champion_audit`` v2 record, written UNCONDITIONALLY
+     every week including on ``outcome="error"``. This is the liveness proxy
+     (config#2054 lesson): pointer mtime cannot prove the engine is alive
+     because a correctly-held week does not touch it.
+  3. ``research/producer_leaderboard_champion_gate/{date}.json`` — this
+     module's own observability history (config#2367, key deliberately
+     distinct from crucible-research's under config#2452). No longer feeds
+     any decision.
 
-    VALID_CHAMPIONS = ("scanner_top20_predictor", "scanner_predictor_direct",
-                       "thinktank_coverage")   # 2026-08-27: three arms, I8756
+**alpha-engine-config-I9318 (2026-08-29) deleted this module's decision
+engine.** Everything below is gone, not refactored:
 
-``agentic`` is READ-TOLERATED (a historical pointer/audit value must never
-crash this engine — ``_normalize_champion_before`` below WARNs and treats
-it as ``scanner_predictor_direct``) but WRITE-FORBIDDEN
-(``write_champion_pointer`` raises on any value outside ``VALID_CHAMPIONS``,
-which no longer includes it). No real ``config/producer_champion.json``
-object was ever actually written with ``champion="agentic"`` — it was only
-ever an implicit pre-bootstrap default — but the 2026-07-13 bootstrap DID
-write a real audit record with ``champion_before="agentic"``
-(``config/apply_audit/producer_champion/2026-07-13.json``), so the
-read-tolerance is not purely defensive.
+  - the winner-take-all comparison (I2518) and, before it, the
+    HAC-significance / two-week-hysteresis / two-week-cooldown gate
+    (config#2367);
+  - the per-arm evidence floors — ``thin_evidence``,
+    ``MIN_CYCLES_FOR_INFERENCE``, ``confidence != "ok"``,
+    ``leaderboard_row_confidence`` and the champion-side half of the same
+    (I7542/I7549). The anytime-valid confidence sequence IS the evidence bar
+    (policy §5.0), and a floor on top of it is a second, weaker bar;
+  - the three per-arm scorers reading three different sources on three
+    different cohorts. THAT asymmetry is the defect: the incumbent was
+    scored from this repo's own ``sector_neutral_mean_alpha_21d``
+    counterfactual while challengers were scored from crucible-research's
+    board, so the champion's own thin weeks could never render as thinness —
+    they rendered as another arm's. Every arm now routes through
+    ``producer_arena.build_series``: one board, one cohort, one benchmark.
 
-**Weekly winner-take-all policy (supersedes the entire HAC-significance /
-2-week-hysteresis / 2-week-cooldown gated engine this module shipped with
-under config#2367 — INCLUDING the standing ``cooldown_until:
-2026-07-27`` carried in the prior ``latest.json``, which this policy no
-longer reads or honors):**
+Two guards survived, because they are about WHICH measurement is in front of
+us rather than how much of it there is: ``LEADERBOARD_STALENESS_DAYS`` (8)
+and ``GATE_HORIZON_DAYS`` (21, the board's primary horizon — §4 requires one
+horizon across a slot and §3 requires a promoted arm's series to stay
+continuous). Both raise ``LeaderboardUnusable`` and produce a classified
+``outcome="error"`` rather than a silently rescored pointer.
 
-    Each weekly evaluation compares the two arms' realized top-N alpha lift
-    for the trailing week and flips the pointer to whichever arm scores
-    higher, if that arm is not already champion. No significance test, no
-    consecutive-week hysteresis, no cooldown — "whichever performs best in
-    a given week is promoted at that time" (Brian's ruling, verbatim).
+**The roster is DERIVED.** ``VALID_CHAMPIONS`` was a hand-typed tuple — one
+of four independent arm registers in the fleet — and it silently omitted
+``no_agent_quant`` and ``single_agent_quant``, the two arms with the most
+evidence on the board, with nothing anywhere recording the omission. It is
+now ``producer_arena.promotion_eligible_arm_names()``, off the slot's durable
+register, and ``producer_arena.roster_disagreement`` raises when the
+derivation falls behind its source. ``agentic`` remains READ-TOLERATED (a
+historical pointer or audit value must never crash this engine —
+``_normalize_champion_before`` WARNs and treats it as the base-case arm) and
+WRITE-FORBIDDEN.
 
-**SHADOW-ONLY ARMS (Brian's ruling, 2026-08-20, recorded on
-alpha-engine-config-I2515) — NARROWLY supersedes the 2026-07-14 ruling
-above:**
+**``arena_cycle`` is authoritative; this audit record is a PROJECTION of it.**
+``decision_record_from_cycle`` computes nothing — it renames. The projection
+is lossy in exactly one direction and only because the frozen contract forces
+it: the audit enum admits four arm names and the roster has five, so a
+promotion onto ``no_agent_quant`` or ``single_agent_quant`` is recorded with
+``champion_after: null`` (never ``champion_before``, which would assert the
+pointer did not move) plus a WARN, while the open ``arm_scores`` map carries
+every arm's number and ``arena_cycle`` names the arm outright. Retiring this
+record in favour of ``arena_cycle`` is option (B) of
+alpha-engine-config-I9406. ``_reconcile_pointer`` reads the ENGINE's verdict,
+never this projection, so the live pointer is never narrowed by a rendering.
 
-    "research should now be think tank in shadow mode only with the main
-    research process skipped by passing a scanner top 20 to predictor"
-    (Brian, verbatim)
+**Pointer PROVENANCE is now maintained every cycle (I9318's ``closes-when``).**
+``config/producer_champion.json`` read ``promotion_source:
+"operator_bootstrap"`` from 2026-07-13 through 2026-08-29 while an automated
+engine evaluated it weekly. The value was right and the record of how it got
+there was false, and no surface said so. Every cycle now sets
+``promotion_source`` to ``arena_decided``/``arena_held``/
+``arena_unmeasurable``/``arena_unservable``/``arena_bootstrap`` and PRESERVES
+``promoted_at`` whenever the champion did not change, so "when did the
+pointer last move" survives the correction.
 
-``thinktank_coverage`` is MEASURED, not promotable. It keeps scoring every
-week, keeps its leaderboard row, and this gate keeps recording who WOULD
-have won — but it may never take the live pointer by winning. Promoting it
-requires its own separate ruling, which is a ONE-LINE data change here
-(remove it from ``SHADOW_ONLY_ARMS`` below) plus that ruling.
+**Shadow-only arms** (Brian 2026-08-20, released 2026-08-27) are measured
+every cycle and never served. ``SHADOW_ONLY_ARMS`` is EMPTY today; the
+mechanism stays, enforced at two layers — ``producer_arena.build_preconditions``
+(the policy: a named, recorded ineligibility on the artifact) and
+``write_champion_pointer`` (the invariant: nothing reaching S3 can violate
+it) — so a future arm inherits the protection by joining that frozenset and
+nothing else.
 
-This supersedes 2026-07-14 on exactly ONE question — whether a shadow-only
-arm may take the live pointer. Everything else the 2026-07-14 ruling
-established is unchanged: both arms are scored weekly on the same yardstick
-(champion-challenger-policy.md §3, measurement is unconditional), the
-leaderboard is unchanged, ties still favour the incumbent, and a NON-shadow
-challenger that outscores the champion still promotes immediately with no
-significance test, hysteresis or cooldown.
+**Promotion-time feed liveness (alpha-engine-config-I3165)** is now a per-arm
+SERVING PRECONDITION, probed for every arm in ``ARM_FEED_DEPENDENCIES``
+before the cycle rather than for "the challenger that would win" — a question
+with no answer in an N-arm slot before the engine has decided. Note the
+consequence, which is a real broadening: an unservable INCUMBENT no longer
+parks the pointer on an arm that cannot trade (the config#3053 state); the
+engine forces the pointer to the best eligible arm and says so.
 
-Shadow-only-ness is a PROPERTY OF AN ARM, declared once in
-``SHADOW_ONLY_ARMS`` — never a hard-coded string at the veto site — so a
-future arm added in shadow mode inherits the protection automatically. It
-is enforced at TWO layers: ``evaluate_gates`` (the POLICY — degrades a
-shadow-only arm's win to ``outcome="held_shadow_only"`` with
-``blocked_by=["shadow_only_arm"]``, never reaching the writer) and
-``write_champion_pointer`` (the INVARIANT — raises, so a future caller that
-bypasses the gate entirely still cannot flip the pointer onto a shadow arm).
-
-**Validity guards (definitional NO-CONTEST, not a statistical gate) —
-``evaluate_gates`` below:** a week where either arm's realized-lift score
-is unavailable (no valid ``thinktank_coverage`` selections this week, no
-resolved/matured outcomes yet, the evidence artifact itself missing or
-stale) is a NO-CONTEST: the pointer is left unchanged and the outcome
-record says so explicitly via a machine-readable ``blocked_by`` slug. A
-no-contest NEVER defaults a win to either side.
-
-**Evidence sourcing — DIRECT per-arm realized lift, NO shared comparator
-(alpha-engine-config-I2998, 2026-07-20 ruling — supersedes the
-Bucher-style indirect/common-comparator design below this module shipped
-with under I2518):**
-
-  The pre-I2998 design scored both arms as "lift vs the live
-  ``agentic_sector_teams``/CIO-ADVANCE baseline" on the premise that
-  Research kept running its full agentic pipeline weekly regardless of
-  which arm the executor traded. config-I2993 (2026-07-19/20) found that
-  premise false: ``agentic_sector_teams`` retired 2026-07-12 with no
-  successor ``kind=="champion"`` producer registered, so BOTH arms'
-  "vs agentic" scores could go simultaneously no-contest — a materially
-  worse failure than either arm alone going stale, since a no-contest week
-  is a legitimate, non-alerting outcome by design (freezing
-  ``config/producer_champion.json`` silently). I2998's fix removes the
-  shared-comparator dependency entirely: each arm now scores its OWN
-  realized lift against a FIXED, always-available neutral baseline, so
-  neither arm's score can ever depend on whether Research's agentic
-  pipeline (or any future comparator) happens to be live that week.
-
-  - ``scanner_predictor_direct``'s weekly score is this run's
-    ``analysis.end_to_end.compute_lift_metrics()['scanner_then_predictor_counterfactual']
-    ['methods']['scanner_then_predictor_topN']['sector_neutral_mean_alpha_21d']``
-    — the arm's own realized, sector-neutral 21d alpha, ALREADY benchmark
-    -relative (realized log return minus the log SPY return over the same
-    window, at the source, ``analysis/end_to_end.py::_scanner_then_predictor_topN``) —
-    i.e. lift vs the SPY zero-line, not vs any live comparator arm. A
-    backtester-internal counterfactual (research.db-derived) already
-    computed earlier in the same ``evaluate.py`` run, extracted via
-    ``leaderboard_entry_from_e2e_lift`` (this module's OWN
-    ``research/producer_leaderboard_champion_gate/{date}.json`` history
-    artifact is STILL maintained for observability and to keep
-    config#2452's in-flight live-verification intact — see
-    ``update_leaderboard_and_get_gate_inputs`` — but its accumulated
-    ``weekly_points`` series is no longer consumed by the gate itself,
-    since winner-take-all needs only THIS week's point, not a multi-week
-    HAC-adjusted series). The retired ``sn_lift_vs_agentic_cio`` field is
-    still carried on the leaderboard-history entry for observability but
-    is no longer the gate's score source.
-  - ``thinktank_coverage``'s weekly score is read from crucible-research's
-    real champion/challenger producer leaderboard,
-    ``research/producer_leaderboard/{date}.json``
-    (``scoring/leaderboard_producers.py::build_producer_leaderboard`` +
-    ``scoring/leaderboard_scoring.py::score_leaderboard``, config#1221/
-    #1223, made champion-optional under I2998) — verified schema
-    (2026-07-20, read from the crucible-research checkout, NOT guessed):
-    ``{"champion": <research producer champion name> | None,
-    "horizon_days": 21, "top_n": 50, "benchmark_ticker": "SPY", "n_dates":
-    int, "specs": [{"name", "kind", "realized_rank_ic",
-    "topn_alpha_vs_champion": {...} | None,
-    "topn_alpha_vs_benchmark": {"mean","se","t_stat","n_dates"} | None,
-    "n_dates_scored", "confidence"}, ...],
-    "horizons_days": [21, 126, 252], "min_dates_for_inference": 5,
-    "horizons": [{"horizon_days", "status", "reason", "n_dates", "specs"},
-    ...]}``. We read the ``specs`` row named
-    ``"thinktank_coverage"`` and take its ``topn_alpha_vs_benchmark.mean``
-    — the SAME kind of statistic as ``scanner_predictor_direct``'s score
-    (a mean top-N realized return lift vs the SPY benchmark, date
-    -clustered), so the two scores remain apples-to-apples comparable
-    under winner-take-all's direct "higher wins" rule. This field is
-    computed champion-free (``score_leaderboard`` degrades to
-    champion-free metrics for every spec when no producer is registered
-    ``kind=="champion"`` — see I2998) — unlike the retired
-    ``topn_alpha_vs_champion``, it is available even while config-I2993's
-    "no successor champion registered" state persists. ``coverage_complete``
-    validity (the full current-scan top-60 rule, Brian's ruling
-    config#1580) is enforced UPSTREAM at the artifact boundary —
-    crucible-research PR427 writes ``signals_shadow/thinktank_coverage/
-    {trading_day}/signals.json`` (the input this leaderboard scores) ONLY
-    when ``coverage_complete`` — so any date this spec contributed to
-    ``n_dates_scored`` was necessarily a full-coverage day; no separate
-    coverage_complete check is needed on this side of the boundary.
-
-    **LATEST-AVAILABLE read (alpha-engine-config-I2544, 2026-07-14 ruling,
-    same-session follow-up to I2518):** ``research/producer_leaderboard/
-    {date}.json`` is now written by an ASYNC advisory child Step Function
-    (config-I2518's persistent-dash rearchitecture) that may not have
-    finished — or may have failed outright — by the time this Evaluator
-    -stage gate runs in the MAIN weekly SF. An exact same-day key read is
-    therefore no longer a safe assumption. This module instead lists the
-    ``research/producer_leaderboard/`` prefix
-    (``find_latest_research_producer_leaderboard_date``) and reads the
-    LATEST artifact dated <= ``run_date`` (``read_latest_research_producer
-    _leaderboard``). This is the semantically CORRECT read, not a
-    compromise: the gate scores REALIZED (matured) outcomes of PRIOR
-    weeks' ``thinktank_coverage`` selections — a same-day leaderboard could
-    not contain resolved outcomes for same-day picks even if it existed on
-    time. An honest staleness bound still applies: a selected leaderboard
-    more than ``LEADERBOARD_STALENESS_DAYS`` (8) calendar days older than
-    ``run_date`` is treated as unavailable (``leaderboard_stale_gt_8d``,
-    a no-contest) rather than silently scored against stale evidence. The
-    date actually used is threaded through to the audit record as
-    ``leaderboard_date_used`` (additive, nousergon_lib.contracts's
-    producer_champion_audit schema) so the audit trail always shows which week's evidence
-    decided (or declined to decide) a flip.
-
-    **EVIDENCE-CONFIDENCE gate (alpha-engine-config-I7549, 2026-08-17):**
-    until this change the gate accepted a leaderboard row on
-    ``n_dates_scored`` being TRUTHY. ``n_dates_scored == 1`` is truthy, so
-    a one-date mean — carrying ``se: null`` and ``t_stat: null`` because
-    neither can be computed at n=1 — could move the live champion pointer.
-    That was not hypothetical: ``research/producer_leaderboard/
-    2026-08-14.json`` carried ``thinktank_coverage`` with
-    ``n_dates_scored: 1``, ``topn_alpha_vs_benchmark.mean: -0.060751``,
-    ``se: null``, ``t_stat: null``.
-
-    crucible-research PR643 (alpha-engine-config-I7542) now stamps every
-    spec row with an explicit ``confidence`` —
-    ``insufficient`` (nothing scored) / ``thin`` (scored on fewer than the
-    artifact's ``min_dates_for_inference`` dates) / ``ok`` — produced by
-    ``scoring/leaderboard_scoring.py::confidence_for`` against the slot's
-    registered evidence floor (``LEADERBOARD_SLOTS``). This module CONSUMES
-    that field; it deliberately does not reimplement the thinness test, so
-    the floor stays a single per-slot fact owned by the producer
-    (champion-challenger-policy.md §10).
-
-    Only a ``confidence == "ok"`` row is scored. A ``thin`` row yields
-    ``thinktank_coverage_thin_evidence``; an ``insufficient`` row keeps the
-    existing ``thinktank_coverage_no_resolved_outcomes`` — deliberately
-    DIFFERENT slugs, because they call for different operator responses
-    (wait for the cohort to mature vs go find out why nothing scored).
-
-    This does NOT weaken §5's fast path. §5 permits promoting on
-    DIRECTIONAL evidence without a full statistical gate because the
-    platform is paper and the decision is reversible; it says nothing that
-    makes n=1 evidence. A thin row is not a weak directional signal, it is
-    a number whose own dispersion is undefined. Excluding it removes
-    non-evidence from the fast path rather than adding a statistical gate
-    to it: the promotion rule remains "strictly higher score wins", with
-    no significance test, PSR/DSR bar, or cohort-count requirement.
-
-    Nor does it weaken §5.2 hysteresis. This module's hysteresis under the
-    I2518 winner-take-all ruling is "the pointer never moves on a null or
-    an exactly-equal signal — ties favour the incumbent". Every path added
-    here produces a ``None`` score, i.e. strictly MORE reasons to leave the
-    pointer where it is, in BOTH directions (a thin champion row cannot
-    demote the incumbent either — a no_contest holds the pointer). Nothing
-    here can cause a flip that would not have happened before.
-
-    **Backwards compatibility is fail-STATIC, never fail-``ok``.** A
-    pre-I7542 artifact carries no ``confidence`` key. Treating its absence
-    as ``ok`` would be the very defect being fixed, so this module derives
-    the verdict from the artifact's OWN declared floor
-    (``min_dates_for_inference``) against ``n_dates_scored``; when the
-    artifact declares neither, the row is unavailable under its own slug
-    (``thinktank_coverage_confidence_unknown``) rather than trusted. Same
-    slug for a ``confidence`` value outside the known vocabulary — a
-    producer that changed its vocabulary is a reason to stop, not to
-    guess. The audit record's ``arm_confidence`` distinguishes the two
-    (``unknown`` vs ``unrecognized``).
-
-    **The CHAMPION side of the same comparison (alpha-engine-config-I7549,
-    champion-side half).** Everything above gates the arm scored off the
-    producer leaderboard. ``scanner_predictor_direct`` is scored off this
-    repo's own ``scanner_then_predictor_topN`` counterfactual, which returns a
-    result at ``n_cycles >= 1`` — so the identical one-observation defect
-    survived on the other input to the same gate. A two-arm gate is not fixed
-    while either arm can be a single draw: the quantity the gate acts on is the
-    DIFFERENCE, and a thin champion makes that difference noise exactly as a
-    thin challenger does, while the audit record reads identically either way.
-    ``MIN_CYCLES_FOR_INFERENCE`` (5 cycles, this repo's registry because this
-    repo owns that arm's measurement — §10) is that arm's floor, reported in
-    the same ``ok``/``thin``/``insufficient``/``unknown`` vocabulary and
-    blocking under its own per-arm slugs
-    (``scanner_predictor_direct_thin_evidence`` /
-    ``scanner_predictor_direct_confidence_unknown``), because the operator
-    response differs by arm: one waits on crucible-research's cohort, the other
-    on this repo's own research.db cycles. Measured 2026-08-17: live runs carry
-    ``n_cycles: 15``, so the floor bounds the degenerate case without binding
-    on today's evidence.
-
-    **HORIZON: the gate reads the artifact's PRIMARY (21-session) block,
-    and now says so (alpha-engine-config-I7540/I7549).** The leaderboard
-    now scores every arm at 21, 126 and 252 sessions and emits one block
-    per horizon under ``horizons``; the PRIMARY horizon's block is also
-    spread across the artifact's top level, which is what ``specs`` here
-    is. The gate stays on 21 for two binding reasons, not by inertia:
-    (1) §4 requires the same horizon across every arm in a slot, and the
-    other arm — ``scanner_predictor_direct`` — is scored from this repo's
-    own ``sector_neutral_mean_alpha_21d`` counterfactual, a 21-session
-    statistic with no 126/252 equivalent; ranking a 252-session
-    thinktank_coverage number against a 21-session scanner number is not a
-    comparison. (2) §3 requires a promoted arm's series to stay
-    continuous; the live pointer's whole history is 21-session, and
-    silently rebasing the gate onto a different horizon would reset it.
-    Moving this gate to a longer horizon is a real and arguably correct
-    future change — the scanner's stated objective is a ~1-year view — but
-    it requires a 126/252-session score for BOTH arms first, and it is an
-    explicit decision, not a side effect of the producer growing a field.
-    ``GATE_HORIZON_DAYS`` names the choice, and a leaderboard whose
-    top-level ``horizon_days`` disagrees with it is refused
-    (``leaderboard_horizon_mismatch``) rather than scored — so an upstream
-    change of primary horizon surfaces as a loud no-contest instead of
-    silently rescoring the champion gate.
-
-  **config-I2993 item 2 (windowing ``end_to_end.py``'s
-  ``sn_lift_vs_agentic_cio`` aggregation) is NO LONGER a dependency for
-  this gate's correctness** — that field is retired as this gate's score
-  source under I2998 (still computed and carried for observability/other
-  consumers, e.g. the evaluator tile, but this module reads
-  ``sector_neutral_mean_alpha_21d`` instead). It may still be worth doing
-  for the evaluator tile's own accuracy, independent of this gate.
-
-  **REGISTRATION — CLOSED (was alpha-engine-config-I2519; corrected here
-  2026-08-20):** this docstring previously carried I2519 as an open
-  "KNOWN, TRACKED GAP" — ``thinktank_coverage`` not yet registered in
-  crucible-research's ``producers/registry.py::RESEARCH_PRODUCERS`` /
-  ``challenger_producers()``, so its leaderboard row could never exist and
-  ``_score_thinktank_coverage`` would return
-  ``blocked_by=["thinktank_coverage_not_in_leaderboard"]`` forever. That
-  claim is STALE and has been removed rather than tolerated: the arm has
-  been registered and scoring since 2026-08-14, whose evaluation was the
-  first week with a real ``thinktank_coverage`` score
-  (``scanner_predictor_direct`` -0.00203 vs ``thinktank_coverage``
-  -0.060751, outcome ``unchanged_winner_already_champion``). The
-  ``thinktank_coverage_not_in_leaderboard`` slug is RETAINED and still
-  correct — it now means a genuine regression (the row disappeared), not
-  an expected steady state, and is a NO-CONTEST either way.
-
-``hac_significance`` (Newey-West/HAC overlap-aware significance) is
-RETAINED below, unchanged and still independently unit-tested — it is no
-longer wired into the promotion decision (winner-take-all has no
-significance gate) but remains available as a possible future diagnostic
-(e.g. reporting whether a winning margin looks like signal or noise
-alongside the decision) without having to re-derive it.
-
-**Single writer function, dual caller (no parallel writer implementations):**
-``write_champion_pointer`` is the ONLY code path that may write
-``config/producer_champion.json``. The gate engine calls it with
-``promotion_source="gate_engine"``; the one-shot 2026-07-13 operator
-bootstrap (``bootstrap_champion_promotion.py``) called it with
-``promotion_source="operator_bootstrap"`` — never a hand-edited S3 object.
-
-**Liveness (config#2054 lesson, binding):** ``config/producer_champion.json``
-mtime alone cannot prove this engine is alive — a correctly-held
-(no-contest) week does not touch it. ``run_weekly_evaluation`` writes
-``config/apply_audit/producer_champion/{date}.json`` (+ ``latest.json``)
-UNCONDITIONALLY, including on ``outcome="error"``.
-
-**Promotion-time feed-dependency liveness (alpha-engine-config-I3165,
-2026-07-23):** the config#3053 2026-07-20 no-trade-morning incident's root
-cause was that ``scanner_predictor_direct``'s live-trade feed chain
-(``research_free_backfill``) was never declared anywhere in the promotion
-record, and nothing at promotion time checked its producer was alive —
-config#1580 orphaned that chain's ultimate upstream one day after the
-2026-07-13 bootstrap, invisibly, for 10 days. ``ARM_FEED_DEPENDENCIES``
-below is the static arm -> feed source of truth this module previously
-lacked; ``check_feed_dependencies_live`` probes each declared dependency
-(reusing ``analysis/scanner_predictor_research_free_backfill.py::
-assert_champion_feed_fresh`` for ``research_free_backfill``) and, wired
-into ``evaluate_gates`` via ``run_weekly_evaluation``, degrades a would-be
-promotion onto a dead/orphaned feed to ``no_contest`` with
-``blocked_by=["feed_producer_dead"]`` — never crashes the run, never
-silently promotes through it, exactly the same validity-guard posture as
-``leaderboard_stale_gt_8d``. This is the PROMOTION-TIME complement to the
-config-I3086 ``critical_while_champion_arm`` ONGOING-monitoring mechanism
-(``alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml``), which
-catches a feed dying AFTER promotion; this gate catches it AT the moment
-of promotion. ``build_champion_audit`` records the promoted arm's
-declared dependencies as ``feed_dependencies`` on every outcome.
+``hac_significance`` (Newey-West/HAC overlap-aware significance) is RETAINED
+below, unchanged and independently unit-tested. It is not wired into any
+decision and is kept as an available diagnostic.
 """
 
 from __future__ import annotations
@@ -357,6 +113,8 @@ from typing import Any
 import boto3
 from botocore.exceptions import ClientError
 
+from optimizer import champion_digest, producer_arena
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1          # config/producer_champion.json pointer — unchanged shape
@@ -364,6 +122,8 @@ AUDIT_SCHEMA_VERSION = 2    # config/apply_audit/producer_champion/{date}.json �
 POINTER_KEY = "config/producer_champion.json"
 AUDIT_PREFIX = "config/apply_audit/producer_champion"
 
+# ── The arm roster — DERIVED, never typed (alpha-engine-config-I9318) ─────
+#
 # alpha-engine-config-I8756 — Brian's ruling 2026-08-27:
 #
 #     "I want the champion/challenger for research to include the scanner top 20
@@ -372,17 +132,27 @@ AUDIT_PREFIX = "config/apply_audit/producer_champion"
 #      configurations. But at this point I'm thinking we promote the best
 #      performer weekly"
 #
-# Three arms, one slot, best performer weekly. `scanner_top20_predictor` is
-# listed first because it is the arm the ruling names; ORDER IS NOT PRECEDENCE.
-# `evaluate_gates` breaks a champion-vs-challenger tie toward the INCUMBENT and
-# a challenger-vs-challenger tie on this tuple's order — the second is a
-# stability choice (a declared order beats dict iteration order), never a
-# statement that an earlier arm is preferred.
-VALID_CHAMPIONS = (
-    "scanner_top20_predictor",
-    "scanner_predictor_direct",
-    "thinktank_coverage",
-)
+# This WAS a hand-typed tuple of three arm names. It was a SECOND, independent
+# arm register — the fleet carried four of them (this tuple, crucible-executor's
+# `executor/champion.py::VALID_CHAMPIONS`, crucible-research's
+# `producers/registry.py::RESEARCH_PRODUCERS`, and a test asserting this tuple
+# as a literal) — and it silently omitted `no_agent_quant` and
+# `single_agent_quant`, the two arms with the MOST evidence on the board
+# (6 scored cohort dates each against the incumbent's 5, measured 2026-08-29).
+# Nothing anywhere recorded that they were excluded, or why: they were simply
+# not typed here. "Scored but ineligible, for no recorded reason" is the same
+# silent-omission class alpha-engine-config-I9277 closed one hop upstream,
+# recurring here.
+#
+# It is now DERIVED from the slot's durable arm register
+# (`optimizer/arena/producer_register.json`), itself derived from
+# crucible-research's producer leaderboard. `producer_arena.roster_disagreement`
+# RAISES when the derived roster falls behind its source, so drift becomes a
+# loud failure rather than an arm quietly dropping out of the contest.
+#
+# ORDER IS NOT PRECEDENCE — the arena engine ranks by Copeland score and picks
+# the largest supported lead, never by position in this tuple.
+VALID_CHAMPIONS: tuple[str, ...] = producer_arena.promotion_eligible_arm_names()
 
 # The arm an unrecognized or legacy pointer normalizes to FOR GATE PURPOSES.
 #
@@ -540,62 +310,22 @@ _BLOCKED_BY_SLUGS = (
 # _score_thinktank_coverage.
 LEADERBOARD_STALENESS_DAYS = 8
 
-# ── Evidence-confidence contract with crucible-research (alpha-engine-config
-# -I7549 consuming I7542) ─────────────────────────────────────────────────
+# ── The per-arm evidence verdict carried on the audit record ──────────────
 #
-# The per-spec confidence vocabulary PRODUCED by crucible-research
-# scoring/leaderboard_scoring.py::confidence_for. This module consumes it and
-# deliberately does NOT reimplement the thinness test: the evidence floor is a
-# per-slot fact owned by the producer's LEADERBOARD_SLOTS registry
-# (champion-challenger-policy.md §10), and a second copy here would drift.
-CONFIDENCE_OK = "ok"
-CONFIDENCE_THIN = "thin"
-CONFIDENCE_INSUFFICIENT = "insufficient"
-LEADERBOARD_CONFIDENCE_VOCABULARY = (
-    CONFIDENCE_OK, CONFIDENCE_THIN, CONFIDENCE_INSUFFICIENT,
-)
-
-# Verdicts this module records for itself when the ARTIFACT did not supply a
-# usable one. Both are refusals, never a pass — see the module docstring's
-# backwards-compatibility note.
-CONFIDENCE_UNKNOWN = "unknown"            # pre-I7542 artifact, no floor to derive from
-CONFIDENCE_UNRECOGNISED = "unrecognised"  # confidence present, outside the vocabulary
-# RETIRED as an emitted value (alpha-engine-config-I7549 champion-side half,
-# same tracker): between #688 and this change, scanner_predictor_direct carried
-# ``not_leaderboard_scored`` because it is scored from this repo's own
-# counterfactual rather than the producer leaderboard. That was true and is
-# still true — but it named the SOURCE of the evidence where the field's job is
-# to state how much of it there is, so the arm the gate compares AGAINST the
-# gated one had no confidence verdict at all. It now carries a real verdict
-# against this repo's own declared floor (MIN_CYCLES_FOR_INFERENCE below). The
-# constant stays defined for read-tolerance of any audit record written in that
-# window; nothing emits it.
-CONFIDENCE_NOT_LEADERBOARD_SCORED = "not_leaderboard_scored"
-
-# ── The champion side's evidence floor (alpha-engine-config-I7549) ─────────
+# The `ok`/`thin`/`insufficient`/`unknown`/`unrecognised` vocabulary is
+# RETIRED as an emitted value (alpha-engine-config-I9318). It existed to say
+# how far an arm was from a minimum-cohort floor, and there is no floor any
+# more: the anytime-valid confidence sequence IS the evidence bar, and it
+# expresses "not enough evidence yet" as a wide interval rather than as a
+# refusal to compare (champion-challenger-policy.md §5.0). Keeping a
+# thinness verdict on the record would describe a gate that no longer runs.
 #
-# #688 closed the challenger side: a producer-leaderboard row is admitted only
-# at ``confidence == "ok"``. The other arm of the same two-arm comparison was
-# left unfloored, and it is reachable at exactly one observation:
-# ``analysis/end_to_end.py::_scanner_then_predictor_topN`` returns a result at
-# ``if n_cycles < 1``. So the identical defect — a mean with no computable
-# dispersion moving the live pointer — survived on the champion's side of the
-# comparison #688 fixed. A gate is not fixed while either input to it can be
-# one observation; whichever arm is thin, the DIFFERENCE the gate acts on is
-# noise, and the audit record reads the same either way.
-#
-# The floor lives here, not on the artifact, because THIS repo owns that arm's
-# measurement (champion-challenger-policy.md §10: every slot names its evidence
-# floor in the registry that owns it — the leaderboard-scored arm's floor is
-# crucible-research's ``min_dates_for_inference`` and is read off the artifact,
-# never reimplemented; this arm has no producer to read it from).
-#
-# 5 mirrors crucible-research's MIN_DATES_FOR_INFERENCE for the same reason:
-# fewer than five clusters cannot carry a clustered statistic. Measured
-# 2026-08-17 from ``research/producer_leaderboard_champion_gate/2026-08-14.json``:
-# the live weekly runs carry ``n_cycles: 15`` (``n_picks: 119``), so this floor
-# bounds the degenerate case without binding on today's evidence.
-MIN_CYCLES_FOR_INFERENCE = 5
+# Two values remain, and they answer the only question the record can still
+# honestly answer: did this arm have a series to be scored on at all?
+# The old vocabulary stays read-tolerated for historical audit records —
+# the upstream contract's `arm_confidence` is an open string map.
+CONFIDENCE_MEASURED = "measured"
+CONFIDENCE_UNAVAILABLE = "unavailable"
 
 # The horizon this gate decides on, in trading sessions. See the module
 # docstring's HORIZON section: 21 is the leaderboard's PRIMARY horizon (whose
@@ -803,33 +533,6 @@ def hac_significance(
 # ── Gate engine (weekly winner-take-all) ────────────────────────────────────
 
 
-def _challengers(champion: str) -> list[str]:
-    """Every registered arm that is not the incumbent, in ``VALID_CHAMPIONS`` order.
-
-    Replaces ``_other_champion``, which returned "the other one" and raised
-    unless exactly two arms existed (alpha-engine-config-I2518 / -I8756). An
-    N-arm gate has no "the other one", and the raise made adding a third arm a
-    crash rather than a comparison.
-    """
-    return [c for c in VALID_CHAMPIONS if c != champion]
-
-
-def _best_challenger(
-    champion: str, scores: dict,
-) -> tuple[str | None, float | None]:
-    """The highest-scoring challenger, or ``(None, None)`` if none is scored.
-
-    Ties among challengers break on ``VALID_CHAMPIONS`` order — declared and
-    stable — never on dict iteration order, which is neither.
-    """
-    challengers = _challengers(champion)
-    ranked = sorted(
-        ((arm, scores.get(arm)) for arm in challengers if scores.get(arm) is not None),
-        key=lambda row: (-row[1], challengers.index(row[0])),
-    )
-    return (ranked[0][0], ranked[0][1]) if ranked else (None, None)
-
-
 def _normalize_champion_before(champion: str) -> str:
     """Normalize a pointer/default champion value for GATE purposes only —
     never mutates the pointer itself (a held/no-contest week must never
@@ -859,209 +562,6 @@ def _normalize_champion_before(champion: str) -> str:
     return DEFAULT_GATE_CHAMPION
 
 
-def evaluate_gates(
-    *,
-    champion_before: str,
-    arm_scores: dict,
-    freeze: bool,
-    feed_blocked_slug: str | None = None,
-) -> dict:
-    """Weekly winner-take-all decision (Brian's ruling, alpha-engine-config
-    -I2518, 2026-07-14) — supersedes the HAC-significance / 2-week hysteresis
-    / 2-week cooldown gates this module previously enforced, INCLUDING the
-    standing ``cooldown_until: 2026-07-27`` carried in a prior audit record
-    (no longer read or honored).
-
-    ``arm_scores`` is the return of ``build_weekly_arm_scores`` below:
-    ``{"scores": {"scanner_predictor_direct": float|None,
-    "thinktank_coverage": float|None}, "unavailable_reasons": {arm: slug,
-    ...}, "leaderboard_date_used": str|None}``. A ``None`` score means no
-    valid evidence exists for that arm THIS week — a definitional
-    NO-CONTEST (validity guard), never a statistical gate and never a
-    default win for either side. ``leaderboard_date_used`` (alpha-engine
-    -config-I2544) is the date of the ``research/producer_leaderboard/
-    {date}.json`` artifact actually selected (latest available <=
-    run_date) — carried through into every outcome record (promoted,
-    no_contest, and unchanged) so the audit trail always shows which
-    week's evidence decided (or declined to decide) a flip.
-
-    ``feed_blocked_slug`` (alpha-engine-config-I3165, 2026-07-23) is the
-    precomputed result of ``check_feed_dependencies_live`` for the
-    CHALLENGER arm — the caller (``run_weekly_evaluation``) does that I/O
-    up front and passes only the verdict in, keeping this function pure.
-    When non-None (currently only ever ``"feed_producer_dead"``) AND the
-    challenger would otherwise win this week, the would-be promotion is
-    degraded to a no_contest instead — a challenger whose declared feed
-    producer looks dead/orphaned must never become champion, exactly
-    parallel to the ``leaderboard_stale_gt_8d`` validity guard. Checked
-    only on the win path (irrelevant to a no-contest or a defended
-    incumbency, since the pointer would not move either way).
-
-    Decision: whichever arm has the strictly higher score this week wins.
-    A tie (or either side missing) never flips the pointer — ties favor the
-    incumbent (``champion_before``) so the pointer never moves on a null or
-    exactly-equal signal.
-
-    Pure function — no I/O — independently unit-testable against synthetic
-    score fixtures.
-
-    ``arm_confidence`` (additive, alpha-engine-config-I7549) is threaded
-    straight through from ``build_weekly_arm_scores`` onto every outcome
-    record. Under I7549 a ``None`` score can now also mean "the arm WAS
-    scored, on evidence too thin to compare" (``thinktank_coverage_thin
-    _evidence``) — indistinguishable from every other no-contest by
-    ``blocked_by`` alone once a second thin-adjacent slug exists, so the
-    verdict itself is recorded. This strengthens rather than weakens the
-    §5.2 hysteresis posture: every I7549 path produces a ``None`` score,
-    which is already a definitional no-contest holding the pointer in BOTH
-    directions, so no flip becomes possible that was not possible before.
-
-    **Shadow-only veto (Brian's ruling, 2026-08-20, alpha-engine-config
-    -I2515)** — symmetric with ``feed_blocked_slug`` above and applied on
-    the same win path: when the arm that won on score is declared in
-    ``SHADOW_ONLY_ARMS`` and is not already the champion, the would-be
-    promotion is degraded to ``outcome="held_shadow_only"`` with
-    ``blocked_by=["shadow_only_arm"]`` and ``champion_after`` left at
-    ``champion_before`` — ``run_weekly_evaluation`` therefore never reaches
-    ``write_champion_pointer``. The MEASUREMENT is untouched: both scores
-    are still computed, still recorded, and ``counterfactual_winner`` names
-    the arm that would have taken the pointer, so a shadow arm's wins
-    remain visible in the durable weekly audit trail rather than being
-    erased into a hold that looks like a defended incumbency. Checked
-    BEFORE ``feed_blocked_slug`` and before ``--freeze``: a shadow-only
-    hold is a standing policy decision, not a per-week validity guard or a
-    suppression, so it is the true and stable reason the pointer did not
-    move (and the feed probe is I/O the caller can skip entirely for a
-    shadow-only challenger).
-
-    ``counterfactual_winner`` (additive, alpha-engine-config-I2515) is on
-    EVERY outcome: the arm with the strictly higher score this week, or
-    ``None`` when no comparison was possible (a no-contest). On an ordinary
-    promotion it equals ``champion_after``; on a defended incumbency it
-    equals ``champion_before``; on ``held_shadow_only`` it is the shadow
-    arm — the one case where it differs from the pointer's destination, and
-    the reason the field exists.
-
-    Returns a dict with keys: outcome, champion_before, champion_after,
-    challenger, champion_score, challenger_score, blocked_by,
-    leaderboard_date_used, arm_confidence, counterfactual_winner.
-    """
-    scores = arm_scores.get("scores", {})
-    reasons = arm_scores.get("unavailable_reasons", {})
-    champ_score = scores.get(champion_before)
-    # alpha-engine-config-I8756 — N arms. The incumbent is compared against
-    # EVERY other registered arm, and only the best-scoring one can take the
-    # seat, so `challenger` keeps its two-arm meaning ("the arm that could win")
-    # and every historical reader of the audit record keeps working.
-    challenger, chall_score = _best_challenger(champion_before, scores)
-
-    record: dict[str, Any] = {
-        "champion_before": champion_before,
-        "champion_after": champion_before,
-        "challenger": challenger,
-        "champion_score": champ_score,
-        "challenger_score": chall_score,
-        # The N-arm view. `champion_score`/`challenger_score` collapse the week
-        # into the pair that happened to matter; this keeps the rest legible. A
-        # null VALUE means that arm produced no comparable evidence — different
-        # from the arm being absent (nousergon-lib v0.124.92 admits the field).
-        "arm_scores": {arm: scores.get(arm) for arm in VALID_CHAMPIONS},
-        "blocked_by": None,
-        "leaderboard_date_used": arm_scores.get("leaderboard_date_used"),
-        # alpha-engine-config-I7549 — carried on EVERY outcome, so the audit
-        # trail names the evidence that decided, or declined to decide.
-        "arm_confidence": arm_scores.get("arm_confidence") or None,
-        # alpha-engine-config-I2515 (2026-08-20) — who WOULD have taken the
-        # pointer on score alone. Populated below once both scores are
-        # known; stays None on a no-contest, where no comparison happened.
-        "counterfactual_winner": None,
-    }
-
-    # A contest needs the incumbent scored AND at least one scored challenger.
-    # An unscored incumbent is not a beatable incumbent: promoting over it would
-    # be promoting over an ABSENCE, which is how a silent producer failure
-    # becomes a pointer move.
-    if champ_score is None or chall_score is None:
-        blocked: list[str] = []
-        if champ_score is None:
-            blocked.append(reasons.get(champion_before, "arm_score_unavailable"))
-        # Every unscored arm is named, not just one. With N arms, "the
-        # challenger had no score" no longer identifies which challenger.
-        for arm in _challengers(champion_before):
-            if scores.get(arm) is None:
-                blocked.append(reasons.get(arm, "arm_score_unavailable"))
-        record["outcome"] = "no_contest"
-        record["blocked_by"] = blocked
-        return record
-
-    # Ties favour the incumbent — the pointer never moves on an exactly-equal
-    # signal.
-    winner = challenger if chall_score > champ_score else champion_before
-    record["counterfactual_winner"] = winner
-
-    if winner == champion_before:
-        record["outcome"] = "unchanged_winner_already_champion"
-        return record
-
-    # ── Shadow-only veto (Brian's ruling 2026-08-20, alpha-engine-config
-    # -I2515) ────────────────────────────────────────────────────────────
-    # The challenger won on score, but a SHADOW-ONLY arm is measured, never
-    # promoted: it may not take the live pointer by winning. Checked first
-    # on the win path — ahead of the feed probe and --freeze — because it
-    # is a standing policy decision rather than a per-week validity guard
-    # or a suppression, so it is the TRUE and stable reason the pointer did
-    # not move, and the audit record must say that rather than attribute
-    # the hold to a transient feed or a freeze flag.
-    #
-    # The measurement is untouched: champion_score, challenger_score,
-    # arm_confidence and counterfactual_winner are all already on the
-    # record above, so this week's "the shadow arm would have won" is
-    # durable in config/apply_audit/producer_champion/{date}.json. Removing
-    # the arm from SHADOW_ONLY_ARMS (with Brian's ruling) restores the
-    # ordinary promotion path with no other change here.
-    if is_shadow_only(winner):
-        record["outcome"] = "held_shadow_only"
-        record["blocked_by"] = ["shadow_only_arm"]
-        logger.warning(
-            "champion_promotion: %r outscored the champion %r this week "
-            "(%s > %s) but is declared SHADOW-ONLY (alpha-engine-config"
-            "-I2515, Brian's 2026-08-20 ruling) — the live pointer is HELD "
-            "at %r. This is the designed outcome, not a defect: the win is "
-            "recorded as counterfactual_winner in the weekly audit record. "
-            "Promoting this arm needs its own ruling plus removing it from "
-            "SHADOW_ONLY_ARMS.",
-            winner, champion_before, chall_score, champ_score, champion_before,
-        )
-        return record
-
-    # Challenger wins this week on score alone — but a promotion-time feed
-    # -liveness guard (alpha-engine-config-I3165) can still veto it: the
-    # challenger's declared feed_dependencies must have a live producer
-    # before the pointer is allowed to move onto it. Checked before
-    # --freeze so the audit record always shows the TRUE reason a
-    # would-be promotion didn't happen (feed_producer_dead is a validity
-    # guard, not a suppression like frozen — the two are mutually
-    # exclusive outcomes of the same win, and the feed check is the more
-    # fundamental one: freeze only suppresses a promotion this gate has
-    # already decided is otherwise valid).
-    if feed_blocked_slug is not None:
-        record["outcome"] = "no_contest"
-        record["blocked_by"] = [feed_blocked_slug]
-        return record
-
-    # Challenger wins this week — a promotion, subject only to --freeze.
-    if freeze:
-        record["outcome"] = "promoted"
-        record["blocked_by"] = ["frozen"]
-        # champion_after is NOT advanced under freeze — the write is
-        # suppressed, so the carry-forward state must reflect reality.
-        return record
-
-    record["outcome"] = "promoted"
-    record["champion_after"] = winner
-    return record
-
-
 # ── config/producer_champion.json writer (single writer, dual caller) ──────
 
 
@@ -1072,6 +572,7 @@ def write_champion_pointer(
     promotion_source: str,
     upload: bool,
     s3_client=None,
+    promoted_at: str | None = None,
 ) -> dict:
     """THE single writer for ``config/producer_champion.json``. Both the
     gate engine (``promotion_source="gate_engine"``) and the one-shot
@@ -1122,10 +623,27 @@ def write_champion_pointer(
             "not be moved onto it. Promoting it requires its own ruling "
             "plus removing it from SHADOW_ONLY_ARMS."
         )
+    if champion not in producer_arena.POINTER_ADMISSIBLE_ARMS:
+        # Fail LOUD, same posture as the shadow-only invariant above and for
+        # the same reason: this is the WRITER, and a pointer value the frozen
+        # contract does not admit halts the executor's planner rather than
+        # degrading. The arm is still registered, still scored, still ranked
+        # and still on the authoritative arena_cycle artifact — the pointer
+        # simply may not carry it until the enum is widened.
+        raise ValueError(
+            f"write_champion_pointer: champion={champion!r} is not admitted by "
+            "contracts/producer_champion.schema.json's `champion` enum "
+            f"({sorted(producer_arena.POINTER_ADMISSIBLE_ARMS)}). The executor raises "
+            "ChampionPointerError on an unrecognized value and refuses to start a "
+            "planning cycle, so writing it would halt trading."
+        )
     pointer = {
         "schema_version": SCHEMA_VERSION,
         "champion": champion,
-        "promoted_at": datetime.now(timezone.utc).isoformat(),
+        # PRESERVED when the caller supplies it — a provenance correction on an
+        # unmoved pointer must not overwrite when the pointer last actually
+        # MOVED, or the correction destroys the fact it exists to record.
+        "promoted_at": promoted_at or datetime.now(timezone.utc).isoformat(),
         "promotion_source": promotion_source,
     }
     if upload:
@@ -1203,12 +721,24 @@ def load_prior_audit(bucket: str, s3_client=None) -> dict | None:
         return None
 
 
+class LeaderboardUnusable(ValueError):
+    """The evidence artifact does not describe this cycle.
+
+    A distinct type so the audit record can say WHICH failure occurred. Before
+    this existed the error path emitted ``leaderboard_unavailable`` for every
+    exception, so a bug anywhere in the cycle was recorded as "the producer
+    board was missing" — a slug that sends the reader to crucible-research to
+    investigate a defect in this repo.
+    """
+
+
 def build_champion_audit(
     as_of: str,
     gate_result: dict | None,
     *,
     freeze: bool,
     error: str | None = None,
+    error_slug: str = "unclassified_error",
 ) -> dict:
     """Build the weekly audit record (schema v2, published in
     ``nousergon_lib.contracts`` as ``producer_champion_audit`` — moved out of
@@ -1275,13 +805,14 @@ def build_champion_audit(
             "champion_after": None,
             "champion_score": None,
             "challenger_score": None,
-            "blocked_by": ["leaderboard_unavailable" if error else "unclassified_error"],
+            "blocked_by": [error_slug],
             "freeze": freeze,
             "detail": error or "gate evaluation did not run",
             "leaderboard_date_used": None,
             "feed_dependencies": None,
             "counterfactual_winner": None,
             "arm_confidence": None,
+            "arm_scores": None,
         }
     return {
         "schema_version": AUDIT_SCHEMA_VERSION,
@@ -1305,6 +836,17 @@ def build_champion_audit(
         # point of shadow mode (champion-challenger-policy.md §3).
         "counterfactual_winner": gate_result.get("counterfactual_winner"),
         "arm_confidence": gate_result.get("arm_confidence"),
+        # alpha-engine-config-I8756 built this N-arm view in ``evaluate_gates``
+        # and then dropped it HERE, so it never reached the durable artifact:
+        # every audit record from 2026-08-21 onward carries ``arm_confidence``
+        # but no ``arm_scores``, and on 2026-08-28 (``challenger: null``, both
+        # challengers unscored) the record therefore named NO arm's score at
+        # all. ``champion_score``/``challenger_score`` collapse the week into
+        # the pair that happened to matter; with three arms that is no longer
+        # the verdict. champion-challenger-policy.md §3 requires every arm's
+        # measurement to be recorded every cycle, and a number computed and
+        # then discarded before it becomes durable was never recorded.
+        "arm_scores": gate_result.get("arm_scores"),
     }
 
 
@@ -1325,368 +867,6 @@ def write_champion_audit(bucket: str, run_date: str, audit: dict, s3_client=None
 
 
 # ── Weekly arm-score sourcing ────────────────────────────────────────────────
-
-
-def _score_scanner_predictor_direct(
-    e2e_lift: dict | None,
-) -> tuple[float | None, str | None, str]:
-    """scanner_predictor_direct's weekly score (alpha-engine-config-I2998):
-    this run's backtester-internal ``scanner_then_predictor_topN``
-    counterfactual's OWN realized sector-neutral 21d alpha —
-    ``sector_neutral_mean_alpha_21d`` — which is already benchmark-relative
-    at the source (realized log return minus the log SPY return over the
-    same window, see ``analysis/end_to_end.py::_scanner_then_predictor_topN``),
-    i.e. a direct lift vs the SPY zero-line, not vs any live comparator arm. See
-    ``leaderboard_entry_from_e2e_lift``.
-
-    Returns ``(score, unavailable_slug, confidence_verdict)`` — the same
-    three-element shape as ``_score_thinktank_coverage``, and for the same
-    reason (alpha-engine-config-I7549 champion-side half): both arms of a
-    two-arm gate must state how much evidence stands behind them, in one
-    vocabulary, or the audit record cannot be read as a comparison.
-
-    The evidence floor is ``MIN_CYCLES_FOR_INFERENCE`` cycles. The
-    counterfactual admits a result at one cycle, so before this the champion
-    side of the comparison could be a single observation while the challenger
-    side was floored at five — the arm that #688 protected was being compared
-    against one that nothing protected."""
-    entry = leaderboard_entry_from_e2e_lift(e2e_lift)
-    if entry is None:
-        # Nothing scored at all — the pre-existing slug, unchanged meaning.
-        return (
-            None,
-            "scanner_predictor_direct_counterfactual_unavailable",
-            CONFIDENCE_INSUFFICIENT,
-        )
-    n_cycles = entry.get("n_cycles")
-    if isinstance(n_cycles, bool) or not isinstance(n_cycles, int) or n_cycles < 0:
-        # A mean with no honest count behind it. Refused, never trusted —
-        # exactly the posture leaderboard_row_confidence takes toward an
-        # artifact that cannot supply a usable verdict.
-        logger.warning(
-            "[champion_promotion] scanner_predictor_direct counterfactual "
-            "reported no usable n_cycles (%r) — refusing to score it, "
-            "no-contest (alpha-engine-config-I7549)", n_cycles,
-        )
-        return (
-            None, "scanner_predictor_direct_confidence_unknown", CONFIDENCE_UNKNOWN,
-        )
-    if n_cycles == 0:
-        return (
-            None,
-            "scanner_predictor_direct_counterfactual_unavailable",
-            CONFIDENCE_INSUFFICIENT,
-        )
-    if n_cycles < MIN_CYCLES_FOR_INFERENCE:
-        logger.warning(
-            "[champion_promotion] scanner_predictor_direct NOT scored this "
-            "week: n_cycles=%d < MIN_CYCLES_FOR_INFERENCE=%d -> "
-            "blocked_by=scanner_predictor_direct_thin_evidence. The champion "
-            "pointer is unchanged; a thin arm is not evidence on the "
-            "champion's side of the comparison either "
-            "(champion-challenger-policy.md §4, alpha-engine-config-I7549).",
-            n_cycles, MIN_CYCLES_FOR_INFERENCE,
-        )
-        return None, "scanner_predictor_direct_thin_evidence", CONFIDENCE_THIN
-    return entry["sector_neutral_mean_alpha_21d"], None, CONFIDENCE_OK
-
-
-def leaderboard_row_confidence(row: dict, leaderboard: dict) -> str:
-    """How much evidence stands behind one producer-leaderboard spec ``row``.
-
-    Returns one of ``LEADERBOARD_CONFIDENCE_VOCABULARY`` (the producer's own
-    verdict, read straight off the row — alpha-engine-config-I7542), or one of
-    this module's two refusal verdicts (``CONFIDENCE_UNKNOWN`` /
-    ``CONFIDENCE_UNRECOGNISED``) when the artifact did not supply a usable one.
-
-    NEVER returns ``ok`` on inference — ``ok`` is only ever the producer's own
-    word, or derived from the artifact's OWN declared
-    ``min_dates_for_inference`` floor for a pre-I7542 artifact. An old artifact
-    read as confident is the same class of defect as the one I7549 fixes.
-
-    Shared, arm-agnostic, and applied by name: any FUTURE arm scored off this
-    artifact routes through here rather than growing a second thinness test
-    (issue I7549 deliverable 2).
-    """
-    declared = row.get("confidence")
-    if isinstance(declared, str):
-        if declared in LEADERBOARD_CONFIDENCE_VOCABULARY:
-            return declared
-        # A producer that changed its vocabulary is a reason to stop, not to
-        # guess which side of the floor an unknown word falls on.
-        logger.warning(
-            "[champion_promotion] leaderboard row %r carries an unrecognised "
-            "confidence %r (known: %s) — refusing to score it",
-            row.get("name"), declared, LEADERBOARD_CONFIDENCE_VOCABULARY,
-        )
-        return CONFIDENCE_UNRECOGNISED
-    # Pre-I7542 artifact: derive from the artifact's own declared floor.
-    floor = leaderboard.get("min_dates_for_inference")
-    n_scored = row.get("n_dates_scored")
-    if isinstance(floor, bool) or not isinstance(floor, int) or floor < 1:
-        return CONFIDENCE_UNKNOWN
-    if isinstance(n_scored, bool) or not isinstance(n_scored, int) or n_scored < 0:
-        return CONFIDENCE_UNKNOWN
-    if n_scored == 0:
-        return CONFIDENCE_INSUFFICIENT
-    if n_scored < floor:
-        return CONFIDENCE_THIN
-    return CONFIDENCE_OK
-
-
-# Confidence verdict -> the blocked_by slug the gate reports when it declines
-# to score a row carrying that verdict. ``ok`` is the only verdict absent from
-# this map: it is the only one that scores.
-_CONFIDENCE_BLOCK_SLUGS: dict[str, str] = {
-    # Nothing scored at all — go look at the producer.
-    CONFIDENCE_INSUFFICIENT: "thinktank_coverage_no_resolved_outcomes",
-    # Scored, but below the slot's evidence floor — wait for the cohort.
-    CONFIDENCE_THIN: "thinktank_coverage_thin_evidence",
-    # The artifact could not tell us, either way.
-    CONFIDENCE_UNKNOWN: "thinktank_coverage_confidence_unknown",
-    CONFIDENCE_UNRECOGNISED: "thinktank_coverage_confidence_unknown",
-}
-
-
-def _score_thinktank_coverage(
-    tt_leaderboard: dict | None, run_date: str, leaderboard_date_used: str | None,
-) -> tuple[float | None, str | None, str]:
-    """thinktank_coverage's weekly score: read from crucible-research's
-    ``research/producer_leaderboard/{date}.json`` (see module docstring for
-    the verified schema and the coverage_complete-enforced-upstream
-    reasoning).
-
-    ``leaderboard_date_used`` (alpha-engine-config-I2544) is the date of
-    the ``tt_leaderboard`` artifact actually selected by
-    ``find_latest_research_producer_leaderboard_date`` — the latest
-    available <= ``run_date``, never the same-day exact match this
-    function required before I2544. An honest staleness bound still
-    applies: more than ``LEADERBOARD_STALENESS_DAYS`` calendar days older
-    than ``run_date`` is treated as unavailable (this IS the semantically
-    correct behavior, not a compromise — the gate scores realized outcomes
-    of PRIOR weeks' selections, which a same-day leaderboard could not
-    contain anyway; see module docstring).
-
-    Returns ``(score, unavailable_slug, confidence_verdict)``. The third
-    element (alpha-engine-config-I7549) is ALWAYS populated — including on
-    every refusal path — so the audit record can name the evidence that
-    declined to decide, not merely that something did
-    (champion-challenger-policy.md §7.2). Paths that fail before a row is even
-    reached report ``CONFIDENCE_UNKNOWN``: no row means no verdict, and that
-    is itself the honest answer."""
-    if not isinstance(tt_leaderboard, dict) or leaderboard_date_used is None:
-        return None, "leaderboard_unavailable", CONFIDENCE_UNKNOWN
-    age_days = (
-        date.fromisoformat(run_date) - date.fromisoformat(leaderboard_date_used)
-    ).days
-    if age_days < 0:
-        # Defensive: find_latest_research_producer_leaderboard_date never
-        # selects a date > run_date, but a caller passing
-        # leaderboard_date_used directly (bypassing that selection) must
-        # never have a "future" artifact trusted as this week's evidence.
-        return None, "leaderboard_unavailable", CONFIDENCE_UNKNOWN
-    if age_days > LEADERBOARD_STALENESS_DAYS:
-        return None, "leaderboard_stale_gt_8d", CONFIDENCE_UNKNOWN
-    # alpha-engine-config-I7549: assert the horizon the gate decides on rather
-    # than inheriting whichever block the producer spreads across the top
-    # level. See the module docstring's HORIZON section. Tolerant of the field
-    # being absent (a pre-multi-horizon artifact always meant 21) but never of
-    # it DISAGREEING — an upstream primary-horizon change must surface as a
-    # loud no-contest, not silently rescore the live champion gate.
-    declared_horizon = tt_leaderboard.get("horizon_days")
-    if declared_horizon is not None and declared_horizon != GATE_HORIZON_DAYS:
-        logger.warning(
-            "[champion_promotion] producer leaderboard %s declares "
-            "horizon_days=%r but this gate decides at %d sessions "
-            "(GATE_HORIZON_DAYS) — refusing to score, no-contest",
-            leaderboard_date_used, declared_horizon, GATE_HORIZON_DAYS,
-        )
-        return None, "leaderboard_horizon_mismatch", CONFIDENCE_UNKNOWN
-    specs = tt_leaderboard.get("specs")
-    if not isinstance(specs, list):
-        return None, "leaderboard_unavailable", CONFIDENCE_UNKNOWN
-    row = next(
-        (s for s in specs if isinstance(s, dict) and s.get("name") == "thinktank_coverage"),
-        None,
-    )
-    if row is None:
-        # Expected until crucible-research registers thinktank_coverage in
-        # producers/registry.py::challenger_producers() — see module
-        # docstring "KNOWN, TRACKED GAP" / alpha-engine-config-I2519. This
-        # condition is now fully independent of whether a champion producer
-        # is registered (alpha-engine-config-I2998 decoupled the two
-        # concerns — score_leaderboard writes this row champion-free).
-        return None, "thinktank_coverage_not_in_leaderboard", CONFIDENCE_UNKNOWN
-    # alpha-engine-config-I7549: the evidence gate. Replaces the pre-fix
-    # truthiness check on n_dates_scored, under which n_dates_scored == 1 --
-    # a mean with a null SE and a null t_stat -- could move the live champion
-    # pointer. Only the producer's own "ok" scores; every other verdict is a
-    # no-contest that holds the pointer in BOTH directions.
-    confidence = leaderboard_row_confidence(row, tt_leaderboard)
-    if confidence != CONFIDENCE_OK:
-        slug = _CONFIDENCE_BLOCK_SLUGS[confidence]
-        # §7.2: a gate that declines to decide must SAY SO. The blocked_by
-        # slug and arm_confidence land in the durable weekly audit record;
-        # this log is the same fact on the run's own surface. Deliberately
-        # NOT an ops alert: `thin` is a WAIT state that resolves as the
-        # cohort matures, and a weekly page for a self-resolving condition
-        # is the noise §7.2 exists to prevent. The dead/absent cases that
-        # DO warrant a page are already covered by _publish_gate_error_alert
-        # and the ARTIFACT_REGISTRY freshness monitor.
-        logger.warning(
-            "[champion_promotion] thinktank_coverage NOT scored this week: "
-            "confidence=%s (n_dates_scored=%r, artifact "
-            "min_dates_for_inference=%r, leaderboard=%s) -> blocked_by=%s. "
-            "The champion pointer is unchanged; a thin arm is not evidence "
-            "(champion-challenger-policy.md §5, alpha-engine-config-I7549).",
-            confidence, row.get("n_dates_scored"),
-            tt_leaderboard.get("min_dates_for_inference"),
-            leaderboard_date_used, slug,
-        )
-        return None, slug, confidence
-    # alpha-engine-config-I2998: direct lift vs the SPY benchmark, computed
-    # champion-free — the SAME kind of statistic as
-    # scanner_predictor_direct's score (mean top-N realized return lift vs
-    # SPY, date-clustered), replacing the retired topn_alpha_vs_champion
-    # (which required a live comparator producer and went permanently
-    # unavailable once config-I2993 retired agentic_sector_teams with no
-    # successor champion registered).
-    alpha = row.get("topn_alpha_vs_benchmark")
-    if not isinstance(alpha, dict) or alpha.get("mean") is None:
-        # confidence said "ok" but the primary metric is absent — an
-        # internally inconsistent row. Fail static, and keep the confidence
-        # the row actually claimed so the audit shows the contradiction.
-        return None, "thinktank_coverage_no_resolved_outcomes", confidence
-    return float(alpha["mean"]), None, confidence
-
-
-def _score_scanner_top20_predictor(
-    e2e_lift: dict | None,
-) -> tuple[float | None, str | None, str]:
-    """``scanner_top20_predictor``'s weekly score (alpha-engine-config-I8756).
-
-    Mirrors ``_score_scanner_predictor_direct`` exactly — same evidence floor,
-    same three-element return, same confidence vocabulary — because both sides
-    of a comparison must state how much evidence stands behind them in ONE
-    vocabulary or the audit record cannot be read as a comparison.
-
-    Reads ``scanner_top20_predictor_counterfactual``, produced in the same
-    evaluate run by ``analysis/end_to_end.py::_scanner_top20_predictor_lift``.
-    """
-    if not isinstance(e2e_lift, dict):
-        return (
-            None,
-            "scanner_top20_predictor_counterfactual_unavailable",
-            CONFIDENCE_INSUFFICIENT,
-        )
-    cf = e2e_lift.get("scanner_top20_predictor_counterfactual")
-    if not isinstance(cf, dict) or cf.get("status") != "ok":
-        return (
-            None,
-            "scanner_top20_predictor_counterfactual_unavailable",
-            CONFIDENCE_INSUFFICIENT,
-        )
-    method = (cf.get("methods") or {}).get("scanner_top20_predictor")
-    if not isinstance(method, dict):
-        return (
-            None,
-            "scanner_top20_predictor_counterfactual_unavailable",
-            CONFIDENCE_INSUFFICIENT,
-        )
-    n_cycles = cf.get("n_cycles")
-    if isinstance(n_cycles, bool) or not isinstance(n_cycles, int) or n_cycles < 0:
-        # A mean with no honest count behind it is refused, never trusted.
-        logger.warning(
-            "[champion_promotion] scanner_top20_predictor reported no usable "
-            "n_cycles (%r) — refusing to score it, no-contest", n_cycles,
-        )
-        return None, "scanner_top20_predictor_confidence_unknown", CONFIDENCE_UNKNOWN
-    if n_cycles == 0:
-        return (
-            None,
-            "scanner_top20_predictor_counterfactual_unavailable",
-            CONFIDENCE_INSUFFICIENT,
-        )
-    if n_cycles < MIN_CYCLES_FOR_INFERENCE:
-        logger.warning(
-            "[champion_promotion] scanner_top20_predictor NOT scored this week: "
-            "n_cycles=%d < MIN_CYCLES_FOR_INFERENCE=%d. Expected while the cut "
-            "matures — it began 2026-07-30 and each cohort needs 21 trading "
-            "days — not a defect to chase.",
-            n_cycles, MIN_CYCLES_FOR_INFERENCE,
-        )
-        return None, "scanner_top20_predictor_thin_evidence", CONFIDENCE_THIN
-    sn = method.get("sector_neutral_mean_alpha_21d")
-    if sn is None:
-        return (
-            None,
-            "scanner_top20_predictor_counterfactual_unavailable",
-            CONFIDENCE_INSUFFICIENT,
-        )
-    return float(sn), None, CONFIDENCE_OK
-
-
-def build_weekly_arm_scores(
-    e2e_lift: dict | None,
-    tt_leaderboard: dict | None,
-    *,
-    run_date: str,
-    leaderboard_date_used: str | None = None,
-) -> dict:
-    """Reduce this run's two evidence sources to the shape ``evaluate_gates``
-    expects: ``{"scores": {"scanner_predictor_direct": float|None,
-    "thinktank_coverage": float|None}, "unavailable_reasons": {arm: slug},
-    "leaderboard_date_used": str|None}``. Both scores are lift-vs-the-shared
-    -agentic-baseline (see module docstring's common-comparator reasoning)
-    — comparable directly, no combined-variance step needed since
-    winner-take-all performs no significance test.
-
-    ``leaderboard_date_used`` (alpha-engine-config-I2544) MUST be supplied
-    by the caller as the date actually selected via
-    ``find_latest_research_producer_leaderboard_date`` /
-    ``read_latest_research_producer_leaderboard`` — it is threaded straight
-    through into the returned dict (and from there into every
-    ``evaluate_gates`` outcome record) so the audit trail always shows
-    which week's evidence decided (or declined to decide) a flip.
-
-    ``arm_confidence`` (additive, alpha-engine-config-I7549) names, per arm,
-    how much evidence stood behind its score this week —
-    ``ok``/``thin``/``insufficient`` from the producer leaderboard row itself,
-    ``unknown``/``unrecognised`` when the artifact could not say, and
-    and the SAME vocabulary for ``scanner_predictor_direct``, measured against
-    this repo's own ``MIN_CYCLES_FOR_INFERENCE`` floor rather than the
-    leaderboard's (alpha-engine-config-I7549 champion-side half — it reads this
-    repo's counterfactual, which has its own registry, not no registry).
-    Threaded
-    through ``evaluate_gates`` into the weekly audit record so the audit trail
-    shows WHICH EVIDENCE declined to decide, not merely that something did."""
-    spd_score, spd_reason, spd_confidence = _score_scanner_predictor_direct(e2e_lift)
-    t20_score, t20_reason, t20_confidence = _score_scanner_top20_predictor(e2e_lift)
-    tt_score, tt_reason, tt_confidence = _score_thinktank_coverage(
-        tt_leaderboard, run_date, leaderboard_date_used,
-    )
-    reasons: dict[str, str] = {}
-    for arm, reason in (
-        ("scanner_predictor_direct", spd_reason),
-        ("scanner_top20_predictor", t20_reason),
-        ("thinktank_coverage", tt_reason),
-    ):
-        if reason is not None:
-            reasons[arm] = reason
-    return {
-        "scores": {
-            "scanner_predictor_direct": spd_score,
-            "scanner_top20_predictor": t20_score,
-            "thinktank_coverage": tt_score,
-        },
-        "unavailable_reasons": reasons,
-        "arm_confidence": {
-            "scanner_predictor_direct": spd_confidence,
-            "scanner_top20_predictor": t20_confidence,
-            "thinktank_coverage": tt_confidence,
-        },
-        "leaderboard_date_used": leaderboard_date_used,
-    }
 
 
 def _publish_gate_error_alert(run_date: str, error: str) -> None:
@@ -1731,6 +911,171 @@ def _publish_gate_error_alert(run_date: str, error: str) -> None:
         )
 
 
+# ── The decision: taken by nousergon_lib.arena, projected onto the audit ──
+
+
+def _ladder_mean(cycle, arm_id: str) -> float | None:
+    """The arm's LONGEST-window mean score this cycle, or None if it has none.
+
+    The audit record's `arm_scores` is a per-arm scalar by contract, so the
+    N-arm view it carries is the longest rung of each arm's ladder. It is an
+    observability projection ONLY: no decision anywhere reads it. The decision
+    reads paired per-date windows, which is the whole point — an incumbent
+    scored over 2 dates successfully defended against a challenger rejected
+    for having 4, on windows that barely overlapped (measured 2026-08-29).
+    """
+    for ladder in cycle.ladders:
+        if ladder.arm_id == arm_id:
+            longest = ladder.longest
+            return longest.mean_score if longest else None
+    return None
+
+
+def decision_record_from_cycle(
+    cycle, gaps, register, *, champion_before: str, freeze: bool,
+) -> dict:
+    """Project one :class:`ArenaCycle` onto the frozen audit-record shape.
+
+    **There is exactly one decision, taken once, by
+    ``nousergon_lib.arena.engine.run_cycle``.** This function computes
+    nothing — it renames. Every gate that used to live here is gone: the
+    winner-take-all comparison, the `thin_evidence` / `MIN_CYCLES_FOR_INFERENCE`
+    / `confidence != ok` evidence floors, the champion-side floor, the
+    two-week hysteresis and the two-week cooldown before them. The evidence
+    bar is the anytime-valid confidence sequence and nothing else
+    (champion-challenger-policy.md §5.0/§5.2, Brian ruling 2026-08-29).
+
+    ``blocked_by`` is projected onto the CLOSED slug enum the frozen
+    `producer_champion_audit` contract declares. The arena's own richer
+    reasons — the per-pair window, the confidence bound, the named serving
+    precondition that failed — are on `arena_cycle`, which is the
+    authoritative record.
+    """
+    name_of = {a: register.state(a).record.name for a in register.all_arms()}
+    decision = cycle.decision
+    champion_after_name = name_of.get(decision.champion) if decision.champion else None
+
+    # Who WOULD have taken the pointer on evidence alone, ignoring every
+    # serving precondition. The Copeland leader is the honest answer for an
+    # N-arm slot; the old two-arm "higher score" reading has no meaning here.
+    counterfactual = None
+    if cycle.ranking is not None and cycle.ranking.ordering:
+        counterfactual = name_of.get(cycle.ranking.ordering[0])
+
+    # The best-placed arm that is NOT the incumbent — the audit's `challenger`.
+    challenger = None
+    if cycle.ranking is not None:
+        for arm in cycle.ranking.ordering:
+            if name_of.get(arm) != champion_before:
+                challenger = name_of.get(arm)
+                break
+
+    arm_scores = {name_of[a]: _ladder_mean(cycle, a) for a in cycle.scored_arms if a in name_of}
+    gap_names = {g.arm_name for g in gaps}
+    arm_confidence = {
+        name: (CONFIDENCE_UNAVAILABLE if name in gap_names else CONFIDENCE_MEASURED)
+        for name in arm_scores
+    }
+
+    record: dict[str, Any] = {
+        "champion_before": champion_before,
+        "champion_after": champion_before,
+        "challenger": challenger,
+        "champion_score": arm_scores.get(champion_before),
+        "challenger_score": arm_scores.get(challenger) if challenger else None,
+        "arm_scores": arm_scores,
+        "arm_confidence": arm_confidence,
+        "counterfactual_winner": counterfactual,
+        "blocked_by": None,
+        "leaderboard_date_used": None,  # filled by the caller
+        # Not part of the frozen audit shape — carried on the returned record
+        # so `run_weekly_evaluation` can wire the pointer write without
+        # re-deriving the engine's verdict. Stripped by `build_champion_audit`.
+        "_arena_status": decision.status,
+        "_arena_reason": decision.reason,
+        "_champion_after_name": champion_after_name,
+    }
+
+    if decision.status in producer_arena.ALARMING_STATUSES:
+        # §7.2: an unmeasurable/unservable cycle is a definitional hold that
+        # SAYS SO. It is never a default win for either side, and it never
+        # renders as a defended incumbency.
+        record["outcome"] = "no_contest"
+        record["blocked_by"] = _blocked_slugs(decision, gaps)
+        return record
+
+    if champion_after_name is None or champion_after_name == champion_before:
+        record["outcome"] = "unchanged_winner_already_champion"
+        # WHY it was held, when the reason is an arm the engine ruled
+        # ineligible rather than an unbeaten incumbent. Without this the
+        # record is indistinguishable from a defended incumbency, which is a
+        # different and false claim — and on a shadow-only hold it would erase
+        # the counterfactual shadow mode exists to measure (§7.2).
+        leader = cycle.ranking.ordering[0] if (
+            cycle.ranking is not None and cycle.ranking.ordering
+        ) else None
+        failed = [
+            c for c in decision.ineligible.get(leader, ()) if not c.passed
+        ] if leader is not None else []
+        if failed:
+            record["blocked_by"] = _blocked_slugs_for(failed)
+            if all(c.name == "not_shadow_only" for c in failed):
+                record["outcome"] = "held_shadow_only"
+        return record
+
+    # The pointer moved. One thing can still hold it: --freeze, a suppression
+    # of a decision the engine has already taken (recorded as such, with
+    # champion_after NOT advanced, so the carry-forward state is real).
+    if is_shadow_only(champion_after_name):
+        # Defence in depth. The engine already excluded shadow-only arms via
+        # the `not_shadow_only` serving precondition, so reaching here means a
+        # precondition was not wired — fail loud rather than promote.
+        raise ValueError(
+            f"arena promoted shadow-only arm {champion_after_name!r}; the "
+            "`not_shadow_only` serving precondition was not applied. A shadow-only "
+            "arm is measured, never served."
+        )
+    if freeze:
+        record["outcome"] = "promoted"
+        record["blocked_by"] = ["frozen"]
+        return record
+
+    record["outcome"] = "promoted"
+    record["champion_after"] = champion_after_name
+    return record
+
+
+def _blocked_slugs_for(failed_checks) -> list[str]:
+    """Project failed serving preconditions onto the contract's CLOSED enum.
+
+    The enum lives in `nousergon_lib.contracts` and cannot grow from this
+    repo, so the projection is lossy BY CONSTRUCTION — which is exactly why
+    `arena_cycle` is the authoritative artifact and this record is a narrowed
+    view of it. Every slug emitted here is one the contract already declares;
+    `pointer_contract_admits` has no slug of its own and lands on the generic
+    one rather than inventing a value the consumer would reject.
+
+    Stable and de-duplicated: a reader diffing two weeks' records should see a
+    change only when the reason changed.
+    """
+    by_name = {
+        "not_shadow_only": "shadow_only_arm",
+        "feed_producer_live": "feed_producer_dead",
+    }
+    return sorted({
+        by_name.get(c.name, "arm_score_unavailable") for c in failed_checks
+    })
+
+
+def _blocked_slugs(decision, gaps) -> list[str]:
+    """The same projection across EVERY ineligible arm, plus series gaps."""
+    failed = [c for checks in decision.ineligible.values() for c in checks if not c.passed]
+    slugs = set(_blocked_slugs_for(failed))
+    if gaps or not slugs:
+        slugs.add("arm_score_unavailable")
+    return sorted(slugs)
+
+
 def run_weekly_evaluation(
     *,
     bucket: str,
@@ -1742,114 +1087,101 @@ def run_weekly_evaluation(
     upload: bool,
     s3_client=None,
 ) -> dict:
-    """Top-level entry point wired into evaluate.py. Runs the weekly
-    winner-take-all decision and writes both artifacts:
+    """Top-level entry point wired into evaluate.py. Runs ONE arena cycle and
+    writes three artifacts:
 
-      1. The weekly audit record (config/apply_audit/producer_champion/
-         {date}.json + latest.json) — ALWAYS written, any outcome.
-      2. The champion pointer (config/producer_champion.json) — written ONLY
-         on outcome="promoted" AND not freeze. A no-contest,
-         unchanged-winner-already-champion, held_shadow_only, or frozen run
-         never touches the pointer — idempotent, bidirectional-safe.
-         ``held_shadow_only`` (alpha-engine-config-I2515, Brian's 2026-08-20
-         ruling) is a shadow-only arm winning on score: the pointer is held
-         and the win is recorded as ``counterfactual_winner``.
+      1. ``arena/producer/{date}.json`` (+ ``latest.json``) — the
+         AUTHORITATIVE `arena_cycle` record, schema-validated before the
+         write, emitted every cycle whatever the outcome
+         (champion-challenger-policy.md §11).
+      2. ``config/apply_audit/producer_champion/{date}.json`` (+
+         ``latest.json``) — the narrowed `producer_champion_audit` v2 view its
+         existing consumers still read. ALWAYS written, any outcome.
+      3. ``config/producer_champion.json`` — the live pointer. Rewritten when
+         the arena moved it, and ALSO rewritten in place (same champion, same
+         `promoted_at`) when the recorded `promotion_source` no longer
+         describes how the pointer got there. That second case is the one
+         alpha-engine-config-I9318 exists for: this pointer read
+         ``promotion_source: "operator_bootstrap"`` from 2026-07-13 for six
+         weeks of automated evaluations, and no surface said so (§11).
 
-    ``e2e_lift`` is the ``diagnostics["e2e_lift"]`` dict already computed
-    earlier in the same evaluate.py run (scanner_predictor_direct's
-    evidence). ``tt_leaderboard`` is the parsed
-    ``research/producer_leaderboard/{date}.json`` artifact for
-    ``tt_leaderboard_date_used`` (thinktank_coverage's evidence), read from
-    crucible-research via ``read_latest_research_producer_leaderboard`` —
-    the LATEST artifact available <= ``run_date`` (alpha-engine-config
-    -I2544: the writer is now an async advisory child SF that may not have
-    finished/may have failed by the time this gate runs; a same-day exact
-    match is no longer assumed). ``tt_leaderboard_date_used`` is the date
-    of that selected artifact (None if none was found <= run_date) —
-    threaded through to the audit record's ``leaderboard_date_used`` field
-    so the audit trail always shows which week's evidence decided a flip.
-    Either evidence source being unavailable, or the selected leaderboard
-    being more than ``LEADERBOARD_STALENESS_DAYS`` days stale, degrades to
-    a no-contest week for that arm (never an ``error`` outcome by itself)
-    via ``build_weekly_arm_scores``; only an exception raised during
-    evaluation itself produces ``outcome="error"``.
-
-    Returns the audit record that was built (and, for callers that want it,
-    it also carries the pointer dict under ``_pointer_write`` when a write
-    happened — internal to evaluate.py wiring, not part of the frozen
-    audit schema).
+    ``e2e_lift`` is retained for the observability leaderboard history only —
+    it no longer feeds any decision. ``tt_leaderboard`` is the parsed
+    ``research/producer_leaderboard/{date}.json`` (the LATEST available <=
+    ``run_date``), which is now the single evidence source for EVERY arm
+    including the incumbent: one board, one cohort, one benchmark. The
+    per-arm scorers reading three different sources on three different
+    cohorts are deleted — that asymmetry is what let the champion's silence
+    render as another arm's thinness.
     """
     pointer = read_champion_pointer(bucket, s3_client=s3_client)
     champion_before = _normalize_champion_before(
         (pointer or {}).get("champion", DEFAULT_GATE_CHAMPION)
     )
 
-    gate_result = None
+    record = None
+    cycle = None
+    gaps: list = []
     error = None
+    error_slug = "unclassified_error"
     try:
-        arm_scores = build_weekly_arm_scores(
-            e2e_lift, tt_leaderboard, run_date=run_date,
-            leaderboard_date_used=tt_leaderboard_date_used,
+        _assert_leaderboard_usable(tt_leaderboard, run_date, tt_leaderboard_date_used)
+        # Feed liveness stays a per-arm SERVING PRECONDITION, probed for every
+        # arm that declares a dependency rather than only for "the challenger
+        # that would win" — with N arms and a free-moving pointer there is no
+        # single such arm before the engine has decided.
+        feed_blocked = {
+            arm: "declared feed producer looks dead or orphaned at promotion time"
+            for arm in ARM_FEED_DEPENDENCIES
+            if check_feed_dependencies_live(
+                arm, bucket=bucket, run_date=run_date, s3_client=s3_client,
+            ) is not None
+        }
+        cycle, gaps, register = producer_arena.run_arena_cycle(
+            as_of=run_date,
+            leaderboard=tt_leaderboard,
+            incumbent_name=champion_before,
+            shadow_only_names=SHADOW_ONLY_ARMS,
+            feed_blocked_names=feed_blocked,
         )
-        # alpha-engine-config-I3165: probe the CHALLENGER's declared feed
-        # dependencies for producer liveness before deciding the gate — a
-        # challenger that would otherwise win must not be promoted onto a
-        # dead/orphaned feed (config#3053). check_feed_dependencies_live
-        # never raises (any probe failure degrades to the
-        # "feed_producer_dead" slug), so this call cannot itself turn a
-        # normal week into an error outcome. Only probed when a promotion
-        # is even POSSIBLE this week (both scores present and the
-        # challenger's is strictly higher) — mirrors evaluate_gates' own
-        # win condition so a no-contest/defended-incumbent week never pays
-        # for an S3 read + parquet parse whose result couldn't change the
-        # outcome either way.
-        # alpha-engine-config-I8756: with N arms the probe targets the
-        # BEST-scoring challenger — the only one that can take the seat this
-        # week — so the S3 read count does not grow with the number of arms.
-        scores = arm_scores.get("scores", {})
-        challenger, _best_score = _best_challenger(champion_before, scores)
-        challenger_would_win = (
-            challenger is not None
-            and scores.get(champion_before) is not None
-            and _best_score > scores[champion_before]
+        doc = producer_arena.cycle_document(cycle, gaps)
+        producer_arena.write_arena_cycle(
+            bucket, run_date, doc, upload=upload, s3_client=s3_client,
         )
-        # alpha-engine-config-I2515: a shadow-only challenger's win is
-        # vetoed by evaluate_gates regardless of feed liveness, so the
-        # probe's S3 read + parquet parse could not change the outcome —
-        # skipped for the same reason a non-winning challenger's is.
-        feed_blocked_slug = (
-            check_feed_dependencies_live(
-                challenger, bucket=bucket, run_date=run_date, s3_client=s3_client,
-            )
-            if challenger_would_win and not is_shadow_only(challenger) else None
+        producer_arena.publish_cycle_alert(cycle, gaps)
+        record = decision_record_from_cycle(
+            cycle, gaps, register, champion_before=champion_before, freeze=freeze,
         )
-        gate_result = evaluate_gates(
-            champion_before=champion_before,
-            arm_scores=arm_scores,
-            freeze=freeze,
-            feed_blocked_slug=feed_blocked_slug,
-        )
-    except Exception as e:  # noqa: BLE001 — gate evaluation must never
-        # crash the weekly evaluate run; record as an error outcome
-        # (still written, per the liveness posture) and move on.
-        logger.exception("Champion-promotion gate evaluation raised")
+        record["leaderboard_date_used"] = tt_leaderboard_date_used
+    except Exception as e:  # noqa: BLE001 — the cycle must never crash the
+        # weekly evaluate run; it is recorded as an error outcome (still
+        # written, per the liveness posture) and alerted.
+        logger.exception("Producer arena cycle raised")
         error = str(e)
+        if isinstance(e, LeaderboardUnusable):
+            error_slug = "leaderboard_unavailable"
         _publish_gate_error_alert(run_date, error)
 
-    audit = build_champion_audit(run_date, gate_result, freeze=freeze, error=error)
+    audit = build_champion_audit(
+        run_date, record, freeze=freeze, error=error, error_slug=error_slug,
+    )
 
     pointer_written = None
-    if gate_result is not None and gate_result["outcome"] == "promoted" and not freeze:
-        pointer_written = write_champion_pointer(
-            bucket, gate_result["champion_after"],
-            promotion_source="gate_engine", upload=upload, s3_client=s3_client,
+    if record is not None:
+        pointer_written = _reconcile_pointer(
+            bucket,
+            pointer=pointer,
+            record=record,
+            freeze=freeze,
+            upload=upload,
+            s3_client=s3_client,
         )
 
     logger.info(
         "producer_champion evaluation: outcome=%s champion_before=%s champion_after=%s "
-        "champion_score=%s challenger_score=%s blocked_by=%s leaderboard_date_used=%s",
+        "arena_status=%s blocked_by=%s leaderboard_date_used=%s",
         audit["outcome"], audit["champion_before"], audit["champion_after"],
-        audit.get("champion_score"), audit.get("challenger_score"), audit["blocked_by"],
+        (record or {}).get("_arena_status"), audit["blocked_by"],
         audit.get("leaderboard_date_used"),
     )
 
@@ -1865,10 +1197,117 @@ def run_weekly_evaluation(
     else:
         logger.info("producer_champion audit S3 write skipped (upload=%s) — logged only", upload)
 
+    # ── Deliver the verdict (alpha-engine-config-I2364 measurability gap) ──
+    # A verdict nobody is told is indistinguishable from a loop that stopped
+    # running (principles.md §2.7). Gated on ``upload`` for the same reason
+    # the S3 write is, and never allowed to fail the weekly evaluate run.
+    if upload:
+        try:
+            champion_digest.send_verdict_digest(audit)
+        except Exception:  # noqa: BLE001 — notification must never crash the run
+            logger.exception(
+                "producer_champion verdict digest raised — the verdict is still "
+                "durable in the audit record, but no operator was told",
+            )
+
     result = dict(audit)
     if pointer_written is not None:
         result["_pointer_write"] = pointer_written
     return result
+
+
+def _assert_leaderboard_usable(
+    leaderboard: dict | None, run_date: str, date_used: str | None,
+) -> None:
+    """Well-formedness of the evidence artifact. NOT an evidence bar.
+
+    Staleness and a horizon mismatch are statements about whether the
+    artifact describes THIS cycle at all — an eight-day-old board scored at a
+    different primary horizon is not thin evidence, it is a different
+    measurement. Every gate that spoke about HOW MUCH evidence an arm had is
+    deleted; these two survive because they speak about WHICH measurement is
+    in front of us.
+    """
+    if not isinstance(leaderboard, dict) or date_used is None:
+        raise LeaderboardUnusable(
+            "no research/producer_leaderboard/{date}.json available at or before "
+            f"{run_date} — the slot has no evidence artifact to score any arm from"
+        )
+    age_days = (date.fromisoformat(run_date) - date.fromisoformat(date_used)).days
+    if age_days < 0:
+        raise LeaderboardUnusable(
+            f"producer leaderboard {date_used} is DATED AFTER the run date {run_date}; "
+            "a future artifact is never this cycle's evidence"
+        )
+    if age_days > LEADERBOARD_STALENESS_DAYS:
+        raise LeaderboardUnusable(
+            f"producer leaderboard {date_used} is {age_days} days older than {run_date} "
+            f"(bound {LEADERBOARD_STALENESS_DAYS}) — refusing to decide the live pointer "
+            "on evidence this stale"
+        )
+    declared_horizon = leaderboard.get("horizon_days")
+    if declared_horizon is not None and declared_horizon != GATE_HORIZON_DAYS:
+        raise LeaderboardUnusable(
+            f"producer leaderboard {date_used} declares horizon_days={declared_horizon!r} but "
+            f"this slot decides at {GATE_HORIZON_DAYS} sessions; an upstream primary-horizon "
+            "change must surface loudly, never silently rescore the live pointer"
+        )
+
+
+def _reconcile_pointer(
+    bucket: str,
+    *,
+    pointer: dict | None,
+    record: dict,
+    freeze: bool,
+    upload: bool,
+    s3_client=None,
+) -> dict | None:
+    """Move the pointer when the arena moved it; otherwise make its PROVENANCE true.
+
+    The second half is alpha-engine-config-I9318's ``closes-when``:
+    ``config/producer_champion.json`` read ``promotion_source:
+    "operator_bootstrap"`` from 2026-07-13 through 2026-08-29 while an
+    automated engine evaluated it every week. That claim was false about the
+    live system, and §11 calls it a finding rather than a stable state.
+
+    So on every cycle the recorded provenance is set to what actually decided
+    this pointer's current value — ``arena_decided``/``arena_held``/
+    ``arena_unmeasurable``/``arena_bootstrap`` — and ``promoted_at`` is
+    PRESERVED whenever the champion did not change, so "when did the pointer
+    last move" survives the provenance correction. ``operator_bootstrap``
+    can now only appear when a human bootstrap genuinely wrote it and no
+    cycle has run since.
+    """
+    status = record.get("_arena_status") or "unknown"
+    source = f"arena_{status}"
+    # The arm the ENGINE decided, NOT the audit record's projection of it. The
+    # projection nulls any arm the frozen `producer_champion_audit` enum cannot
+    # name (`no_agent_quant`, `single_agent_quant` today), and the live pointer
+    # must never be narrowed by a rendering: the POINTER contract admits both
+    # arms, so reading the audit field here would silently refuse to promote
+    # exactly the two arms with the most evidence.
+    champion_after = record["_champion_after_name"]
+    moved = record["outcome"] == "promoted" and not freeze
+    if moved and champion_after is None:
+        raise ValueError(
+            "arena reported a promotion with no champion arm; refusing to write the "
+            "live pointer from an incomplete decision"
+        )
+
+    if not moved:
+        current_source = (pointer or {}).get("promotion_source")
+        if pointer is not None and current_source == source:
+            return None  # already true; nothing to say
+        return write_champion_pointer(
+            bucket, record["champion_before"],
+            promotion_source=source, upload=upload, s3_client=s3_client,
+            promoted_at=(pointer or {}).get("promoted_at"),
+        )
+    return write_champion_pointer(
+        bucket, champion_after,
+        promotion_source=source, upload=upload, s3_client=s3_client,
+    )
 
 
 # ── research/producer_leaderboard_champion_gate/{date}.json ─────────────────

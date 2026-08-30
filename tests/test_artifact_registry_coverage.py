@@ -185,6 +185,23 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # config/executor_params.json (1 PUT in apply()) — mirrors
     # barrier_sizing_optimizer; no new freshness-SLA artifact.
     "optimizer/stance_sizing_optimizer.py": 1,
+    # alpha-engine-config-I9320: S-slot arena cycle artifact at
+    # arena/strategy/{date}.json + arena/strategy/latest.json (dated first).
+    "optimizer/strategy_arena.py": 2,
+    # alpha-engine-config-I9318: R-slot (selection-producer) arena cycle
+    # artifact at arena/producer/{date}.json + arena/producer/latest.json
+    # (dated first), mirroring optimizer/strategy_arena.py's layout above so
+    # both slots live under one `arena/` prefix family.
+    #
+    # REGISTERED as a freshness-SLA row in ARTIFACT_REGISTRY.yaml, NOT
+    # grandfathered, and for a reason this repo has already been bitten by:
+    # this is the AUTHORITATIVE record of which producer arm trades live. Its
+    # absence is indistinguishable from "the slot was never evaluated", which
+    # is the exact state config/producer_champion.json was in for six weeks —
+    # correct value, no evidence anywhere that anything had looked at it. The
+    # narrowed producer_champion_audit row below stays until every consumer
+    # reads this artifact instead (alpha-engine-config-I9406).
+    "optimizer/producer_arena.py": 2,
     "optimizer/tech_weight_ablation.py": 3,
     "optimizer/trigger_optimizer.py": 1,
     "optimizer/weight_optimizer.py": 5,
