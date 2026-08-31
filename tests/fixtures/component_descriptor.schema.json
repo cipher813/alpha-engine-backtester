@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nousergon.github.io/nousergon-console/schemas/component_descriptor.schema.json",
+  "title": "Component descriptor",
+  "description": "Onboarding a process or module is writing THIS FILE (console-policy.md 2.6). It is committed beside the thing it describes and it binds the component to the places its facts already live. Nothing about the console changes, and in the normal case nothing about the module changes either: modules log the metrics they need to expose, and the descriptor points at that log. The binding lives here rather than in the console's configuration because console config is per-SOURCE, and a component whose data lands somewhere new would then cost a console edit — onboarding free by coincidence rather than by design.",
+  "type": "object",
+  "required": ["component_id"],
+  "additionalProperties": true,
+  "properties": {
+    "component_id": {
+      "type": "string",
+      "description": "The one name every signal, log key, alert and console row uses (3.6). Assigned by whoever owns the component, never minted by the console."
+    },
+    "lifecycle": {
+      "type": "string",
+      "enum": ["in-service", "disabled", "deprecated", "retired"],
+      "default": "in-service",
+      "description": "DECLARED here and nowhere else. observability-policy.md 8.3: disabled/deprecated/retired are declared, never inferred, because telemetry structurally cannot tell a decision from a defect. A claim to one of these from any non-declaration source is superseded at merge (2.5)."
+    },
+    "owner": {"type": "string", "description": "The identity accountable for this row being true."},
+    "substrate": {"type": "string"},
+    "owning_repo": {"type": "string"},
+    "authority_tier": {"type": "string", "description": "What it may do unattended."},
+    "runs": {
+      "description": "Where this component's executions are recorded — a state machine, a unit, a schedule. One binding or a list.",
+      "$ref": "#/$defs/bindingOrList"
+    },
+    "artifacts": {
+      "description": "Durable things it produces, each with a declared cadence. WITHOUT A CADENCE STALENESS IS NOT COMPUTABLE, and the console says so rather than assuming fresh (5.2).",
+      "$ref": "#/$defs/bindingOrList"
+    },
+    "metrics": {
+      "description": "Where this component's own numbers are. A module logs the metrics it needs to expose and this points at that log or table. A METRIC IS READ FROM A STRUCTURED RECORD ADDRESSED BY FIELD NAME — never a pattern matched against prose, which couples the surface to a format nobody promised to keep and fails by matching nothing, silently, rendering that as absence.",
+      "$ref": "#/$defs/bindingOrList"
+    },
+    "produces": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Artifact keys this component writes. Not a binding — nothing is read to satisfy it; it is the component stating its own edges (6)."
+    },
+    "consumes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Artifact keys this component reads. THE DIRECTION THAT MATTERS: the forward edge is a property of the producer and is usually written down somewhere, while 'who breaks if this is stale' exists nowhere unless somebody states it — and it is the only question an incident actually asks."
+    }
+  },
+  "$defs": {
+    "binding": {
+      "type": "object",
+      "required": ["driver"],
+      "additionalProperties": true,
+      "properties": {
+        "driver": {
+          "type": "string",
+          "description": "A source SHAPE (2.7) — object-store, state-machine, local-unit, log-source, sql-source, emitted-envelope, document-fields. A driver naming an INSTANCE is a build finding: which bucket, group, ARN or table belongs to this component is the rest of this object. A descriptor naming a driver that does not exist FAILS THE BUILD rather than rendering the component absent, because a typo and a genuinely-gone component must not look the same."
+        },
+        "key": {"type": "string", "description": "For object-shaped sources: the object this component wrote."},
+        "cadence_minutes": {"type": "number", "exclusiveMinimum": 0, "description": "How often this is expected to change. The single most valuable optional field: without it, staleness is not computable."},
+        "field": {"type": "string", "description": "For record-shaped sources: the FIELD NAME carrying the metric. A name, never a pattern."},
+        "unit": {"type": "string", "description": "Required for a numeric field (observability-policy.md 3.4). A column emitted as a normalized ratio and consumed as raw share volume silently failed 901 of 903 tickers for months."},
+        "baseline": {"description": "What it is compared against, or null declared explicitly — green means BETTER THAN THE BASELINE, and where there is no baseline there is no colour (5.4)."},
+        "render": {
+          "type": "string",
+          "enum": ["value", "duration", "bytes", "ratio", "count", "timeseries", "link", "text"],
+          "default": "value"
+        }
+      }
+    },
+    "bindingOrList": {
+      "oneOf": [
+        {"$ref": "#/$defs/binding"},
+        {"type": "array", "items": {"$ref": "#/$defs/binding"}}
+      ]
+    }
+  }
+}

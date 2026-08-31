@@ -1,0 +1,12 @@
+{
+  "_comment": "Vendored copy of nousergon-console/console/drivers/__init__.py::KNOWN_DRIVERS (frozenset(DRIVERS)) as of nousergon-console main @ PR102 merge, 2026-08-17 (alpha-engine-config-I7477 T4). A copy, not a symlink/import, for the same reason tests/fixtures/component_descriptor.schema.json is a copy: this is a public AGPL repo with no runtime dependency on nousergon-console. Re-sync by hand if the upstream driver registry changes.",
+  "drivers": [
+    "object-store",
+    "emitted-envelope",
+    "log-source",
+    "sql-source",
+    "document-fields",
+    "s3-records",
+    "state-machine"
+  ]
+}
