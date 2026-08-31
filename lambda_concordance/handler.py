@@ -433,6 +433,35 @@ def _run(event: dict, context) -> dict:
     # OBSERVE MODE — never changes this handler's own outcome. run_date is
     # this Lambda's end_time (the SF's $$.Execution.StartTime), falling
     # back to "now" for a bare invocation with no end_time_iso.
+    #
+    # alpha-engine-config-I8206: NEVER asserted on a `dry_run=True`
+    # invocation. `deploy_concordance.sh` invokes exactly this shape after
+    # every publish (`{"dry_run": true, "window_days": 14}`) to validate
+    # router resolution before promoting the `:live` alias — a deploy-time
+    # canary, not a pipeline stage execution. Before this fix the assertion
+    # ran unconditionally: the canary's own `window_start` is captured at
+    # DEPLOY time, hours after the Saturday weekly run already wrote a
+    # fresh, COVERED artifact, so `assert_stage_coverage` re-evaluated
+    # freshness against the canary's later window, found the real artifact
+    # "stale" relative to it, and OVERWROTE the correct COVERED verdict in
+    # `_stage_coverage/{date}/ReplayConcordance.json` with a false STALE
+    # one. Measured 2026-08-22: the real weekly Task invocation (05:21:24
+    # PT) wrote `decision_artifacts/_replay_summary/2608220900_deepseek-v4-
+    # flash.json` and recorded `status: COVERED`; a deploy canary for
+    # Lambda version 240, published 18:00:55 UTC, ran `dry_run=True,
+    # window_days=14` at 18:01:06 UTC and clobbered that same S3 object
+    # with `status: STALE, covered: []` — a stage that ran and wrote its
+    # artifact reported as having produced nothing, entirely from an
+    # unrelated deploy-time probe never intended to represent the stage's
+    # own execution. A dry run never asserts coverage for the same reason
+    # it never persists a summary: it does not run the stage.
+    if dry_run:
+        result["stage_coverage"] = {
+            "stage": "ReplayConcordance",
+            "status": "SKIPPED",
+            "reason": "dry_run=True (deploy canary) — not a stage execution, never asserted",
+        }
+        return result
     _coverage_run_date = (end_time or _started).date().isoformat()
     try:
         from krepis.stage_coverage import assert_stage_coverage
