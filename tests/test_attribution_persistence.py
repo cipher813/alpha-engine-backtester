@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
+from botocore.exceptions import ClientError
 
 from analysis.attribution_persistence import (
     ATTRIBUTION_INSUFFICIENT_PERSISTENCE_ALERT,
+    _load_history,
     count_trailing_insufficient,
     evaluate_attribution_persistence,
     record_and_evaluate,
@@ -191,3 +195,46 @@ def test_render_never_raises_on_missing_keys():
     # always-emit contract: a degraded result dict still renders a section.
     md = render_attribution_persistence_section({})
     assert "## Attribution sample adequacy (persistence)" in md
+
+
+# ── _load_history error handling (alpha-engine-config#9620 bug class) ────────
+# A transient/non-absence S3 error must RAISE, never be swallowed to `[]` —
+# record_and_evaluate() would otherwise overwrite HISTORY_KEY with just the
+# current cycle's entry, destroying every prior week on the next upload.
+
+def _client_error(code: str) -> ClientError:
+    return ClientError({"Error": {"Code": code, "Message": "x"}}, "GetObject")
+
+
+@patch("boto3.client")
+def test_load_history_no_such_key_returns_empty(mock_boto_client):
+    mock_s3 = MagicMock()
+    mock_s3.get_object.side_effect = _client_error("NoSuchKey")
+    mock_boto_client.return_value = mock_s3
+    assert _load_history("b") == []
+
+
+@patch("boto3.client")
+def test_load_history_404_returns_empty(mock_boto_client):
+    mock_s3 = MagicMock()
+    mock_s3.get_object.side_effect = _client_error("404")
+    mock_boto_client.return_value = mock_s3
+    assert _load_history("b") == []
+
+
+@patch("boto3.client")
+def test_load_history_transient_error_raises(mock_boto_client):
+    mock_s3 = MagicMock()
+    mock_s3.get_object.side_effect = _client_error("SlowDown")
+    mock_boto_client.return_value = mock_s3
+    with pytest.raises(ClientError):
+        _load_history("b")
+
+
+@patch("boto3.client")
+def test_load_history_access_denied_raises(mock_boto_client):
+    mock_s3 = MagicMock()
+    mock_s3.get_object.side_effect = _client_error("AccessDenied")
+    mock_boto_client.return_value = mock_s3
+    with pytest.raises(ClientError):
+        _load_history("b")
