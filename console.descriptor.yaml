@@ -41,7 +41,7 @@
 component_id: crucible-backtester-trials
 owning_repo: crucible-backtester
 substrate: ec2-spot
-origin: "crucible-backtester backtest.py::increment_trial_count + analysis/grade_history.py::append_grades — backtest/cumulative_trial_count.json and backtest/grade_history.json"
+origin: "crucible-backtester backtest.py::increment_trial_count — backtest/cumulative_trial_count.json"
 parent_component: alpha-engine-weekly-freshness-spot-dispatcher
 parent_component_reason: >-
   Runs as the `Backtester` stage the `alpha-engine-weekly-freshness-spot-
@@ -92,13 +92,16 @@ signals:
   outcome:
     status: emitted
     reason: >-
-      `backtest/grade_history.json` is the module grade SERIES —
-      `{date, overall, research, predictor, executor, components}` per weekly
-      grading run (`analysis/grade_history.py`). It is bound as an artifact
-      rather than as fields because its body is a top-level JSON ARRAY, which
-      neither `document-fields` (dict-only) nor `s3-records` (raises
-      "records body must be a JSON object") can address by field name — see
-      the artifacts block. Audited 2026-08-31 (alpha-engine-config-I9497).
+      Not emitted by this component. `backtest/grade_history.json` was the
+      module grade SERIES, and its producer `analysis/grade_history.py::
+      append_grades` was retired in `3eba0bb` (PR678, 2026-08-16,
+      config-I7474) with the artifact tombstoned on 2026-08-25 (config-I8406).
+      The module grade now lives on the Report Card
+      (`evaluator/latest/report_card.json`), which is `crucible-evaluator`'s
+      own descriptor to claim — a second component claiming it would be two
+      declarations of one substrate object (the `router-funded-depth-probe`
+      failure, ops-PR904). Audited 2026-08-31 (alpha-engine-config-I9497,
+      corrected I9620).
 
 log_location: s3://alpha-engine-research/backtest/cumulative_trial_count.json
 log_location_reason: >-
@@ -183,15 +186,17 @@ metrics:
 # `object-store` is a HEAD, not a body read: it renders freshness with the
 # four-field row contract (state · source · as-of · evidence link).
 #
-# `grade_history.json` is bound here rather than as fields because its body
-# is a top-level JSON ARRAY: `document-fields` resolves dotted paths against
-# a dict and would render every field null, and `s3-records` raises
-# "records body must be a JSON object" on a list. Binding it as an artifact
-# renders its FRESHNESS honestly today, and it is already saying something —
-# probed 2026-08-31, LastModified 2026-08-15 with a last entry dated
-# 2026-08-14, i.e. two weekly grading cycles behind. That is the console
-# doing its job on the first build, not a defect in this file; the fix is a
-# producer question and is filed rather than papered over.
+# `backtest/grade_history.json` was bound here when this file first landed and
+# is NOT bound any more (alpha-engine-config-I9620). The binding read its
+# two-cycle-old LastModified as a producer defect worth surfacing. It was not:
+# `analysis/grade_history.py::append_grades` and its `evaluate.py` call site
+# were DELETED in `3eba0bb` (PR678, 2026-08-16, config-I7474), and the
+# artifact was tombstoned out of `ARTIFACT_REGISTRY.yaml` on 2026-08-25 as a
+# frozen historical asset (config-I8406; the same question was already closed
+# premise-false as config-I8397). A freshness binding on a deliberately
+# retired artifact renders a declared decision as a permanent defect — the
+# `#7715` disease, one artifact over — so the honest rendering is no row at
+# all. `evaluate.py:3050-3067` carries the retirement rationale.
 #
 # `backtest/latest/attestation.json` is DELIBERATELY not bound here: it is
 # already the `metrics` binding of `governance/observability.d/
@@ -199,9 +204,6 @@ metrics:
 # same key would be two declarations of one substrate object — the
 # `router-funded-depth-probe` failure (ops-PR904).
 artifacts:
-  - driver: object-store
-    key: "s3://alpha-engine-research/backtest/grade_history.json"
-    cadence_minutes: 10080
   - driver: object-store
     key: "s3://alpha-engine-research/backtest/cumulative_trial_count.json"
     cadence_minutes: 10080
@@ -218,4 +220,3 @@ consumes:
   - "s3://alpha-engine-research/predictor/predictions/{date}.json"
 produces:
   - "s3://alpha-engine-research/backtest/cumulative_trial_count.json"
-  - "s3://alpha-engine-research/backtest/grade_history.json"
