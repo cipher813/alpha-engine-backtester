@@ -1,0 +1,221 @@
+# Console component descriptor — console-policy.md §2.6.
+#
+# WHAT THIS EXISTS FOR (alpha-engine-config-I9497). Before this file the only
+# `crucible-backtester` rows in the fleet registry were `crucible-backtester-
+# ci`, `-gitleaks` (CI scans) and `crucible-backtester-attestation` — and that
+# last one is a pass/fail §2.3a CORRECTNESS verdict, not a measurement of what
+# the backtester produced. Nothing on the console said how much search this
+# repo has actually spent, and nothing bound the module grade series it
+# writes. Both are outcome facts; neither had an entity.
+#
+# ── Identity: a PRODUCER identity, exactly like its sibling row ────────────
+#
+# Copied deliberately from `governance/observability.d/crucible-backtester-
+# attestation.yaml`: no discoverer enumerates a standalone backtester
+# component — `substrate: ec2-spot` is populated ONLY by the overseer-playbook
+# / t1-automation kinds — because the weekly run is the `Backtester` stage the
+# `alpha-engine-weekly-freshness-spot-dispatcher` Lambda launches on the
+# shared spot box. `parent_component` is this registry's mechanism for that
+# shape; without it the row would be reported ABSENT by a discoverer that can
+# only ever see the parent Lambda.
+#
+# ── Why this row cannot render a false transparency gap ────────────────────
+#
+# A registry row with `lifecycle: in-service` and no observation renders
+# UNREPORTED (`console/adapters/yaml_directory.py::_state_from_row`) — §9.2's
+# transparency-gap count itself. The `document-fields` binding below is what
+# stops that: that driver emits a COMPONENT entity under this row's own
+# `component_id` as an OBSERVATION claim, and observation outranks a
+# declaration-without-lifecycle for `state` (`console/index/merge.py::
+# _state_rank`, 1 vs 3). The row falls back to UNREPORTED only if the
+# backtester genuinely stops writing the trial ledger — which is the finding.
+#
+# The binding cadence equals the row cadence (10080) on purpose: §9.6's own
+# staleness threshold is `cadence x 1.5 + the observing source's poll
+# cadence`, while the driver's is `cadence x 1.5`, so the driver flips to
+# `MISSED` — a DISCLOSED state — strictly before §9.6 could ever count this
+# row as a staleness-honesty violation. One number, declared once, in two
+# places that agree (the `cadence-below-publisher-floor` disease is two
+# numbers that do not).
+
+component_id: crucible-backtester-trials
+owning_repo: crucible-backtester
+substrate: ec2-spot
+origin: "crucible-backtester backtest.py::increment_trial_count + analysis/grade_history.py::append_grades — backtest/cumulative_trial_count.json and backtest/grade_history.json"
+parent_component: alpha-engine-weekly-freshness-spot-dispatcher
+parent_component_reason: >-
+  Runs as the `Backtester` stage the `alpha-engine-weekly-freshness-spot-
+  dispatcher` Lambda launches on the Saturday weekly-SF cycle
+  (`ne-weekly-freshness-pipeline`), on the same shared spot box
+  `ae-preflight-stage-Backtester.yaml` and `crucible-backtester-attestation.yaml`
+  already parent to it. This is a producer identity for the S3 keys the
+  bindings below read, not a schedulable substrate of its own.
+owner: brian
+lifecycle: in-service
+cadence_minutes: 10080
+cadence_source: >-
+  The Saturday weekly-SF cycle runs the `Backtester` stage once per week
+  (`ne-weekly-freshness-pipeline`), the same trigger and the same number the
+  sibling `crucible-backtester-attestation` row declares for the same stage.
+
+authority_tier: observe-and-report
+authority_tier_reason: >-
+  The backtester searches parameter space and writes grades and trial counts;
+  it promotes nothing and takes no remediation action of its own. Champion
+  promotion is a separate decision made downstream against the report card.
+
+signals:
+  execution:
+    status: emitted
+    reason: >-
+      `backtest/cumulative_trial_count.json` carries `last_updated`, rewritten
+      by `increment_trial_count` on every sweep the stage runs. Probed
+      2026-08-31: `last_updated: 2026-08-28`, LastModified 2026-08-29.
+  cost:
+    status: unknown
+    reason: >-
+      Not audited — the trial ledger counts SEARCH, not spend, and neither
+      artifact carries the spot-box cost of the run that produced it.
+  resource:
+    status: unknown
+    reason: >-
+      Not audited — neither artifact carries a memory/CPU record of the
+      stage's own run.
+  data:
+    status: emitted
+    reason: >-
+      `backtest/cumulative_trial_count.json::by_producer` is the per-producer
+      trial ledger the deflated-Sharpe correction reads
+      (`nousergon_lib.quant.stats.trial_accumulator`, consumed by
+      `crucible-evaluator/grading/aggregate.py`). Probed 2026-08-31: 907
+      cumulative trials across four producers.
+  outcome:
+    status: emitted
+    reason: >-
+      `backtest/grade_history.json` is the module grade SERIES —
+      `{date, overall, research, predictor, executor, components}` per weekly
+      grading run (`analysis/grade_history.py`). It is bound as an artifact
+      rather than as fields because its body is a top-level JSON ARRAY, which
+      neither `document-fields` (dict-only) nor `s3-records` (raises
+      "records body must be a JSON object") can address by field name — see
+      the artifacts block. Audited 2026-08-31 (alpha-engine-config-I9497).
+
+log_location: s3://alpha-engine-research/backtest/cumulative_trial_count.json
+log_location_reason: >-
+  Declared per §6.2 from the fixed pointer this row's `metrics` binding
+  actually reads and which was probed live 2026-08-31 — not from a naming
+  convention. The stage's own stdout lives on an ephemeral spot box and does
+  not survive the run, so the durable S3 ledger is the location this row
+  monitors.
+alert_channel: unknown
+alert_channel_reason: >-
+  Unaudited at registration — whether anything pages when the trial ledger
+  or the grade series stops advancing was not verified.
+severity_source: unknown
+severity_source_reason: >-
+  Unaudited at registration. The numeric fields below ship with
+  `baseline: null` declared explicitly (§5.4 — no colour without a baseline);
+  alpha-engine-config-I9005 owns the viability bars and is reserved for
+  Brian's ruling, so no threshold is invented here.
+console_surface: descriptor:metrics/document-fields,artifacts/object-store
+console_surface_reason: >-
+  Declared alpha-engine-config-I9497. This descriptor is the WHOLE onboarding
+  act (console-policy.md §2.6): the console's gatherer reads it directly from
+  this repo via `observability-registry-publish.yml`. No console-repo edit,
+  no console config entry, and NO `governance/observability.d/` row — adding
+  one for a component a repo descriptor already declares is the duplicate
+  that broke the fleet registry publish for nine minutes on 2026-08-28
+  (alpha-engine-config-I9002).
+retention: unknown
+retention_reason: >-
+  Not audited. Both keys are last-write-wins accumulators (current value
+  only); no retention policy was verified at registration.
+
+# ── Metrics: the search ledger, read by FIELD NAME ─────────────────────────
+#
+# A metric is read from a structured record addressed by field name, never a
+# pattern matched against prose (console-policy.md §2.6). WHY THIS NUMBER
+# MATTERS rather than merely existing: `total` is the multiple-testing
+# denominator the deflated-Sharpe correction divides by
+# (`nousergon_lib.quant.stats.trial_accumulator`), so a report card whose
+# Sharpe looks fine against 900 trials and a report card whose Sharpe looks
+# fine against 90 are two different claims. Until now that denominator was
+# reachable on no console surface at all.
+#
+# `baseline: null` is declared EXPLICITLY on every numeric field rather than
+# omitted: §5.4 says green means better than the baseline and where there is
+# no baseline there is no colour, and the explicit null is the difference
+# between "deliberately uncoloured" and "somebody forgot".
+metrics:
+  - driver: document-fields
+    documents:
+      - key: "s3://alpha-engine-research/backtest/cumulative_trial_count.json"
+        fields:
+          cumulative_trials_total:
+            path: total
+            unit: trials
+            baseline: null
+          trials_predictor_param_sweep:
+            path: by_producer.predictor_param_sweep
+            unit: trials
+            baseline: null
+          trials_optimizer_param_sweep:
+            path: by_producer.optimizer_param_sweep
+            unit: trials
+            baseline: null
+          trials_cov_estimator_sweep:
+            path: by_producer.cov_estimator_sweep
+            unit: trials
+            baseline: null
+          trials_contribution_lift:
+            path: by_producer.contribution_lift
+            unit: trials
+            baseline: null
+          trials_last_updated:
+            path: last_updated
+            render: text
+    # Equal to this row's own declared cadence — see the header for why the
+    # driver must be able to disclose staleness before §9.6 audits it.
+    cadence_minutes: 10080
+
+# ── Artifacts ──────────────────────────────────────────────────────────────
+#
+# `object-store` is a HEAD, not a body read: it renders freshness with the
+# four-field row contract (state · source · as-of · evidence link).
+#
+# `grade_history.json` is bound here rather than as fields because its body
+# is a top-level JSON ARRAY: `document-fields` resolves dotted paths against
+# a dict and would render every field null, and `s3-records` raises
+# "records body must be a JSON object" on a list. Binding it as an artifact
+# renders its FRESHNESS honestly today, and it is already saying something —
+# probed 2026-08-31, LastModified 2026-08-15 with a last entry dated
+# 2026-08-14, i.e. two weekly grading cycles behind. That is the console
+# doing its job on the first build, not a defect in this file; the fix is a
+# producer question and is filed rather than papered over.
+#
+# `backtest/latest/attestation.json` is DELIBERATELY not bound here: it is
+# already the `metrics` binding of `governance/observability.d/
+# crucible-backtester-attestation.yaml`, and a second component claiming the
+# same key would be two declarations of one substrate object — the
+# `router-funded-depth-probe` failure (ops-PR904).
+artifacts:
+  - driver: object-store
+    key: "s3://alpha-engine-research/backtest/grade_history.json"
+    cadence_minutes: 10080
+  - driver: object-store
+    key: "s3://alpha-engine-research/backtest/cumulative_trial_count.json"
+    cadence_minutes: 10080
+
+# ── Lineage (§6) ───────────────────────────────────────────────────────────
+#
+# `consumes` is the direction that matters: the forward edge is a property of
+# the producer and is written down somewhere already, while "who breaks if
+# this is stale" exists nowhere unless somebody states it.
+# Read straight off the two key templates `backtest.py` names in source, not
+# inferred from a key pattern.
+consumes:
+  - "s3://alpha-engine-research/signals/{date}/signals.json"
+  - "s3://alpha-engine-research/predictor/predictions/{date}.json"
+produces:
+  - "s3://alpha-engine-research/backtest/cumulative_trial_count.json"
+  - "s3://alpha-engine-research/backtest/grade_history.json"
