@@ -196,9 +196,38 @@ def test_artifact_bindings_declare_a_cadence():
     """
     d = _load_descriptor()
     bindings = _bindings(d.get("artifacts"))
-    assert len(bindings) == 2
+    assert bindings, "at least one artifact binding is expected"
     for binding in bindings:
         assert binding.get("cadence_minutes", 0) > 0
+
+
+def test_no_binding_names_a_retired_artifact():
+    """alpha-engine-config-I9620: a freshness binding on a deliberately
+    retired artifact renders a declared decision as a permanent defect.
+
+    `backtest/grade_history.json`'s producer was deleted in `3eba0bb`
+    (PR678, 2026-08-16, config-I7474) and the artifact was tombstoned out of
+    `ARTIFACT_REGISTRY.yaml` on 2026-08-25 (config-I8406). Binding it made
+    this descriptor claim a producer that no longer exists.
+
+    The list is explicit rather than derived because the tombstones live in
+    a private repo this public one cannot read. Adding a retired key here is
+    the cheap half of retiring one.
+    """
+    retired = {"backtest/grade_history.json"}
+    d = _load_descriptor()
+    for section in ("runs", "artifacts", "metrics"):
+        for binding in _bindings(d.get(section)):
+            keys = [binding["key"]] if "key" in binding else []
+            keys += [doc["key"] for doc in binding.get("documents", [])]
+            for k in keys:
+                for r in retired:
+                    assert r not in k, (
+                        f"{section} binding names retired artifact {r!r}: {k}"
+                    )
+    for k in list(d.get("produces") or []) + list(d.get("consumes") or []):
+        for r in retired:
+            assert r not in k, f"lineage names retired artifact {r!r}: {k}"
 
 
 def test_numeric_fields_declare_an_explicit_null_baseline():
