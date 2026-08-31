@@ -34,6 +34,7 @@ import json
 import logging
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -94,13 +95,34 @@ def evaluate_attribution_persistence(
 # ── S3 history (mirrors retrain_alert._write_alert_to_s3) ─────────────────────
 
 def _load_history(bucket: str) -> list[dict]:
-    """Read the append-only adequacy history (chronological). [] if absent."""
+    """Read the append-only adequacy history (chronological). [] if absent.
+
+    Only a genuine absence (``NoSuchKey``/404 — first run, nothing written
+    yet) is treated as empty history. Any OTHER failure (throttle,
+    permissions, transient network error) must RAISE rather than be
+    swallowed to ``[]``: ``record_and_evaluate`` below unconditionally
+    appends this cycle's entry to whatever this function returns and, when
+    ``upload=True``, overwrites ``HISTORY_KEY`` with the result — treating a
+    transient read failure as "no history" would silently truncate the
+    entire multi-week attribution-persistence trail down to one entry
+    (alpha-engine-config#9620's bug class, found live here on
+    2026-08-31 — the retired `grade_history.py::_load_history` this module's
+    docstring cites as its pattern-sibling made the identical mistake).
+    Recording surface: the caller (evaluate.py's attribution-persistence
+    section, ~line 2928) already wraps this in a try/except that logs the
+    exception at ERROR and emits a report placeholder naming this file and
+    the S3 history key — so raising here surfaces loudly without crashing
+    the rest of the weekly evaluation report.
+    """
     s3 = boto3.client("s3")
     try:
         obj = s3.get_object(Bucket=bucket, Key=HISTORY_KEY)
         text = obj["Body"].read().decode()
-    except Exception:  # noqa: BLE001 — first run / missing object → empty history
-        return []
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code in ("NoSuchKey", "404"):
+            return []
+        raise
     rows: list[dict] = []
     for line in text.splitlines():
         line = line.strip()

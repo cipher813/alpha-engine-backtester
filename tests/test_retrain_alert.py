@@ -4,6 +4,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
 
 from analysis.retrain_alert import (
     evaluate_retrain_triggers,
@@ -11,6 +12,7 @@ from analysis.retrain_alert import (
     _should_suppress,
     _build_subject,
     _build_plain_body,
+    _write_alert_to_s3,
 )
 
 
@@ -315,3 +317,69 @@ def test_no_suppress_no_previous(mock_boto):
     mock_boto.client.return_value = s3
     s3.get_object.side_effect = Exception("Not found")
     assert _should_suppress("bucket") is False
+
+
+# ── _write_alert_to_s3 history-append error handling ─────────────────────────
+# (alpha-engine-config#9620 bug class). A transient/non-absence S3 error
+# reading history.jsonl must NOT be treated as "no prior history" — that
+# used to fall through to an unconditional put_object of `"" + line`,
+# silently truncating the append-only audit trail to one entry.
+
+def _client_error(code: str) -> ClientError:
+    return ClientError({"Error": {"Code": code, "Message": "x"}}, "GetObject")
+
+
+@patch("analysis.retrain_alert.boto3")
+def test_write_alert_history_appends_on_no_such_key(mock_boto):
+    s3 = MagicMock()
+    mock_boto.client.return_value = s3
+    s3.get_object.side_effect = _client_error("NoSuchKey")
+    alert = {"date": "2026-08-31", "triggered": True}
+
+    _write_alert_to_s3(alert, "bucket")
+
+    history_calls = [
+        c for c in s3.put_object.call_args_list
+        if c.kwargs.get("Key") == "predictor/alerts/history.jsonl"
+    ]
+    assert len(history_calls) == 1
+    body = history_calls[0].kwargs["Body"].decode()
+    assert body.count("\n") == 1  # only this cycle's line — legitimate first write
+
+
+@patch("analysis.retrain_alert.boto3")
+def test_write_alert_history_preserves_prior_rows(mock_boto):
+    s3 = MagicMock()
+    mock_boto.client.return_value = s3
+    prior = json.dumps({"date": "2026-08-24"}) + "\n"
+    s3.get_object.return_value = {"Body": MagicMock(read=lambda: prior.encode())}
+    alert = {"date": "2026-08-31", "triggered": True}
+
+    _write_alert_to_s3(alert, "bucket")
+
+    history_calls = [
+        c for c in s3.put_object.call_args_list
+        if c.kwargs.get("Key") == "predictor/alerts/history.jsonl"
+    ]
+    body = history_calls[0].kwargs["Body"].decode()
+    assert "2026-08-24" in body
+    assert "2026-08-31" in body
+
+
+@patch("analysis.retrain_alert.boto3")
+def test_write_alert_history_transient_error_does_not_truncate(mock_boto):
+    s3 = MagicMock()
+    mock_boto.client.return_value = s3
+    s3.get_object.side_effect = _client_error("SlowDown")
+    alert = {"date": "2026-08-31", "triggered": True}
+
+    # Outer handler in _write_alert_to_s3 swallows + logs — must not crash
+    # the caller, but must NOT have overwritten history.jsonl with a
+    # single-line body derived from a transient error read as "empty".
+    _write_alert_to_s3(alert, "bucket")
+
+    history_calls = [
+        c for c in s3.put_object.call_args_list
+        if c.kwargs.get("Key") == "predictor/alerts/history.jsonl"
+    ]
+    assert history_calls == []

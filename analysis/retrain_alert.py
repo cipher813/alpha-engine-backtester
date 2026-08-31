@@ -30,6 +30,7 @@ import logging
 from datetime import date, datetime
 
 import boto3
+from botocore.exceptions import ClientError
 
 from nousergon_lib.email_sender import send_email
 from nousergon_lib.secrets import get_secret
@@ -252,7 +253,19 @@ def _write_alert_to_s3(alert: dict, bucket: str) -> None:
     except Exception as exc:
         log.warning("Failed to write retrain alert to S3: %s", exc)
 
-    # Append to history (JSONL)
+    # Append to history (JSONL). Only a genuine absence (NoSuchKey/404 —
+    # first run) may be treated as "no prior history" here. Any OTHER read
+    # failure (throttle, permissions, transient) used to fall into the bare
+    # `except Exception: pass` below, which then unconditionally overwrote
+    # `history.jsonl` with `"" + line` — silently truncating the whole
+    # append-only audit trail to this one alert (alpha-engine-config#9620's
+    # bug class; the sibling `attribution_persistence.py::_load_history`
+    # carried the identical defect, fixed alongside this one). Recording
+    # surface: the outer `except Exception as exc: log.warning(...)` below
+    # still catches this raise, so a real S3 outage degrades to "history not
+    # appended this cycle" (logged) rather than "history silently reset to
+    # one entry" — the alert write to `retrain_alert_latest.json` above is
+    # unaffected either way.
     try:
         line = json.dumps(alert, default=str) + "\n"
         # Read existing history, append
@@ -260,8 +273,9 @@ def _write_alert_to_s3(alert: dict, bucket: str) -> None:
         try:
             obj = s3.get_object(Bucket=bucket, Key="predictor/alerts/history.jsonl")
             existing = obj["Body"].read().decode()
-        except Exception:
-            pass
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") not in ("NoSuchKey", "404"):
+                raise
         s3.put_object(
             Bucket=bucket,
             Key="predictor/alerts/history.jsonl",
