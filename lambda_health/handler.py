@@ -121,12 +121,12 @@ def handler(event: dict, context) -> dict:
             from krepis.cost_sink import flush_default_sink
             _n = flush_default_sink()
             if _n:
-                logger.info("[lambda_health] cost sink flushed: %d object(s)", _n)
+                log.info("[lambda_health] cost sink flushed: %d object(s)", _n)
         except ImportError as exc:
             # Loud, not silent: the image's krepis pin predates the function.
             # Any records held would be lost, and AggregateCosts' fan-in
             # coverage check is what would say so.
-            logger.error("cost-sink flush unavailable — records lost: %s", exc)
+            log.error("cost-sink flush unavailable — records lost: %s", exc)
 
 
 def _run(event: dict, context) -> dict:
