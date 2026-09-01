@@ -75,3 +75,60 @@ def test_all_deploy_artifacts_pin_same_lib_version():
         f"its own hardcoded `pip install \"alpha-engine-lib@vX.Y.Z\"` line "
         f"that is independent of requirements.txt."
     )
+
+
+# ── A commit-SHA pin is a CI failure here, not a Step Functions degradation ──
+#
+# alpha-engine-config-I7301 deliverable 3. This repo is one half of the only
+# multi-repo co-install site in the fleet: `infrastructure/spot_backtest.sh`
+# installs THIS repo's requirements and then `crucible-predictor`'s into ONE
+# venv, so the two nousergon-lib pins must be equal or the second install
+# silently downgrades the shared lib (the 2026-05-12 incident).
+#
+# `crucible-predictor` pinned the lib to a bare commit SHA on 2026-07-31
+# (crucible-predictor#422). The commit was not an ancestor of `main` — the
+# branch was squash-merged — so production installed a tree that never landed
+# and the parity invariant went unverifiable for thirteen days. Nothing in CI
+# said so. The first signal was the weekly Step Function's `LibPinDriftCheck`
+# reporting `reason: sha_pinned` and degrading the run, which is the wrong
+# layer: a committed repo state that recurs on every run until a human edits
+# the file is a CI failure, not a runtime gate that fires forever.
+#
+# The tag-shaped `_read_pin` assertions above already fail on a SHA pin, but
+# they fail as *"could not find alpha-engine-lib pin"* — a message that reads
+# like a moved file or a renamed dependency. This test names the condition, so
+# the red build states the fix.
+_SHA_PIN_RE = re.compile(
+    r"(?:alpha-engine-lib|nousergon-lib)\[[^\]]*\]\s*@\s*git\+https://github\.com/"
+    r"nousergon/nousergon-lib@([0-9a-f]{7,40})\b"
+)
+
+_PIN_FILES = (
+    "requirements.txt",
+    "lambda_health/Dockerfile",
+    "lambda_concordance/Dockerfile",
+    "lambda_counterfactual/Dockerfile",
+)
+
+
+def test_no_deploy_artifact_pins_the_lib_by_commit_sha():
+    """Every alpha-engine-lib pin is a `vX.Y.Z` release tag.
+
+    A commit SHA is not comparable to `crucible-predictor`'s tag or to the
+    weekly pipeline's `MIN_LIB_VERSION` floor, so it makes the co-install
+    parity invariant permanently unverifiable rather than merely unsatisfied.
+    """
+    offenders = {
+        name: match.group(1)
+        for name in _PIN_FILES
+        if (match := _SHA_PIN_RE.search((_REPO_ROOT / name).read_text()))
+    }
+    assert not offenders, (
+        "alpha-engine-lib is pinned by commit SHA in:\n"
+        + "\n".join(f"  {name}: {sha}" for name, sha in offenders.items())
+        + "\n\nPin a released vX.Y.Z tag instead, equal to crucible-predictor's "
+        "pin. A SHA pin cannot be compared to the co-install partner's pin or "
+        "to the weekly pipeline's MIN_LIB_VERSION floor, so `LibPinDriftCheck` "
+        "reports `sha_pinned` and DEGRADES the Saturday run on every "
+        "invocation until the file is edited (alpha-engine-config-I7301)."
+    )
