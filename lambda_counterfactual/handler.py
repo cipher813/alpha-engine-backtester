@@ -91,6 +91,40 @@ def _ensure_init() -> None:
 
 @monitor_handler
 def handler(event: dict, context) -> dict:
+    """Entry point. Runs the counterfactual, then flushes cost telemetry.
+
+    The `finally` is structural, not a prediction (alpha-engine-config-I7423).
+    `krepis.cost_sink.S3JsonlCostSink` buffers to 200 records per
+    `(date, callsite_id)` group and otherwise relies on an `atexit` hook —
+    and **an AWS Lambda container is FROZEN between invocations, not exited,
+    so `atexit` never runs.** A handler finishing below the threshold writes
+    nothing at all.
+
+    This handler makes no model call today. The flush is here anyway, for the
+    same reason its two siblings in this repo and every handler in
+    crucible-research and crucible-evaluator have it: the guard that keeps
+    `lambda_concordance` honest is a glob over `lambda_*/handler.py`, and a
+    guard that has to correctly predict which handlers reach a model is the
+    guard that misses the next one. `flush_default_sink` returns 0 when no
+    sink is configured and never raises, so the cost of being wrong in this
+    direction is one function call.
+    """
+    try:
+        return _run(event, context)
+    finally:
+        try:
+            from krepis.cost_sink import flush_default_sink
+            _n = flush_default_sink()
+            if _n:
+                logger.info("[lambda_counterfactual] cost sink flushed: %d object(s)", _n)
+        except ImportError as exc:
+            # Loud, not silent: the image's krepis pin predates the function.
+            # Any records held would be lost, and AggregateCosts' fan-in
+            # coverage check is what would say so.
+            logger.error("cost-sink flush unavailable — records lost: %s", exc)
+
+
+def _run(event: dict, context) -> dict:
     """Compute + emit per-agent counterfactual rule fit.
 
     Returns OK / PARTIAL / ERROR same as the concordance Lambda:
